@@ -41,7 +41,7 @@ class Settings:
             artifact_dir=(data_dir / "artifacts").resolve(),
             secret_key=os.getenv("AUTOJEV_SECRET_KEY") or None,
             cors_origins=origins,
-            headless=_bool_env("AUTOJEV_HEADLESS", True),
+            headless=_bool_env("AUTOJEV_HEADLESS", False),
             browser=os.getenv("AUTOJEV_BROWSER", "chromium").lower(),
             http_timeout_seconds=float(os.getenv("AUTOJEV_HTTP_TIMEOUT_SECONDS", "45")),
         )

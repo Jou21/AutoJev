@@ -3,9 +3,81 @@ import pytest
 from autojev.adapters.openai_compatible import (
     ModelResponseError,
     OpenAIAuxiliaryScenarioGenerator,
+    OpenAICompatibleClient,
     OpenAIJevAgent,
     extract_json,
 )
+
+
+@pytest.mark.asyncio
+async def test_list_models_uses_openrouter_model_name(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"id": "openai/gpt-4o", "name": "GPT-4o"}]}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, *args, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kwargs: FakeClient())
+    models = await OpenAICompatibleClient(
+        "https://openrouter.ai/api/v1", "sk-or-test"
+    ).list_models()
+
+    assert models == [{"id": "openai/gpt-4o", "label": "GPT-4o"}]
+
+
+@pytest.mark.asyncio
+async def test_chat_json_captures_and_drains_provider_usage(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [{"message": {"content": '{"ok": true}'}}],
+                "usage": {
+                    "prompt_tokens": 31,
+                    "completion_tokens": 9,
+                    "total_tokens": 40,
+                    "cost": 0.00042,
+                },
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, *args, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kwargs: FakeClient())
+    client = OpenAICompatibleClient("https://openrouter.ai/api/v1", "sk-or-test")
+    assert await client.chat_json("openai/gpt-4o", "system", "user") == {"ok": True}
+    assert client.drain_usage() == {
+        "prompt_tokens": 31,
+        "completion_tokens": 9,
+        "total_tokens": 40,
+        "cost": 0.00042,
+        "cost_known": True,
+    }
+    assert client.drain_usage()["total_tokens"] == 0
 from autojev.domain.models import (
     ActionResult,
     AssertionResult,

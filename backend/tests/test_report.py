@@ -19,6 +19,13 @@ def test_report_is_standalone_and_escapes_model_content(tmp_path):
             "blocked": 0,
             "skipped": 0,
         },
+        "usage": {
+            "prompt_tokens": 120,
+            "completion_tokens": 30,
+            "total_tokens": 150,
+            "cost": 0.0042,
+            "cost_known": True,
+        },
         "scenarios": [
             {
                 "id": "CT001",
@@ -47,3 +54,5 @@ def test_report_is_standalone_and_escapes_model_content(tmp_path):
     assert "<style>" in document and "<script>" in document
     assert 'id="search"' in document
     assert '<details class="scenario"' in document
+    assert ">150</strong>Tokens" in document
+    assert ">$0.004200</strong>Custo" in document

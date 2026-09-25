@@ -98,6 +98,10 @@ def _headers(api_key: str | None) -> dict[str, str]:
     return headers
 
 
+def _is_jev_model(model: str) -> bool:
+    return model.removeprefix("~").startswith("typesafe/jev-")
+
+
 def _safe_error(exc: Exception, secrets: list[str] | None = None) -> str:
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
@@ -147,6 +151,42 @@ class OpenAICompatibleClient:
         self.base_url = base_url
         self.api_key = api_key
         self.timeout = httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 15))
+        self._pending_usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cost": 0.0,
+            "cost_known": False,
+        }
+
+    def _record_usage(self, body: dict[str, Any]) -> None:
+        usage = body.get("usage") if isinstance(body, dict) else None
+        if not isinstance(usage, dict):
+            return
+        prompt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+        completion = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+        total = int(usage.get("total_tokens") or prompt + completion)
+        raw_cost = usage.get("cost", body.get("cost"))
+        try:
+            cost = float(raw_cost) if raw_cost is not None else 0.0
+        except (TypeError, ValueError):
+            cost = 0.0
+        self._pending_usage["prompt_tokens"] += prompt
+        self._pending_usage["completion_tokens"] += completion
+        self._pending_usage["total_tokens"] += total
+        self._pending_usage["cost"] += cost
+        self._pending_usage["cost_known"] = self._pending_usage["cost_known"] or raw_cost is not None
+
+    def drain_usage(self) -> dict[str, int | float | bool]:
+        usage = dict(self._pending_usage)
+        self._pending_usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cost": 0.0,
+            "cost_known": False,
+        }
+        return usage
 
     async def list_models(self) -> list[dict[str, str]]:
         try:
@@ -166,7 +206,12 @@ class OpenAICompatibleClient:
                 label = item
             elif isinstance(item, dict):
                 model_id = str(item.get("id") or item.get("name") or "").strip()
-                label = str(item.get("label") or item.get("display_name") or model_id).strip()
+                label = str(
+                    item.get("label")
+                    or item.get("display_name")
+                    or item.get("name")
+                    or model_id
+                ).strip()
             else:
                 continue
             if model_id:
@@ -207,6 +252,7 @@ class OpenAICompatibleClient:
                     )
                 response.raise_for_status()
                 body = response.json()
+                self._record_usage(body)
                 content = body["choices"][0]["message"]["content"]
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
             raise ProviderConnectionError(_safe_error(exc, [self.api_key or ""])) from exc
@@ -216,9 +262,41 @@ class OpenAICompatibleClient:
             )
         return extract_json(str(content))
 
+    async def decisions(
+        self,
+        model: str,
+        state: dict[str, Any],
+        questions: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        payload = {"model": model, "state": state, "questions": questions}
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+                response = await client.post(
+                    f"{self.base_url.split('/api/')[0]}/api/alpha/decisions",
+                    headers=_headers(self.api_key),
+                    json=payload,
+                )
+                response.raise_for_status()
+                body = response.json()
+                self._record_usage(body)
+        except (httpx.HTTPError, ValueError, TypeError) as exc:
+            raise ProviderConnectionError(_safe_error(exc, [self.api_key or ""])) from exc
+        answers = body.get("answers") if isinstance(body, dict) else None
+        if not isinstance(answers, dict):
+            raise ProviderConnectionError("JEV returned no typed decisions")
+        return answers
+
     async def test(self, model_id: str | None = None) -> dict[str, Any]:
         started = time.perf_counter()
-        if model_id:
+        if model_id and _is_jev_model(model_id):
+            answers = await self.decisions(
+                model_id,
+                {"connection_check": True},
+                {"ok": {"type": "noul", "instructions": "Is this a connection check?"}},
+            )
+            if answers.get("ok", {}).get("noul", 0) < 0.5:
+                raise ProviderConnectionError("JEV failed the typed decision capability check")
+        elif model_id:
             result = await self.chat_json(
                 model_id,
                 "Return JSON only.",
@@ -288,9 +366,73 @@ Use finish once useful reachable areas have been explored or no safe new action 
             "available_credential_keys": credential_keys,
             "recent_history": history[-12:],
         }
-        raw_payload = await self.client.chat_json(
-            self.model, system, json.dumps(page, ensure_ascii=False)
-        )
+        if _is_jev_model(self.model):
+            interactive_elements = [
+                element for element in observation.interactive_elements if element.get("ref")
+            ]
+            target_actions = {"click", "fill", "select", "press", "hover"}
+            available_actions = self.ALLOWED_ACTIONS - {"navigate"}
+            if not credential_keys:
+                available_actions -= {"fill"}
+            if not interactive_elements:
+                available_actions -= target_actions
+            criteria = {
+                "navigate": "Do not choose navigate; exploration stays on this application.",
+                "click": "Choose click to interact with a button, link, or control and discover new areas.",
+                "fill": "Choose fill to enter text into a field (use a credential alias when needed).",
+                "select": "Choose select to change a dropdown option.",
+                "press": "Choose press to submit a form with Enter or send a key.",
+                "hover": "Choose hover to reveal menus or tooltips.",
+                "go_back": "Choose go_back to return to the previous page.",
+                "reload": "Choose reload to verify page state after changes.",
+                "wait": "Choose wait only when the page is visibly loading content.",
+                "screenshot": "Choose screenshot only to record evidence without interacting.",
+                "finish": "Choose finish ONLY when recent_history shows several different areas were already explored and no safe new action remains. Never finish as the first decision on an unexplored page.",
+            }
+            action_choices = {
+                action: criteria[action]
+                for action in sorted(available_actions)
+            }
+            target_choices = {
+                str(element.get("ref")): str(element.get("name") or element.get("role") or "Interactive element")
+                for element in interactive_elements
+            }
+            questions = {
+                "action": {
+                    "type": "choice",
+                    "instructions": "Which safe action should the Playwright executor take next?",
+                    "criteria": action_choices,
+                },
+            }
+            if target_choices:
+                questions["target"] = {
+                    "type": "choice",
+                    "instructions": "Which observed element should the action target? Choose an element only for click, fill, select, press, or hover.",
+                    "criteria": target_choices,
+                }
+            if credential_keys:
+                questions["credential"] = {
+                    "type": "choice",
+                    "instructions": "Which credential alias should be used for a fill action, if needed?",
+                    "criteria": {key: f"Use the {key} credential alias." for key in credential_keys},
+                }
+            answers = await self.client.decisions(
+                self.model,
+                page,
+                questions,
+            )
+            action = answers.get("action", {}).get("choice")
+            target = answers.get("target", {}).get("choice")
+            raw_payload = {
+                "action": action,
+                "target": target if action in target_actions else None,
+                "credential_key": answers.get("credential", {}).get("choice"),
+                "rationale": "Decision selected by TypeSafe Jev.",
+            }
+        else:
+            raw_payload = await self.client.chat_json(
+                self.model, system, json.dumps(page, ensure_ascii=False)
+            )
         try:
             payload = _AgentDecisionPayload.model_validate(raw_payload)
         except ValidationError as exc:

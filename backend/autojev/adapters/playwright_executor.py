@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,10 @@ class BrowserUnavailableError(RuntimeError):
 
 class PlaywrightExecutor:
     """The sole component permitted to perform browser actions."""
+
+    # IDs de UI própria injetada no site. Nunca entram em observações,
+    # candidatos de ação, texto visível ou screenshots de evidência.
+    PANEL_SELECTOR = "#autojev-sidepanel,#autojev-intervention-panel,#autojev-live-panel"
 
     def __init__(
         self,
@@ -45,6 +50,8 @@ class PlaywrightExecutor:
         self._screenshot_number = 0
         self._allowed_origin: tuple[str, str, int] | None = None
         self._blocked_navigation_url: str | None = None
+        self._user_input_event = asyncio.Event()
+        self._intervention_message = ""
 
     async def start(self, url: str) -> Observation:
         self._validate_url(url)
@@ -67,18 +74,37 @@ class PlaywrightExecutor:
             if browser_type is None:
                 raise BrowserUnavailableError(f"Unsupported browser: {self.browser_name}")
             launch_options = {"headless": self.headless}
+            viewport_width = max(int(self.options.viewport_width or 1440), 1)
+            viewport_height = max(int(self.options.viewport_height or 900), 1)
+            if self.headless:
+                context_options: dict[str, Any] = {
+                    "ignore_https_errors": False,
+                    "viewport": {"width": viewport_width, "height": viewport_height},
+                }
+            else:
+                # Modo com interface (login manual): viewport LIVRE.
+                # Com viewport fixo (ex. 1440x900), maximizar a janela maior
+                # que isso deixa faixas brancas — a página fica "reduzida" no
+                # canto. Com no_viewport=True o layout acompanha qualquer
+                # tamanho de janela/redimensionamento/maximizar.
+                # O --window-size só dá o tamanho inicial (~viewport pedido).
+                launch_options["args"] = [
+                    f"--window-size={viewport_width + 16},{viewport_height + 145}",
+                ]
+                context_options = {
+                    "ignore_https_errors": False,
+                    "no_viewport": True,
+                }
             if channel:
                 launch_options["channel"] = channel
             self._browser = await browser_type.launch(**launch_options)
-            self._context = await self._browser.new_context(
-                viewport={
-                    "width": self.options.viewport_width,
-                    "height": self.options.viewport_height,
-                },
-                ignore_https_errors=False,
-            )
+            self._context = await self._browser.new_context(**context_options)
             await self._context.route("**/*", self._guard_navigation)
             self._page = await self._context.new_page()
+            await self._page.expose_binding(
+                "__autojev_resume",
+                lambda source: self._user_input_event.set(),
+            )
             self._page.on("console", self._on_console)
             self._page.on("pageerror", self._on_page_error)
             self._page.on("response", self._on_response)
@@ -91,6 +117,235 @@ class PlaywrightExecutor:
         except Exception as exc:
             await self.close()
             raise BrowserUnavailableError(f"Browser could not start or navigate: {exc}") from exc
+
+    _SIDEPANEL_CSS = (
+        "#autojev-sidepanel{position:fixed !important;z-index:2147483647;top:0;right:0;"
+        "width:330px;height:100vh;overflow-y:auto;margin:0;box-sizing:border-box;"
+        "padding:28px 22px;color:#e8ecec;background:#111719;border-left:1px solid #765b25;"
+        "box-shadow:-8px 0 28px rgba(0,0,0,.28);font:14px ui-sans-serif,system-ui,sans-serif;"
+        "display:block !important;visibility:visible !important;opacity:1 !important;}"
+        "#autojev-sidepanel .autojev-panel-kicker{color:#eab94e;font-size:10px;font-weight:700;"
+        "letter-spacing:.12em;}"
+        "#autojev-sidepanel h2{margin:18px 0 10px;font-size:21px;color:#fff;}"
+        "#autojev-sidepanel p{color:#aebbb9;line-height:1.55;}"
+        "#autojev-sidepanel ul{list-style:none;margin:14px 0 0;padding:0;}"
+        "#autojev-sidepanel li{margin:0 0 8px;padding:8px 10px;border-radius:6px;"
+        "background:#1a2224;color:#c8d4d2;font-size:12px;line-height:1.45;"
+        "border-left:2px solid #eab94e;word-break:break-word;}"
+        "#autojev-sidepanel button{width:100%;margin-top:18px;padding:12px 14px;border:0;"
+        "border-radius:6px;background:#eab94e;color:#17130b;font-weight:700;cursor:pointer;}"
+        "#autojev-sidepanel button:disabled{opacity:.7;cursor:default;}"
+        "#autojev-sidepanel .autojev-live-dot{display:inline-block;width:8px;height:8px;"
+        "border-radius:50%;background:#4ade80;margin-right:6px;}"
+        "#autojev-sidepanel .autojev-usage{display:flex;gap:8px;margin:12px 0 0;color:#eab94e;"
+        "font-size:11px;font-weight:700;}"
+    )
+
+    async def _ensure_sidepanel(self) -> bool:
+        """Cria a barra lateral única (status + ação). Retorna False se impossível."""
+        if not self._page or self.headless:
+            return False
+        try:
+            await self._page.evaluate(
+                """(css) => {
+                  const ID = 'autojev-sidepanel';
+                  if (document.getElementById(ID)) return;
+                  const panel = document.createElement('aside');
+                  panel.id = ID;
+                  const kicker = document.createElement('div');
+                  kicker.className = 'autojev-panel-kicker';
+                  kicker.innerHTML = '<span class="autojev-live-dot"></span><span id="autojev-kicker-text">AUTOJEV · EXPLORANDO</span>';
+                  const title = document.createElement('h2');
+                  title.id = 'autojev-panel-title';
+                  title.textContent = 'Exploração em andamento';
+                  const log = document.createElement('ul');
+                  log.id = 'autojev-panel-log';
+                  const action = document.createElement('div');
+                  action.id = 'autojev-panel-action';
+                  action.style.display = 'none';
+                  const actionText = document.createElement('p');
+                  actionText.id = 'autojev-action-text';
+                  const button = document.createElement('button');
+                  button.id = 'autojev-action-button';
+                  button.type = 'button';
+                  button.textContent = 'Continuar exploração';
+                  button.addEventListener('click', () => {
+                    try {
+                      const fn = window.__autojev_resume;
+                      if (typeof fn === 'function') fn();
+                    } catch (e) {}
+                    button.disabled = true;
+                    button.textContent = 'Retomando…';
+                  });
+                  action.append(actionText, button);
+                  const usage = document.createElement('div');
+                  usage.id = 'autojev-usage';
+                  usage.className = 'autojev-usage';
+                  usage.textContent = 'Tokens: 0 · Custo: —';
+                  const style = document.createElement('style');
+                  style.textContent = css;
+                  panel.append(kicker, title, usage, action, log, style);
+                  const mount = () => {
+                    if (!document.body) return false;
+                    if (!document.getElementById(ID)) document.body.append(panel);
+                    return true;
+                  };
+                  if (!mount()) {
+                    new MutationObserver((_, obs) => { if (mount()) obs.disconnect(); })
+                      .observe(document.documentElement, { childList: true, subtree: true });
+                  }
+                }""",
+                self._SIDEPANEL_CSS,
+            )
+            return True
+        except Exception:
+            return False
+
+    async def show_live_panel(self) -> None:
+        await self._ensure_sidepanel()
+
+    async def update_live_panel(self, title: str, line: str) -> None:
+        """Atualiza título e acrescenta linha de log (máx. 8). Sem botões."""
+        if not self._page or self.headless:
+            return
+        if not await self._ensure_sidepanel():
+            return
+        try:
+            await self._page.evaluate(
+                """([title, line]) => {
+                  const panel = document.getElementById('autojev-sidepanel');
+                  if (!panel) return;
+                  const titleEl = document.getElementById('autojev-panel-title');
+                  if (titleEl && title) titleEl.textContent = title;
+                  if (line) {
+                    const log = document.getElementById('autojev-panel-log');
+                    if (log) {
+                      const li = document.createElement('li');
+                      li.textContent = line;
+                      log.prepend(li);
+                      while (log.children.length > 8) log.lastChild.remove();
+                    }
+                  }
+                }""",
+                [str(title or "")[:200], str(line or "")[:500]],
+            )
+        except Exception:
+            pass
+
+    async def update_usage_panel(
+        self, total_tokens: int, cost: float | None, cost_known: bool
+    ) -> None:
+        if not self._page or self.headless:
+            return
+        try:
+            await self._page.evaluate(
+                """([tokens, costText]) => {
+                  const usage = document.getElementById('autojev-usage');
+                  if (usage) usage.textContent = `Tokens: ${tokens.toLocaleString('pt-BR')} · Custo: ${costText}`;
+                }""",
+                [total_tokens, f"${cost:.6f}" if cost_known and cost is not None else "—"],
+            )
+        except Exception:
+            pass
+
+    async def hide_live_panel(self) -> None:
+        if not self._page:
+            return
+        try:
+            await self._page.evaluate("document.getElementById('autojev-sidepanel')?.remove()");
+        except Exception:
+            pass
+
+    async def show_intervention_panel(self, message: str) -> None:
+        """Mostra a seção de ação (botão Continuar) mantendo o log visível."""
+        if not self._page or self.headless:
+            return
+        self._intervention_message = message
+        if not await self._ensure_sidepanel():
+            return
+        try:
+            await self._page.evaluate(
+                """(message) => {
+                  const action = document.getElementById('autojev-panel-action');
+                  const text = document.getElementById('autojev-action-text');
+                  const button = document.getElementById('autojev-action-button');
+                  const kicker = document.getElementById('autojev-kicker-text');
+                  if (text) text.textContent = message;
+                  if (action) action.style.display = 'block';
+                  if (button) { button.disabled = false; button.textContent = 'Continuar exploração'; }
+                  if (kicker) kicker.textContent = 'AUTOJEV · AÇÃO NECESSÁRIA';
+                  const title = document.getElementById('autojev-panel-title');
+                  if (title) title.textContent = 'Faça login para continuar';
+                }""",
+                message,
+            )
+        except Exception:
+            pass
+
+    async def hide_intervention_panel(self) -> None:
+        """Esconde só a seção de ação; o log de status continua visível."""
+        if not self._page:
+            return
+        try:
+            await self._page.evaluate(
+                """() => {
+                  document.getElementById('autojev-panel-action')?.style.setProperty('display', 'none');
+                  const kicker = document.getElementById('autojev-kicker-text');
+                  if (kicker) kicker.textContent = 'AUTOJEV · EXPLORANDO';
+                  const button = document.getElementById('autojev-action-button');
+                  if (button) { button.disabled = false; button.textContent = 'Continuar exploração'; }
+                }"""
+            )
+        except Exception:
+            pass
+
+    def notify_user_input(self) -> None:
+        self._user_input_event.set()
+
+    async def is_login_page(self) -> bool:
+        """Checagem leve (sem screenshot) para detectar tela de login."""
+        if not self._page:
+            return False
+        try:
+            return bool(
+                await self._page.evaluate(
+                    """() => {
+                      const field = document.querySelector(
+                        'input[type="password"], input[name*="pass" i], input[name*="senha" i], input[id*="pass" i]'
+                      );
+                      if (!field) return false;
+                      const box = field.getBoundingClientRect();
+                      const style = getComputedStyle(field);
+                      return style.display !== 'none' && style.visibility !== 'hidden' && box.width > 0 && box.height > 0;
+                    }"""
+                )
+            )
+        except Exception:
+            return True
+
+    async def wait_for_user_input(self) -> None:
+        # Mantém a barra lateral sempre visível durante a espera:
+        # reinjeta se navegação/JS do site a remover.
+        self._user_input_event.clear()
+        await self.show_intervention_panel(self._intervention_message or "Preencha usuário e senha na página.")
+        while not self._user_input_event.is_set():
+            try:
+                await asyncio.wait_for(self._user_input_event.wait(), timeout=1.0)
+                break
+            except asyncio.TimeoutError:
+                pass
+            if self.headless or not self._page:
+                continue
+            try:
+                exists = await self._page.evaluate(
+                    "!!document.getElementById('autojev-sidepanel')"
+                )
+            except Exception:
+                exists = True
+            if not exists and not self._user_input_event.is_set():
+                await self.show_intervention_panel(self._intervention_message or "Preencha usuário e senha na página.")
+        self._user_input_event.clear()
+        await self.hide_intervention_panel()
 
     @staticmethod
     def _validate_url(url: str) -> None:
@@ -248,7 +503,37 @@ class PlaywrightExecutor:
                     masks.append(text_locator)
             except Exception:
                 continue
-        await self._page.screenshot(path=str(path), full_page=True, mask=masks, timeout=20_000)
+        # Esconde a barra do AutoJev para não poluir as evidências.
+        panels_hidden = False
+        try:
+            await self._page.evaluate(
+                """() => {
+                  document.querySelectorAll(
+                    '#autojev-sidepanel,#autojev-intervention-panel,#autojev-live-panel'
+                  ).forEach((panel) => {
+                    panel.setAttribute('data-autojev-restore', panel.style.display || '');
+                    panel.style.display = 'none';
+                  });
+                }"""
+            )
+            panels_hidden = True
+        except Exception:
+            panels_hidden = False
+        try:
+            await self._page.screenshot(path=str(path), full_page=True, mask=masks, timeout=20_000)
+        finally:
+            if panels_hidden:
+                try:
+                    await self._page.evaluate(
+                        """() => {
+                          document.querySelectorAll('[data-autojev-restore]').forEach((panel) => {
+                            panel.style.display = panel.getAttribute('data-autojev-restore') || '';
+                            panel.removeAttribute('data-autojev-restore');
+                          });
+                        }"""
+                    )
+                except Exception:
+                    pass
         return filename
 
     async def observe(self, screenshot_label: str = "page") -> Observation:
@@ -256,14 +541,23 @@ class PlaywrightExecutor:
             raise BrowserUnavailableError("Browser page is not active")
         snapshot = await self._page.evaluate(
             """() => {
-              const candidates = Array.from(document.querySelectorAll(
-                'a,button,input,select,textarea,[role="button"],[role="link"],[role="checkbox"],[role="radio"],[tabindex]'
-              )).filter((el) => {
-                const style = getComputedStyle(el);
-                const box = el.getBoundingClientRect();
-                return style.visibility !== 'hidden' && style.display !== 'none' && box.width > 0 && box.height > 0;
-              }).slice(0, 100);
-              document.querySelectorAll('[data-autojev-ref]').forEach(el => el.removeAttribute('data-autojev-ref'));
+              const PANEL_SELECTOR = '#autojev-sidepanel,#autojev-intervention-panel,#autojev-live-panel';
+              const panels = Array.from(document.querySelectorAll(PANEL_SELECTOR));
+              const previous = panels.map((panel) => panel.style.display);
+              // Esconde a UI do AutoJev de forma síncrona: nem os candidatos
+              // nem o texto visível a incluem, e nenhum repaint ocorre no meio.
+              panels.forEach((panel) => { panel.style.display = 'none'; });
+              let result;
+              try {
+                const candidates = Array.from(document.querySelectorAll(
+                  'a,button,input,select,textarea,[role="button"],[role="link"],[role="checkbox"],[role="radio"],[tabindex]'
+                )).filter((el) => {
+                  if (el.closest(PANEL_SELECTOR)) return false;
+                  const style = getComputedStyle(el);
+                  const box = el.getBoundingClientRect();
+                  return style.visibility !== 'hidden' && style.display !== 'none' && box.width > 0 && box.height > 0;
+                }).slice(0, 100);
+                document.querySelectorAll('[data-autojev-ref]').forEach(el => el.removeAttribute('data-autojev-ref'));
               const elements = candidates.map((el, index) => {
                 const ref = `e${index}`;
                 el.setAttribute('data-autojev-ref', ref);
@@ -282,6 +576,9 @@ class PlaywrightExecutor:
                 text: (document.body?.innerText || '').slice(0, 12000),
                 elements,
               };
+              } finally {
+                panels.forEach((panel, index) => { panel.style.display = previous[index]; });
+              }
             }"""
         )
         screenshot = await self._capture(screenshot_label)

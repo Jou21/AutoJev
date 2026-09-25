@@ -13,6 +13,7 @@ import {
   BrainCircuit,
   Check,
   CheckCircle2,
+  CircleDollarSign,
   ChevronDown,
   ChevronRight,
   CircleStop,
@@ -26,6 +27,7 @@ import {
   FileText,
   Gauge,
   Globe2,
+  Hash,
   History,
   KeyRound,
   LayoutDashboard,
@@ -59,6 +61,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useId,
   useRef,
   useState,
 } from "react";
@@ -105,6 +108,7 @@ type ExplorationEvent = {
   timestamp?: string;
   created_at?: string;
   status?: string;
+  payload?: Record<string, unknown>;
 };
 
 type Exploration = {
@@ -151,6 +155,13 @@ type Exploration = {
   activity?: ExplorationEvent[];
   logs?: ExplorationEvent[];
   error?: string | null;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+    cost?: number | null;
+    cost_known?: boolean;
+  };
 };
 
 type Toast = {
@@ -185,6 +196,7 @@ const STATUS_LABELS: Record<string, string> = {
   queued: "Na fila",
   pending: "Preparando",
   running: "Em execução",
+  waiting_input: "Aguardando sua intervenção",
   completed: "Concluída",
   success: "Concluída",
   failed: "Falhou",
@@ -197,6 +209,7 @@ const STATUS_TONES: Record<string, string> = {
   queued: "neutral",
   pending: "neutral",
   running: "running",
+  waiting_input: "warning",
   completed: "success",
   success: "success",
   failed: "error",
@@ -207,6 +220,12 @@ const STATUS_TONES: Record<string, string> = {
 
 function normalizeBaseUrl(url: string) {
   return url.replace(/\/$/, "");
+}
+
+function normalizeTargetUrl(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  return /^[a-z][a-z\d+.-]*:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
 }
 
 function listFrom<T>(value: unknown, keys: string[]): T[] {
@@ -228,6 +247,33 @@ function modelLabel(model: Model) {
   return model.label || model.name || model.model_id || model.id || "Modelo sem nome";
 }
 
+const FREE_MODEL_PREFERENCE = [
+  "nvidia/nemotron-3-ultra-550b-a55b:free",
+  "nvidia/nemotron-3-super-120b-a12b:free",
+  "qwen/qwen3.8-27b:free",
+  "z-ai/glm-5.2:free",
+  "google/gemma-4-31b-it:free",
+];
+
+const JEV_MODEL_PREFERENCE = ["typesafe/jev-1.13", "typesafe/jev-latest"];
+
+function defaultModel(models: Model[], role: "agent" | "auxiliary") {
+  if (role === "agent") {
+    const jevModel = JEV_MODEL_PREFERENCE.find((preferred) =>
+      models.some((model) => modelValue(model) === preferred),
+    );
+    if (jevModel) return jevModel;
+  }
+  const freeModels = models.filter((model) => modelValue(model).endsWith(":free"));
+  if (!freeModels.length) return models[0] ? modelValue(models[0]) : "";
+  return (
+    FREE_MODEL_PREFERENCE.find((preferred) =>
+      freeModels.some((model) => modelValue(model) === preferred),
+    )
+    || modelValue(freeModels[0])
+  );
+}
+
 function providerIsEnabled(provider: Provider) {
   return provider.enabled ?? provider.active ?? true;
 }
@@ -243,7 +289,7 @@ function explorationStatus(status?: string) {
 
 function isLive(status?: string) {
   const value = (status || "").toLowerCase();
-  return ["queued", "pending", "running"].includes(value);
+  return ["queued", "pending", "running", "waiting_input"].includes(value);
 }
 
 function formatDate(value?: string, withTime = true) {
@@ -276,6 +322,15 @@ function durationBetween(start?: string, end?: string) {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   return `${minutes}m ${seconds}s`;
+}
+
+function formatTokens(value?: number) {
+  return new Intl.NumberFormat("pt-BR").format(value || 0);
+}
+
+function formatCost(usage?: Exploration["usage"]) {
+  if (!usage?.cost_known) return "—";
+  return `$${(usage.cost || 0).toFixed(6)}`;
 }
 
 function errorMessage(error: unknown) {
@@ -484,7 +539,20 @@ export default function AutoJevApp() {
 
     const successful = results.filter((result) => result.status === "fulfilled").length;
     if (results[0].status === "fulfilled") {
-      setProviders(listFrom<Provider>(results[0].value, ["providers", "items", "data"]));
+      const loadedProviders = listFrom<Provider>(results[0].value, ["providers", "items", "data"]);
+      setProviders(loadedProviders);
+      const openRouterProviders = loadedProviders.filter((provider) =>
+        provider.has_api_key
+        && !provider.models?.some((model) => modelValue(model) === "typesafe/jev-1.13")
+        && /openrouter\.ai/i.test(provider.base_url),
+      );
+      if (openRouterProviders.length) {
+        await Promise.allSettled(
+          openRouterProviders.map((provider) => request(`/providers/${encodeURIComponent(provider.id)}/discover-models`, { method: "POST" })),
+        );
+        const refreshed = await request<unknown>("/providers").catch(() => null);
+        if (refreshed) setProviders(listFrom<Provider>(refreshed, ["providers", "items", "data"]));
+      }
     }
     if (results[1].status === "fulfilled") {
       setModels(listFrom<Model>(results[1].value, ["models", "items", "data"]));
@@ -509,6 +577,19 @@ export default function AutoJevApp() {
     try {
       const data = await request<Exploration>(`/explorations/${encodeURIComponent(id)}`);
       setSelectedExploration(data);
+      setExplorations((current) => current.map((item) => {
+        if (item.id !== data.id) return item;
+        return {
+          ...item,
+          status: data.status,
+          progress: data.progress,
+          updated_at: data.updated_at,
+          current_action: data.current_action,
+          counters: data.counters,
+          usage: data.usage,
+          screenshot_url: data.screenshot_url,
+        };
+      }));
       setApiState("online");
       setConnectionError("");
       return data;
@@ -555,6 +636,12 @@ export default function AutoJevApp() {
     return () => window.clearInterval(timer);
   }, [route, pollInterval, loadExploration, loadCore]);
 
+  useEffect(() => {
+    if (route.view === "detail" || !explorations.some((item) => isLive(item.status))) return;
+    const timer = window.setInterval(() => void loadCore(true), pollInterval);
+    return () => window.clearInterval(timer);
+  }, [route.view, explorations, pollInterval, loadCore]);
+
   const navigate = (hash: string) => {
     if (window.location.hash === hash) setRoute(parseRoute());
     else window.location.hash = hash;
@@ -569,6 +656,19 @@ export default function AutoJevApp() {
   };
 
   const currentNavView = route.view === "detail" ? "explorations" : route.view;
+  const activeUsage = explorations
+    .filter((item) => isLive(item.status))
+    .reduce(
+      (total, item) => ({
+        prompt_tokens: total.prompt_tokens + (item.usage?.prompt_tokens || 0),
+        completion_tokens: total.completion_tokens + (item.usage?.completion_tokens || 0),
+        total_tokens: total.total_tokens + (item.usage?.total_tokens || 0),
+        cost: total.cost + (item.usage?.cost || 0),
+        cost_known: total.cost_known || Boolean(item.usage?.cost_known),
+      }),
+      { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost: 0, cost_known: false },
+    );
+  const hasActiveUsage = explorations.some((item) => isLive(item.status));
   const totalModels = useMemo(
     () => providers.reduce((total, provider) => total + (provider.models?.filter((model) => model.enabled !== false).length || 0), 0) || models.filter((model) => model.enabled !== false).length,
     [providers, models],
@@ -690,6 +790,15 @@ export default function AutoJevApp() {
         </nav>
 
         <div className="sidebar-footer">
+          {hasActiveUsage && (
+            <div className="usage-indicator" title="Consumo acumulado das explorações em andamento">
+              <div className="usage-indicator-heading"><Activity size={14} /><strong>Uso ao vivo</strong><span className="live-mini"><span />ao vivo</span></div>
+              <div className="usage-indicator-values">
+                <span><Hash size={13} /><strong>{formatTokens(activeUsage.total_tokens)}</strong><small>tokens</small></span>
+                <span><CircleDollarSign size={13} /><strong>{activeUsage.cost_known ? `$${activeUsage.cost.toFixed(6)}` : "—"}</strong><small>custo informado</small></span>
+              </div>
+            </div>
+          )}
           <div className={`api-indicator api-${apiState}`} title={`API: ${apiBase}`}>
             <span className="api-dot" />
             <div><strong>{apiState === "online" ? "API conectada" : apiState === "checking" ? "Verificando API" : "API indisponível"}</strong><small>FastAPI · {apiState === "online" ? "operacional" : "localhost:8000"}</small></div>
@@ -945,25 +1054,33 @@ function NewExplorationView({
 
   useEffect(() => {
     const available = modelsFor(agentProvider);
-    if (!available.some((model) => modelValue(model) === agentModel)) setAgentModel(available[0] ? modelValue(available[0]) : "");
+    if (!available.some((model) => modelValue(model) === agentModel)) setAgentModel(defaultModel(available, "agent"));
   }, [agentProvider, agentModel, modelsFor]);
 
   useEffect(() => {
     const available = modelsFor(auxProvider);
-    if (!available.some((model) => modelValue(model) === auxModel)) setAuxModel(available[0] ? modelValue(available[0]) : "");
+    if (!available.some((model) => modelValue(model) === auxModel)) setAuxModel(defaultModel(available, "auxiliary"));
   }, [auxProvider, auxModel, modelsFor]);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (!url || !agentProvider || !agentModel || !auxProvider || !auxModel) {
+    const targetUrl = normalizeTargetUrl(url);
+    try {
+      new URL(targetUrl);
+    } catch {
+      toast("Informe um domínio ou URL válida.", "error");
+      return;
+    }
+    if (!targetUrl || !agentProvider || !agentModel || !auxProvider || !auxModel) {
       toast("Preencha a URL e selecione os dois modelos.", "error");
       return;
     }
+    setUrl(targetUrl);
     setSubmitting(true);
     try {
       const [viewportWidth, viewportHeight] = viewport.split("x").map(Number);
       const body: Record<string, unknown> = {
-        app_url: url,
+        app_url: targetUrl,
         agent: { provider_id: agentProvider, model_id: agentModel },
         auxiliary_llm: { provider_id: auxProvider, model_id: auxModel },
         options: {
@@ -1005,7 +1122,7 @@ function NewExplorationView({
             <div className="form-section-content">
               <div className="form-section-heading"><div><h2>Aplicação alvo</h2><p>Informe a URL inicial. O JEV descobrirá as rotas durante a navegação.</p></div><Globe2 size={21} /></div>
               <label className="field-label" htmlFor="target-url">URL da aplicação</label>
-              <div className="input-with-icon"><Globe2 size={17} /><input id="target-url" type="url" required placeholder="https://app.exemplo.com" value={url} onChange={(event) => setUrl(event.target.value)} autoComplete="url" /></div>
+              <div className="input-with-icon"><Globe2 size={17} /><input id="target-url" type="text" inputMode="url" required placeholder="https://app.exemplo.com ou www.exemplo.com" value={url} onChange={(event) => setUrl(event.target.value)} onBlur={() => setUrl(normalizeTargetUrl(url))} autoComplete="url" /></div>
               <span className="field-hint">A aplicação deve estar acessível pelo servidor que executa o Playwright.</span>
             </div>
           </section>
@@ -1125,7 +1242,83 @@ function ModelRoleCard({
     <div className={`model-role-card accent-${accent}`}>
       <div className="model-role-head"><span className="model-role-icon">{icon}</span><div><strong>{roleTitle}</strong><small>{description}</small></div></div>
       <label className="field-group"><span>Provedor</span><select value={providerValue} onChange={(event) => onProvider(event.target.value)} disabled={!providers.length}><option value="">Selecione o provedor</option>{providers.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select></label>
-      <label className="field-group"><span>Modelo</span><select value={modelValueSelected} onChange={(event) => onModel(event.target.value)} disabled={!providerValue || !modelsFor(providerValue).length}><option value="">Selecione o modelo</option>{modelsFor(providerValue).map((model) => <option key={modelValue(model)} value={modelValue(model)}>{modelLabel(model)}</option>)}</select></label>
+      <div className="field-group"><span>Modelo</span><ModelCombobox models={modelsFor(providerValue)} value={modelValueSelected} onChange={onModel} disabled={!providerValue} /></div>
+    </div>
+  );
+}
+
+function ModelCombobox({
+  models,
+  value,
+  onChange,
+  disabled,
+}: {
+  models: Model[];
+  value: string;
+  onChange: (value: string) => void;
+  disabled: boolean;
+}) {
+  const listboxId = useId();
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const selected = models.find((model) => modelValue(model) === value);
+  const normalizedQuery = query.trim().toLowerCase();
+  const filtered = models.filter((model) => {
+    if (!normalizedQuery) return true;
+    return `${modelLabel(model)} ${modelValue(model)}`.toLowerCase().includes(normalizedQuery);
+  });
+
+  useEffect(() => {
+    if (!open) setQuery(selected ? modelLabel(selected) : "");
+  }, [open, selected]);
+
+  const choose = (model: Model) => {
+    onChange(modelValue(model));
+    setQuery(modelLabel(model));
+    setOpen(false);
+  };
+
+  return (
+    <div className="model-combobox">
+      <input
+        aria-autocomplete="list"
+        aria-controls={listboxId}
+        aria-expanded={open}
+        aria-label="Pesquisar modelo"
+        disabled={disabled || !models.length}
+        role="combobox"
+        value={query}
+        placeholder={models.length ? "Pesquisar modelo..." : "Nenhum modelo disponível"}
+        onFocus={() => { setOpen(true); setQuery(""); }}
+        onBlur={() => window.setTimeout(() => setOpen(false), 120)}
+        onChange={(event) => { setQuery(event.target.value); setOpen(true); }}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") setOpen(false);
+          if (event.key === "Enter" && filtered[0]) { event.preventDefault(); choose(filtered[0]); }
+        }}
+      />
+      <ChevronDown size={15} className="model-combobox-chevron" />
+      {open && !disabled && (
+        <div className="model-combobox-menu" id={listboxId} role="listbox">
+          {filtered.length ? filtered.map((model) => {
+            const id = modelValue(model);
+            return (
+              <button
+                type="button"
+                role="option"
+                aria-selected={id === value}
+                className={id === value ? "selected" : ""}
+                key={id}
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => choose(model)}
+              >
+                <strong>{modelLabel(model)}</strong>
+                {modelLabel(model) !== id && <small>{id}</small>}
+              </button>
+            );
+          }) : <div className="model-combobox-empty">Nenhum modelo encontrado.</div>}
+        </div>
+      )}
     </div>
   );
 }
@@ -1161,7 +1354,7 @@ function ExplorationsView({ explorations, loading, navigate }: { explorations: E
         ) : (
           <div className="exploration-table-wrap">
             <table className="data-table">
-              <thead><tr><th>Aplicação</th><th>Status</th><th>Progresso</th><th>Cenários</th><th>Iniciada</th><th><span className="sr-only">Ações</span></th></tr></thead>
+              <thead><tr><th>Aplicação</th><th>Status</th><th>Progresso</th><th>Cenários</th><th>Tokens</th><th>Custo</th><th>Iniciada</th><th><span className="sr-only">Ações</span></th></tr></thead>
               <tbody>{filtered.map((item) => {
                 const progress = item.progress ?? (["completed", "success"].includes(item.status?.toLowerCase()) ? 100 : 0);
                 return (
@@ -1170,6 +1363,8 @@ function ExplorationsView({ explorations, loading, navigate }: { explorations: E
                     <td><StatusBadge status={item.status} /></td>
                     <td><div className="table-progress"><span><i style={{ width: `${Math.min(100, Math.max(0, progress))}%` }} /></span><small>{Math.round(progress)}%</small></div></td>
                     <td><div className="scenario-cell"><strong>{item.counters?.scenarios || item.counters?.test_scenarios || item.scenarios_count || 0}</strong>{item.summary && <small>{item.summary.pass || 0} PASS · {item.summary.fail || 0} FAIL</small>}</div></td>
+                    <td>{formatTokens(item.usage?.total_tokens)}</td>
+                    <td>{formatCost(item.usage)}</td>
                     <td><span className="date-cell">{formatDate(item.created_at)}</span></td>
                     <td><button className="icon-button" aria-label={`Abrir exploração de ${hostFromUrl(item.app_url)}`} onClick={(event) => { event.stopPropagation(); navigate(`#/exploracoes/${encodeURIComponent(item.id)}`); }}><ChevronRight size={18} /></button></td>
                   </tr>
@@ -1394,7 +1589,7 @@ function ProviderCard({ provider, initiallyOpen, request, toast, reload }: { pro
 }
 
 function AddProviderModal({ request, onClose, onSaved, toast }: { request: ApiRequest; onClose: () => void; onSaved: () => Promise<void>; toast: (message: string, tone?: Toast["tone"]) => void }) {
-  const [draft, setDraft] = useState<ProviderDraft>({ name: "", base_url: "", api_key: "", enabled: true });
+  const [draft, setDraft] = useState<ProviderDraft>({ name: "OpenRouter", base_url: "https://openrouter.ai/api/v1", api_key: "", enabled: true });
   const [saving, setSaving] = useState(false);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -1402,7 +1597,10 @@ function AddProviderModal({ request, onClose, onSaved, toast }: { request: ApiRe
     try {
       const payload: Record<string, unknown> = { name: draft.name.trim(), base_url: draft.base_url.trim(), enabled: draft.enabled, models: [] };
       if (draft.api_key.trim()) payload.api_key = draft.api_key.trim();
-      await request("/providers", { method: "POST", body: JSON.stringify(payload) });
+      const provider = await request<{ id: string }>("/providers", { method: "POST", body: JSON.stringify(payload) });
+      const discovered = await request<unknown>(`/providers/${encodeURIComponent(provider.id)}/discover-models`, { method: "POST" });
+      const models = listFrom<Model>(discovered, ["models", "items", "data"]);
+      toast(`${models.length} modelo(s) do OpenRouter carregado(s).`, "success");
       await onSaved();
     } catch (error) {
       toast(errorMessage(error), "error");
@@ -1448,6 +1646,7 @@ function ExplorationDetailView({
   pollInterval: number;
 }) {
   const [cancelling, setCancelling] = useState(false);
+  const [resuming, setResuming] = useState(false);
   const [openingReport, setOpeningReport] = useState(false);
   if (loading && !exploration) return <div className="detail-loading"><Spinner size={24} /><span>Carregando exploração…</span></div>;
   if (!exploration) {
@@ -1457,6 +1656,8 @@ function ExplorationDetailView({
   const status = explorationStatus(exploration.status);
   const progress = exploration.progress ?? (["completed", "success"].includes(status.value) ? 100 : 0);
   const events = exploration.events || exploration.activity || exploration.logs || [];
+  const waitingForInput = exploration.status.toLowerCase() === "waiting_input";
+  const waitingEvent = [...events].reverse().find((event) => event.type === "waiting_input");
   const screenshot = resolveAssetUrl(exploration.screenshot_url);
   const providerName = (id?: string) => providers.find((provider) => provider.id === id)?.name || id || "—";
   const counters = {
@@ -1476,6 +1677,19 @@ function ExplorationDetailView({
       toast(errorMessage(error), "error");
     } finally {
       setCancelling(false);
+    }
+  };
+
+  const resume = async () => {
+    setResuming(true);
+    try {
+      await request(`/explorations/${encodeURIComponent(exploration.id)}/resume`, { method: "POST" });
+      toast("Exploração retomada.", "success");
+      onRefresh();
+    } catch (error) {
+      toast(errorMessage(error), "error");
+    } finally {
+      setResuming(false);
     }
   };
 
@@ -1527,7 +1741,7 @@ function ExplorationDetailView({
           <strong className="progress-number">{Math.round(progress)}<small>%</small></strong>
         </div>
         <div className="large-progress"><span style={{ width: `${Math.min(100, Math.max(0, progress))}%` }} /></div>
-        <div className="live-counters"><DetailCounter icon={Globe2} value={counters.pages} label="páginas" /><DetailCounter icon={Zap} value={counters.actions} label="ações" /><DetailCounter icon={AlertCircle} value={counters.issues} label="achados" /><DetailCounter icon={FileCheck2} value={counters.scenarios} label="cenários" /><DetailCounter icon={Clock3} value={durationBetween(exploration.started_at || exploration.created_at, exploration.finished_at)} label="duração" /></div>
+        <div className="live-counters"><DetailCounter icon={Globe2} value={counters.pages} label="páginas" /><DetailCounter icon={Zap} value={counters.actions} label="ações" /><DetailCounter icon={AlertCircle} value={counters.issues} label="achados" /><DetailCounter icon={FileCheck2} value={counters.scenarios} label="cenários" /><DetailCounter icon={Hash} value={formatTokens(exploration.usage?.total_tokens)} label="tokens" /><DetailCounter icon={CircleDollarSign} value={formatCost(exploration.usage)} label="custo" /><DetailCounter icon={Clock3} value={durationBetween(exploration.started_at || exploration.created_at, exploration.finished_at)} label="duração" /></div>
       </section>
 
       <div className="detail-grid">
@@ -1543,6 +1757,17 @@ function ExplorationDetailView({
         </section>
 
         <aside className="detail-side">
+          {waitingForInput && (
+            <section className="panel intervention-card">
+              <span className="section-kicker"><span className="live-pulse" />Ação necessária</span>
+              <h2>Faça login no navegador</h2>
+              <p>{waitingEvent?.message || "O navegador está aguardando sua intervenção para continuar."}</p>
+              <button className="button primary" onClick={() => void resume()} disabled={resuming}>
+                {resuming ? <Spinner /> : <Play size={16} />}
+                Continuar exploração
+              </button>
+            </section>
+          )}
           <section className="panel configuration-card">
             <div className="panel-heading"><span className="section-kicker">Modelos da execução</span><h2>Configuração</h2></div>
             <div className="config-model"><span className="model-role-icon amber"><BrainCircuit size={18} /></span><div><small>JEV · agente QA</small><strong>{exploration.agent?.model_id || exploration.agent?.model || "—"}</strong><em>{providerName(exploration.agent?.provider_id || exploration.agent?.provider)}</em></div></div>

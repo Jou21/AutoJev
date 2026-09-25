@@ -278,6 +278,65 @@ a {
   border-top: 1px solid var(--border-soft);
 }
 
+.usage-indicator {
+  margin-bottom: 9px;
+  padding: 10px;
+  border: 1px solid #4b4027;
+  border-radius: 7px;
+  background: #1a1812;
+}
+
+.usage-indicator-heading,
+.usage-indicator-values,
+.usage-indicator-values span {
+  display: flex;
+  align-items: center;
+}
+
+.usage-indicator-heading {
+  gap: 6px;
+  color: var(--amber);
+  font-size: 10px;
+}
+
+.usage-indicator-heading .live-mini {
+  margin-left: auto;
+  font-size: 8px;
+}
+
+.usage-indicator-values {
+  gap: 12px;
+  margin-top: 9px;
+}
+
+.usage-indicator-values span {
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.usage-indicator-values svg {
+  flex: 0 0 auto;
+  color: var(--teal);
+}
+
+.usage-indicator-values strong {
+  overflow: hidden;
+  max-width: 86px;
+  color: #f1f3f0;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-indicator-values small {
+  width: 100%;
+  padding-left: 17px;
+  color: var(--muted);
+  font-size: 8px;
+}
+
 .api-indicator {
   display: flex;
   align-items: center;
@@ -372,6 +431,10 @@ a {
 .sidebar-collapsed .nav-section-label,
 .sidebar-collapsed .nav-item span:not(.nav-count),
 .sidebar-collapsed .api-indicator div,
+.sidebar-collapsed .usage-indicator-heading strong,
+.sidebar-collapsed .usage-indicator-heading .live-mini,
+.sidebar-collapsed .usage-indicator-values strong,
+.sidebar-collapsed .usage-indicator-values small,
 .sidebar-collapsed .collapse-button span,
 .sidebar-collapsed .nav-count {
   display: none;
@@ -390,6 +453,24 @@ a {
 .sidebar-collapsed .api-indicator {
   justify-content: center;
   padding: 14px 0;
+}
+
+.sidebar-collapsed .usage-indicator {
+  padding: 8px 4px;
+}
+
+.sidebar-collapsed .usage-indicator-heading,
+.sidebar-collapsed .usage-indicator-values {
+  justify-content: center;
+}
+
+.sidebar-collapsed .usage-indicator-values {
+  flex-direction: column;
+  gap: 7px;
+}
+
+.sidebar-collapsed .usage-indicator-values span {
+  justify-content: center;
 }
 
 .mobile-header,
@@ -1327,12 +1408,21 @@ input::placeholder {
   gap: 12px;
 }
 
+.form-section.model-section {
+  overflow: visible;
+}
+
 .model-role-card {
+  position: relative;
   padding: 17px;
   border: 1px solid #343c41;
   border-top: 2px solid #566067;
   border-radius: 8px;
   background: #111518;
+}
+
+.model-role-card:focus-within {
+  z-index: 2;
 }
 
 .model-role-card.accent-amber {
@@ -1399,6 +1489,85 @@ input::placeholder {
   margin-top: 11px;
 }
 
+.model-combobox {
+  position: relative;
+}
+
+.model-combobox input {
+  padding-right: 35px;
+}
+
+.model-combobox-chevron {
+  position: absolute;
+  top: 12px;
+  right: 11px;
+  pointer-events: none;
+  color: #7e898f;
+}
+
+.model-combobox-menu {
+  position: absolute;
+  z-index: 10;
+  top: calc(100% + 5px);
+  right: 0;
+  left: 0;
+  max-height: 245px;
+  overflow-y: auto;
+  padding: 4px;
+  border: 1px solid #4a4430;
+  border-radius: 6px;
+  background: #151a1c;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, .35);
+}
+
+.model-combobox-menu button {
+  display: flex;
+  width: 100%;
+  min-height: 42px;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #dfe4e5;
+  text-align: left;
+  cursor: pointer;
+}
+
+.model-combobox-menu button:hover,
+.model-combobox-menu button.selected {
+  background: #272319;
+  color: #f2c873;
+}
+
+.model-combobox-menu button strong {
+  overflow: hidden;
+  max-width: 100%;
+  font-size: 11px;
+  font-weight: 620;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-combobox-menu button small {
+  overflow: hidden;
+  max-width: 100%;
+  margin-top: 2px;
+  color: #7f8b90;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-combobox-empty {
+  padding: 12px 9px;
+  color: #7f8b90;
+  font-size: 10px;
+}
+
 .separation-note {
   display: flex;
   align-items: center;
@@ -1415,6 +1584,28 @@ input::placeholder {
 .separation-note svg {
   flex: 0 0 auto;
   color: var(--teal);
+}
+
+.intervention-card {
+  border-color: #705826;
+  background: #1c1912;
+}
+
+.intervention-card h2 {
+  margin: 12px 0 7px;
+  font-size: 15px;
+}
+
+.intervention-card p {
+  margin: 0 0 16px;
+  color: #c4b58c;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.intervention-card .button {
+  width: 100%;
+  justify-content: center;
 }
 
 .static-field {

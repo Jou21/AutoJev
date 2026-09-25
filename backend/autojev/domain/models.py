@@ -13,6 +13,7 @@ def utc_now() -> str:
 class ExplorationStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
+    WAITING_INPUT = "waiting_input"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"

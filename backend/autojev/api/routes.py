@@ -220,6 +220,11 @@ async def discover_models(provider_id: str, request: Request) -> dict[str, Any]:
             request.app.state.settings.http_timeout_seconds,
         )
         discovered = await client.list_models()
+        if "openrouter.ai" in provider.base_url.lower():
+            discovered = [
+                *discovered,
+                {"id": "typesafe/jev-1.13", "label": "TypeSafe: Jev 1.13"},
+            ]
         old_by_id = {model.id: model for model in provider.models}
         merged = list(provider.models)
         for model in discovered:
@@ -360,6 +365,20 @@ async def cancel_exploration(
 ) -> dict[str, Any]:
     try:
         _repository(request).request_cancel(exploration_id)
+        request.app.state.exploration_manager.cancel(exploration_id)
+        return _exploration_payload(
+            _repository(request).get_exploration(exploration_id, include_details=False)
+        )
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/explorations/{exploration_id}/resume", status_code=status.HTTP_202_ACCEPTED)
+async def resume_exploration(
+    exploration_id: str, request: Request
+) -> dict[str, Any]:
+    try:
+        request.app.state.exploration_manager.resume_after_user_input(exploration_id)
         return _exploration_payload(
             _repository(request).get_exploration(exploration_id, include_details=False)
         )

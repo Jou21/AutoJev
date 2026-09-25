@@ -72,7 +72,12 @@ class SQLiteRepository:
             finished_at TEXT,
             cancel_requested INTEGER NOT NULL DEFAULT 0,
             error TEXT,
-            report_path TEXT
+            report_path TEXT,
+            prompt_tokens INTEGER NOT NULL DEFAULT 0,
+            completion_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            cost REAL,
+            cost_known INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS exploration_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -119,6 +124,18 @@ class SQLiteRepository:
         """
         with self._lock, self._connect() as connection:
             connection.executescript(schema)
+            for column, definition in (
+                ("prompt_tokens", "INTEGER NOT NULL DEFAULT 0"),
+                ("completion_tokens", "INTEGER NOT NULL DEFAULT 0"),
+                ("total_tokens", "INTEGER NOT NULL DEFAULT 0"),
+                ("cost", "REAL"),
+                ("cost_known", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                try:
+                    connection.execute(f"ALTER TABLE explorations ADD COLUMN {column} {definition}")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column name" not in str(exc).lower():
+                        raise
             connection.execute(
                 """UPDATE explorations
                    SET status = ?, finished_at = ?, error = ?
@@ -309,6 +326,11 @@ class SQLiteRepository:
         "cancel_requested",
         "error",
         "report_path",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "cost",
+        "cost_known",
     }
 
     def update_exploration(self, exploration_id: str, **values: Any) -> None:
@@ -332,6 +354,7 @@ class SQLiteRepository:
         if item["status"] not in {
             ExplorationStatus.QUEUED,
             ExplorationStatus.RUNNING,
+            ExplorationStatus.WAITING_INPUT,
         }:
             return
         self.update_exploration(exploration_id, cancel_requested=True)
@@ -453,6 +476,13 @@ class SQLiteRepository:
             "cancel_requested": bool(row["cancel_requested"]),
             "error": row["error"],
             "report_available": bool(row["report_path"]),
+            "usage": {
+                "prompt_tokens": row["prompt_tokens"],
+                "completion_tokens": row["completion_tokens"],
+                "total_tokens": row["total_tokens"],
+                "cost": row["cost"],
+                "cost_known": bool(row["cost_known"]),
+            },
         }
 
     def get_exploration(
