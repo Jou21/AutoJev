@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -50,8 +51,40 @@ class PlaywrightExecutor:
         self._screenshot_number = 0
         self._allowed_origin: tuple[str, str, int] | None = None
         self._blocked_navigation_url: str | None = None
+        self._ref_selectors: dict[str, str] = {}
+        self._ref_semantics: dict[str, dict[str, Any]] = {}
+        self._page_stack: list[Any] = []
+        self._pending_pages: deque[Any] = deque(maxlen=20)
         self._user_input_event = asyncio.Event()
         self._intervention_message = ""
+
+    async def _prepare_page(self, page: Any) -> None:
+        """Attach AutoJev observation hooks to a newly adopted browser page."""
+
+        try:
+            await page.expose_binding(
+                "__autojev_resume",
+                lambda source: self._user_input_event.set(),
+            )
+        except Exception:
+            # The binding may already exist after a same-document transition.
+            pass
+        page.on("console", self._on_console)
+        page.on("pageerror", self._on_page_error)
+        page.on("response", self._on_response)
+        page.on("requestfailed", self._on_request_failed)
+        page.on("close", lambda: self._on_page_close(page))
+
+    def _on_context_page(self, page: Any) -> None:
+        self._pending_pages.append(page)
+
+    def _on_page_close(self, page: Any) -> None:
+        self._page_stack = [item for item in self._page_stack if item is not page]
+        if self._page is page:
+            open_pages = [item for item in self._page_stack if not item.is_closed()]
+            self._page = open_pages[-1] if open_pages else None
+            self._ref_selectors.clear()
+            self._ref_semantics.clear()
 
     async def start(self, url: str) -> Observation:
         self._validate_url(url)
@@ -101,15 +134,17 @@ class PlaywrightExecutor:
             self._context = await self._browser.new_context(**context_options)
             await self._context.route("**/*", self._guard_navigation)
             self._page = await self._context.new_page()
-            await self._page.expose_binding(
-                "__autojev_resume",
-                lambda source: self._user_input_event.set(),
-            )
-            self._page.on("console", self._on_console)
-            self._page.on("pageerror", self._on_page_error)
-            self._page.on("response", self._on_response)
-            self._page.on("requestfailed", self._on_request_failed)
+            self._context.on("page", self._on_context_page)
+            self._page_stack = [self._page]
+            await self._prepare_page(self._page)
             await self._page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            try:
+                await self._page.wait_for_load_state("load", timeout=5_000)
+            except Exception:
+                pass
+            # Give hydrated SPAs one short frame budget to attach click
+            # handlers before the first observed refs can be executed.
+            await self._page.wait_for_timeout(250)
             return await self.observe("initial")
         except BrowserUnavailableError:
             await self.close()
@@ -123,7 +158,7 @@ class PlaywrightExecutor:
         "width:330px;height:100vh;overflow-y:auto;margin:0;box-sizing:border-box;"
         "padding:28px 22px;color:#e8ecec;background:#111719;border-left:1px solid #765b25;"
         "box-shadow:-8px 0 28px rgba(0,0,0,.28);font:14px ui-sans-serif,system-ui,sans-serif;"
-        "display:block !important;visibility:visible !important;opacity:1 !important;}"
+        "display:block !important;visibility:visible !important;opacity:1 !important;pointer-events:none;}"
         "#autojev-sidepanel .autojev-panel-kicker{color:#eab94e;font-size:10px;font-weight:700;"
         "letter-spacing:.12em;}"
         "#autojev-sidepanel h2{margin:18px 0 10px;font-size:21px;color:#fff;}"
@@ -133,7 +168,7 @@ class PlaywrightExecutor:
         "background:#1a2224;color:#c8d4d2;font-size:12px;line-height:1.45;"
         "border-left:2px solid #eab94e;word-break:break-word;}"
         "#autojev-sidepanel button{width:100%;margin-top:18px;padding:12px 14px;border:0;"
-        "border-radius:6px;background:#eab94e;color:#17130b;font-weight:700;cursor:pointer;}"
+        "border-radius:6px;background:#eab94e;color:#17130b;font-weight:700;cursor:pointer;pointer-events:auto;}"
         "#autojev-sidepanel button:disabled{opacity:.7;cursor:default;}"
         "#autojev-sidepanel .autojev-live-dot{display:inline-block;width:8px;height:8px;"
         "border-radius:50%;background:#4ade80;margin-right:6px;}"
@@ -252,7 +287,9 @@ class PlaywrightExecutor:
         if not self._page:
             return
         try:
-            await self._page.evaluate("document.getElementById('autojev-sidepanel')?.remove()");
+            await self._page.evaluate(
+                "document.getElementById('autojev-sidepanel')?.remove()"
+            )
         except Exception:
             pass
 
@@ -363,8 +400,20 @@ class PlaywrightExecutor:
 
     async def _guard_navigation(self, route: Any, request: Any) -> None:
         try:
-            is_top_level = request.is_navigation_request() and request.frame.parent_frame is None
-            if is_top_level and self._origin(request.url) != self._allowed_origin:
+            is_top_level = True
+            if request.is_navigation_request():
+                try:
+                    is_top_level = request.frame.parent_frame is None
+                except Exception:
+                    # A popup's first navigation may arrive before its Frame is
+                    # exposed. Treat that specific unknown navigation as
+                    # top-level; normal iframe requests have a usable parent.
+                    is_top_level = True
+            if (
+                request.is_navigation_request()
+                and is_top_level
+                and self._origin(request.url) != self._allowed_origin
+            ):
                 self._blocked_navigation_url = self._public_url(request.url)
                 await route.abort("blockedbyclient")
                 return
@@ -503,37 +552,18 @@ class PlaywrightExecutor:
                     masks.append(text_locator)
             except Exception:
                 continue
-        # Esconde a barra do AutoJev para não poluir as evidências.
-        panels_hidden = False
-        try:
-            await self._page.evaluate(
-                """() => {
-                  document.querySelectorAll(
-                    '#autojev-sidepanel,#autojev-intervention-panel,#autojev-live-panel'
-                  ).forEach((panel) => {
-                    panel.setAttribute('data-autojev-restore', panel.style.display || '');
-                    panel.style.display = 'none';
-                  });
-                }"""
-            )
-            panels_hidden = True
-        except Exception:
-            panels_hidden = False
-        try:
-            await self._page.screenshot(path=str(path), full_page=True, mask=masks, timeout=20_000)
-        finally:
-            if panels_hidden:
-                try:
-                    await self._page.evaluate(
-                        """() => {
-                          document.querySelectorAll('[data-autojev-restore]').forEach((panel) => {
-                            panel.style.display = panel.getAttribute('data-autojev-restore') || '';
-                            panel.removeAttribute('data-autojev-restore');
-                          });
-                        }"""
-                    )
-                except Exception:
-                    pass
+        # Playwright applies this stylesheet only while composing the image.
+        # It reveals the tested page below the fixed 330px panel without
+        # mutating the live DOM, scrolling the page or leaving an opaque mask.
+        screenshot_style = f"{self.PANEL_SELECTOR}{{visibility:hidden !important;}}"
+        await self._page.screenshot(
+            path=str(path),
+            full_page=self.headless,
+            mask=masks,
+            mask_color="#101416",
+            style=screenshot_style,
+            timeout=20_000,
+        )
         return filename
 
     async def observe(self, screenshot_label: str = "page") -> Observation:
@@ -549,18 +579,58 @@ class PlaywrightExecutor:
               panels.forEach((panel) => { panel.style.display = 'none'; });
               let result;
               try {
-                const candidates = Array.from(document.querySelectorAll(
-                  'a,button,input,select,textarea,[role="button"],[role="link"],[role="checkbox"],[role="radio"],[tabindex]'
-                )).filter((el) => {
-                  if (el.closest(PANEL_SELECTOR)) return false;
+                const isVisible = (el) => {
                   const style = getComputedStyle(el);
                   const box = el.getBoundingClientRect();
-                  return style.visibility !== 'hidden' && style.display !== 'none' && box.width > 0 && box.height > 0;
-                }).slice(0, 100);
-                document.querySelectorAll('[data-autojev-ref]').forEach(el => el.removeAttribute('data-autojev-ref'));
+                  return el.getAttribute('aria-hidden') !== 'true'
+                    && style.visibility !== 'hidden'
+                    && style.display !== 'none'
+                    && box.width > 0
+                    && box.height > 0;
+                };
+                const visibleDialogs = Array.from(document.querySelectorAll(
+                  'dialog[open],[role="dialog"]'
+                )).filter(isVisible);
+                const modalDialog = [...visibleDialogs].reverse().find((dialog) => {
+                  try { return dialog.matches(':modal'); } catch { return false; }
+                });
+                const activeDialog = modalDialog
+                  || visibleDialogs[visibleDialogs.length - 1]
+                  || null;
+                const candidates = Array.from(document.querySelectorAll(
+                  'a,button,input,select,textarea,[aria-haspopup],[role="button"],[role="link"],[role="menuitem"],[role="checkbox"],[role="radio"],[tabindex]'
+                )).filter((el) => {
+                  if (el.closest(PANEL_SELECTOR)) return false;
+                  if (activeDialog && !activeDialog.contains(el)) return false;
+                  return isVisible(el);
+                }).slice(0, 300);
+              const selectorFor = (node) => {
+                const parts = [];
+                let current = node;
+                while (current && current.nodeType === Node.ELEMENT_NODE) {
+                  const tag = current.tagName.toLowerCase();
+                  const parent = current.parentElement;
+                  if (!parent) {
+                    parts.unshift(tag);
+                    break;
+                  }
+                  const siblings = Array.from(parent.children).filter(
+                    (item) => item.tagName === current.tagName
+                  );
+                  parts.unshift(`${tag}:nth-of-type(${siblings.indexOf(current) + 1})`);
+                  current = parent;
+                }
+                return parts.join(' > ');
+              };
               const elements = candidates.map((el, index) => {
                 const ref = `e${index}`;
-                el.setAttribute('data-autojev-ref', ref);
+                const box = el.getBoundingClientRect();
+                const contextNode = el.closest(
+                  'tr,[role="row"],li,[role="listitem"],form,[role="dialog"],nav,[role="navigation"],aside'
+                ) || el.closest('section,main');
+                const contextText = contextNode
+                  ? (contextNode.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 120)
+                  : '';
                 return {
                   ref,
                   tag: el.tagName.toLowerCase(),
@@ -569,11 +639,38 @@ class PlaywrightExecutor:
                   type: el.getAttribute('type') || null,
                   href: el instanceof HTMLAnchorElement ? el.href : null,
                   enabled: !el.disabled,
+                  read_only: Boolean(el.readOnly),
+                  has_value: el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement
+                    ? Boolean(el.value)
+                    : null,
+                  checked: el instanceof HTMLInputElement && ['checkbox', 'radio'].includes(el.type)
+                    ? el.checked
+                    : null,
+                  selected_index: el instanceof HTMLSelectElement ? el.selectedIndex : null,
+                  aria_haspopup: el.getAttribute('aria-haspopup'),
+                  aria_expanded: el.getAttribute('aria-expanded'),
+                  aria_pressed: el.getAttribute('aria-pressed'),
+                  aria_selected: el.getAttribute('aria-selected'),
+                  options: el instanceof HTMLSelectElement
+                    ? Array.from(el.options).slice(0, 100).map((option) => ({
+                        value: option.value,
+                        label: (option.label || option.textContent || '').trim().slice(0, 200),
+                        disabled: option.disabled,
+                        selected: option.selected,
+                      }))
+                    : null,
+                  document_top: Math.round(box.top + window.scrollY),
+                  in_viewport: box.bottom > 0 && box.top < window.innerHeight,
+                  in_navigation: Boolean(el.closest('nav,[role="navigation"],aside')),
+                  context: contextNode
+                    ? `${contextNode.tagName.toLowerCase()} ${contextNode.getAttribute('aria-label') || contextNode.getAttribute('role') || ''} ${contextText}`.trim().slice(0, 160)
+                    : null,
+                  _selector: selectorFor(el),
                 };
               });
               return {
                 title: document.title || '',
-                text: (document.body?.innerText || '').slice(0, 12000),
+                text: ((activeDialog || document.body)?.innerText || '').slice(0, 12000),
                 elements,
               };
               } finally {
@@ -587,11 +684,29 @@ class PlaywrightExecutor:
         self._console_buffer.clear()
         self._network_buffer.clear()
         elements = snapshot.get("elements", [])
+        self._ref_selectors = {}
+        self._ref_semantics = {}
         for element in elements:
             if isinstance(element, dict):
+                selector = element.pop("_selector", None)
+                if element.get("ref") and isinstance(selector, str) and selector:
+                    self._ref_selectors[str(element["ref"])] = selector
                 element["name"] = self._redact_text(str(element.get("name") or ""))
+                if element.get("context"):
+                    element["context"] = self._redact_text(
+                        str(element.get("context") or "")
+                    )[:160]
                 if element.get("href"):
                     element["href"] = self._public_url(str(element["href"]))
+                if element.get("ref"):
+                    self._ref_semantics[str(element["ref"])] = {
+                        "tag": str(element.get("tag") or "").lower(),
+                        "role": element.get("role"),
+                        "type": element.get("type"),
+                        "name": element["name"],
+                        "href": element.get("href"),
+                        "aria_haspopup": element.get("aria_haspopup"),
+                    }
         return Observation(
             url=self._public_url(self._page.url),
             title=self._redact_text(str(snapshot.get("title", ""))),
@@ -602,13 +717,93 @@ class PlaywrightExecutor:
             screenshot=screenshot,
         )
 
-    def _locator(self, ref: str | None) -> Any:
+    async def _locator(self, ref: str | None) -> Any:
         if not ref or not ref.startswith("e") or not ref[1:].isdigit():
             raise ValueError("Action requires a valid observed element ref")
-        return self._page.locator(f'[data-autojev-ref="{ref}"]')
+        selector = self._ref_selectors.get(ref)
+        if not selector:
+            raise ValueError("Observed element is no longer attached to the page")
+        locator = self._page.locator(selector)
+        if await locator.count() != 1:
+            raise ValueError("Observed element is no longer uniquely addressable")
+        observed = self._ref_semantics.get(ref)
+        if observed:
+            actual = await locator.evaluate(
+                """el => ({
+                  tag: el.tagName.toLowerCase(),
+                  role: el.getAttribute('role'),
+                  type: el.getAttribute('type'),
+                  name: (el.getAttribute('aria-label') || el.innerText || el.getAttribute('placeholder') || el.getAttribute('name') || '').trim().slice(0, 300),
+                  href: el instanceof HTMLAnchorElement ? el.href : null,
+                  aria_haspopup: el.getAttribute('aria-haspopup'),
+                })"""
+            )
+            actual = {
+                "tag": str(actual.get("tag") or "").lower(),
+                "role": actual.get("role"),
+                "type": actual.get("type"),
+                "name": self._redact_text(str(actual.get("name") or "")),
+                "href": self._public_url(str(actual["href"]))
+                if actual.get("href")
+                else None,
+                "aria_haspopup": actual.get("aria_haspopup"),
+            }
+            if actual != observed:
+                raise ValueError(
+                    "Observed element changed after the decision; re-observation is required"
+                )
+        return locator
+
+    async def _wait_for_dom_settle(self, timeout_ms: int = 1_200) -> None:
+        """Wait for a short stable DOM window after an action, bounded by timeout."""
+
+        if not self._page:
+            return
+        stable_samples = 0
+        previous: str | None = None
+        samples = max(timeout_ms // 150, 1)
+        for _ in range(samples):
+            if not self._page or self._page.is_closed():
+                return
+            try:
+                signature = await self._page.evaluate(
+                    """() => JSON.stringify({
+                      url: location.href,
+                      title: document.title,
+                      text: (document.body?.innerText || '').slice(0, 4000),
+                      controls: Array.from(document.querySelectorAll(
+                        'a,button,input,select,textarea,[aria-haspopup],[role="button"],[role="link"],[role="menuitem"],[role="checkbox"],[role="radio"],[tabindex]'
+                      )).slice(0, 400).map((el) => [
+                        el.tagName,
+                        el.getAttribute('role'),
+                        el.getAttribute('aria-expanded'),
+                        el.getAttribute('aria-selected'),
+                        el instanceof HTMLSelectElement ? el.selectedIndex : null,
+                        el instanceof HTMLInputElement && ['checkbox', 'radio'].includes(el.type) ? el.checked : null,
+                      ]),
+                    })"""
+                )
+            except Exception:
+                return
+            if signature == previous:
+                stable_samples += 1
+                if stable_samples >= 3:
+                    return
+            else:
+                stable_samples = 0
+                previous = signature
+            await self._page.wait_for_timeout(150)
 
     async def _enforce_safe_interaction(self, locator: Any) -> None:
         destructive_words = {
+            "account security",
+            "admin role",
+            "bank",
+            "banking",
+            "card",
+            "cartao",
+            "cartão",
+            "change password",
             "delete",
             "remove",
             "erase",
@@ -621,13 +816,26 @@ class PlaywrightExecutor:
             "comprar",
             "pagar",
             "confirmar pagamento",
+            "permissao",
+            "permissão",
+            "permission",
+            "pix",
+            "role",
+            "security",
+            "senha",
+            "withdraw",
+            "saque",
         }
+        destructive_phrases = (
+            r"\bcancel\s+(?:(?:the|your|an?)\s+)?(?:subscription|order|booking)\b",
+            r"\bcancelar\s+(?:(?:a|o|sua|seu)\s+)?(?:assinatura|pedido|reserva)\b",
+        )
         try:
             form_text = await locator.evaluate(
                 """el => {
-                  const form = el.closest('form');
-                  if (!form) return '';
-                  return `${form.innerText || ''} ${form.getAttribute('aria-label') || ''} ${form.getAttribute('action') || ''}`;
+                  const context = el.closest('form,[role="dialog"]');
+                  if (!context) return '';
+                  return `${context.innerText || ''} ${context.getAttribute('aria-label') || ''} ${context.getAttribute('action') || ''}`;
                 }"""
             )
             text = " ".join(
@@ -637,13 +845,22 @@ class PlaywrightExecutor:
                         await locator.inner_text(timeout=500),
                         await locator.get_attribute("aria-label", timeout=500),
                         await locator.get_attribute("title", timeout=500),
+                        await locator.get_attribute("placeholder", timeout=500),
+                        await locator.get_attribute("name", timeout=500),
                         str(form_text or ""),
                     ],
                 )
             ).strip().lower()
         except Exception:
             text = ""
-        if any(word in text for word in destructive_words):
+        has_destructive_word = any(
+            re.search(rf"(?<!\w){re.escape(word)}(?!\w)", text)
+            for word in destructive_words
+        )
+        has_destructive_phrase = any(
+            re.search(pattern, text) for pattern in destructive_phrases
+        )
+        if has_destructive_word or has_destructive_phrase:
             raise PermissionError(
                 "PolicyBlocked: destructive or transactional clicks are disabled"
             )
@@ -669,11 +886,60 @@ class PlaywrightExecutor:
                     raise PermissionError("PolicyBlocked: cross-origin navigation is disabled")
                 await self._page.goto(decision.url, wait_until="domcontentloaded", timeout=30_000)
             elif action == "click":
-                locator = self._locator(decision.target)
+                locator = await self._locator(decision.target)
                 await self._enforce_safe_interaction(locator)
+                pages_before = set(self._context.pages)
+                self._pending_pages.clear()
+                opens_new_tab = (
+                    await locator.get_attribute("target", timeout=500) == "_blank"
+                )
                 await locator.click(timeout=10_000)
+                # Same-origin links that open a new tab are part of the tested
+                # application. Adopt the tab so observations and JEV decisions
+                # continue there; the page stack lets go_back close it and
+                # resume the exact parent state. External popups remain blocked.
+                await self._page.wait_for_timeout(100)
+                if opens_new_tab and not self._pending_pages:
+                    # target=_blank is explicit; allow a small event window for
+                    # a delayed popup without slowing ordinary clicks.
+                    for _ in range(4):
+                        await self._page.wait_for_timeout(100)
+                        if self._pending_pages:
+                            break
+                new_pages = [
+                    page
+                    for page in [*self._pending_pages, *self._context.pages]
+                    if page not in pages_before and not page.is_closed()
+                ]
+                if new_pages:
+                    popup = new_pages[-1]
+                    # A newly created target starts at about:blank before its
+                    # first navigation is committed. Waiting only for the load
+                    # state can resolve against that transient document, so
+                    # first wait explicitly for a real URL.
+                    for _ in range(50):
+                        if popup.url != "about:blank":
+                            break
+                        await popup.wait_for_timeout(100)
+                    try:
+                        await popup.wait_for_load_state("domcontentloaded", timeout=5_000)
+                    except Exception:
+                        pass
+                    if (
+                        self._blocked_navigation_url
+                        or popup.url == "about:blank"
+                        or self._origin(popup.url) != self._allowed_origin
+                    ):
+                        await popup.close()
+                        raise PermissionError(
+                            "PolicyBlocked: cross-origin or unresolved popup navigation is disabled"
+                        )
+                    await self._prepare_page(popup)
+                    self._page = popup
+                    self._page_stack.append(popup)
             elif action == "fill":
-                locator = self._locator(decision.target)
+                locator = await self._locator(decision.target)
+                await self._enforce_safe_interaction(locator)
                 if decision.credential_key:
                     if decision.credential_key not in credentials:
                         raise KeyError(f"Credential alias {decision.credential_key!r} is unavailable")
@@ -691,17 +957,31 @@ class PlaywrightExecutor:
             elif action == "select":
                 if decision.value is None:
                     raise ValueError("select requires value")
-                await self._locator(decision.target).select_option(decision.value, timeout=10_000)
+                locator = await self._locator(decision.target)
+                await self._enforce_safe_interaction(locator)
+                await locator.select_option(decision.value, timeout=10_000)
             elif action == "press":
-                locator = self._locator(decision.target)
+                locator = await self._locator(decision.target)
                 key = decision.key or "Enter"
                 if "enter" in key.lower():
                     await self._enforce_safe_interaction(locator)
                 await locator.press(key, timeout=10_000)
             elif action == "hover":
-                await self._locator(decision.target).hover(timeout=10_000)
+                locator = await self._locator(decision.target)
+                await locator.hover(timeout=10_000)
             elif action == "go_back":
-                await self._page.go_back(wait_until="domcontentloaded", timeout=30_000)
+                before_back_url = self._page.url
+                response = await self._page.go_back(
+                    wait_until="domcontentloaded", timeout=30_000
+                )
+                if (
+                    response is None
+                    and self._page.url == before_back_url
+                    and len(self._page_stack) > 1
+                ):
+                    popup = self._page_stack.pop()
+                    self._page = self._page_stack[-1]
+                    await popup.close()
             elif action == "reload":
                 await self._page.reload(wait_until="domcontentloaded", timeout=30_000)
             elif action == "wait":
@@ -715,6 +995,11 @@ class PlaywrightExecutor:
                 await self._page.wait_for_load_state("domcontentloaded", timeout=3_000)
             except Exception:
                 pass
+            # SPA/API updates often land after the action promise resolves.
+            # Observe only after a short stable DOM window so late controls are
+            # not missed and refs do not point into a transient render.
+            if action not in {"wait", "screenshot"}:
+                await self._wait_for_dom_settle()
             if self._origin(self._page.url) != self._allowed_origin:
                 raise PermissionError("PolicyBlocked: action navigated to another origin")
             if self._blocked_navigation_url:
@@ -767,7 +1052,8 @@ class PlaywrightExecutor:
                     actual = self._redact_text(actual)
                     passed = str(expected).lower() in actual.lower()
                 elif kind == "element_visible":
-                    actual = bool(await self._locator(str(expected)).is_visible(timeout=2_000))
+                    locator = await self._locator(str(expected))
+                    actual = bool(await locator.is_visible(timeout=2_000))
                     passed = actual
             except Exception as exc:
                 actual = self._redact_text(f"{exc.__class__.__name__}: {exc}")[:500]
@@ -796,3 +1082,7 @@ class PlaywrightExecutor:
             except Exception:
                 pass
         self._page = self._context = self._browser = self._playwright = None
+        self._page_stack = []
+        self._pending_pages.clear()
+        self._ref_selectors.clear()
+        self._ref_semantics.clear()

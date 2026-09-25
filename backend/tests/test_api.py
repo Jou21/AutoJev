@@ -102,6 +102,39 @@ def test_exploration_request_does_not_echo_credentials(tmp_path):
         assert "actions" not in history[0]
 
 
+def test_exploration_accepts_optional_focused_scope_alias(tmp_path):
+    app = create_app(settings(tmp_path))
+    with TestClient(app) as client:
+        provider = client.post(
+            "/api/providers",
+            json={
+                "name": "Provider",
+                "base_url": "http://localhost:4000",
+                "models": [{"id": "model"}],
+            },
+        ).json()
+        app.state.exploration_manager.submit = lambda exploration_id: None
+        response = client.post(
+            "/api/explorations",
+            json={
+                "app_url": "http://localhost:3000",
+                "agent": {"provider_id": provider["id"], "model_id": "model"},
+                "auxiliary_llm": {
+                    "provider_id": provider["id"],
+                    "model_id": "model",
+                },
+                "options": {
+                    "max_steps": 3,
+                    "max_duration_seconds": 30,
+                    "focusArea": "  Financeiro   / Faturas  ",
+                },
+            },
+        )
+
+        assert response.status_code == 202
+        assert response.json()["options"]["focus_area"] == "Financeiro / Faturas"
+
+
 def test_validation_errors_never_echo_secrets(tmp_path):
     app = create_app(settings(tmp_path))
     with TestClient(app) as client:

@@ -119,14 +119,19 @@ class ModelSelectionInput(ApiModel):
 
 class ExplorationOptionsInput(ApiModel):
     mode: str = Field(default="full", max_length=30)
+    focus_area: str | None = Field(
+        default=None,
+        max_length=500,
+        validation_alias=AliasChoices("focus_area", "focusArea"),
+    )
     max_steps: int = Field(
-        default=50,
+        default=100,
         ge=1,
         le=500,
         validation_alias=AliasChoices("max_steps", "maxSteps"),
     )
     max_duration_seconds: int = Field(
-        default=900,
+        default=1800,
         ge=10,
         le=86_400,
         validation_alias=AliasChoices("max_duration_seconds", "maxDurationSeconds"),
@@ -163,6 +168,14 @@ class ExplorationOptionsInput(ApiModel):
         le=2160,
         validation_alias=AliasChoices("viewport_height", "viewportHeight"),
     )
+
+    @field_validator("focus_area")
+    @classmethod
+    def clean_focus_area(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = " ".join(value.split())
+        return cleaned or None
 
 
 class ExplorationCreate(ApiModel):

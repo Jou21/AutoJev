@@ -139,13 +139,15 @@ class SQLiteRepository:
             connection.execute(
                 """UPDATE explorations
                    SET status = ?, finished_at = ?, error = ?
-                   WHERE status IN (?, ?)""",
+                   WHERE status IN (?, ?, ?, ?)""",
                 (
                     ExplorationStatus.FAILED,
                     utc_now(),
                     "Backend restarted before this exploration finished",
                     ExplorationStatus.QUEUED,
                     ExplorationStatus.RUNNING,
+                    ExplorationStatus.WAITING_INPUT,
+                    ExplorationStatus.POSTPROCESSING,
                 ),
             )
 
@@ -355,6 +357,7 @@ class SQLiteRepository:
             ExplorationStatus.QUEUED,
             ExplorationStatus.RUNNING,
             ExplorationStatus.WAITING_INPUT,
+            ExplorationStatus.POSTPROCESSING,
         }:
             return
         self.update_exploration(exploration_id, cancel_requested=True)

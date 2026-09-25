@@ -11,7 +11,8 @@ from autojev.adapters.report import StandaloneHtmlReport
 from autojev.adapters.repository import SQLiteRepository
 from autojev.adapters.secrets import EphemeralCredentialVault, SecretCipher
 from autojev.api.routes import router
-from autojev.config import Settings, settings as default_settings
+from autojev.config import Settings
+from autojev.config import settings as default_settings
 from autojev.services.exploration import ExplorationManager
 
 

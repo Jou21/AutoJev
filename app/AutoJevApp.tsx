@@ -25,6 +25,7 @@ import {
   Eye,
   FileCheck2,
   FileText,
+  Focus,
   Gauge,
   Globe2,
   Hash,
@@ -123,6 +124,8 @@ type Exploration = {
   current_step?: string;
   current_action?: string;
   screenshot_url?: string | null;
+  report_available?: boolean;
+  report_url?: string | null;
   agent?: { provider_id?: string; provider?: string; model_id?: string; model?: string };
   auxiliary_llm?: {
     provider_id?: string;
@@ -197,8 +200,10 @@ const STATUS_LABELS: Record<string, string> = {
   pending: "Preparando",
   running: "Em execução",
   waiting_input: "Aguardando sua intervenção",
+  postprocessing: "Gerando relatório",
   completed: "Concluída",
   success: "Concluída",
+  partial: "Cobertura parcial",
   failed: "Falhou",
   error: "Falhou",
   cancelled: "Cancelada",
@@ -210,8 +215,10 @@ const STATUS_TONES: Record<string, string> = {
   pending: "neutral",
   running: "running",
   waiting_input: "warning",
+  postprocessing: "running",
   completed: "success",
   success: "success",
+  partial: "warning",
   failed: "error",
   error: "error",
   cancelled: "warning",
@@ -226,6 +233,11 @@ function normalizeTargetUrl(value: string) {
   const trimmed = value.trim();
   if (!trimmed) return "";
   return /^[a-z][a-z\d+.-]*:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+}
+
+function explorationFocusArea(options?: Record<string, unknown>) {
+  const value = options?.focus_area ?? options?.focusArea;
+  return typeof value === "string" && value.trim() ? value.trim() : "";
 }
 
 function listFrom<T>(value: unknown, keys: string[]): T[] {
@@ -289,7 +301,7 @@ function explorationStatus(status?: string) {
 
 function isLive(status?: string) {
   const value = (status || "").toLowerCase();
-  return ["queued", "pending", "running", "waiting_input"].includes(value);
+  return ["queued", "pending", "running", "waiting_input", "postprocessing"].includes(value);
 }
 
 function formatDate(value?: string, withTime = true) {
@@ -628,13 +640,13 @@ export default function AutoJevApp() {
   }, [route, loadExploration]);
 
   useEffect(() => {
-    if (route.view !== "detail" || !route.explorationId) return;
+    if (route.view !== "detail" || !route.explorationId || (selectedExploration && !isLive(selectedExploration.status))) return;
     const timer = window.setInterval(async () => {
       const data = await loadExploration(route.explorationId as string, true);
       if (data && !isLive(data.status)) void loadCore(true);
     }, pollInterval);
     return () => window.clearInterval(timer);
-  }, [route, pollInterval, loadExploration, loadCore]);
+  }, [route, pollInterval, loadExploration, loadCore, selectedExploration]);
 
   useEffect(() => {
     if (route.view === "detail" || !explorations.some((item) => isLive(item.status))) return;
@@ -1025,12 +1037,14 @@ function NewExplorationView({
 }) {
   const enabledProviders = providers.filter(providerIsEnabled);
   const [url, setUrl] = useState("");
+  const [focusMode, setFocusMode] = useState<"all" | "focused">("all");
+  const [focusArea, setFocusArea] = useState("");
   const [agentProvider, setAgentProvider] = useState("");
   const [agentModel, setAgentModel] = useState("");
   const [auxProvider, setAuxProvider] = useState("");
   const [auxModel, setAuxModel] = useState("");
-  const [maxSteps, setMaxSteps] = useState(50);
-  const [maxDuration, setMaxDuration] = useState(900);
+  const [maxSteps, setMaxSteps] = useState(100);
+  const [maxDuration, setMaxDuration] = useState(1800);
   const [viewport, setViewport] = useState("1440x900");
   const [captureConsoleErrors, setCaptureConsoleErrors] = useState(true);
   const [captureNetworkErrors, setCaptureNetworkErrors] = useState(true);
@@ -1075,25 +1089,32 @@ function NewExplorationView({
       toast("Preencha a URL e selecione os dois modelos.", "error");
       return;
     }
+    if (focusMode === "focused" && !focusArea.trim()) {
+      toast("Informe a tela, menu ou submenu que deve ser explorado.", "error");
+      return;
+    }
     setUrl(targetUrl);
     setSubmitting(true);
     try {
       const [viewportWidth, viewportHeight] = viewport.split("x").map(Number);
+      const normalizedFocusArea = focusMode === "focused" ? focusArea.trim() : "";
+      const explorationOptions: Record<string, unknown> = {
+        max_steps: maxSteps,
+        max_duration_seconds: maxDuration,
+        capture_screenshots: true,
+        capture_console_errors: captureConsoleErrors,
+        capture_network_errors: captureNetworkErrors,
+        generate_test_cases: true,
+        generate_html_report: true,
+        viewport_width: viewportWidth,
+        viewport_height: viewportHeight,
+      };
+      if (normalizedFocusArea) explorationOptions.focus_area = normalizedFocusArea;
       const body: Record<string, unknown> = {
         app_url: targetUrl,
         agent: { provider_id: agentProvider, model_id: agentModel },
         auxiliary_llm: { provider_id: auxProvider, model_id: auxModel },
-        options: {
-          max_steps: maxSteps,
-          max_duration_seconds: maxDuration,
-          capture_screenshots: true,
-          capture_console_errors: captureConsoleErrors,
-          capture_network_errors: captureNetworkErrors,
-          generate_test_cases: true,
-          generate_html_report: true,
-          viewport_width: viewportWidth,
-          viewport_height: viewportHeight,
-        },
+        options: explorationOptions,
       };
       if (credentialsOpen && (username || password)) body.credentials = { username, password };
       const created = await request<Exploration>("/explorations", { method: "POST", body: JSON.stringify(body) });
@@ -1124,6 +1145,29 @@ function NewExplorationView({
               <label className="field-label" htmlFor="target-url">URL da aplicação</label>
               <div className="input-with-icon"><Globe2 size={17} /><input id="target-url" type="text" inputMode="url" required placeholder="https://app.exemplo.com ou www.exemplo.com" value={url} onChange={(event) => setUrl(event.target.value)} onBlur={() => setUrl(normalizeTargetUrl(url))} autoComplete="url" /></div>
               <span className="field-hint">A aplicação deve estar acessível pelo servidor que executa o Playwright.</span>
+              <fieldset className="focus-area-field">
+                <legend>Tela, menu ou submenu <em>opcional</em></legend>
+                <p>Escolha se o JEV deve percorrer toda a aplicação ou esgotar primeiro um recorte funcional.</p>
+                <div className="scope-mode-grid">
+                  <label className={focusMode === "all" ? "selected" : ""}>
+                    <input type="radio" name="exploration-scope" value="all" checked={focusMode === "all"} onChange={() => setFocusMode("all")} />
+                    <span><strong>Toda a aplicação</strong><small>Descobrir e testar todos os recursos acessíveis.</small></span>
+                    <i><Check size={13} /></i>
+                  </label>
+                  <label className={focusMode === "focused" ? "selected" : ""}>
+                    <input type="radio" name="exploration-scope" value="focused" checked={focusMode === "focused"} onChange={() => setFocusMode("focused")} />
+                    <span><strong>Tela/menu específico</strong><small>Concentrar o exploratório em uma área escolhida.</small></span>
+                    <i><Check size={13} /></i>
+                  </label>
+                </div>
+                {focusMode === "focused" && (
+                  <div className="focus-area-input">
+                    <label className="field-label" htmlFor="focus-area">Qual área deve ser explorada?</label>
+                    <div className="input-with-icon"><Focus size={17} /><input id="focus-area" type="text" required maxLength={500} placeholder="Ex.: Configurações > Usuários > Permissões" value={focusArea} onChange={(event) => setFocusArea(event.target.value)} aria-describedby="focus-area-hint" /></div>
+                    <span className="field-hint" id="focus-area-hint">Informe o caminho visível dos menus ou descreva a funcionalidade. O JEV poderá navegar para frente e voltar entre telas dentro deste escopo.</span>
+                  </div>
+                )}
+              </fieldset>
             </div>
           </section>
 
@@ -1202,6 +1246,7 @@ function NewExplorationView({
           <div className="launch-summary">
             <SummaryRow label="Agente JEV" value={agentModel || "Selecione um modelo"} />
             <SummaryRow label="LLM auxiliar" value={auxModel || "Selecione um modelo"} />
+            <SummaryRow label="Escopo" value={focusMode === "focused" ? focusArea.trim() || "Defina uma área" : "Aplicação inteira"} />
             <SummaryRow label="Limite" value={`${maxSteps} ações`} />
             <SummaryRow label="Duração" value={`${Math.round(maxDuration / 60)} minutos`} />
             <SummaryRow label="Viewport" value={viewport.replace("x", " × ")} />
@@ -1344,7 +1389,7 @@ function ExplorationsView({ explorations, loading, navigate }: { explorations: E
         <div className="table-toolbar">
           <div className="search-box"><Search size={17} /><input aria-label="Buscar explorações" placeholder="Buscar por aplicação ou ID" value={query} onChange={(event) => setQuery(event.target.value)} /></div>
           <div className="filter-tabs" aria-label="Filtrar por status">
-            {[{ value: "all", label: "Todas" }, { value: "live", label: "Em andamento" }, { value: "completed", label: "Concluídas" }, { value: "failed", label: "Falhas" }].map((item) => <button key={item.value} className={filter === item.value ? "active" : ""} onClick={() => setFilter(item.value)}>{item.label}</button>)}
+            {[{ value: "all", label: "Todas" }, { value: "live", label: "Em andamento" }, { value: "completed", label: "Concluídas" }, { value: "partial", label: "Parciais" }, { value: "failed", label: "Falhas" }].map((item) => <button key={item.value} className={filter === item.value ? "active" : ""} onClick={() => setFilter(item.value)}>{item.label}</button>)}
           </div>
         </div>
         {loading ? <ListSkeleton rows={5} /> : explorations.length === 0 ? (
@@ -1359,7 +1404,7 @@ function ExplorationsView({ explorations, loading, navigate }: { explorations: E
                 const progress = item.progress ?? (["completed", "success"].includes(item.status?.toLowerCase()) ? 100 : 0);
                 return (
                   <tr key={item.id} onClick={() => navigate(`#/exploracoes/${encodeURIComponent(item.id)}`)}>
-                    <td><div className="table-app"><span className="app-avatar"><Globe2 size={17} /></span><span><strong>{hostFromUrl(item.app_url)}</strong><small>{item.id}</small></span></div></td>
+                    <td><div className="table-app"><span className="app-avatar"><Globe2 size={17} /></span><span><strong>{hostFromUrl(item.app_url)}</strong><small>{explorationFocusArea(item.options) ? `Escopo: ${explorationFocusArea(item.options)}` : "Aplicação inteira"}</small></span></div></td>
                     <td><StatusBadge status={item.status} /></td>
                     <td><div className="table-progress"><span><i style={{ width: `${Math.min(100, Math.max(0, progress))}%` }} /></span><small>{Math.round(progress)}%</small></div></td>
                     <td><div className="scenario-cell"><strong>{item.counters?.scenarios || item.counters?.test_scenarios || item.scenarios_count || 0}</strong>{item.summary && <small>{item.summary.pass || 0} PASS · {item.summary.fail || 0} FAIL</small>}</div></td>
@@ -1729,7 +1774,13 @@ function ExplorationDetailView({
         <div className="detail-title"><span className="app-avatar large"><Globe2 size={22} /></span><div><div className="detail-title-line"><h1>{hostFromUrl(exploration.app_url)}</h1><StatusBadge status={exploration.status} /></div><a href={exploration.app_url} target="_blank" rel="noreferrer">{exploration.app_url}<SquareArrowOutUpRight size={13} /></a></div></div>
         <div className="page-actions">
           <button className="button secondary" onClick={onRefresh}><RefreshCcw size={16} />Atualizar</button>
-          {isLive(exploration.status) ? <button className="button danger" onClick={() => void cancel()} disabled={cancelling}>{cancelling ? <Spinner /> : <CircleStop size={16} />}Cancelar</button> : <button className="button primary" onClick={() => void openReport()} disabled={openingReport}>{openingReport ? <Spinner /> : <FileText size={16} />}Abrir relatório</button>}
+          {isLive(exploration.status) ? (
+            <button className="button danger" onClick={() => void cancel()} disabled={cancelling}>{cancelling ? <Spinner /> : <CircleStop size={16} />}Cancelar</button>
+          ) : exploration.report_available ? (
+            <button className="button primary" onClick={() => void openReport()} disabled={openingReport}>{openingReport ? <Spinner /> : <FileText size={16} />}Abrir relatório</button>
+          ) : (
+            <button className="button secondary" disabled><FileText size={16} />Relatório indisponível</button>
+          )}
         </div>
       </header>
 
@@ -1770,6 +1821,7 @@ function ExplorationDetailView({
           )}
           <section className="panel configuration-card">
             <div className="panel-heading"><span className="section-kicker">Modelos da execução</span><h2>Configuração</h2></div>
+            <div className="exploration-scope"><span className="model-role-icon"><Focus size={18} /></span><div><small>Escopo da exploração</small><strong>{explorationFocusArea(exploration.options) || "Aplicação inteira"}</strong><em>{explorationFocusArea(exploration.options) ? "O JEV prioriza e esgota este recorte funcional." : "O JEV explora todos os recursos que conseguir descobrir."}</em></div></div>
             <div className="config-model"><span className="model-role-icon amber"><BrainCircuit size={18} /></span><div><small>JEV · agente QA</small><strong>{exploration.agent?.model_id || exploration.agent?.model || "—"}</strong><em>{providerName(exploration.agent?.provider_id || exploration.agent?.provider)}</em></div></div>
             <div className="model-divider"><span /><ArrowRight size={14} /><span /></div>
             <div className="config-model"><span className="model-role-icon teal"><Sparkles size={18} /></span><div><small>LLM auxiliar</small><strong>{exploration.auxiliary_llm?.model_id || exploration.auxiliary_llm?.model || "—"}</strong><em>{providerName(exploration.auxiliary_llm?.provider_id || exploration.auxiliary_llm?.provider)}</em></div></div>

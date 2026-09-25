@@ -12,6 +12,14 @@ def test_report_is_standalone_and_escapes_model_content(tmp_path):
     exploration = {
         "id": "run-1",
         "app_url": "https://example.test/?x=<script>alert(1)</script>",
+        "status": "partial",
+        "events": [
+            {
+                "type": "coverage_partial",
+                "message": "Limite de tempo; a fronteira ainda tinha itens.",
+            }
+        ],
+        "options": {"focus_area": "Administração > Usuários"},
         "summary": {
             "total_scenarios": 1,
             "pass": 1,
@@ -56,3 +64,7 @@ def test_report_is_standalone_and_escapes_model_content(tmp_path):
     assert '<details class="scenario"' in document
     assert ">150</strong>Tokens" in document
     assert ">$0.004200</strong>Custo" in document
+    assert "Administração &gt; Usuários" in document
+    assert "Cobertura parcial" in document
+    assert "Motivo do encerramento:" in document
+    assert "Limite de tempo; a fronteira ainda tinha itens." in document

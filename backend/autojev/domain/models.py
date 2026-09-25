@@ -14,7 +14,9 @@ class ExplorationStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
     WAITING_INPUT = "waiting_input"
+    POSTPROCESSING = "postprocessing"
     COMPLETED = "completed"
+    PARTIAL = "partial"
     FAILED = "failed"
     CANCELLED = "cancelled"
 
@@ -54,8 +56,11 @@ class ModelSelection:
 @dataclass(slots=True)
 class ExplorationOptions:
     mode: str = "full"
-    max_steps: int = 50
-    max_duration_seconds: int = 900
+    # Optional human-readable scope (screen, menu or submenu).  When omitted the
+    # coverage planner treats the whole same-origin application as its scope.
+    focus_area: str | None = None
+    max_steps: int = 100
+    max_duration_seconds: int = 1800
     capture_screenshots: bool = True
     capture_console_errors: bool = True
     capture_network_errors: bool = True
@@ -149,4 +154,3 @@ class ExplorationRequest:
     agent: ModelSelection
     auxiliary_llm: ModelSelection
     options: ExplorationOptions
-

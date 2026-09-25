@@ -40,7 +40,29 @@ FastAPI API -> ExplorationManager -> JEV adapter -> JSON AgentDecision
 - `domain/` contains models and ports without FastAPI or Playwright dependencies.
 - `adapters/openai_compatible.py` implements OpenAI-compatible model discovery, connectivity checks, schema-validated JEV JSON decisions and auxiliary documentation. The auxiliary model receives the redacted DOM plus a masked screenshot when it supports vision; incompatible models automatically fall back to textual evidence.
 - `adapters/playwright_executor.py` is the only browser executor. Element targets are observation refs such as `e4`, not model-supplied selectors or JavaScript.
-- `services/exploration.py` owns state, limits, cancellation, deduplication and loop protection.
+- `services/coverage.py` owns route/state identity, semantic control memory,
+  the atomic pending frontier, selector-free DOM-state replay and verified
+  backtracking. `services/exploration.py` owns lifecycle, limits, cancellation,
+  usage accounting and evidence orchestration.
+- TypeSafe JEV receives one native `Choice` over complete atomic moves rather
+  than unrelated action and target questions. Parallel QA-focus and issue
+  judgments, returned probability/confidence, recent Playwright state deltas,
+  console/network errors and frontier metrics make each next-step decision
+  evidence-based while code still owns safety and completion.
+- Coverage is keyed by `semantic element + action + value`: menu controls can
+  contribute separate `hover` and `click` moves, and a select contributes up to
+  eight enabled, non-destructive option moves. JEV receives at most 30 moves per
+  decision. Text-like fields use one deterministic synthetic value.
+- When a dialog is open, only the active modal's controls are observed; page
+  controls behind it cannot enter the frontier. Exit controls are attempted
+  only after the remaining useful controls on that surface.
+- DOM-only states (open submenus, tabs and modals that keep the same URL) are
+  restored from bounded selector-free recipes. The planner re-resolves a fresh
+  semantic ref and replays the safe interaction; an unrestorable branch is
+  marked blocked. Same-origin popups are adopted and backtracked through an
+  executor-owned page stack.
+- Passwords, uploads, hidden/read-only fields, destructive choices and
+  cross-origin top-level navigation are excluded or blocked.
 - `adapters/repository.py` stores providers, models, runs, events, actions, evidence, scenarios, issues and artifact metadata in SQLite.
 - `adapters/report.py` creates an offline HTML report with embedded CSS/JS and base64 screenshots. Every model/site string is HTML-escaped.
 
@@ -60,6 +82,7 @@ All endpoints use `/api` (not `/api/v1`). Input accepts the documented snake_cas
 | GET | `/api/explorations` | Recent explorations |
 | GET | `/api/explorations/{id}` | Live state, events, actions, evidence and scenarios |
 | POST | `/api/explorations/{id}/cancel` | Request cooperative cancellation |
+| POST | `/api/explorations/{id}/resume` | Resume after a manual-login intervention |
 | GET | `/api/explorations/{id}/report` | Standalone HTML report |
 | GET | `/api/explorations/{id}/screenshots/{file}` | Validated screenshot artifact |
 
@@ -72,8 +95,9 @@ Example exploration:
   "auxiliary_llm": {"provider_id": "provider-uuid", "model_id": "claude-sonnet"},
   "options": {
     "mode": "full",
-    "max_steps": 50,
-    "max_duration_seconds": 900,
+    "focus_area": "Configurações > Usuários > Permissões",
+    "max_steps": 100,
+    "max_duration_seconds": 1800,
     "capture_screenshots": true,
     "capture_console_errors": true,
     "capture_network_errors": true,
@@ -86,16 +110,49 @@ Example exploration:
 
 Credential aliases—not their values—are shown to JEV. The executor resolves the alias in memory. Credentials are discarded at the end, redacted from actions/errors, and never inserted into SQLite. Inputs filled from credentials are masked in subsequent screenshots.
 
-`max_duration_seconds` is enforced as a deadline across browser startup, JEV calls, Playwright actions and auxiliary-model calls. Repeated action/state fingerprints and actual URL transitions provide separate loop protection for SPAs.
+`focus_area` is optional. Without it, the planner covers every safe reachable
+same-origin branch it can discover. With it, navigation may traverse the menus
+needed to reach the requested screen, then the selected route becomes the
+backtracking root and unrelated global navigation is excluded. If that root is
+a same-URL submenu or modal, its entry state is retained only as a replay anchor;
+background controls remain out of scope.
+
+`max_duration_seconds` is enforced across browser startup, JEV decisions and
+Playwright actions. Auxiliary documentation is post-processed after navigation
+so its latency cannot reduce browser coverage; deterministic evidence is used
+as fallback when documentation reaches its own bound. Route fingerprints keep
+path, query and hash distinct for SPAs. `max_steps` counts real browser actions;
+invalid/rejected model responses use a separate bounded planning budget.
 
 ## Evidence and status
 
-- `PASS`: the Playwright action succeeded and every explicit supported assertion was observed.
-- `FAIL`: execution or a supported assertion failed.
-- `BLOCKED`: a safety policy or unavailable dependency prevented execution.
-- `SKIPPED`: an action succeeded but no verifiable assertion exists. The model cannot turn this into `PASS`.
+- `PASS`: the Playwright action succeeded, at least one verifiable assertion
+  exists, and every assertion passed. An observable URL/DOM/control-state delta
+  can supply deterministic evidence.
+- `FAIL`: ordinary execution failed or a supported assertion failed. Captured
+  console/network errors correlated with a changed state also fail the evidence.
+- `BLOCKED`: an executor policy or unavailable control prevented execution.
+- `SKIPPED`: an action succeeded but no verifiable assertion exists. The model
+  cannot turn this into `PASS`.
 
 Captured browser evidence includes console/page errors, failed requests and HTTP 4xx/5xx responses. Reports only describe actions actually returned by Playwright.
+
+Exploration lifecycle status is separate from scenario status. `completed`
+means the discovered frontier and return stack were exhausted. `partial` means
+a time/action/planning bound was reached, the requested focus could not be
+found, or blocked candidates left the frontier incomplete. `postprocessing` is
+a live, cancelable phase after browser work in which the auxiliary model formats
+captured evidence and the report is generated; only then is the terminal status
+published. A backend restart marks `queued`, `running`, `waiting_input` and
+`postprocessing` runs as failed rather than leaving them orphaned. Visible-browser
+screenshots capture only the viewport and mask the AutoJev overlay without
+toggling it, avoiding full-page scroll oscillation.
+
+Token usage is accumulated for both JEV and auxiliary calls as prompt,
+completion and total tokens. Monetary cost is persisted only when the provider
+returns it; unknown cost remains `—` rather than being estimated. The live
+browser panel and React sidebar show the running total, and exploration history,
+detail payloads and the standalone report retain the final values.
 
 ## Security notes
 
@@ -114,8 +171,14 @@ cd backend
 pytest
 ```
 
-Tests cover encrypted/write-only secrets, in-memory credentials, redaction, provider CRUD, exploration request secrecy, evidence-derived statuses, repository summaries and report XSS escaping/base64 embedding.
+Tests cover encrypted/write-only secrets, in-memory credentials, redaction,
+provider CRUD, exploration request secrecy, semantic SPA state identity,
+atomic move variants, frontier/backtracking rules, selector-free DOM replay,
+focused-scope and active-modal isolation, stable screenshots, evidence-derived
+statuses, lifecycle recovery, usage persistence, repository summaries and
+report XSS escaping/base64 embedding.
 
-The standalone report includes duration, status filters, full-text search,
-expandable scenario cards and embedded screenshots, so `report.html` can be
-opened without the API running.
+The standalone report includes scope, terminal lifecycle status/reason,
+duration, tokens, provider-reported cost, scenario filters, full-text search,
+expandable cards and embedded screenshots, so `report.html` can be opened
+without the API running.

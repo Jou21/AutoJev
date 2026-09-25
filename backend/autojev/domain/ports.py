@@ -11,6 +11,7 @@ class AgentPort(Protocol):
         observation: Observation,
         history: list[dict[str, Any]],
         credential_keys: list[str],
+        coverage_context: dict[str, Any] | None = None,
     ) -> AgentDecision: ...
 
 

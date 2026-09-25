@@ -1,4 +1,10 @@
-from autojev.domain.models import Observation
+from autojev.domain.models import (
+    ActionResult,
+    AgentDecision,
+    Observation,
+    ScenarioStatus,
+    utc_now,
+)
 from autojev.services.exploration import ExplorationManager
 
 
@@ -15,3 +21,97 @@ def test_login_form_requires_user_intervention_even_without_login_label():
     )
 
     assert ExplorationManager._needs_login(observation) is True
+
+
+def test_action_fingerprint_distinguishes_spa_hash_routes():
+    decision = AgentDecision(action="click", target="e0", rationale="test")
+
+    first = ExplorationManager._fingerprint("https://app.test/#/clientes", decision)
+    second = ExplorationManager._fingerprint("https://app.test/#/produtos", decision)
+
+    assert first != second
+
+
+def test_action_fingerprint_scopes_reused_refs_to_semantic_state():
+    decision = AgentDecision(action="click", target="e0", rationale="test")
+
+    modal = ExplorationManager._fingerprint(
+        "https://app.test/dashboard", decision, "state:modal"
+    )
+    submenu = ExplorationManager._fingerprint(
+        "https://app.test/dashboard", decision, "state:submenu"
+    )
+
+    assert modal != submenu
+
+
+def test_observable_state_delta_becomes_verified_pass_evidence():
+    decision = AgentDecision(action="click", target="e0", rationale="Open details")
+    result = ActionResult(
+        action="click",
+        success=True,
+        started_at=utc_now(),
+        finished_at=utc_now(),
+        before_url="https://app.test/",
+        after_url="https://app.test/details",
+    )
+    observation = Observation(
+        url=result.after_url,
+        title="Details",
+        text="Details opened",
+        interactive_elements=[],
+    )
+
+    ExplorationManager._append_observable_state_evidence(
+        result,
+        decision,
+        observation,
+        state_changed=True,
+        capture_console_errors=True,
+        capture_network_errors=True,
+    )
+
+    assert [item.kind for item in result.assertions] == [
+        "observable_state_change",
+        "no_new_browser_errors",
+    ]
+    assert all(item.passed for item in result.assertions)
+    scenario = ExplorationManager._scenario_from_evidence(
+        observation, decision, result, 1
+    )
+    assert scenario.status == ScenarioStatus.PASS
+
+
+def test_state_delta_with_correlated_browser_error_is_fail_evidence():
+    decision = AgentDecision(action="select", target="e1", rationale="Filter status")
+    result = ActionResult(
+        action="select",
+        success=True,
+        started_at=utc_now(),
+        finished_at=utc_now(),
+        before_url="https://app.test/orders",
+        after_url="https://app.test/orders",
+    )
+    observation = Observation(
+        url=result.after_url,
+        title="Orders",
+        text="Loading failed",
+        interactive_elements=[],
+        network_errors=[{"url": "/api/orders", "status_code": 500}],
+    )
+
+    ExplorationManager._append_observable_state_evidence(
+        result,
+        decision,
+        observation,
+        state_changed=True,
+        capture_console_errors=True,
+        capture_network_errors=True,
+    )
+
+    assert result.assertions[-1].kind == "no_new_browser_errors"
+    assert result.assertions[-1].passed is False
+    scenario = ExplorationManager._scenario_from_evidence(
+        observation, decision, result, 2
+    )
+    assert scenario.status == ScenarioStatus.FAIL

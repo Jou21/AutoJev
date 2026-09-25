@@ -48,3 +48,16 @@ test("removes disposable starter assets and metadata", async () => {
   assert.match(packageJson, /lucide-react/);
   await assert.rejects(access(new URL("app/_sites-preview", root)));
 });
+
+test("offers an optional focused exploration scope", async () => {
+  const source = await readFile(new URL("../app/AutoJevApp.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /useState<"all" \| "focused">\("all"\)/);
+  assert.match(source, /Tela, menu ou submenu/);
+  assert.match(source, /Toda a aplicação/);
+  assert.match(source, /Tela\/menu específico/);
+  assert.match(source, /Configurações &gt; Usuários &gt; Permissões|Configurações > Usuários > Permissões/);
+  assert.match(source, /focusMode === "focused" && !focusArea\.trim\(\)/);
+  assert.match(source, /if \(normalizedFocusArea\) explorationOptions\.focus_area = normalizedFocusArea/);
+  assert.match(source, /explorationFocusArea\(exploration\.options\)/);
+});

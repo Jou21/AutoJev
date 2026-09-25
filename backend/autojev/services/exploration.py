@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import time
+from contextlib import suppress
 from dataclasses import asdict
 from typing import Any
 
@@ -19,14 +20,17 @@ from autojev.adapters.repository import SQLiteRepository
 from autojev.adapters.secrets import EphemeralCredentialVault, redact
 from autojev.config import Settings
 from autojev.domain.models import (
+    ActionResult,
     AgentDecision,
+    AssertionResult,
     ExplorationOptions,
     ExplorationStatus,
     Observation,
-    utc_now,
     ScenarioStatus,
     TestScenario,
+    utc_now,
 )
+from autojev.services.coverage import CoveragePlanner, canonical_url
 
 
 class ExplorationManager:
@@ -66,10 +70,20 @@ class ExplorationManager:
     @staticmethod
     def _needs_login(observation: Observation) -> bool:
         element_text = " ".join(
-            str(element.get("name") or "") for element in observation.interactive_elements
+            str(element.get("name") or "")
+            for element in observation.interactive_elements
         )
         text = f"{observation.title} {observation.text} {observation.url} {element_text}".lower()
-        login_words = ("log in", "login", "sign in", "sign-in", "entrar", "acessar", "username", "user-name")
+        login_words = (
+            "log in",
+            "login",
+            "sign in",
+            "sign-in",
+            "entrar",
+            "acessar",
+            "username",
+            "user-name",
+        )
         has_login_copy = any(word in text for word in login_words)
         has_password = any(
             str(element.get("type") or "").lower() == "password"
@@ -129,7 +143,9 @@ class ExplorationManager:
             "Login detected. Complete the login in the browser window, then continue the exploration.",
             {"kind": "login", "url": observation.url},
         )
-        await executor.show_intervention_panel(panel_message or self.LOGIN_PANEL_MESSAGE)
+        await executor.show_intervention_panel(
+            panel_message or self.LOGIN_PANEL_MESSAGE
+        )
         limit = deadline if deadline is not None else time.monotonic() + 3600
         app_resume = asyncio.create_task(event.wait())
         browser_resume = asyncio.create_task(executor.wait_for_user_input())
@@ -219,29 +235,47 @@ class ExplorationManager:
             for key in ("prompt_tokens", "completion_tokens", "total_tokens", "cost"):
                 usage[key] += current[key]
             usage["cost_known"] = usage["cost_known"] or current["cost_known"]
-        if not any(usage[key] for key in ("prompt_tokens", "completion_tokens", "total_tokens")) and not usage["cost_known"]:
+        if (
+            not any(
+                usage[key]
+                for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+            )
+            and not usage["cost_known"]
+        ):
             return
         item = self.repository.get_exploration(exploration_id, include_details=False)
         previous = item.get("usage", {})
-        total_tokens = int(previous.get("total_tokens") or 0) + int(usage["total_tokens"])
+        total_tokens = int(previous.get("total_tokens") or 0) + int(
+            usage["total_tokens"]
+        )
         cost_known = bool(previous.get("cost_known")) or bool(usage["cost_known"])
         cost = float(previous.get("cost") or 0.0) + float(usage["cost"])
         self.repository.update_exploration(
             exploration_id,
-            prompt_tokens=int(previous.get("prompt_tokens") or 0) + int(usage["prompt_tokens"]),
-            completion_tokens=int(previous.get("completion_tokens") or 0) + int(usage["completion_tokens"]),
+            prompt_tokens=int(previous.get("prompt_tokens") or 0)
+            + int(usage["prompt_tokens"]),
+            completion_tokens=int(previous.get("completion_tokens") or 0)
+            + int(usage["completion_tokens"]),
             total_tokens=total_tokens,
             cost=cost if cost_known else None,
             cost_known=cost_known,
         )
         if executor:
-            await executor.update_usage_panel(total_tokens, cost if cost_known else None, cost_known)
+            await executor.update_usage_panel(
+                total_tokens, cost if cost_known else None, cost_known
+            )
 
     @staticmethod
-    def _fingerprint(url: str, decision: AgentDecision) -> str:
+    def _fingerprint(
+        url: str, decision: AgentDecision, state_key: str | None = None
+    ) -> str:
         raw = json.dumps(
             {
-                "url": url.split("#", 1)[0],
+                "url": canonical_url(url),
+                # Refs are only meaningful inside one semantic browser state.
+                # The same e0 may legitimately identify a different control in
+                # another modal/hash/React surface at the same URL.
+                "state": state_key,
                 "action": decision.action,
                 "target": decision.target,
                 "value": decision.value,
@@ -302,7 +336,7 @@ class ExplorationManager:
     def _scenario_from_evidence(
         observation: Observation,
         decision: AgentDecision,
-        result: Any,
+        result: ActionResult,
         scenario_number: int,
     ) -> TestScenario:
         status = ScenarioStatus.SKIPPED
@@ -322,11 +356,19 @@ class ExplorationManager:
         hint = decision.scenario_hint or {}
         return TestScenario(
             id=f"CT{scenario_number:03d}",
-            title=str(hint.get("title") or f"Explore {decision.action} on {observation.title or observation.url}")[:300],
+            title=str(
+                hint.get("title")
+                or f"Explore {decision.action} on {observation.title or observation.url}"
+            )[:300],
             description=str(hint.get("description") or decision.rationale)[:3000],
-            preconditions=[str(item)[:500] for item in hint.get("preconditions", []) if item][:20],
+            preconditions=[
+                str(item)[:500] for item in hint.get("preconditions", []) if item
+            ][:20],
             steps=[f"Execute {decision.action} on the observed page"],
-            expected_result=str(hint.get("expected_result") or "The declared assertion should be observed.")[:3000],
+            expected_result=str(
+                hint.get("expected_result")
+                or "The declared assertion should be observed."
+            )[:3000],
             actual_result=result.message or f"Browser ended at {result.after_url}",
             status=status,
             url=result.after_url,
@@ -343,15 +385,152 @@ class ExplorationManager:
             },
         )
 
+    @staticmethod
+    def _append_observable_state_evidence(
+        result: ActionResult,
+        decision: AgentDecision,
+        observation: Observation,
+        *,
+        state_changed: bool,
+        capture_console_errors: bool,
+        capture_network_errors: bool,
+    ) -> None:
+        """Turn a verified post-action delta into deterministic assertions.
+
+        JEV predicts useful behavior before execution, but Playwright owns the
+        verdict. A visible route/DOM/control-state delta is concrete evidence
+        that an interaction produced an observable result; correlated browser
+        errors are evaluated alongside it so a changed screen with a failed API
+        request cannot be reported as PASS.
+        """
+
+        if not result.success or not state_changed or decision.action in {
+            "wait",
+            "screenshot",
+        }:
+            return
+        if not any(item.kind == "observable_state_change" for item in result.assertions):
+            result.assertions.append(
+                AssertionResult(
+                    kind="observable_state_change",
+                    expected="The route or interactive page state changes",
+                    actual="An observable state delta was captured after the action",
+                    passed=True,
+                    message="Observed",
+                )
+            )
+        if not (capture_console_errors or capture_network_errors):
+            return
+        console_count = len(observation.console_errors) if capture_console_errors else 0
+        network_count = len(observation.network_errors) if capture_network_errors else 0
+        error_count = console_count + network_count
+        result.assertions.append(
+            AssertionResult(
+                kind="no_new_browser_errors",
+                expected="0 new console or network errors",
+                actual={
+                    "console_errors": console_count,
+                    "network_errors": network_count,
+                },
+                passed=error_count == 0,
+                message=(
+                    "Observed"
+                    if error_count == 0
+                    else "The action produced new browser errors"
+                ),
+            )
+        )
+
+    async def _materialize_scenarios(
+        self,
+        exploration_id: str,
+        pending: list[tuple[Observation, AgentDecision, ActionResult, int]],
+        auxiliary: OpenAIAuxiliaryScenarioGenerator,
+        auxiliary_client: OpenAICompatibleClient,
+        use_local_evidence: bool,
+    ) -> None:
+        """Document browser evidence after navigation has finished.
+
+        Auxiliary-model latency must not consume the browser's exploration
+        budget. If post-processing is slow or unavailable, deterministic local
+        evidence still produces a complete report instead of blocking coverage.
+        """
+
+        if not pending:
+            return
+        documentation_deadline = time.monotonic() + min(max(len(pending) * 8, 45), 180)
+        for observation, decision, result, scenario_number in pending:
+            fallback_reason: str | None = None
+            cancel_requested = self.repository.is_cancel_requested(exploration_id)
+            if (
+                use_local_evidence
+                or cancel_requested
+                or time.monotonic() >= documentation_deadline
+            ):
+                scenario = self._scenario_from_evidence(
+                    observation, decision, result, scenario_number
+                )
+                if cancel_requested:
+                    fallback_reason = "exploration_cancelled"
+                elif not use_local_evidence:
+                    fallback_reason = "documentation_time_limit"
+            else:
+                remaining = max(documentation_deadline - time.monotonic(), 0.1)
+                try:
+                    scenario = await asyncio.wait_for(
+                        auxiliary.create_scenario(
+                            observation, decision, result, scenario_number
+                        ),
+                        timeout=min(45.0, remaining),
+                    )
+                except Exception as exc:
+                    fallback_reason = exc.__class__.__name__
+                    scenario = self._scenario_from_evidence(
+                        observation, decision, result, scenario_number
+                    )
+                await self._record_model_usage(exploration_id, [auxiliary_client], None)
+
+            self.repository.add_scenario(exploration_id, scenario_number, scenario)
+            if result.screenshot:
+                self.repository.add_screenshot(
+                    exploration_id,
+                    result.screenshot,
+                    f"Evidence for {scenario.id}",
+                    scenario.id,
+                )
+            self.repository.add_event(
+                exploration_id,
+                "warning" if fallback_reason else "info",
+                "scenario_documentation_fallback"
+                if fallback_reason
+                else "scenario_created",
+                (
+                    f"{scenario.id} — local evidence used ({fallback_reason})"
+                    if fallback_reason
+                    else f"{scenario.id} — {scenario.title}"
+                ),
+                {"scenario_id": scenario.id, "status": scenario.status},
+            )
+
     async def _run(self, exploration_id: str) -> None:
         credentials = self.credential_vault.get(exploration_id)
         secret_values = list(credentials.values())
         executor: PlaywrightExecutor | None = None
         options: ExplorationOptions | None = None
+        coverage: CoveragePlanner | None = None
+        auxiliary: OpenAIAuxiliaryScenarioGenerator | None = None
+        auxiliary_client: OpenAICompatibleClient | None = None
+        agent_model_id = ""
+        auxiliary_model_id = ""
+        pending_scenarios: list[
+            tuple[Observation, AgentDecision, ActionResult, int]
+        ] = []
         terminal = ExplorationStatus.FAILED
         error_message: str | None = None
         try:
-            item = self.repository.get_exploration(exploration_id, include_details=False)
+            item = self.repository.get_exploration(
+                exploration_id, include_details=False
+            )
             options = ExplorationOptions(**item["options"])
             if item["cancel_requested"]:
                 terminal = ExplorationStatus.CANCELLED
@@ -366,11 +545,13 @@ class ExplorationManager:
             deadline = started + options.max_duration_seconds
             agent_client = self._client_for(item["agent"]["provider_id"])
             auxiliary_client = self._client_for(item["auxiliary_llm"]["provider_id"])
-            agent = OpenAIJevAgent(agent_client, item["agent"]["model_id"])
+            agent_model_id = item["agent"]["model_id"]
+            auxiliary_model_id = item["auxiliary_llm"]["model_id"]
+            agent = OpenAIJevAgent(agent_client, agent_model_id)
             screenshot_dir = self.settings.artifact_dir / exploration_id / "screenshots"
             auxiliary = OpenAIAuxiliaryScenarioGenerator(
                 auxiliary_client,
-                item["auxiliary_llm"]["model_id"],
+                auxiliary_model_id,
                 screenshot_dir,
             )
             executor = PlaywrightExecutor(
@@ -390,7 +571,9 @@ class ExplorationManager:
                 executor.start(item["app_url"]),
                 timeout=max(deadline - time.monotonic(), 0.1),
             )
-            self.repository.update_exploration(exploration_id, current_url=observation.url)
+            self.repository.update_exploration(
+                exploration_id, current_url=observation.url
+            )
             self._record_screenshot(exploration_id, observation, "Initial page")
             self.repository.add_event(
                 exploration_id,
@@ -405,27 +588,36 @@ class ExplorationManager:
             )
             history: list[dict[str, Any]] = []
             action_counts: dict[str, int] = {}
-            url_visits: dict[str, int] = {}
             known_issues: set[str] = set()
             scenario_fingerprints: set[str] = set()
             scenario_number = 0
             consecutive_model_errors = 0
-            last_canonical_url: str | None = None
             login_retried = False
             actions_executed = 0
-            finish_rejections = 0
             consecutive_loop_rejections = 0
-            tried_targets: set[tuple[str, str | None]] = set()
-            # Guarda contra encerramento precoce: o JEV às vezes responde
-            # "finish" na primeira decisão de uma página inexplorada.
-            MIN_ACTIONS_BEFORE_FINISH = 5
-            MAX_FINISH_REJECTIONS = 5
+            planning_attempts = 0
+            max_planning_attempts = max(options.max_steps * 6, 30)
             # Teto de teimosia: após N rejeições seguidas sem nenhuma ação
             # nova, encerra (o resto é fumaça do modelo, não exploração).
             MAX_CONSECUTIVE_LOOP_REJECTIONS = 8
+            coverage = CoveragePlanner(item["app_url"], options.focus_area)
+            coverage.observe(observation)
+            self.repository.add_event(
+                exploration_id,
+                "info",
+                "coverage_scope",
+                (
+                    f"Focused exploratory scope: {options.focus_area}"
+                    if options.focus_area
+                    else "Exploratory scope: entire same-origin application"
+                ),
+                {"focus_area": options.focus_area},
+            )
             self._record_observation_issues(exploration_id, observation, known_issues)
 
-            for step in range(1, options.max_steps + 1):
+            # max_steps is an action budget. Invalid or rejected model
+            # decisions use a separate bounded planning budget.
+            while actions_executed < options.max_steps:
                 if self.repository.is_cancel_requested(exploration_id):
                     terminal = ExplorationStatus.CANCELLED
                     self.repository.add_event(
@@ -433,12 +625,13 @@ class ExplorationManager:
                     )
                     break
                 if time.monotonic() - started >= options.max_duration_seconds:
-                    terminal = ExplorationStatus.COMPLETED
+                    terminal = ExplorationStatus.PARTIAL
                     self.repository.add_event(
                         exploration_id,
                         "warning",
-                        "limit_reached",
-                        "Maximum exploration duration reached",
+                        "coverage_partial",
+                        "Maximum exploration duration reached; coverage is partial",
+                        {"reason": "duration_limit", **coverage.context(observation)},
                     )
                     break
                 if self._needs_login(observation):
@@ -457,16 +650,22 @@ class ExplorationManager:
                         panel_message,
                         deadline,
                     )
-                    if outcome == "cancelled" or self.repository.is_cancel_requested(exploration_id):
+                    if outcome == "cancelled" or self.repository.is_cancel_requested(
+                        exploration_id
+                    ):
                         terminal = ExplorationStatus.CANCELLED
                         break
                     if outcome == "timeout":
-                        terminal = ExplorationStatus.COMPLETED
+                        terminal = ExplorationStatus.PARTIAL
                         self.repository.add_event(
                             exploration_id,
                             "warning",
-                            "limit_reached",
-                            "Maximum exploration duration reached while waiting for login",
+                            "coverage_partial",
+                            "Maximum exploration duration reached while waiting for login; coverage is partial",
+                            {
+                                "reason": "duration_limit",
+                                **coverage.context(observation),
+                            },
                         )
                         break
                     observation = await asyncio.wait_for(
@@ -497,29 +696,32 @@ class ExplorationManager:
                             "e só então clique em Continuar exploração."
                         )
                         continue
-                canonical_url = observation.url.split("#", 1)[0]
-                if canonical_url != last_canonical_url:
-                    url_visits[canonical_url] = url_visits.get(canonical_url, 0) + 1
-                    last_canonical_url = canonical_url
-                if url_visits[canonical_url] > 8:
-                    terminal = ExplorationStatus.COMPLETED
+                planning_attempts += 1
+                if planning_attempts > max_planning_attempts:
+                    terminal = ExplorationStatus.PARTIAL
                     self.repository.add_event(
                         exploration_id,
                         "warning",
-                        "loop_prevented",
-                        "Page visit limit reached; exploration stopped safely",
+                        "coverage_partial",
+                        "Exploration planning limit reached before the coverage frontier was exhausted",
+                        coverage.context(observation),
                     )
                     break
                 try:
                     decision = await asyncio.wait_for(
                         agent.decide(
-                            observation, history, sorted(credentials.keys())
+                            observation,
+                            history,
+                            sorted(credentials.keys()),
+                            coverage.context(observation),
                         ),
                         timeout=max(deadline - time.monotonic(), 0.1),
                     )
                     consecutive_model_errors = 0
                 except ModelResponseError as exc:
-                    await self._record_model_usage(exploration_id, [agent_client], executor)
+                    await self._record_model_usage(
+                        exploration_id, [agent_client], executor
+                    )
                     consecutive_model_errors += 1
                     self.repository.add_event(
                         exploration_id,
@@ -528,75 +730,112 @@ class ExplorationManager:
                         str(exc),
                     )
                     if consecutive_model_errors >= 3:
-                        raise RuntimeError("JEV returned three invalid decisions in sequence") from exc
+                        raise RuntimeError(
+                            "JEV returned three invalid decisions in sequence"
+                        ) from exc
                     continue
                 await self._record_model_usage(exploration_id, [agent_client], executor)
+                decision, coverage_override = coverage.reconcile(observation, decision)
+                if coverage_override:
+                    self.repository.add_event(
+                        exploration_id,
+                        "info",
+                        "coverage_decision_overridden",
+                        "Coverage planner replaced the model decision to continue systematic exploration",
+                        {
+                            "reason": coverage_override,
+                            "action": decision.action,
+                            "target": decision.target,
+                            "url": decision.url,
+                        },
+                    )
+                is_restoration_action = decision.action == "go_back" or bool(
+                    coverage_override
+                    and (
+                        "restore" in coverage_override
+                        or "backtrack" in coverage_override
+                        or coverage_override == "focus_boundary_return"
+                    )
+                )
                 if decision.action == "finish":
-                    if (
-                        actions_executed < MIN_ACTIONS_BEFORE_FINISH
-                        and finish_rejections < MAX_FINISH_REJECTIONS
-                    ):
-                        finish_rejections += 1
+                    if not coverage.can_finish():
+                        state = coverage.context(observation)
                         history.append(
                             {
                                 "action": "finish",
                                 "target": None,
-                                "result": (
-                                    "rejected: exploration just started "
-                                    f"({actions_executed} actions so far); "
-                                    "choose a useful interactive action instead"
-                                ),
+                                "result": "rejected: coverage frontier or backtracking path is not exhausted",
+                                "coverage_state": state,
                             }
                         )
                         self.repository.add_event(
                             exploration_id,
                             "warning",
                             "finish_rejected",
-                            "Premature finish rejected; exploration continues",
-                            {"actions_so_far": actions_executed},
+                            "Premature finish rejected; coverage frontier is not exhausted",
+                            state,
                         )
                         await executor.update_live_panel(
-                            f"Decisão {step} de {options.max_steps}",
-                            "JEV tentou encerrar cedo — exploração continua.",
+                            f"Etapa {actions_executed + 1} de {options.max_steps}",
+                            "JEV tentou encerrar cedo — retomando a cobertura.",
                         )
                         continue
+                    if options.focus_area and not coverage.focus_reached:
+                        terminal = ExplorationStatus.PARTIAL
+                        self.repository.add_event(
+                            exploration_id,
+                            "warning",
+                            "coverage_scope_not_found",
+                            "The requested screen/menu scope was not found among reachable safe routes",
+                            coverage.context(observation),
+                        )
+                        break
+                    if not coverage.coverage_complete():
+                        terminal = ExplorationStatus.PARTIAL
+                        self.repository.add_event(
+                            exploration_id,
+                            "warning",
+                            "coverage_partial",
+                            "The reachable frontier settled with blocked controls; coverage is partial",
+                            {
+                                "reason": "blocked_candidates",
+                                **coverage.context(observation),
+                            },
+                        )
+                        break
                     terminal = ExplorationStatus.COMPLETED
                     self.repository.add_event(
                         exploration_id,
                         "info",
-                        "agent_finished",
-                        "JEV concluded that exploration was complete",
-                        {"rationale": decision.rationale},
+                        "coverage_complete",
+                        "Coverage frontier exhausted; exploration complete",
+                        {
+                            "rationale": decision.rationale,
+                            **coverage.context(observation),
+                        },
                     )
                     break
-                fingerprint = self._fingerprint(observation.url, decision)
+                fingerprint = self._fingerprint(
+                    observation.url,
+                    decision,
+                    coverage.state_key(observation),
+                )
                 action_counts[fingerprint] = action_counts.get(fingerprint, 0) + 1
-                tried_targets.add((decision.action, decision.target))
-                if action_counts[fingerprint] > 2:
+                if action_counts[fingerprint] > 2 and not is_restoration_action:
                     consecutive_loop_rejections += 1
                     # Direciona o modelo para elementos ainda não tentados,
                     # em vez de só dizer "não" e desistir em seguida.
-                    valid_refs = sorted(
-                        (
-                            str(element.get("ref"))
-                            for element in observation.interactive_elements
-                            if element.get("ref")
-                        ),
-                        key=lambda ref: int(ref[1:]) if ref[1:].isdigit() else 9999,
-                    )
-                    alternatives = [
-                        ref
-                        for ref in valid_refs
-                        if (decision.action, ref) not in tried_targets
-                    ][:6]
                     hint = (
                         f"rejected by loop protection: '{decision.action} on "
                         f"{decision.target}' was already tried "
                         f"{action_counts[fingerprint]}x on this page. You MUST "
                         "choose a DIFFERENT element."
                     )
-                    if alternatives:
-                        hint += f" Untried options include: {', '.join(alternatives)}."
+                    untried = coverage.context(observation)["current_untried"][:6]
+                    if untried:
+                        hint += " Untried semantic options include: " + ", ".join(
+                            str(item.get("name") or item.get("ref")) for item in untried
+                        )
                     history.append(
                         {
                             "action": decision.action,
@@ -616,12 +855,13 @@ class ExplorationManager:
                         },
                     )
                     if consecutive_loop_rejections >= MAX_CONSECUTIVE_LOOP_REJECTIONS:
-                        terminal = ExplorationStatus.COMPLETED
+                        terminal = ExplorationStatus.PARTIAL
                         self.repository.add_event(
                             exploration_id,
                             "warning",
-                            "agent_stuck",
-                            "JEV kept repeating tried actions; exploration stopped",
+                            "coverage_partial",
+                            "JEV kept repeating tried actions; coverage is partial",
+                            coverage.context(observation),
                         )
                         break
                     continue
@@ -631,9 +871,10 @@ class ExplorationManager:
                     "action_started",
                     f"Executing {decision.action}",
                     {
-                        "step": step,
+                        "step": actions_executed + 1,
                         "action": decision.action,
                         "target": decision.target,
+                        "rationale": decision.rationale,
                     },
                 )
                 next_action = actions_executed + 1
@@ -646,19 +887,52 @@ class ExplorationManager:
                     executor.execute(decision, credentials),
                     timeout=max(deadline - time.monotonic(), 0.1),
                 )
+                before_state_key = coverage.effect_key(observation)
+                after_state_key = coverage.effect_key(next_observation)
+                state_changed = before_state_key != after_state_key
+                if (
+                    decision.action == "go_back"
+                    and result.success
+                    and not state_changed
+                ):
+                    result.success = False
+                    result.message = (
+                        "Playwright attempted go_back, but no route or interactive-state "
+                        "change was observed"
+                    )
+                elif (
+                    decision.action in {"click", "hover"}
+                    and result.success
+                    and not state_changed
+                ):
+                    result.message = (
+                        f"{result.message}; no new route or interactive-state change was observed"
+                    )
+                self._append_observable_state_evidence(
+                    result,
+                    decision,
+                    next_observation,
+                    state_changed=state_changed,
+                    capture_console_errors=options.capture_console_errors,
+                    capture_network_errors=options.capture_network_errors,
+                )
                 safe_decision = redact(asdict(decision), secret_values)
                 safe_result = redact(result.to_dict(), secret_values)
                 self.repository.add_action(
-                    exploration_id, step, safe_decision, safe_result
+                    exploration_id, next_action, safe_decision, safe_result
                 )
                 actions_executed += 1
+                coverage.record_action(observation, decision, result, next_observation)
+                coverage_after = coverage.context(next_observation)
                 consecutive_loop_rejections = 0
                 self.repository.update_exploration(
                     exploration_id,
                     current_url=next_observation.url,
                     steps_completed=actions_executed,
                 )
-                self._record_screenshot(exploration_id, next_observation, decision.action)
+                self._record_screenshot(
+                    exploration_id, next_observation, decision.action
+                )
                 self._record_observation_issues(
                     exploration_id, next_observation, known_issues
                 )
@@ -668,10 +942,21 @@ class ExplorationManager:
                     "action_completed",
                     result.message,
                     {
-                        "step": step,
+                        "step": actions_executed,
                         "action": decision.action,
                         "success": result.success,
                         "url": result.after_url,
+                        "state_changed": state_changed,
+                        "coverage": {
+                            "known_states": coverage_after["known_states"],
+                            "frontier_states": coverage_after["frontier_states"],
+                            "frontier_candidates": coverage_after[
+                                "frontier_candidates"
+                            ],
+                            "candidates_attempted": coverage_after[
+                                "candidates_attempted"
+                            ],
+                        },
                     },
                 )
                 await executor.update_live_panel(
@@ -684,68 +969,62 @@ class ExplorationManager:
                     {
                         "action": decision.action,
                         "target": decision.target,
+                        "rationale": decision.rationale,
                         "success": result.success,
+                        "result": result.message,
                         "before_url": result.before_url,
                         "after_url": result.after_url,
+                        "state_changed": state_changed,
+                        "next_page_title": next_observation.title,
+                        "new_console_errors": len(next_observation.console_errors),
+                        "new_network_errors": len(next_observation.network_errors),
+                        "coverage_after": {
+                            "known_states": coverage_after["known_states"],
+                            "frontier_states": coverage_after["frontier_states"],
+                            "frontier_candidates": coverage_after[
+                                "frontier_candidates"
+                            ],
+                            "path_depth": coverage_after["path_depth"],
+                        },
                         "assertions": [asdict(value) for value in result.assertions],
                     }
                 )
-                # Gera cenário para toda ação executada (sucesso ou falha).
-                # O JEV tipado (typesafe/jev-*) nunca retorna scenario_hint ou
-                # assertions, então a condição antiga deixava o relatório vazio
-                # mesmo com dezenas de ações bem-sucedidas.
-                if options.generate_test_cases and fingerprint not in scenario_fingerprints:
+                # Preserve evidence now and document it after navigation. The
+                # auxiliary LLM never blocks or shortens browser exploration.
+                if (
+                    options.generate_test_cases
+                    and not is_restoration_action
+                    and fingerprint not in scenario_fingerprints
+                ):
                     scenario_fingerprints.add(fingerprint)
                     scenario_number += 1
-                    if self._is_jev_model(item["agent"]["model_id"]):
-                        scenario = self._scenario_from_evidence(
-                            next_observation, decision, result, scenario_number
-                        )
-                    else:
-                        scenario = await asyncio.wait_for(
-                            auxiliary.create_scenario(
-                                next_observation, decision, result, scenario_number
-                            ),
-                            timeout=max(deadline - time.monotonic(), 0.1),
-                        )
-                    await self._record_model_usage(exploration_id, [auxiliary_client], executor)
-                    self.repository.add_scenario(
-                        exploration_id, scenario_number, scenario
-                    )
-                    if result.screenshot:
-                        # Associate the existing file with the scenario as a separate metadata row.
-                        self.repository.add_screenshot(
-                            exploration_id,
-                            result.screenshot,
-                            f"Evidence for {scenario.id}",
-                            scenario.id,
-                        )
-                    self.repository.add_event(
-                        exploration_id,
-                        "info",
-                        "scenario_created",
-                        f"{scenario.id} — {scenario.title}",
-                        {"scenario_id": scenario.id, "status": scenario.status},
+                    pending_scenarios.append(
+                        (next_observation, decision, result, scenario_number)
                     )
                 observation = next_observation
             else:
-                terminal = ExplorationStatus.COMPLETED
+                terminal = ExplorationStatus.PARTIAL
                 self.repository.add_event(
                     exploration_id,
                     "warning",
                     "limit_reached",
-                    "Maximum number of steps reached",
+                    "Maximum number of actions reached; coverage is partial",
+                    {"reason": "action_limit", **coverage.context(observation)},
                 )
         except asyncio.CancelledError:
             terminal = ExplorationStatus.CANCELLED
             error_message = "Backend shutdown interrupted this exploration"
         except asyncio.TimeoutError:
-            terminal = ExplorationStatus.COMPLETED
+            terminal = ExplorationStatus.PARTIAL
             self.repository.add_event(
                 exploration_id,
                 "warning",
-                "limit_reached",
-                "Maximum exploration duration reached",
+                "coverage_partial",
+                "Maximum exploration duration reached; coverage is partial",
+                {
+                    "reason": "duration_limit",
+                    **(coverage.context(observation) if coverage else {}),
+                },
             )
         except Exception as exc:
             terminal = ExplorationStatus.FAILED
@@ -758,26 +1037,63 @@ class ExplorationManager:
             )
         finally:
             if executor:
-                try:
+                with suppress(Exception):
                     await executor.update_live_panel(
                         "Exploração concluída",
                         f"Status: {terminal.value} — veja o relatório no AutoJev.",
                     )
-                except Exception:
-                    pass
                 await executor.close()
+                executor = None
             self.input_events.pop(exploration_id, None)
             self.credential_vault.discard(exploration_id)
             finished = utc_now()
+            needs_postprocessing = bool(
+                (pending_scenarios and auxiliary and auxiliary_client)
+                or (options and options.generate_html_report)
+            )
+            persisted_status = (
+                ExplorationStatus.POSTPROCESSING
+                if needs_postprocessing
+                else terminal
+            )
+            # Browser work has ended. Keep a distinct live phase so polling,
+            # cancellation and token/cost updates continue until the report is
+            # actually available, without pretending the browser is running.
             self.repository.update_exploration(
                 exploration_id,
-                status=terminal,
+                status=persisted_status,
                 finished_at=finished,
                 error=error_message,
             )
+            if pending_scenarios and auxiliary and auxiliary_client:
+                try:
+                    await self._materialize_scenarios(
+                        exploration_id,
+                        pending_scenarios,
+                        auxiliary,
+                        auxiliary_client,
+                        self._is_jev_model(auxiliary_model_id)
+                        or terminal
+                        in {ExplorationStatus.CANCELLED, ExplorationStatus.FAILED},
+                    )
+                except Exception as scenario_error:
+                    self.repository.add_event(
+                        exploration_id,
+                        "error",
+                        "scenario_postprocessing_failed",
+                        str(redact(str(scenario_error), secret_values))[:1000],
+                    )
+            if (
+                persisted_status == ExplorationStatus.POSTPROCESSING
+                and self.repository.is_cancel_requested(exploration_id)
+            ):
+                terminal = ExplorationStatus.CANCELLED
             if options and options.generate_html_report:
                 try:
                     exploration = self.repository.get_exploration(exploration_id)
+                    # Render the durable terminal outcome rather than freezing
+                    # the transient "postprocessing" phase into the report.
+                    exploration["status"] = terminal.value
                     report_path = (
                         self.settings.artifact_dir / exploration_id / "report.html"
                     )
@@ -802,3 +1118,10 @@ class ExplorationManager:
                         "report_failed",
                         str(redact(str(report_error), secret_values))[:1000],
                     )
+            if persisted_status == ExplorationStatus.POSTPROCESSING:
+                self.repository.update_exploration(
+                    exploration_id,
+                    status=terminal,
+                    finished_at=finished,
+                    error=error_message,
+                )

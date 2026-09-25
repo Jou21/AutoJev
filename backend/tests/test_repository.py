@@ -5,11 +5,14 @@ from autojev.adapters.secrets import SecretCipher
 from autojev.domain.models import (
     ExplorationOptions,
     ExplorationRequest,
+    ExplorationStatus,
     ModelSelection,
     ProviderModel,
     ScenarioStatus,
-    TestScenario as DomainScenario,
     utc_now,
+)
+from autojev.domain.models import (
+    TestScenario as DomainScenario,
 )
 
 
@@ -94,6 +97,37 @@ def test_usage_columns_migrate_legacy_database_and_round_trip(tmp_path):
         "cost": 0.001234,
         "cost_known": True,
     }
+
+
+def test_restart_fails_every_nonterminal_exploration_phase(tmp_path):
+    repo = repository(tmp_path)
+    provider = repo.create_provider(
+        "P", "http://localhost:4000", None, True, [ProviderModel("m", "M")]
+    )
+    run_ids = []
+    for phase in (
+        ExplorationStatus.QUEUED,
+        ExplorationStatus.RUNNING,
+        ExplorationStatus.WAITING_INPUT,
+        ExplorationStatus.POSTPROCESSING,
+    ):
+        run_id = repo.create_exploration(
+            ExplorationRequest(
+                app_url="http://localhost:3000",
+                agent=ModelSelection(provider.id, "m"),
+                auxiliary_llm=ModelSelection(provider.id, "m"),
+                options=ExplorationOptions(max_steps=3),
+            )
+        )
+        repo.update_exploration(run_id, status=phase)
+        run_ids.append(run_id)
+
+    repo.initialize()
+
+    for run_id in run_ids:
+        item = repo.get_exploration(run_id, include_details=False)
+        assert item["status"] == ExplorationStatus.FAILED
+        assert "Backend restarted" in item["error"]
 
 
 def test_exploration_details_and_summary(tmp_path):

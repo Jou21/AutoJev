@@ -1385,6 +1385,123 @@ input::placeholder {
   line-height: 1.4;
 }
 
+.focus-area-field {
+  min-width: 0;
+  margin: 20px 0 0;
+  padding: 20px 0 0;
+  border: 0;
+  border-top: 1px solid var(--border-soft);
+}
+
+.focus-area-field legend {
+  padding: 0;
+  color: #bdc4c8;
+  font-size: 10.5px;
+  font-weight: 620;
+}
+
+.focus-area-field legend em {
+  margin-left: 5px;
+  color: var(--teal);
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 550;
+  text-transform: uppercase;
+}
+
+.focus-area-field > p {
+  margin: 5px 0 12px;
+  color: var(--muted);
+  font-size: 9.5px;
+  line-height: 1.45;
+}
+
+.scope-mode-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.scope-mode-grid > label {
+  position: relative;
+  display: flex;
+  min-height: 70px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid #31393e;
+  border-radius: 7px;
+  background: #111517;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.scope-mode-grid > label:hover {
+  border-color: #4b555a;
+}
+
+.scope-mode-grid > label.selected {
+  border-color: #705a2d;
+  background: #201c14;
+}
+
+.scope-mode-grid input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+
+.scope-mode-grid label:has(input:focus-visible) {
+  outline: 2px solid var(--amber);
+  outline-offset: 2px;
+}
+
+.scope-mode-grid label > span {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.scope-mode-grid strong {
+  color: #d4d8da;
+  font-size: 10.5px;
+  font-weight: 630;
+}
+
+.scope-mode-grid small {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 8.5px;
+  line-height: 1.4;
+}
+
+.scope-mode-grid i {
+  display: grid;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid #455057;
+  border-radius: 50%;
+  color: transparent;
+}
+
+.scope-mode-grid .selected i {
+  border-color: var(--amber);
+  background: var(--amber);
+  color: #17130d;
+}
+
+.focus-area-input {
+  margin-top: 13px;
+  padding: 13px;
+  border: 1px solid #343c41;
+  border-radius: 7px;
+  background: #111518;
+}
+
 .field-grid {
   display: grid;
   gap: 13px;
@@ -2539,7 +2656,7 @@ input::placeholder {
 
 .live-counters {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   margin-top: 17px;
   padding-top: 15px;
   border-top: 1px solid var(--border-soft);
@@ -2739,7 +2856,8 @@ input::placeholder {
   padding: 19px;
 }
 
-.config-model {
+.config-model,
+.exploration-scope {
   display: flex;
   align-items: center;
   gap: 11px;
@@ -2750,13 +2868,15 @@ input::placeholder {
   background: #111517;
 }
 
-.config-model > div {
+.config-model > div,
+.exploration-scope > div {
   display: flex;
   min-width: 0;
   flex-direction: column;
 }
 
-.config-model small {
+.config-model small,
+.exploration-scope small {
   color: var(--muted);
   font-size: 8px;
   font-weight: 650;
@@ -2764,7 +2884,8 @@ input::placeholder {
   text-transform: uppercase;
 }
 
-.config-model strong {
+.config-model strong,
+.exploration-scope strong {
   overflow: hidden;
   margin-top: 4px;
   font-family: var(--font-geist-mono), monospace;
@@ -2774,11 +2895,33 @@ input::placeholder {
   white-space: nowrap;
 }
 
-.config-model em {
+.config-model em,
+.exploration-scope em {
   margin-top: 3px;
   color: #667177;
   font-size: 8.5px;
   font-style: normal;
+}
+
+.exploration-scope {
+  align-items: flex-start;
+  border-color: #4c4028;
+  background: #19170f;
+}
+
+.exploration-scope .model-role-icon {
+  border-color: #5d4a26;
+  background: #241e13;
+  color: var(--amber);
+}
+
+.exploration-scope strong {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.exploration-scope em {
+  line-height: 1.4;
 }
 
 .model-divider {
@@ -3410,6 +3553,7 @@ input::placeholder {
   .field-grid.three-columns,
   .field-grid.four-columns,
   .model-choice-grid,
+  .scope-mode-grid,
   .settings-grid {
     grid-template-columns: 1fr;
   }
@@ -3431,7 +3575,8 @@ input::placeholder {
     gap: 14px 0;
   }
 
-  .detail-counter:nth-child(3) {
+  .detail-counter:nth-child(3),
+  .detail-counter:nth-child(6) {
     border-right: 0;
   }
 
@@ -3576,7 +3721,8 @@ input::placeholder {
   }
 
   .detail-counter:nth-child(2),
-  .detail-counter:nth-child(4) {
+  .detail-counter:nth-child(4),
+  .detail-counter:nth-child(6) {
     border-right: 0;
   }
 
