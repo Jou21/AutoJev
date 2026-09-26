@@ -48,6 +48,173 @@ def _provider_payload(provider: Provider) -> dict[str, Any]:
     }
 
 
+def _phase_payload(result: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Describe browser work and post-processing as distinct user-facing phases."""
+
+    status_value = str(result.get("status") or "queued")
+    max_steps = max(int(result.get("options", {}).get("max_steps", 1)), 1)
+    actions = int(result.get("steps_completed", 0))
+    browser_percentage = min(round((actions / max_steps) * 100), 100)
+    browser_progress = {
+        "current": actions,
+        "total": max_steps,
+        "percentage": browser_percentage,
+    }
+
+    event_types = [str(event.get("type") or "") for event in events]
+    phase = "preparing"
+    label = "Preparando a exploração"
+    description = "Configurando o navegador e os modelos selecionados."
+    current = 0
+    total = 1
+    percentage = 0
+
+    if status_value in {"running", "waiting_input"}:
+        phase = "waiting_input" if status_value == "waiting_input" else "exploring"
+        label = (
+            "Aguardando sua ação no navegador"
+            if phase == "waiting_input"
+            else "Explorando a aplicação"
+        )
+        description = (
+            "Conclua a etapa solicitada no navegador para o JEV continuar."
+            if phase == "waiting_input"
+            else "O JEV decide e o Playwright executa e valida cada interação."
+        )
+        current, total, percentage = actions, max_steps, browser_percentage
+    elif status_value == "postprocessing":
+        report_started = "report_generation_started" in event_types
+        if report_started:
+            phase = "reporting"
+            label = "Montando o relatório final"
+            description = "A navegação e os casos de teste já terminaram."
+            report_ready = "report_ready" in event_types
+            current, total, percentage = (1, 1, 100) if report_ready else (0, 1, 50)
+        else:
+            phase = "documenting"
+            label = "Criando os casos de teste"
+            description = (
+                "O navegador já terminou. A LLM auxiliar está organizando as "
+                "evidências sem controlar o browser."
+            )
+            progress_event = next(
+                (
+                    event
+                    for event in reversed(events)
+                    if event.get("type")
+                    in {
+                        "scenario_enriched",
+                        "scenario_enrichment_skipped",
+                        "scenario_enrichment_started",
+                        "scenario_preparation_started",
+                        "scenario_documentation_fallback",
+                        "scenario_created",
+                    }
+                ),
+                None,
+            )
+            payload = (progress_event or {}).get("payload") or {}
+            total = max(
+                int(payload.get("total") or 0),
+                len(result.get("scenarios") or []),
+                1,
+            )
+            current = min(int(payload.get("current") or 0), total)
+            percentage = min(round((current / total) * 100), 100)
+    elif status_value in {"completed", "partial", "failed", "cancelled"}:
+        phase = "complete"
+        label = {
+            "completed": "Exploração concluída",
+            "partial": "Exploração concluída com cobertura parcial",
+            "failed": "A exploração foi interrompida por um erro",
+            "cancelled": "Exploração cancelada",
+        }[status_value]
+        description = "Os resultados disponíveis foram preservados."
+        current, total, percentage = 1, 1, 100
+
+    enrichment_event = next(
+        (
+            event
+            for event in reversed(events)
+            if event.get("type")
+            in {
+                "scenario_postprocessing_completed",
+                "scenario_enriched",
+                "scenario_enrichment_skipped",
+            }
+        ),
+        None,
+    )
+    enrichment = (enrichment_event or {}).get("payload") or {}
+    legacy_enriched = sum(1 for event in events if event.get("type") == "scenario_created")
+    legacy_local = sum(
+        1 for event in events if event.get("type") == "scenario_documentation_fallback"
+    )
+    enriched_count = int(enrichment.get("enriched") or legacy_enriched)
+    local_count = int(enrichment.get("local_evidence") or legacy_local)
+    postprocessing = {
+        "current": current if phase == "documenting" else int(enrichment.get("current") or 0),
+        "total": int(enrichment.get("total") or len(result.get("scenarios") or [])),
+        "enriched": enriched_count,
+        "local_evidence": local_count,
+        "stage": enrichment.get("stage"),
+        "reason": enrichment.get("reason"),
+    }
+
+    completion_event = next(
+        (
+            event
+            for event in reversed(events)
+            if event.get("type")
+            in {
+                "limit_reached",
+                "coverage_partial",
+                "coverage_scope_not_found",
+                "coverage_complete",
+                "failed",
+                "cancelled",
+            }
+        ),
+        None,
+    )
+    completion_payload = (completion_event or {}).get("payload") or {}
+    completion = {
+        "type": (completion_event or {}).get("type"),
+        "reason": completion_payload.get("reason"),
+        "message": (completion_event or {}).get("message"),
+        "known_states": completion_payload.get("known_states"),
+        "frontier_states": completion_payload.get("frontier_states"),
+        "frontier_candidates": completion_payload.get("frontier_candidates"),
+        "blocked_candidates": completion_payload.get("blocked_candidates")
+        or completion_payload.get("candidates_blocked"),
+    }
+
+    overall_percentage = percentage
+    if phase in {"exploring", "waiting_input"}:
+        overall_percentage = round(browser_percentage * 0.7)
+    elif phase == "documenting":
+        overall_percentage = 70 + round(percentage * 0.25)
+    elif phase == "reporting":
+        overall_percentage = 95 + round(percentage * 0.05)
+    elif phase == "complete":
+        overall_percentage = 100
+
+    return {
+        "phase": phase,
+        "phase_label": label,
+        "phase_description": description,
+        "phase_progress": {
+            "current": current,
+            "total": total,
+            "percentage": percentage,
+        },
+        "browser_progress": browser_progress,
+        "overall_progress": min(overall_percentage, 100),
+        "postprocessing": postprocessing,
+        "completion": completion,
+    }
+
+
 def _exploration_payload(item: dict[str, Any]) -> dict[str, Any]:
     result = dict(item)
     exploration_id = result["id"]
@@ -114,6 +281,8 @@ def _exploration_payload(item: dict[str, Any]) -> dict[str, Any]:
                 result["current_action"] = last_action_event.get("payload", {}).get(
                     "action"
                 ) or last_action_event.get("message")
+    events = result.get("events", [])
+    result.update(_phase_payload(result, events))
     if "screenshots" in result:
         result["screenshots"] = [
             {

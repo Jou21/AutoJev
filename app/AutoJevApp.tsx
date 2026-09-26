@@ -102,6 +102,7 @@ type Provider = {
 
 type ExplorationEvent = {
   id?: string;
+  level?: string;
   type?: string;
   title?: string;
   message?: string;
@@ -121,6 +122,29 @@ type Exploration = {
   started_at?: string;
   finished_at?: string;
   progress?: number;
+  overall_progress?: number;
+  phase?: "preparing" | "exploring" | "waiting_input" | "documenting" | "reporting" | "complete";
+  phase_label?: string;
+  phase_description?: string;
+  phase_progress?: { current?: number; total?: number; percentage?: number };
+  browser_progress?: { current?: number; total?: number; percentage?: number };
+  postprocessing?: {
+    current?: number;
+    total?: number;
+    enriched?: number;
+    local_evidence?: number;
+    stage?: string | null;
+    reason?: string | null;
+  };
+  completion?: {
+    type?: string | null;
+    reason?: string | null;
+    message?: string | null;
+    known_states?: number | null;
+    frontier_states?: number | null;
+    frontier_candidates?: number | null;
+    blocked_candidates?: number | null;
+  };
   current_step?: string;
   current_action?: string;
   screenshot_url?: string | null;
@@ -200,7 +224,7 @@ const STATUS_LABELS: Record<string, string> = {
   pending: "Preparando",
   running: "Em execução",
   waiting_input: "Aguardando sua intervenção",
-  postprocessing: "Gerando relatório",
+  postprocessing: "Preparando resultados",
   completed: "Concluída",
   success: "Concluída",
   partial: "Cobertura parcial",
@@ -368,6 +392,38 @@ function resolveAssetUrl(value?: string | null) {
   } catch {
     return value;
   }
+}
+
+function activityCopy(event: ExplorationEvent) {
+  const payload = event.payload || {};
+  const scenario = typeof payload.scenario_id === "string" ? payload.scenario_id : "Caso de teste";
+  const fallback: Record<string, { title: string; detail?: string }> = {
+    started: { title: "Exploração iniciada", detail: "O navegador foi preparado para o JEV." },
+    browser_launched: { title: "Aplicação aberta no navegador" },
+    coverage_scope: { title: "Escopo de cobertura definido" },
+    action_started: { title: `Executando ação ${String(payload.step || "")}`.trim(), detail: String(payload.action || event.message || "") },
+    action_completed: { title: `Ação ${String(payload.step || "")} concluída`.trim(), detail: event.message },
+    waiting_input: { title: "Aguardando uma ação sua", detail: event.message },
+    limit_reached: { title: "Limite de ações atingido", detail: "A execução foi preservada com cobertura parcial." },
+    coverage_complete: { title: "Cobertura concluída", detail: "O JEV esgotou as opções alcançáveis." },
+    scenario_preparation_started: { title: "Preparando os casos de teste", detail: event.message },
+    scenario_drafts_ready: { title: "Todos os CTs já estão seguros", detail: event.message },
+    scenario_enrichment_started: { title: "LLM auxiliar aprimorando os CTs", detail: event.message },
+    scenario_enriched: { title: `${scenario} aprimorado`, detail: "Documentado pela LLM auxiliar a partir da evidência capturada." },
+    scenario_enrichment_skipped: { title: `${scenario} preservado`, detail: "A evidência local foi mantida porque a LLM auxiliar demorou a responder." },
+    scenario_postprocessing_completed: { title: "Casos de teste finalizados", detail: event.message },
+    scenario_created: { title: `${scenario} criado`, detail: "Documentado pela LLM auxiliar." },
+    scenario_documentation_fallback: { title: `${scenario} criado com evidência local`, detail: "O caso continua válido; a LLM auxiliar não concluiu o enriquecimento no tempo disponível." },
+    report_generation_started: { title: "Montando o relatório", detail: event.message },
+    report_ready: { title: "Relatório pronto", detail: "O relatório completo já pode ser aberto." },
+    report_failed: { title: "Falha ao montar o relatório", detail: event.message },
+    failed: { title: "Execução interrompida", detail: event.message },
+    cancelled: { title: "Execução cancelada", detail: event.message },
+  };
+  return fallback[event.type || ""] || {
+    title: event.title || event.message || event.type || "Atualização da exploração",
+    detail: event.detail || (event.title ? event.message : undefined),
+  };
 }
 
 function Spinner({ size = 16 }: { size?: number }) {
@@ -1693,13 +1749,20 @@ function ExplorationDetailView({
   const [cancelling, setCancelling] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [openingReport, setOpeningReport] = useState(false);
+  const [detailTab, setDetailTab] = useState<"overview" | "activity" | "evidence" | "config">("overview");
   if (loading && !exploration) return <div className="detail-loading"><Spinner size={24} /><span>Carregando exploração…</span></div>;
   if (!exploration) {
     return <section className="panel"><EmptyState icon={AlertCircle} title="Exploração não encontrada" description="O registro pode ter sido removido ou ainda não está disponível." action={<button className="button secondary" onClick={() => navigate("#/exploracoes")}><ArrowLeft size={16} />Voltar ao histórico</button>} /></section>;
   }
 
   const status = explorationStatus(exploration.status);
-  const progress = exploration.progress ?? (["completed", "success"].includes(status.value) ? 100 : 0);
+  const phase = exploration.phase || (isLive(exploration.status) ? "exploring" : "complete");
+  const phaseProgress = exploration.phase_progress || {
+    current: exploration.counters?.actions || exploration.actions_count || 0,
+    total: Number(exploration.options?.max_steps || 1),
+    percentage: exploration.progress || 0,
+  };
+  const overallProgress = exploration.overall_progress ?? exploration.progress ?? (["completed", "success", "partial"].includes(status.value) ? 100 : 0);
   const events = exploration.events || exploration.activity || exploration.logs || [];
   const waitingForInput = exploration.status.toLowerCase() === "waiting_input";
   const waitingEvent = [...events].reverse().find((event) => event.type === "waiting_input");
@@ -1711,6 +1774,22 @@ function ExplorationDetailView({
     issues: exploration.counters?.issues || exploration.issues_count || 0,
     scenarios: exploration.counters?.scenarios || exploration.counters?.test_scenarios || exploration.scenarios_count || 0,
   };
+  const postprocessing = exploration.postprocessing || {};
+  const completion = exploration.completion || {};
+  const actionLimitReached = completion.type === "limit_reached" || completion.reason === "action_limit";
+  const phaseSteps = [
+    { key: "exploring", label: "Explorar", detail: `${exploration.browser_progress?.current ?? counters.actions} ações` },
+    { key: "documenting", label: "Criar CTs", detail: `${postprocessing.total || counters.scenarios} casos` },
+    { key: "reporting", label: "Relatório", detail: exploration.report_available ? "pronto" : "pendente" },
+  ];
+  const phaseOrder: Record<string, number> = { preparing: 0, exploring: 0, waiting_input: 0, documenting: 1, reporting: 2, complete: 3 };
+  const currentPhaseIndex = phaseOrder[phase] ?? 0;
+  const phaseHeadline = actionLimitReached
+    ? `Limite de ${exploration.browser_progress?.total || exploration.options?.max_steps || counters.actions} ações atingido`
+    : exploration.phase_label || status.label;
+  const phaseDescription = actionLimitReached
+    ? "A automação não falhou na ação 67: ela concluiu o limite configurado e preservou tudo o que encontrou. A cobertura ficou parcial porque ainda havia opções a explorar."
+    : exploration.phase_description || (isLive(exploration.status) ? `Atualização automática a cada ${pollInterval / 1000}s` : "Resultados preservados e prontos para consulta.");
 
   const cancel = async () => {
     setCancelling(true);
@@ -1786,53 +1865,115 @@ function ExplorationDetailView({
 
       {exploration.error && <div className="callout error-callout"><AlertCircle size={19} /><div><strong>A execução encontrou um erro</strong><span>{exploration.error}</span></div></div>}
 
-      <section className="live-status-panel panel">
-        <div className="live-status-top">
-          <div><span className="section-kicker">{isLive(exploration.status) ? <><span className="live-pulse" />Execução ao vivo</> : "Resumo da execução"}</span><h2>{exploration.current_action || exploration.current_step || (status.value === "completed" ? "Exploração finalizada" : status.label)}</h2><p>{isLive(exploration.status) ? `Atualização automática a cada ${pollInterval / 1000}s` : `Finalizada em ${formatDate(exploration.finished_at || exploration.updated_at)}`}</p></div>
-          <strong className="progress-number">{Math.round(progress)}<small>%</small></strong>
+      <section className={`execution-command panel phase-${phase}`} aria-live="polite">
+        <div className="execution-command-head">
+          <span className={`phase-symbol ${isLive(exploration.status) ? "live" : ""}`}>
+            {isLive(exploration.status) ? <Spinner size={22} /> : status.value === "failed" ? <AlertCircle size={22} /> : <CheckCircle2 size={22} />}
+          </span>
+          <div className="execution-command-copy">
+            <span className="section-kicker">{isLive(exploration.status) ? <><span className="live-pulse" />Agora no AutoJev</> : "Resultado da execução"}</span>
+            <h2>{phaseHeadline}</h2>
+            <p>{phaseDescription}</p>
+            {phase === "documenting" && (
+              <div className="ct-live-copy">
+                <strong>CT {Math.min(phaseProgress.current || 0, phaseProgress.total || 0)} de {phaseProgress.total || counters.scenarios}</strong>
+                <span>{counters.scenarios} casos já preservados · {postprocessing.enriched || 0} aprimorados pela LLM</span>
+              </div>
+            )}
+          </div>
+          <div className="overall-progress"><strong>{Math.round(overallProgress)}<small>%</small></strong><span>processo total</span></div>
         </div>
-        <div className="large-progress"><span style={{ width: `${Math.min(100, Math.max(0, progress))}%` }} /></div>
-        <div className="live-counters"><DetailCounter icon={Globe2} value={counters.pages} label="páginas" /><DetailCounter icon={Zap} value={counters.actions} label="ações" /><DetailCounter icon={AlertCircle} value={counters.issues} label="achados" /><DetailCounter icon={FileCheck2} value={counters.scenarios} label="cenários" /><DetailCounter icon={Hash} value={formatTokens(exploration.usage?.total_tokens)} label="tokens" /><DetailCounter icon={CircleDollarSign} value={formatCost(exploration.usage)} label="custo" /><DetailCounter icon={Clock3} value={durationBetween(exploration.started_at || exploration.created_at, exploration.finished_at)} label="duração" /></div>
+        <div className="large-progress"><span style={{ width: `${Math.min(100, Math.max(0, overallProgress))}%` }} /></div>
+        <div className="phase-track" aria-label="Fases da execução">
+          {phaseSteps.map((step, index) => (
+            <div key={step.key} className={`phase-step ${index < currentPhaseIndex ? "done" : ""} ${index === currentPhaseIndex && phase !== "complete" ? "active" : ""}`}>
+              <span>{index < currentPhaseIndex || phase === "complete" ? <Check size={14} /> : index + 1}</span>
+              <div><strong>{step.label}</strong><small>{step.detail}</small></div>
+            </div>
+          ))}
+        </div>
+        <div className="live-counters"><DetailCounter icon={Globe2} value={counters.pages} label="páginas" /><DetailCounter icon={Zap} value={counters.actions} label="ações" /><DetailCounter icon={AlertCircle} value={counters.issues} label="achados" /><DetailCounter icon={FileCheck2} value={counters.scenarios} label="CTs" /><DetailCounter icon={Hash} value={formatTokens(exploration.usage?.total_tokens)} label="tokens" /><DetailCounter icon={CircleDollarSign} value={formatCost(exploration.usage)} label="custo" /><DetailCounter icon={Clock3} value={durationBetween(exploration.started_at || exploration.created_at, isLive(exploration.status) ? undefined : exploration.updated_at || exploration.finished_at)} label="duração total" /></div>
       </section>
 
-      <div className="detail-grid">
-        <section className="panel browser-panel">
-          <div className="panel-heading row-heading"><div><span className="section-kicker"><Eye size={14} />Última observação</span><h2>Browser</h2></div>{screenshot && <a className="text-button" href={screenshot} target="_blank" rel="noreferrer">Abrir imagem <SquareArrowOutUpRight size={14} /></a>}</div>
-          <div className="browser-frame">
-            <div className="browser-chrome"><span className="window-dots"><i /><i /><i /></span><div className="browser-address"><ShieldCheck size={12} />{exploration.app_url}</div><MoreHorizontal size={16} /></div>
-            <div className="browser-canvas">
-              {screenshot ? <img key={`${screenshot}-${exploration.updated_at || "latest"}`} src={`${screenshot}${screenshot.includes("?") ? "&" : "?"}v=${encodeURIComponent(exploration.updated_at || "latest")}`} alt={`Último screenshot de ${hostFromUrl(exploration.app_url)}`} /> : <div className="no-screenshot"><MonitorPlay size={32} /><strong>Aguardando captura do browser</strong><span>O preview aparecerá quando o executor publicar a primeira evidência.</span></div>}
-            </div>
-          </div>
-          <div className="evidence-strip"><span><Eye size={15} />Screenshot</span><span><Code2 size={15} />DOM estruturado</span><span><ShieldCheck size={15} />Somente leitura para a LLM auxiliar</span></div>
+      {waitingForInput && (
+        <section className="panel intervention-card intervention-wide">
+          <span className="section-kicker"><span className="live-pulse" />Ação necessária</span>
+          <div><h2>Faça login no navegador</h2><p>{waitingEvent?.message || "O navegador está aguardando sua intervenção para continuar."}</p></div>
+          <button className="button primary" onClick={() => void resume()} disabled={resuming}>{resuming ? <Spinner /> : <Play size={16} />}Continuar exploração</button>
         </section>
+      )}
 
-        <aside className="detail-side">
-          {waitingForInput && (
-            <section className="panel intervention-card">
-              <span className="section-kicker"><span className="live-pulse" />Ação necessária</span>
-              <h2>Faça login no navegador</h2>
-              <p>{waitingEvent?.message || "O navegador está aguardando sua intervenção para continuar."}</p>
-              <button className="button primary" onClick={() => void resume()} disabled={resuming}>
-                {resuming ? <Spinner /> : <Play size={16} />}
-                Continuar exploração
-              </button>
+      <section className="detail-workspace panel">
+        <div className="detail-tabs" role="tablist" aria-label="Detalhes da exploração">
+          <button role="tab" aria-selected={detailTab === "overview"} className={detailTab === "overview" ? "active" : ""} onClick={() => setDetailTab("overview")}><Gauge size={16} />Visão geral</button>
+          <button role="tab" aria-selected={detailTab === "activity"} className={detailTab === "activity" ? "active" : ""} onClick={() => setDetailTab("activity")}><Activity size={16} />Atividade <span>{events.length}</span></button>
+          <button role="tab" aria-selected={detailTab === "evidence"} className={detailTab === "evidence" ? "active" : ""} onClick={() => setDetailTab("evidence")}><Eye size={16} />Evidência</button>
+          <button role="tab" aria-selected={detailTab === "config"} className={detailTab === "config" ? "active" : ""} onClick={() => setDetailTab("config")}><Settings size={16} />Configuração</button>
+        </div>
+
+        <div className="detail-tab-content" role="tabpanel">
+          {detailTab === "overview" && (
+            <div className="overview-grid">
+              <section className="result-summary-card">
+                <span className="section-kicker">Leitura rápida</span>
+                <h2>{actionLimitReached ? "A automação parou pelo limite, não por uma falha na etapa 67" : phaseHeadline}</h2>
+                <p>{actionLimitReached ? `Foram executadas ${counters.actions} ações e criados ${counters.scenarios} casos de teste. O número 67 representa os CTs gerados.` : phaseDescription}</p>
+                {actionLimitReached && (
+                  <div className="coverage-summary warning">
+                    <AlertCircle size={18} />
+                    <div><strong>Cobertura parcial</strong><span>{completion.frontier_candidates ?? "Algumas"} opções ainda estavam na fila de exploração quando o limite foi alcançado.</span></div>
+                  </div>
+                )}
+                <div className="result-facts">
+                  <div><small>Estado da cobertura</small><strong>{status.label}</strong></div>
+                  <div><small>Estados descobertos</small><strong>{completion.known_states ?? counters.pages}</strong></div>
+                  <div><small>CTs aprimorados</small><strong>{postprocessing.enriched ?? 0}</strong></div>
+                  <div><small>CTs com evidência local</small><strong>{postprocessing.local_evidence || Math.max(0, counters.scenarios - (postprocessing.enriched || 0))}</strong></div>
+                </div>
+              </section>
+
+              <section className="browser-preview-card">
+                <div className="panel-heading row-heading"><div><span className="section-kicker"><Eye size={14} />Última evidência</span><h2>Onde a navegação terminou</h2></div><button className="text-button" onClick={() => setDetailTab("evidence")}>Ver maior <ArrowRight size={14} /></button></div>
+                <div className="browser-frame compact-browser">
+                  <div className="browser-chrome"><span className="window-dots"><i /><i /><i /></span><div className="browser-address"><ShieldCheck size={12} />{exploration.app_url}</div><MoreHorizontal size={16} /></div>
+                  <div className="browser-canvas">{screenshot ? <img key={`${screenshot}-${exploration.updated_at || "latest"}`} src={`${screenshot}${screenshot.includes("?") ? "&" : "?"}v=${encodeURIComponent(exploration.updated_at || "latest")}`} alt={`Último screenshot de ${hostFromUrl(exploration.app_url)}`} /> : <div className="no-screenshot"><MonitorPlay size={32} /><strong>Aguardando captura do browser</strong></div>}</div>
+                </div>
+              </section>
+
+              <section className="recent-activity-card">
+                <div className="panel-heading row-heading"><div><span className="section-kicker">Últimas mudanças</span><h2>O que acabou de acontecer</h2></div><button className="text-button" onClick={() => setDetailTab("activity")}>Ver tudo <ArrowRight size={14} /></button></div>
+                {events.length === 0 ? <div className="activity-empty"><Activity size={20} /><span>A atividade aparecerá conforme a exploração avança.</span></div> : <div className="activity-list compact-list">{[...events].reverse().slice(0, 5).map((event, index) => { const copy = activityCopy(event); return <div className="activity-item" key={event.id || `${event.timestamp}-${index}`}><span className={`activity-marker ${event.level || event.status || event.type || "info"}`}><Activity size={12} /></span><div><strong>{copy.title}</strong>{copy.detail && <p>{copy.detail}</p>}<small>{formatDate(event.timestamp || event.created_at)}</small></div></div>; })}</div>}
+              </section>
+            </div>
+          )}
+
+          {detailTab === "activity" && (
+            <section className="activity-card activity-card-wide">
+              <div className="panel-heading row-heading"><div><span className="section-kicker">Linha do tempo explicada</span><h2>Atividade da exploração</h2><p>Navegação, criação dos CTs e relatório aparecem como etapas separadas.</p></div>{isLive(exploration.status) && <span className="live-mini"><span />ao vivo</span>}</div>
+              {events.length === 0 ? <div className="activity-empty"><Activity size={20} /><span>A atividade detalhada aparecerá conforme a exploração avança.</span></div> : <div className="activity-list">{[...events].reverse().slice(0, 120).map((event, index) => { const copy = activityCopy(event); return <div className="activity-item" key={event.id || `${event.timestamp}-${index}`}><span className={`activity-marker ${event.level || event.status || event.type || "info"}`}><Activity size={12} /></span><div><strong>{copy.title}</strong>{copy.detail && <p>{copy.detail}</p>}<small>{formatDate(event.timestamp || event.created_at)}</small></div></div>; })}</div>}
             </section>
           )}
-          <section className="panel configuration-card">
-            <div className="panel-heading"><span className="section-kicker">Modelos da execução</span><h2>Configuração</h2></div>
-            <div className="exploration-scope"><span className="model-role-icon"><Focus size={18} /></span><div><small>Escopo da exploração</small><strong>{explorationFocusArea(exploration.options) || "Aplicação inteira"}</strong><em>{explorationFocusArea(exploration.options) ? "O JEV prioriza e esgota este recorte funcional." : "O JEV explora todos os recursos que conseguir descobrir."}</em></div></div>
-            <div className="config-model"><span className="model-role-icon amber"><BrainCircuit size={18} /></span><div><small>JEV · agente QA</small><strong>{exploration.agent?.model_id || exploration.agent?.model || "—"}</strong><em>{providerName(exploration.agent?.provider_id || exploration.agent?.provider)}</em></div></div>
-            <div className="model-divider"><span /><ArrowRight size={14} /><span /></div>
-            <div className="config-model"><span className="model-role-icon teal"><Sparkles size={18} /></span><div><small>LLM auxiliar</small><strong>{exploration.auxiliary_llm?.model_id || exploration.auxiliary_llm?.model || "—"}</strong><em>{providerName(exploration.auxiliary_llm?.provider_id || exploration.auxiliary_llm?.provider)}</em></div></div>
-          </section>
 
-          <section className="panel activity-card">
-            <div className="panel-heading row-heading"><div><span className="section-kicker">Timeline</span><h2>Atividade</h2></div>{isLive(exploration.status) && <span className="live-mini"><span />ao vivo</span>}</div>
-            {events.length === 0 ? <div className="activity-empty"><Activity size={20} /><span>A atividade detalhada aparecerá conforme a exploração avança.</span></div> : <div className="activity-list">{[...events].reverse().slice(0, 10).map((event, index) => <div className="activity-item" key={event.id || `${event.timestamp}-${index}`}><span className={`activity-marker ${event.status || event.type || "info"}`}><Activity size={12} /></span><div><strong>{event.title || event.message || event.type || "Evento"}</strong>{(event.detail || (event.title ? event.message : "")) && <p>{event.detail || event.message}</p>}<small>{formatDate(event.timestamp || event.created_at)}</small></div></div>)}</div>}
-          </section>
-        </aside>
-      </div>
+          {detailTab === "evidence" && (
+            <section className="browser-panel evidence-panel">
+              <div className="panel-heading row-heading"><div><span className="section-kicker"><Eye size={14} />Última observação</span><h2>Evidência do navegador</h2></div>{screenshot && <a className="text-button" href={screenshot} target="_blank" rel="noreferrer">Abrir imagem <SquareArrowOutUpRight size={14} /></a>}</div>
+              <div className="browser-frame"><div className="browser-chrome"><span className="window-dots"><i /><i /><i /></span><div className="browser-address"><ShieldCheck size={12} />{exploration.app_url}</div><MoreHorizontal size={16} /></div><div className="browser-canvas">{screenshot ? <img src={`${screenshot}${screenshot.includes("?") ? "&" : "?"}v=${encodeURIComponent(exploration.updated_at || "latest")}`} alt={`Último screenshot de ${hostFromUrl(exploration.app_url)}`} /> : <div className="no-screenshot"><MonitorPlay size={32} /><strong>Aguardando captura do browser</strong><span>O preview aparecerá quando o executor publicar a primeira evidência.</span></div>}</div></div>
+              <div className="evidence-strip"><span><Eye size={15} />Screenshot</span><span><Code2 size={15} />DOM estruturado</span><span><ShieldCheck size={15} />A LLM auxiliar somente interpreta</span></div>
+            </section>
+          )}
+
+          {detailTab === "config" && (
+            <section className="configuration-card configuration-wide">
+              <div className="panel-heading"><span className="section-kicker">Modelos da execução</span><h2>Configuração usada</h2></div>
+              <div className="configuration-grid">
+                <div className="exploration-scope"><span className="model-role-icon"><Focus size={18} /></span><div><small>Escopo da exploração</small><strong>{explorationFocusArea(exploration.options) || "Aplicação inteira"}</strong><em>{explorationFocusArea(exploration.options) ? "O JEV prioriza e esgota este recorte funcional." : "O JEV explora todos os recursos que conseguir descobrir."}</em></div></div>
+                <div className="config-model"><span className="model-role-icon amber"><BrainCircuit size={18} /></span><div><small>JEV · agente QA</small><strong>{exploration.agent?.model_id || exploration.agent?.model || "—"}</strong><em>{providerName(exploration.agent?.provider_id || exploration.agent?.provider)}</em></div></div>
+                <div className="config-model"><span className="model-role-icon teal"><Sparkles size={18} /></span><div><small>LLM auxiliar</small><strong>{exploration.auxiliary_llm?.model_id || exploration.auxiliary_llm?.model || "—"}</strong><em>{providerName(exploration.auxiliary_llm?.provider_id || exploration.auxiliary_llm?.provider)}</em></div></div>
+              </div>
+            </section>
+          )}
+        </div>
+      </section>
     </div>
   );
 }

@@ -61,3 +61,14 @@ test("offers an optional focused exploration scope", async () => {
   assert.match(source, /if \(normalizedFocusArea\) explorationOptions\.focus_area = normalizedFocusArea/);
   assert.match(source, /explorationFocusArea\(exploration\.options\)/);
 });
+
+test("explains navigation, test-case creation, and report as separate phases", async () => {
+  const source = await readFile(new URL("../app/AutoJevApp.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /Explorar/);
+  assert.match(source, /Criar CTs/);
+  assert.match(source, /CT \{Math\.min\(phaseProgress\.current/);
+  assert.match(source, /O número 67 representa os CTs gerados/);
+  assert.match(source, /Linha do tempo explicada/);
+  assert.match(source, /detailTab === "evidence"/);
+});

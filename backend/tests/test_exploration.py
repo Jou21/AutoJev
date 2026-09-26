@@ -1,3 +1,5 @@
+import pytest
+
 from autojev.domain.models import (
     ActionResult,
     AgentDecision,
@@ -115,3 +117,88 @@ def test_state_delta_with_correlated_browser_error_is_fail_evidence():
         observation, decision, result, 2
     )
     assert scenario.status == ScenarioStatus.FAIL
+
+
+@pytest.mark.asyncio
+async def test_all_local_scenarios_are_persisted_before_auxiliary_enrichment():
+    class RecordingRepository:
+        def __init__(self):
+            self.scenarios = []
+            self.events = []
+
+        def add_scenario(self, exploration_id, sequence, scenario):
+            self.scenarios.append((sequence, scenario.title))
+
+        def add_screenshot(self, *args):
+            raise AssertionError("This fixture has no screenshots")
+
+        def add_event(self, exploration_id, level, event_type, message, payload=None):
+            self.events.append((event_type, payload or {}))
+
+        def is_cancel_requested(self, exploration_id):
+            return False
+
+    repository = RecordingRepository()
+
+    class Auxiliary:
+        async def create_scenario(self, observation, decision, result, number):
+            # The complete local set must exist before the first provider call.
+            assert repository.scenarios[:2] == [
+                (1, "Explore click on Dashboard"),
+                (2, "Explore click on Dashboard"),
+            ]
+            scenario = ExplorationManager._scenario_from_evidence(
+                observation, decision, result, number
+            )
+            scenario.title = f"Enriched {number}"
+            return scenario
+
+    manager = object.__new__(ExplorationManager)
+    manager.repository = repository
+
+    async def ignore_usage(*args, **kwargs):
+        return None
+
+    manager._record_model_usage = ignore_usage
+    observation = Observation(
+        url="https://example.test/dashboard",
+        title="Dashboard",
+        text="Dashboard ready",
+        interactive_elements=[],
+    )
+    decision = AgentDecision(action="click", target="e1", rationale="Open dashboard")
+    result = ActionResult(
+        action="click",
+        success=True,
+        started_at=utc_now(),
+        finished_at=utc_now(),
+        before_url="https://example.test/",
+        after_url=observation.url,
+        message="Opened",
+    )
+    pending = [
+        (observation, decision, result, 1),
+        (observation, decision, result, 2),
+    ]
+
+    await manager._materialize_scenarios(
+        "run-1", pending, Auxiliary(), object(), use_local_evidence=False
+    )
+
+    assert repository.scenarios[:2] == [
+        (1, "Explore click on Dashboard"),
+        (2, "Explore click on Dashboard"),
+    ]
+    assert repository.scenarios[2:] == [(1, "Enriched 1"), (2, "Enriched 2")]
+    assert repository.events[1][0] == "scenario_drafts_ready"
+    assert repository.events[-1] == (
+        "scenario_postprocessing_completed",
+        {
+            "current": 2,
+            "total": 2,
+            "enriched": 2,
+            "local_evidence": 0,
+            "reason": "documentation_complete",
+            "stage": "scenarios_complete",
+        },
+    )

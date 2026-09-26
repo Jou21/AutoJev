@@ -449,47 +449,32 @@ class ExplorationManager:
         auxiliary_client: OpenAICompatibleClient,
         use_local_evidence: bool,
     ) -> None:
-        """Document browser evidence after navigation has finished.
+        """Persist every captured scenario, then enrich it when time allows.
 
-        Auxiliary-model latency must not consume the browser's exploration
-        budget. If post-processing is slow or unavailable, deterministic local
-        evidence still produces a complete report instead of blocking coverage.
+        The deterministic evidence pass is intentionally first: the user sees
+        all captured cases immediately and a slow auxiliary model can never
+        make cases disappear. The second pass upgrades those drafts with the
+        auxiliary LLM inside a bounded documentation window.
         """
 
         if not pending:
             return
-        documentation_deadline = time.monotonic() + min(max(len(pending) * 8, 45), 180)
-        for observation, decision, result, scenario_number in pending:
-            fallback_reason: str | None = None
-            cancel_requested = self.repository.is_cancel_requested(exploration_id)
-            if (
-                use_local_evidence
-                or cancel_requested
-                or time.monotonic() >= documentation_deadline
-            ):
-                scenario = self._scenario_from_evidence(
-                    observation, decision, result, scenario_number
-                )
-                if cancel_requested:
-                    fallback_reason = "exploration_cancelled"
-                elif not use_local_evidence:
-                    fallback_reason = "documentation_time_limit"
-            else:
-                remaining = max(documentation_deadline - time.monotonic(), 0.1)
-                try:
-                    scenario = await asyncio.wait_for(
-                        auxiliary.create_scenario(
-                            observation, decision, result, scenario_number
-                        ),
-                        timeout=min(45.0, remaining),
-                    )
-                except Exception as exc:
-                    fallback_reason = exc.__class__.__name__
-                    scenario = self._scenario_from_evidence(
-                        observation, decision, result, scenario_number
-                    )
-                await self._record_model_usage(exploration_id, [auxiliary_client], None)
+        total = len(pending)
+        self.repository.add_event(
+            exploration_id,
+            "info",
+            "scenario_preparation_started",
+            f"Preparando {total} casos de teste a partir das evidências capturadas",
+            {"current": 0, "total": total, "stage": "drafts"},
+        )
 
+        # First make the complete, evidence-backed set durable. This pass is
+        # local and fast, so a report remains complete even if the auxiliary
+        # provider is unavailable or its documentation budget expires.
+        for observation, decision, result, scenario_number in pending:
+            scenario = self._scenario_from_evidence(
+                observation, decision, result, scenario_number
+            )
             self.repository.add_scenario(exploration_id, scenario_number, scenario)
             if result.screenshot:
                 self.repository.add_screenshot(
@@ -498,19 +483,111 @@ class ExplorationManager:
                     f"Evidence for {scenario.id}",
                     scenario.id,
                 )
+        self.repository.add_event(
+            exploration_id,
+            "info",
+            "scenario_drafts_ready",
+            f"{total} casos de teste já estão seguros com evidência do navegador",
+            {"current": total, "total": total, "stage": "drafts"},
+        )
+
+        if use_local_evidence or self.repository.is_cancel_requested(exploration_id):
+            reason = (
+                "exploration_cancelled"
+                if self.repository.is_cancel_requested(exploration_id)
+                else "local_evidence_mode"
+            )
             self.repository.add_event(
                 exploration_id,
-                "warning" if fallback_reason else "info",
-                "scenario_documentation_fallback"
-                if fallback_reason
-                else "scenario_created",
-                (
-                    f"{scenario.id} — local evidence used ({fallback_reason})"
-                    if fallback_reason
-                    else f"{scenario.id} — {scenario.title}"
-                ),
-                {"scenario_id": scenario.id, "status": scenario.status},
+                "info",
+                "scenario_postprocessing_completed",
+                f"Casos finalizados: {total} com evidência validada pelo navegador",
+                {
+                    "current": total,
+                    "total": total,
+                    "enriched": 0,
+                    "local_evidence": total,
+                    "reason": reason,
+                    "stage": "scenarios_complete",
+                },
             )
+            return
+
+        documentation_deadline = time.monotonic() + min(max(len(pending) * 8, 45), 180)
+        enriched = 0
+        processed = 0
+        completion_reason = "documentation_complete"
+        self.repository.add_event(
+            exploration_id,
+            "info",
+            "scenario_enrichment_started",
+            "A LLM auxiliar começou a aprimorar os casos de teste",
+            {"current": 0, "total": total, "stage": "enrichment"},
+        )
+        for observation, decision, result, scenario_number in pending:
+            if self.repository.is_cancel_requested(exploration_id):
+                completion_reason = "exploration_cancelled"
+                break
+            if time.monotonic() >= documentation_deadline:
+                completion_reason = "documentation_time_limit"
+                break
+
+            remaining = max(documentation_deadline - time.monotonic(), 0.1)
+            try:
+                scenario = await asyncio.wait_for(
+                    auxiliary.create_scenario(
+                        observation, decision, result, scenario_number
+                    ),
+                    timeout=min(45.0, remaining),
+                )
+                self.repository.add_scenario(exploration_id, scenario_number, scenario)
+                enriched += 1
+                event_type = "scenario_enriched"
+                event_level = "info"
+                event_message = f"{scenario.id} aprimorado pela LLM auxiliar"
+            except Exception as exc:
+                completion_reason = exc.__class__.__name__
+                event_type = "scenario_enrichment_skipped"
+                event_level = "warning"
+                event_message = (
+                    f"CT{scenario_number:03d} manteve a evidência local; "
+                    "a LLM auxiliar não respondeu a tempo"
+                )
+            processed += 1
+            await self._record_model_usage(exploration_id, [auxiliary_client], None)
+            self.repository.add_event(
+                exploration_id,
+                event_level,
+                event_type,
+                event_message,
+                {
+                    "scenario_id": f"CT{scenario_number:03d}",
+                    "current": processed,
+                    "total": total,
+                    "enriched": enriched,
+                    "local_evidence": total - enriched,
+                    "stage": "enrichment",
+                },
+            )
+
+        local_evidence = total - enriched
+        self.repository.add_event(
+            exploration_id,
+            "info",
+            "scenario_postprocessing_completed",
+            (
+                f"Casos finalizados: {enriched} aprimorados pela LLM e "
+                f"{local_evidence} preservados com evidência do navegador"
+            ),
+            {
+                "current": total,
+                "total": total,
+                "enriched": enriched,
+                "local_evidence": local_evidence,
+                "reason": completion_reason,
+                "stage": "scenarios_complete",
+            },
+        )
 
     async def _run(self, exploration_id: str) -> None:
         credentials = self.credential_vault.get(exploration_id)
@@ -1114,6 +1191,13 @@ class ExplorationManager:
                 terminal = ExplorationStatus.CANCELLED
             if options and options.generate_html_report:
                 try:
+                    self.repository.add_event(
+                        exploration_id,
+                        "info",
+                        "report_generation_started",
+                        "Casos de teste prontos; montando o relatório final",
+                        {"current": 0, "total": 1, "stage": "report"},
+                    )
                     exploration = self.repository.get_exploration(exploration_id)
                     # Render the durable terminal outcome rather than freezing
                     # the transient "postprocessing" phase into the report.
@@ -1133,7 +1217,8 @@ class ExplorationManager:
                         exploration_id,
                         "info",
                         "report_ready",
-                        "Standalone HTML report generated",
+                        "Relatório final pronto para abrir",
+                        {"current": 1, "total": 1, "stage": "report"},
                     )
                 except Exception as report_error:
                     self.repository.add_event(
@@ -1146,6 +1231,6 @@ class ExplorationManager:
                 self.repository.update_exploration(
                     exploration_id,
                     status=terminal,
-                    finished_at=finished,
+                    finished_at=utc_now(),
                     error=error_message,
                 )

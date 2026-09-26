@@ -3,6 +3,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from autojev.config import Settings
+from autojev.api.routes import _phase_payload
 from autojev.main import create_app
 
 
@@ -150,3 +151,41 @@ def test_validation_errors_never_echo_secrets(tmp_path):
         assert response.status_code == 422
         assert "must-never-be-echoed" not in response.text
         assert "input" not in response.text
+
+
+def test_phase_payload_separates_browser_actions_from_scenario_documentation():
+    result = {
+        "status": "postprocessing",
+        "steps_completed": 100,
+        "options": {"max_steps": 100},
+        "scenarios": [{"id": f"CT{index:03d}"} for index in range(1, 68)],
+    }
+    events = [
+        {
+            "type": "scenario_enriched",
+            "message": "CT021 aprimorado",
+            "payload": {
+                "current": 21,
+                "total": 67,
+                "enriched": 21,
+                "local_evidence": 46,
+                "stage": "enrichment",
+            },
+        }
+    ]
+
+    payload = _phase_payload(result, events)
+
+    assert payload["phase"] == "documenting"
+    assert payload["browser_progress"] == {
+        "current": 100,
+        "total": 100,
+        "percentage": 100,
+    }
+    assert payload["phase_progress"] == {
+        "current": 21,
+        "total": 67,
+        "percentage": 31,
+    }
+    assert payload["overall_progress"] == 78
+    assert payload["postprocessing"]["enriched"] == 21
