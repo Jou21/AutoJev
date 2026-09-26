@@ -52,9 +52,14 @@ def _phase_payload(result: dict[str, Any], events: list[dict[str, Any]]) -> dict
     """Describe browser work and post-processing as distinct user-facing phases."""
 
     status_value = str(result.get("status") or "queued")
-    max_steps = max(int(result.get("options", {}).get("max_steps", 1)), 1)
+    raw_max_steps = result.get("options", {}).get("max_steps")
+    max_steps = max(int(raw_max_steps), 1) if raw_max_steps is not None else None
     actions = int(result.get("steps_completed", 0))
-    browser_percentage = min(round((actions / max_steps) * 100), 100)
+    browser_percentage = (
+        min(round((actions / max_steps) * 100), 100)
+        if max_steps is not None
+        else None
+    )
     browser_progress = {
         "current": actions,
         "total": max_steps,
@@ -171,6 +176,8 @@ def _phase_payload(result: dict[str, Any], events: list[dict[str, Any]]) -> dict
                 "coverage_partial",
                 "coverage_scope_not_found",
                 "coverage_complete",
+                "coverage_complete_with_restrictions",
+                "coverage_stalled",
                 "failed",
                 "cancelled",
             }
@@ -189,9 +196,13 @@ def _phase_payload(result: dict[str, Any], events: list[dict[str, Any]]) -> dict
         or completion_payload.get("candidates_blocked"),
     }
 
-    overall_percentage = percentage
+    overall_percentage: int | None = percentage
     if phase in {"exploring", "waiting_input"}:
-        overall_percentage = round(browser_percentage * 0.7)
+        overall_percentage = (
+            round(browser_percentage * 0.7)
+            if browser_percentage is not None
+            else None
+        )
     elif phase == "documenting":
         overall_percentage = 70 + round(percentage * 0.25)
     elif phase == "reporting":
@@ -209,7 +220,11 @@ def _phase_payload(result: dict[str, Any], events: list[dict[str, Any]]) -> dict
             "percentage": percentage,
         },
         "browser_progress": browser_progress,
-        "overall_progress": min(overall_percentage, 100),
+        "overall_progress": (
+            min(overall_percentage, 100)
+            if overall_percentage is not None
+            else None
+        ),
         "postprocessing": postprocessing,
         "completion": completion,
     }
@@ -224,9 +239,14 @@ def _exploration_payload(item: dict[str, Any]) -> dict[str, Any]:
         if result.get("report_available")
         else None
     )
-    max_steps = max(int(result.get("options", {}).get("max_steps", 1)), 1)
+    raw_max_steps = result.get("options", {}).get("max_steps")
+    max_steps = max(int(raw_max_steps), 1) if raw_max_steps is not None else None
     current_step = int(result.get("steps_completed", 0))
-    percentage = min(round((current_step / max_steps) * 100), 100)
+    percentage = (
+        min(round((current_step / max_steps) * 100), 100)
+        if max_steps is not None
+        else None
+    )
     if result.get("status") == "completed":
         percentage = 100
     result["progress"] = percentage
@@ -235,7 +255,9 @@ def _exploration_payload(item: dict[str, Any]) -> dict[str, Any]:
         "total": max_steps,
         "percentage": percentage,
     }
-    result["current_step"] = f"Etapa {current_step} de {max_steps}"
+    result["current_step"] = f"Etapa {current_step}" + (
+        f" de {max_steps}" if max_steps is not None else " · cobrindo até esgotar"
+    )
     result["current_step_number"] = current_step
     result["current_action"] = result.get("current_action")
     result["counters"] = result.get("counters") or {

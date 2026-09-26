@@ -60,6 +60,10 @@ test("offers an optional focused exploration scope", async () => {
   assert.match(source, /focusMode === "focused" && !focusArea\.trim\(\)/);
   assert.match(source, /if \(normalizedFocusArea\) explorationOptions\.focus_area = normalizedFocusArea/);
   assert.match(source, /explorationFocusArea\(exploration\.options\)/);
+  assert.match(source, /max_steps: null/);
+  assert.match(source, /max_duration_seconds: null/);
+  assert.match(source, /Sem teto fixo de ações ou duração/);
+  assert.match(source, /Ao esgotar a cobertura/);
 });
 
 test("explains navigation, test-case creation, and report as separate phases", async () => {

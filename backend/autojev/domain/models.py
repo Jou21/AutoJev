@@ -59,8 +59,11 @@ class ExplorationOptions:
     # Optional human-readable scope (screen, menu or submenu).  When omitted the
     # coverage planner treats the whole same-origin application as its scope.
     focus_area: str | None = None
-    max_steps: int = 100
-    max_duration_seconds: int = 1800
+    # None means coverage-driven execution: the run stops when every reachable
+    # safe candidate in the selected scope has been exhausted, not at an
+    # arbitrary action/time ceiling.
+    max_steps: int | None = None
+    max_duration_seconds: int | None = None
     capture_screenshots: bool = True
     capture_console_errors: bool = True
     capture_network_errors: bool = True

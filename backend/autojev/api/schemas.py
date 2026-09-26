@@ -124,16 +124,16 @@ class ExplorationOptionsInput(ApiModel):
         max_length=500,
         validation_alias=AliasChoices("focus_area", "focusArea"),
     )
-    max_steps: int = Field(
-        default=100,
+    max_steps: int | None = Field(
+        default=None,
         ge=1,
-        le=500,
+        le=100_000,
         validation_alias=AliasChoices("max_steps", "maxSteps"),
     )
-    max_duration_seconds: int = Field(
-        default=1800,
+    max_duration_seconds: int | None = Field(
+        default=None,
         ge=10,
-        le=86_400,
+        le=604_800,
         validation_alias=AliasChoices("max_duration_seconds", "maxDurationSeconds"),
     )
     capture_screenshots: bool = Field(

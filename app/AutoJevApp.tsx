@@ -121,13 +121,13 @@ type Exploration = {
   updated_at?: string;
   started_at?: string;
   finished_at?: string;
-  progress?: number;
-  overall_progress?: number;
+  progress?: number | null;
+  overall_progress?: number | null;
   phase?: "preparing" | "exploring" | "waiting_input" | "documenting" | "reporting" | "complete";
   phase_label?: string;
   phase_description?: string;
-  phase_progress?: { current?: number; total?: number; percentage?: number };
-  browser_progress?: { current?: number; total?: number; percentage?: number };
+  phase_progress?: { current?: number; total?: number | null; percentage?: number | null };
+  browser_progress?: { current?: number; total?: number | null; percentage?: number | null };
   postprocessing?: {
     current?: number;
     total?: number;
@@ -406,6 +406,8 @@ function activityCopy(event: ExplorationEvent) {
     waiting_input: { title: "Aguardando uma ação sua", detail: event.message },
     limit_reached: { title: "Limite de ações atingido", detail: "A execução foi preservada com cobertura parcial." },
     coverage_complete: { title: "Cobertura concluída", detail: "O JEV esgotou as opções alcançáveis." },
+    coverage_complete_with_restrictions: { title: "Cobertura alcançável concluída", detail: "Os controles que não puderam ser executados com segurança foram documentados no resultado." },
+    coverage_stalled: { title: "Exploração bloqueada", detail: event.message },
     scenario_preparation_started: { title: "Preparando os casos de teste", detail: event.message },
     scenario_drafts_ready: { title: "Todos os CTs já estão seguros", detail: event.message },
     scenario_enrichment_started: { title: "LLM auxiliar aprimorando os CTs", detail: event.message },
@@ -1099,8 +1101,6 @@ function NewExplorationView({
   const [agentModel, setAgentModel] = useState("");
   const [auxProvider, setAuxProvider] = useState("");
   const [auxModel, setAuxModel] = useState("");
-  const [maxSteps, setMaxSteps] = useState(100);
-  const [maxDuration, setMaxDuration] = useState(1800);
   const [viewport, setViewport] = useState("1440x900");
   const [captureConsoleErrors, setCaptureConsoleErrors] = useState(true);
   const [captureNetworkErrors, setCaptureNetworkErrors] = useState(true);
@@ -1155,8 +1155,9 @@ function NewExplorationView({
       const [viewportWidth, viewportHeight] = viewport.split("x").map(Number);
       const normalizedFocusArea = focusMode === "focused" ? focusArea.trim() : "";
       const explorationOptions: Record<string, unknown> = {
-        max_steps: maxSteps,
-        max_duration_seconds: maxDuration,
+        mode: focusMode === "focused" ? "focused" : "full",
+        max_steps: null,
+        max_duration_seconds: null,
         capture_screenshots: true,
         capture_console_errors: captureConsoleErrors,
         capture_network_errors: captureNetworkErrors,
@@ -1264,10 +1265,9 @@ function NewExplorationView({
           <section className="panel form-section">
             <div className="section-number">03</div>
             <div className="form-section-content">
-              <div className="form-section-heading"><div><h2>Parâmetros de execução</h2><p>Defina limites para manter o teste previsível e reproduzível.</p></div><Gauge size={21} /></div>
-              <div className="field-grid four-columns">
-                <label className="field-group"><span>Limite de ações</span><input type="number" min="5" max="500" value={maxSteps} onChange={(event) => setMaxSteps(Number(event.target.value))} /></label>
-                <label className="field-group"><span>Duração máxima</span><select value={maxDuration} onChange={(event) => setMaxDuration(Number(event.target.value))}><option value={300}>5 minutos</option><option value={900}>15 minutos</option><option value={1800}>30 minutos</option><option value={3600}>60 minutos</option></select></label>
+              <div className="form-section-heading"><div><h2>Parâmetros de execução</h2><p>A exploração termina pela cobertura: o JEV continua até esgotar as opções alcançáveis do escopo.</p></div><Gauge size={21} /></div>
+              <div className="coverage-mode-note"><CheckCircle2 size={19} /><div><strong>Sem teto fixo de ações ou duração</strong><span>Você pode cancelar quando quiser. O AutoJev só conclui normalmente depois de percorrer toda a cobertura alcançável.</span></div></div>
+              <div className="field-grid two-columns">
                 <label className="field-group"><span>Viewport</span><select value={viewport} onChange={(event) => setViewport(event.target.value)}><option value="1440x900">Desktop · 1440 × 900</option><option value="1280x720">Notebook · 1280 × 720</option><option value="390x844">Mobile · 390 × 844</option></select></label>
                 <div className="field-group"><span>Evidências</span><div className="static-field"><Eye size={16} />Screenshot + DOM</div></div>
               </div>
@@ -1303,8 +1303,8 @@ function NewExplorationView({
             <SummaryRow label="Agente JEV" value={agentModel || "Selecione um modelo"} />
             <SummaryRow label="LLM auxiliar" value={auxModel || "Selecione um modelo"} />
             <SummaryRow label="Escopo" value={focusMode === "focused" ? focusArea.trim() || "Defina uma área" : "Aplicação inteira"} />
-            <SummaryRow label="Limite" value={`${maxSteps} ações`} />
-            <SummaryRow label="Duração" value={`${Math.round(maxDuration / 60)} minutos`} />
+            <SummaryRow label="Conclusão" value="Ao esgotar a cobertura" />
+            <SummaryRow label="Limite" value="Sem teto fixo" />
             <SummaryRow label="Viewport" value={viewport.replace("x", " × ")} />
           </div>
           <div className="launch-route"><BrainCircuit size={17} /><span /><Code2 size={17} /><span /><Globe2 size={17} /><span /><Sparkles size={17} /></div>
@@ -1457,12 +1457,14 @@ function ExplorationsView({ explorations, loading, navigate }: { explorations: E
             <table className="data-table">
               <thead><tr><th>Aplicação</th><th>Status</th><th>Progresso</th><th>Cenários</th><th>Tokens</th><th>Custo</th><th>Iniciada</th><th><span className="sr-only">Ações</span></th></tr></thead>
               <tbody>{filtered.map((item) => {
-                const progress = item.progress ?? (["completed", "success"].includes(item.status?.toLowerCase()) ? 100 : 0);
+                const progress = item.overall_progress ?? item.progress ?? (["completed", "success"].includes(item.status?.toLowerCase()) ? 100 : undefined);
+                const determinate = typeof progress === "number";
+                const progressValue = typeof progress === "number" ? progress : 0;
                 return (
                   <tr key={item.id} onClick={() => navigate(`#/exploracoes/${encodeURIComponent(item.id)}`)}>
                     <td><div className="table-app"><span className="app-avatar"><Globe2 size={17} /></span><span><strong>{hostFromUrl(item.app_url)}</strong><small>{explorationFocusArea(item.options) ? `Escopo: ${explorationFocusArea(item.options)}` : "Aplicação inteira"}</small></span></div></td>
                     <td><StatusBadge status={item.status} /></td>
-                    <td><div className="table-progress"><span><i style={{ width: `${Math.min(100, Math.max(0, progress))}%` }} /></span><small>{Math.round(progress)}%</small></div></td>
+                    <td><div className={`table-progress ${determinate ? "" : "indeterminate"}`}><span><i style={determinate ? { width: `${Math.min(100, Math.max(0, progressValue))}%` } : undefined} /></span><small>{determinate ? `${Math.round(progressValue)}%` : "cobrindo"}</small></div></td>
                     <td><div className="scenario-cell"><strong>{item.counters?.scenarios || item.counters?.test_scenarios || item.scenarios_count || 0}</strong>{item.summary && <small>{item.summary.pass || 0} PASS · {item.summary.fail || 0} FAIL</small>}</div></td>
                     <td>{formatTokens(item.usage?.total_tokens)}</td>
                     <td>{formatCost(item.usage)}</td>
@@ -1757,12 +1759,15 @@ function ExplorationDetailView({
 
   const status = explorationStatus(exploration.status);
   const phase = exploration.phase || (isLive(exploration.status) ? "exploring" : "complete");
+  const configuredStepLimit = typeof exploration.options?.max_steps === "number" ? exploration.options.max_steps : null;
   const phaseProgress = exploration.phase_progress || {
     current: exploration.counters?.actions || exploration.actions_count || 0,
-    total: Number(exploration.options?.max_steps || 1),
-    percentage: exploration.progress || 0,
+    total: configuredStepLimit,
+    percentage: exploration.progress,
   };
-  const overallProgress = exploration.overall_progress ?? exploration.progress ?? (["completed", "success", "partial"].includes(status.value) ? 100 : 0);
+  const overallProgress = exploration.overall_progress ?? exploration.progress ?? (["completed", "success", "partial"].includes(status.value) ? 100 : undefined);
+  const determinateProgress = typeof overallProgress === "number";
+  const overallProgressValue = typeof overallProgress === "number" ? overallProgress : 0;
   const events = exploration.events || exploration.activity || exploration.logs || [];
   const waitingForInput = exploration.status.toLowerCase() === "waiting_input";
   const waitingEvent = [...events].reverse().find((event) => event.type === "waiting_input");
@@ -1785,7 +1790,7 @@ function ExplorationDetailView({
   const phaseOrder: Record<string, number> = { preparing: 0, exploring: 0, waiting_input: 0, documenting: 1, reporting: 2, complete: 3 };
   const currentPhaseIndex = phaseOrder[phase] ?? 0;
   const phaseHeadline = actionLimitReached
-    ? `Limite de ${exploration.browser_progress?.total || exploration.options?.max_steps || counters.actions} ações atingido`
+    ? `Limite de ${exploration.browser_progress?.total || configuredStepLimit || counters.actions} ações atingido`
     : exploration.phase_label || status.label;
   const phaseDescription = actionLimitReached
     ? "A automação não falhou na ação 67: ela concluiu o limite configurado e preservou tudo o que encontrou. A cobertura ficou parcial porque ainda havia opções a explorar."
@@ -1850,7 +1855,7 @@ function ExplorationDetailView({
     <div className="view-stack detail-view">
       <div className="detail-breadcrumb"><button onClick={() => navigate("#/exploracoes")}><ArrowLeft size={15} />Explorações</button><ChevronRight size={14} /><span>{hostFromUrl(exploration.app_url)}</span></div>
       <header className="detail-header">
-        <div className="detail-title"><span className="app-avatar large"><Globe2 size={22} /></span><div><div className="detail-title-line"><h1>{hostFromUrl(exploration.app_url)}</h1><StatusBadge status={exploration.status} /></div><a href={exploration.app_url} target="_blank" rel="noreferrer">{exploration.app_url}<SquareArrowOutUpRight size={13} /></a></div></div>
+        <div className="detail-title"><span className="app-avatar large"><Globe2 size={22} /></span><div><div className="detail-title-line"><h1>{hostFromUrl(exploration.app_url)}</h1>{actionLimitReached ? <span className="status-badge status-warning"><span className="status-dot" />Limite anterior atingido</span> : <StatusBadge status={exploration.status} />}</div><a href={exploration.app_url} target="_blank" rel="noreferrer">{exploration.app_url}<SquareArrowOutUpRight size={13} /></a></div></div>
         <div className="page-actions">
           <button className="button secondary" onClick={onRefresh}><RefreshCcw size={16} />Atualizar</button>
           {isLive(exploration.status) ? (
@@ -1881,9 +1886,9 @@ function ExplorationDetailView({
               </div>
             )}
           </div>
-          <div className="overall-progress"><strong>{Math.round(overallProgress)}<small>%</small></strong><span>processo total</span></div>
+          <div className="overall-progress">{determinateProgress ? <strong>{Math.round(overallProgressValue)}<small>%</small></strong> : <strong className="progress-running">Em andamento</strong>}<span>{determinateProgress ? "processo total" : "até esgotar a cobertura"}</span></div>
         </div>
-        <div className="large-progress"><span style={{ width: `${Math.min(100, Math.max(0, overallProgress))}%` }} /></div>
+        <div className={`large-progress ${determinateProgress ? "" : "indeterminate"}`}><span style={determinateProgress ? { width: `${Math.min(100, Math.max(0, overallProgressValue))}%` } : undefined} /></div>
         <div className="phase-track" aria-label="Fases da execução">
           {phaseSteps.map((step, index) => (
             <div key={step.key} className={`phase-step ${index < currentPhaseIndex ? "done" : ""} ${index === currentPhaseIndex && phase !== "complete" ? "active" : ""}`}>
@@ -1925,7 +1930,7 @@ function ExplorationDetailView({
                   </div>
                 )}
                 <div className="result-facts">
-                  <div><small>Estado da cobertura</small><strong>{status.label}</strong></div>
+                  <div><small>Estado da cobertura</small><strong>{actionLimitReached ? "Execução antiga limitada" : status.label}</strong></div>
                   <div><small>Estados descobertos</small><strong>{completion.known_states ?? counters.pages}</strong></div>
                   <div><small>CTs aprimorados</small><strong>{postprocessing.enriched ?? 0}</strong></div>
                   <div><small>CTs com evidência local</small><strong>{postprocessing.local_evidence || Math.max(0, counters.scenarios - (postprocessing.enriched || 0))}</strong></div>

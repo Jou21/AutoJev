@@ -136,6 +136,45 @@ def test_exploration_accepts_optional_focused_scope_alias(tmp_path):
         assert response.json()["options"]["focus_area"] == "Financeiro / Faturas"
 
 
+def test_exploration_defaults_to_coverage_driven_without_fixed_limits(tmp_path):
+    app = create_app(settings(tmp_path))
+    with TestClient(app) as client:
+        provider = client.post(
+            "/api/providers",
+            json={
+                "name": "Provider",
+                "base_url": "http://localhost:4000",
+                "models": [{"id": "model"}],
+            },
+        ).json()
+        app.state.exploration_manager.submit = lambda exploration_id: None
+
+        response = client.post(
+            "/api/explorations",
+            json={
+                "app_url": "http://localhost:3000",
+                "agent": {"provider_id": provider["id"], "model_id": "model"},
+                "auxiliary_llm": {
+                    "provider_id": provider["id"],
+                    "model_id": "model",
+                },
+            },
+        )
+
+        assert response.status_code == 202
+        payload = response.json()
+        assert payload["options"]["max_steps"] is None
+        assert payload["options"]["max_duration_seconds"] is None
+        assert payload["progress"] is None
+        assert payload["browser_progress"] == {
+            "current": 0,
+            "total": None,
+            "percentage": None,
+        }
+        assert payload["overall_progress"] == 0
+        assert payload["current_step"] == "Etapa 0 · cobrindo até esgotar"
+
+
 def test_validation_errors_never_echo_secrets(tmp_path):
     app = create_app(settings(tmp_path))
     with TestClient(app) as client:
@@ -189,3 +228,22 @@ def test_phase_payload_separates_browser_actions_from_scenario_documentation():
     }
     assert payload["overall_progress"] == 78
     assert payload["postprocessing"]["enriched"] == 21
+
+
+def test_phase_payload_keeps_exhaustive_exploration_progress_indeterminate():
+    payload = _phase_payload(
+        {
+            "status": "running",
+            "steps_completed": 137,
+            "options": {"max_steps": None},
+        },
+        [],
+    )
+
+    assert payload["phase"] == "exploring"
+    assert payload["browser_progress"] == {
+        "current": 137,
+        "total": None,
+        "percentage": None,
+    }
+    assert payload["overall_progress"] is None

@@ -74,6 +74,8 @@ class StandaloneHtmlReport:
         }
         reason = ""
         relevant = {
+            "coverage_complete_with_restrictions",
+            "coverage_stalled",
             "coverage_partial",
             "limit_reached",
             "coverage_scope_not_found",

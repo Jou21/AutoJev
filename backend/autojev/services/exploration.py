@@ -100,7 +100,7 @@ class ExplorationManager:
     )
 
     async def _poll_login_gone(
-        self, executor: PlaywrightExecutor, deadline: float
+        self, executor: PlaywrightExecutor, deadline: float | None
     ) -> bool:
         """Retorna True quando a tela de login some (login feito no site).
 
@@ -110,7 +110,7 @@ class ExplorationManager:
         clear_reads = 0
         while True:
             await asyncio.sleep(1.5)
-            if time.monotonic() >= deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 return False
             try:
                 if await executor.is_login_page():
@@ -146,10 +146,9 @@ class ExplorationManager:
         await executor.show_intervention_panel(
             panel_message or self.LOGIN_PANEL_MESSAGE
         )
-        limit = deadline if deadline is not None else time.monotonic() + 3600
         app_resume = asyncio.create_task(event.wait())
         browser_resume = asyncio.create_task(executor.wait_for_user_input())
-        auto_resume = asyncio.create_task(self._poll_login_gone(executor, limit))
+        auto_resume = asyncio.create_task(self._poll_login_gone(executor, deadline))
         done, pending = await asyncio.wait(
             {app_resume, browser_resume, auto_resume},
             return_when=asyncio.FIRST_COMPLETED,
@@ -195,6 +194,18 @@ class ExplorationManager:
             "User confirmed that the login step is complete.",
         )
         return "manual"
+
+    @staticmethod
+    def _operation_timeout(deadline: float | None) -> float:
+        """Bound one external call without imposing a run-wide deadline."""
+
+        if deadline is None:
+            return 120.0
+        return max(deadline - time.monotonic(), 0.1)
+
+    @staticmethod
+    def _step_label(step: int, max_steps: int | None) -> str:
+        return f"Etapa {step}" + (f" de {max_steps}" if max_steps is not None else "")
 
     async def shutdown(self) -> None:
         tasks = list(self.tasks.values())
@@ -619,7 +630,11 @@ class ExplorationManager:
                 )
                 return
             started = time.monotonic()
-            deadline = started + options.max_duration_seconds
+            deadline = (
+                started + options.max_duration_seconds
+                if options.max_duration_seconds is not None
+                else None
+            )
             agent_client = self._client_for(item["agent"]["provider_id"])
             auxiliary_client = self._client_for(item["auxiliary_llm"]["provider_id"])
             agent_model_id = item["agent"]["model_id"]
@@ -646,7 +661,7 @@ class ExplorationManager:
             )
             observation = await asyncio.wait_for(
                 executor.start(item["app_url"]),
-                timeout=max(deadline - time.monotonic(), 0.1),
+                timeout=self._operation_timeout(deadline),
             )
             self.repository.update_exploration(
                 exploration_id, current_url=observation.url
@@ -674,7 +689,11 @@ class ExplorationManager:
             actions_executed = 0
             consecutive_loop_rejections = 0
             planning_attempts = 0
-            max_planning_attempts = max(options.max_steps * 6, 30)
+            max_planning_attempts = (
+                max(options.max_steps * 6, 30)
+                if options.max_steps is not None
+                else None
+            )
             # Teto de teimosia: após N rejeições seguidas sem nenhuma ação
             # nova, encerra (o resto é fumaça do modelo, não exploração).
             MAX_CONSECUTIVE_LOOP_REJECTIONS = 8
@@ -696,16 +715,17 @@ class ExplorationManager:
                     exploration_id, observation, known_issues
                 )
 
-            # max_steps is an action budget. Invalid or rejected model
-            # decisions use a separate bounded planning budget.
-            while actions_executed < options.max_steps:
+            # With no explicit safety budget, coverage decides when the run is
+            # complete. The loop still has deterministic repeat protection and
+            # per-operation timeouts, but no arbitrary whole-run ceiling.
+            while options.max_steps is None or actions_executed < options.max_steps:
                 if self.repository.is_cancel_requested(exploration_id):
                     terminal = ExplorationStatus.CANCELLED
                     self.repository.add_event(
                         exploration_id, "warning", "cancelled", "Cancellation requested"
                     )
                     break
-                if time.monotonic() - started >= options.max_duration_seconds:
+                if deadline is not None and time.monotonic() >= deadline:
                     terminal = ExplorationStatus.PARTIAL
                     self.repository.add_event(
                         exploration_id,
@@ -751,7 +771,7 @@ class ExplorationManager:
                         break
                     observation = await asyncio.wait_for(
                         executor.observe("after-user-input"),
-                        timeout=max(deadline - time.monotonic(), 0.1),
+                        timeout=self._operation_timeout(deadline),
                     )
                     self._record_screenshot(exploration_id, observation, "After login")
                     self.repository.update_exploration(
@@ -798,7 +818,10 @@ class ExplorationManager:
                         exploration_id, observation, known_issues
                     )
                 planning_attempts += 1
-                if planning_attempts > max_planning_attempts:
+                if (
+                    max_planning_attempts is not None
+                    and planning_attempts > max_planning_attempts
+                ):
                     terminal = ExplorationStatus.PARTIAL
                     self.repository.add_event(
                         exploration_id,
@@ -816,7 +839,7 @@ class ExplorationManager:
                             sorted(credentials.keys()),
                             coverage.context(observation),
                         ),
-                        timeout=max(deadline - time.monotonic(), 0.1),
+                        timeout=self._operation_timeout(deadline),
                     )
                     consecutive_model_errors = 0
                 except ModelResponseError as exc:
@@ -877,7 +900,7 @@ class ExplorationManager:
                             state,
                         )
                         await executor.update_live_panel(
-                            f"Etapa {actions_executed + 1} de {options.max_steps}",
+                            self._step_label(actions_executed + 1, options.max_steps),
                             "JEV tentou encerrar cedo — retomando a cobertura.",
                         )
                         continue
@@ -892,14 +915,18 @@ class ExplorationManager:
                         )
                         break
                     if not coverage.coverage_complete():
-                        terminal = ExplorationStatus.PARTIAL
+                        # The reachable frontier is exhausted. Controls that
+                        # were unsafe or consistently non-executable remain as
+                        # documented restrictions, not as unvisited frontier.
+                        terminal = ExplorationStatus.COMPLETED
                         self.repository.add_event(
                             exploration_id,
                             "warning",
-                            "coverage_partial",
-                            "The reachable frontier settled with blocked controls; coverage is partial",
+                            "coverage_complete_with_restrictions",
+                            "Reachable coverage exhausted; blocked controls were documented as restrictions",
                             {
                                 "reason": "blocked_candidates",
+                                "rationale": decision.rationale,
                                 **coverage.context(observation),
                             },
                         )
@@ -956,14 +983,28 @@ class ExplorationManager:
                         },
                     )
                     if consecutive_loop_rejections >= MAX_CONSECUTIVE_LOOP_REJECTIONS:
-                        terminal = ExplorationStatus.PARTIAL
-                        self.repository.add_event(
-                            exploration_id,
-                            "warning",
-                            "coverage_partial",
-                            "JEV kept repeating tried actions; coverage is partial",
-                            coverage.context(observation),
-                        )
+                        if options.max_steps is None:
+                            terminal = ExplorationStatus.FAILED
+                            error_message = (
+                                "O JEV não conseguiu avançar após várias decisões "
+                                "repetidas. A execução foi interrompida para evitar um loop."
+                            )
+                            self.repository.add_event(
+                                exploration_id,
+                                "error",
+                                "coverage_stalled",
+                                error_message,
+                                coverage.context(observation),
+                            )
+                        else:
+                            terminal = ExplorationStatus.PARTIAL
+                            self.repository.add_event(
+                                exploration_id,
+                                "warning",
+                                "coverage_partial",
+                                "JEV kept repeating tried actions; coverage is partial",
+                                coverage.context(observation),
+                            )
                         break
                     continue
                 self.repository.add_event(
@@ -980,13 +1021,13 @@ class ExplorationManager:
                 )
                 next_action = actions_executed + 1
                 await executor.update_live_panel(
-                    f"Etapa {next_action} de {options.max_steps}",
+                    self._step_label(next_action, options.max_steps),
                     f"Executando · {decision.action}"
                     f"{' ' + str(decision.target) if decision.target else ''}",
                 )
                 result, next_observation = await asyncio.wait_for(
                     executor.execute(decision, credentials),
-                    timeout=max(deadline - time.monotonic(), 0.1),
+                    timeout=self._operation_timeout(deadline),
                 )
                 before_state_key = coverage.effect_key(observation)
                 after_state_key = coverage.effect_key(next_observation)
@@ -1061,7 +1102,7 @@ class ExplorationManager:
                     },
                 )
                 await executor.update_live_panel(
-                    f"Etapa {actions_executed} de {options.max_steps}",
+                    self._step_label(actions_executed, options.max_steps),
                     f"{'OK' if result.success else 'FALHA'} · {decision.action}"
                     f"{' ' + str(decision.target) if decision.target else ''} · "
                     f"{(result.after_url or '')[:80]}",
@@ -1116,17 +1157,31 @@ class ExplorationManager:
             terminal = ExplorationStatus.CANCELLED
             error_message = "Backend shutdown interrupted this exploration"
         except asyncio.TimeoutError:
-            terminal = ExplorationStatus.PARTIAL
-            self.repository.add_event(
-                exploration_id,
-                "warning",
-                "coverage_partial",
-                "Maximum exploration duration reached; coverage is partial",
-                {
-                    "reason": "duration_limit",
-                    **(coverage.context(observation) if coverage else {}),
-                },
-            )
+            if options and options.max_duration_seconds is None:
+                terminal = ExplorationStatus.FAILED
+                error_message = (
+                    "Uma operação do navegador ou do modelo excedeu 120 segundos. "
+                    "A execução foi interrompida por bloqueio técnico, não por limite de cobertura."
+                )
+                self.repository.add_event(
+                    exploration_id,
+                    "error",
+                    "coverage_stalled",
+                    error_message,
+                    coverage.context(observation) if coverage else {},
+                )
+            else:
+                terminal = ExplorationStatus.PARTIAL
+                self.repository.add_event(
+                    exploration_id,
+                    "warning",
+                    "coverage_partial",
+                    "Maximum exploration duration reached; coverage is partial",
+                    {
+                        "reason": "duration_limit",
+                        **(coverage.context(observation) if coverage else {}),
+                    },
+                )
         except Exception as exc:
             terminal = ExplorationStatus.FAILED
             error_message = str(redact(str(exc), secret_values))[:2000]

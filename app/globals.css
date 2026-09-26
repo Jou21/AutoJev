@@ -1703,6 +1703,38 @@ input::placeholder {
   color: var(--teal);
 }
 
+.coverage-mode-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 17px;
+  padding: 13px;
+  border: 1px solid #315149;
+  border-radius: 7px;
+  background: #111d1a;
+  color: var(--teal);
+}
+
+.coverage-mode-note svg {
+  flex: 0 0 auto;
+}
+
+.coverage-mode-note > div {
+  display: flex;
+  flex-direction: column;
+}
+
+.coverage-mode-note strong {
+  font-size: 10.5px;
+}
+
+.coverage-mode-note span {
+  margin-top: 3px;
+  color: #789b94;
+  font-size: 9px;
+  line-height: 1.5;
+}
+
 .intervention-card {
   border-color: #705826;
   background: #1c1912;
@@ -2079,6 +2111,11 @@ input::placeholder {
   height: 100%;
   border-radius: 3px;
   background: var(--amber);
+}
+
+.table-progress.indeterminate i {
+  width: 38%;
+  animation: coverageSweep 1.7s ease-in-out infinite;
 }
 
 .table-progress small,
@@ -2654,6 +2691,11 @@ input::placeholder {
   transition: width 400ms ease;
 }
 
+.large-progress.indeterminate span {
+  width: 34%;
+  animation: coverageSweep 1.7s ease-in-out infinite;
+}
+
 .live-counters {
   display: grid;
   grid-template-columns: repeat(7, minmax(0, 1fr));
@@ -3174,6 +3216,19 @@ input::placeholder {
   font-size: 8px;
   letter-spacing: .05em;
   text-transform: uppercase;
+}
+
+.overall-progress .progress-running {
+  padding-top: 4px;
+  color: var(--amber);
+  font-family: inherit;
+  font-size: 15px;
+  letter-spacing: -.01em;
+}
+
+.phase-documenting .overall-progress .progress-running,
+.phase-reporting .overall-progress .progress-running {
+  color: var(--teal);
 }
 
 .execution-command .large-progress span {
@@ -3904,6 +3959,12 @@ input::placeholder {
 @keyframes shimmer {
   from { opacity: .45; }
   to { opacity: .9; }
+}
+
+@keyframes coverageSweep {
+  0% { transform: translateX(-115%); }
+  50% { transform: translateX(95%); }
+  100% { transform: translateX(265%); }
 }
 
 @keyframes fadeIn {
