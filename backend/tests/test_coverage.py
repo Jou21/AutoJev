@@ -270,7 +270,7 @@ def test_hoverable_menu_exposes_hover_and_click_as_independent_moves():
     assert reason is None
 
 
-def test_new_child_skips_parent_moves_but_parent_keeps_its_pending_frontier():
+def test_new_child_inherits_only_classified_parent_moves_and_settles_shared_move():
     root = observation(
         "https://app.test/",
         [
@@ -327,17 +327,95 @@ def test_new_child_skips_parent_moves_but_parent_keeps_its_pending_frontier():
     )
 
     child_context = planner.context(child)
-    assert child_context["candidates_inherited"] == 2
+    assert child_context["candidates_inherited"] == 1
     assert [move["name"] for move in child_context["current_untried"]] == [
-        "Child-only action"
+        "Child-only action",
+        "Shared parent action",
     ]
 
-    # Inheritance is local to the child. The shared action was not marked as
-    # attempted globally and remains available when the parent is restored.
+    # The still-live shared control can be covered without restoring an
+    # obsolete same-route snapshot. Its exact ancestor move is then settled.
+    shared = AgentDecision(
+        action="click", target="e11", rationale="Cover the shared action"
+    )
+    planner.record_action(
+        child,
+        shared,
+        result("click", child.url, child.url),
+        child,
+    )
     parent_context = planner.context(root)
-    assert [move["name"] for move in parent_context["current_untried"]] == [
-        "Shared parent action"
-    ]
+    assert parent_context["current_untried"] == []
+
+
+def test_exhausted_frontier_can_finish_without_physical_dom_stack_unwind():
+    root = observation(
+        "https://app.test/inventory",
+        [{"ref": "e0", "tag": "button", "name": "Enable", "enabled": True}],
+    )
+    changed = observation(
+        root.url,
+        [{"ref": "e7", "tag": "button", "name": "Disable", "enabled": True}],
+    )
+    planner = CoveragePlanner(root.url)
+    enable, _ = planner.reconcile(root, AgentDecision("finish", "cover"))
+    planner.record_action(root, enable, result("click", root.url, root.url), changed)
+    disable, _ = planner.reconcile(changed, AgentDecision("finish", "cover"))
+    planner.record_action(
+        changed, disable, result("click", changed.url, changed.url), changed
+    )
+
+    finish, reason = planner.reconcile(changed, AgentDecision("finish", "done"))
+
+    assert finish.action == "finish"
+    assert reason is None
+    assert planner.can_finish() is True
+
+
+def test_same_route_backtrack_navigates_known_url_instead_of_browser_history():
+    root = observation(
+        "https://app.test/inventory",
+        [
+            {"ref": "e0", "tag": "button", "name": "Open state", "enabled": True},
+            {"ref": "e1", "tag": "button", "name": "Root sibling", "enabled": True},
+        ],
+    )
+    child = observation(
+        root.url,
+        [{"ref": "e7", "tag": "button", "name": "Child action", "enabled": True}],
+    )
+    planner = CoveragePlanner(root.url)
+    enter = AgentDecision(action="click", target="e0", rationale="Open state")
+    planner.reconcile(root, enter)
+    planner.record_action(root, enter, result("click", root.url, root.url), child)
+    local, _ = planner.reconcile(child, AgentDecision("finish", "cover"))
+    planner.record_action(child, local, result("click", child.url, child.url), child)
+
+    restore, reason = planner.reconcile(child, AgentDecision("finish", "cover"))
+
+    assert restore.action == "navigate"
+    assert restore.url == root.url
+    assert reason == "dom_state_backtrack_navigate"
+
+    planner.record_action(
+        child,
+        restore,
+        result("navigate", child.url, child.url, success=False),
+        child,
+    )
+    retry, _ = planner.reconcile(child, AgentDecision("finish", "cover"))
+    assert retry.action == "navigate"
+    planner.record_action(
+        child,
+        retry,
+        result("navigate", child.url, child.url, success=False),
+        child,
+    )
+    finish, _ = planner.reconcile(child, AgentDecision("finish", "cover"))
+
+    assert finish.action == "finish"
+    assert planner.can_finish() is True
+    assert planner.coverage_complete() is False
 
 
 def test_frontier_exposes_at_most_thirty_atomic_moves_per_decision():
@@ -456,7 +534,14 @@ def test_noop_go_back_falls_back_to_known_same_origin_parent_url():
                 "name": "Child",
                 "href": "https://app.test/child",
                 "enabled": True,
-            }
+            },
+            {
+                "ref": "e1",
+                "tag": "a",
+                "name": "Sibling",
+                "href": "https://app.test/sibling",
+                "enabled": True,
+            },
         ],
     )
     child = observation("https://app.test/child", [], title="Child")

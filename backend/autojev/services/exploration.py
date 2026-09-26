@@ -593,6 +593,7 @@ class ExplorationManager:
             scenario_number = 0
             consecutive_model_errors = 0
             login_retried = False
+            authentication_boundary_crossed = False
             actions_executed = 0
             consecutive_loop_rejections = 0
             planning_attempts = 0
@@ -613,7 +614,10 @@ class ExplorationManager:
                 ),
                 {"focus_area": options.focus_area},
             )
-            self._record_observation_issues(exploration_id, observation, known_issues)
+            if not self._needs_login(observation):
+                self._record_observation_issues(
+                    exploration_id, observation, known_issues
+                )
 
             # max_steps is an action budget. Invalid or rejected model
             # decisions use a separate bounded planning budget.
@@ -696,6 +700,26 @@ class ExplorationManager:
                             "e só então clique em Continuar exploração."
                         )
                         continue
+                    login_retried = False
+                    executor.protect_authenticated_history()
+                    if not authentication_boundary_crossed:
+                        # The login document is an entry gate, not the parent
+                        # of every authenticated screen. Start coverage at the
+                        # first authenticated observation so logical
+                        # backtracking can never target the sign-in page.
+                        coverage = CoveragePlanner(observation.url, options.focus_area)
+                        coverage.observe(observation)
+                        authentication_boundary_crossed = True
+                        self.repository.add_event(
+                            exploration_id,
+                            "info",
+                            "authenticated_scope_started",
+                            "Coverage root moved to the authenticated application",
+                            {"url": observation.url},
+                        )
+                    self._record_observation_issues(
+                        exploration_id, observation, known_issues
+                    )
                 planning_attempts += 1
                 if planning_attempts > max_planning_attempts:
                     terminal = ExplorationStatus.PARTIAL

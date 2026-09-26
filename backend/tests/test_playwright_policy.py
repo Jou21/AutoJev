@@ -145,6 +145,7 @@ async def test_observe_restricts_candidates_and_text_to_active_dialog(tmp_path: 
             assert "dialog[open],[role=\"dialog\"]" in script
             assert "activeDialog && !activeDialog.contains(el)" in script
             assert "(activeDialog || document.body)?.innerText" in script
+            assert "[data-testid],[data-test],[data-qa]" in script
             return {
                 "title": "Orders",
                 "text": "Confirm order dialog",
@@ -177,6 +178,100 @@ async def test_observe_restricts_candidates_and_text_to_active_dialog(tmp_path: 
     assert executor._ref_selectors == {
         "e0": "div:nth-of-type(1) > button:nth-of-type(1)"
     }
+
+
+async def test_observe_normalizes_empty_anchor_href_like_stale_check(tmp_path: Path):
+    class Locator:
+        async def count(self):
+            return 1
+
+        async def evaluate(self, _script):
+            return {
+                "tag": "a",
+                "role": "button",
+                "type": None,
+                "name": "Cart, 1 items",
+                "href": None,
+                "aria_haspopup": None,
+            }
+
+    class Page:
+        url = "https://example.test/inventory"
+
+        async def evaluate(self, _script):
+            return {
+                "title": "Inventory",
+                "text": "Cart",
+                "elements": [
+                    {
+                        "ref": "e0",
+                        "tag": "a",
+                        "role": "button",
+                        "name": "Cart, 1 items",
+                        "type": None,
+                        "href": "",
+                        "enabled": True,
+                        "context": "header Cart",
+                        "aria_haspopup": None,
+                        "_selector": "a:nth-of-type(1)",
+                    }
+                ],
+            }
+
+        def locator(self, _selector):
+            return Locator()
+
+    executor = PlaywrightExecutor(
+        tmp_path, ExplorationOptions(capture_screenshots=False)
+    )
+    executor._page = Page()
+
+    observed = await executor.observe()
+    await executor._locator("e0")
+
+    assert observed.interactive_elements[0]["href"] is None
+    assert executor._ref_semantics["e0"]["href"] is None
+
+
+async def test_go_back_restores_forward_page_at_authenticated_boundary(
+    tmp_path: Path,
+):
+    class Page:
+        url = "https://example.test/inventory"
+        went_forward = False
+
+        async def go_back(self, **_kwargs):
+            self.url = "https://example.test/login"
+            return object()
+
+        async def go_forward(self, **_kwargs):
+            self.url = "https://example.test/inventory"
+            self.went_forward = True
+            return object()
+
+        async def evaluate(self, script):
+            if "input[type=\"password\"]" in script:
+                return self.url.endswith("/login")
+            return {"title": "Inventory", "text": "Products", "elements": []}
+
+    executor = PlaywrightExecutor(
+        tmp_path, ExplorationOptions(capture_screenshots=False)
+    )
+    page = Page()
+    executor._page = page
+    executor._allowed_origin = executor._origin(page.url)
+    executor.protect_authenticated_history()
+
+    from autojev.domain.models import AgentDecision
+
+    result, observation = await executor.execute(
+        AgentDecision(action="go_back", rationale="Return to coverage parent"), {}
+    )
+
+    assert result.success is False
+    assert "authenticated session boundary" in result.message
+    assert page.went_forward is True
+    assert observation.url == "https://example.test/inventory"
 
 
 @pytest.mark.parametrize(

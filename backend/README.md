@@ -61,6 +61,11 @@ FastAPI API -> ExplorationManager -> JEV adapter -> JSON AgentDecision
   semantic ref and replays the safe interaction; an unrestorable branch is
   marked blocked. Same-origin popups are adopted and backtracked through an
   executor-owned page stack.
+- Repeated controls are separated by bounded card/row/form context, including
+  `data-test*` containers. Classified parent moves propagate across live
+  same-route states, so a cart/filter toggle does not force an obsolete DOM
+  restore. Manual login is excluded from the coverage graph: the authenticated
+  page becomes the root and history backtracking cannot reopen the login form.
 - Passwords, uploads, hidden/read-only fields, destructive choices and
   cross-origin top-level navigation are excluded or blocked.
 - `adapters/repository.py` stores providers, models, runs, events, actions, evidence, scenarios, issues and artifact metadata in SQLite.

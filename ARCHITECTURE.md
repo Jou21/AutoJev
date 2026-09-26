@@ -56,9 +56,17 @@ FastAPI -> Exploration Engine -> Coverage planner -> JEV agent (priority/decisio
   controls on the active surface.
 - The coverage planner, not the model, owns the pending frontier and route
   stack. A premature `finish` or `go_back` is replaced with the next untried
-  safe control. Once a child is exhausted, backtracking is mandatory; if
-  browser history cannot restore the parent, the executor returns to its known
-  same-origin URL.
+  safe control. Already-classified parent moves propagate into a child while
+  still-pending controls that remain mounted can be exercised directly in the
+  live DOM. Backtracking happens only while a remote frontier remains; an
+  exhausted run does not unwind browser history just to finish. Same-route
+  parents use their known URL instead of browser history, and failed restores
+  are bounded and reported as partial coverage.
+- Repeated labels are disambiguated by bounded row/card/form/dialog context,
+  including common `data-test*` containers. Empty anchor URLs are normalized
+  consistently before stale-element validation. After manual authentication,
+  the first authenticated observation becomes the coverage root and browser
+  backtracking is prevented from crossing into the login document.
 - A route URL is not enough to restore a DOM-only state such as an expanded
   submenu, tab or modal. Successful safe transitions are stored as
   selector-free recipes containing a semantic fingerprint and atomic action.

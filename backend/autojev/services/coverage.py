@@ -666,8 +666,10 @@ class CoveragePlanner:
 
     def can_finish(self) -> bool:
         # The requested focus may legitimately not exist; completion is still
-        # valid once the reachable discovery frontier has been exhausted.
-        return self.frontier_exhausted() and len(self.path) <= 1
+        # valid once the reachable discovery frontier has been exhausted. A
+        # browser does not need to physically unwind every already-covered DOM
+        # state merely to end on the original screen.
+        return self.frontier_exhausted() and self.restoration_target is None
 
     def coverage_complete(self) -> bool:
         """True only when the frontier settled without blocked candidates."""
@@ -970,8 +972,31 @@ class CoveragePlanner:
     ) -> tuple[AgentDecision, str | None] | None:
         if len(self.path) > 1:
             current = self.path[-1]
+            current_state = self.states[current]
             previous = self.states[self.path[-2]]
             failures = self.backtrack_failures.get(current, 0)
+            if current_state.url == previous.url:
+                if failures >= 2:
+                    # A same-route snapshot that cannot be recreated after two
+                    # direct navigations is not an excuse for an infinite
+                    # restore loop. Preserve the gap as blocked/partial and
+                    # continue with any other reachable frontier.
+                    for fingerprint, _ in self._remaining(previous):
+                        previous.attempted.add(fingerprint)
+                        previous.blocked.add(fingerprint)
+                    self.path.pop(-2)
+                    return self._backtrack_decision()
+                return (
+                    AgentDecision(
+                        action="navigate",
+                        url=previous.url,
+                        rationale=(
+                            "The logical parent is another DOM state on this same route; "
+                            "reload its known same-origin URL instead of crossing unrelated browser history."
+                        ),
+                    ),
+                    "dom_state_backtrack_navigate",
+                )
             if failures == 0:
                 return (
                     AgentDecision(
@@ -1033,6 +1058,8 @@ class CoveragePlanner:
             )
             if forced:
                 return forced, "finish_replaced_by_frontier_action"
+            if self.frontier_exhausted():
+                return decision, None
             backtrack = self._backtrack_decision()
             if backtrack:
                 return backtrack[0], backtrack[1] or "finish_replaced_by_backtrack"
@@ -1163,6 +1190,23 @@ class CoveragePlanner:
                     before_state.attempted.add(fingerprint)
                     before_state.blocked.add(fingerprint)
             classified = fingerprint in before_state.attempted
+            if result.success or policy_blocked:
+                # The exact same semantic move may remain mounted while a
+                # same-route state evolves (filters, carts, toggles). If it is
+                # exercised in a descendant, settle the matching move in its
+                # logical ancestors too; otherwise the planner later tries to
+                # restore an obsolete DOM snapshot just to repeat completed
+                # work.
+                for ancestor_key in self.path:
+                    if ancestor_key == before_key:
+                        continue
+                    ancestor = self.states.get(ancestor_key)
+                    if ancestor is None or fingerprint not in ancestor.candidates:
+                        continue
+                    ancestor.attempted.add(fingerprint)
+                    ancestor.failures.pop(fingerprint, None)
+                    if policy_blocked:
+                        ancestor.blocked.add(fingerprint)
             if classified and element.get("in_navigation"):
                 self.global_navigation_attempted.add(fingerprint)
             if self.focus_area and not self.focus_reached:
@@ -1184,13 +1228,15 @@ class CoveragePlanner:
         child_is_new = after_key_hint not in self.states
         after_key = self.observe(after)
         if result.success and after_key != before_key and child_is_new:
-            # A submenu, modal or child route often keeps its parent's controls
-            # mounted. They remain pending/covered in the parent state and are
-            # not actions to repeat inside this newly discovered child. This is
-            # intentionally state-local: no move is marked attempted globally.
+            # A child often keeps its parent's controls mounted. Propagate only
+            # moves already classified in the parent; still-untried shared
+            # controls remain executable in the current live DOM. This avoids
+            # both duplicate work and artificial backtracking after every
+            # small same-page mutation.
             child_state = self.states[after_key]
+            classified_parent = before_state.attempted | before_state.inherited
             child_state.inherited.update(
-                set(before_state.candidates) & set(child_state.candidates)
+                classified_parent & set(child_state.candidates)
             )
         if (
             entered_focus_by_target

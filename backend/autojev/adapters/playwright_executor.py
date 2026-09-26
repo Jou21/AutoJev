@@ -57,6 +57,7 @@ class PlaywrightExecutor:
         self._pending_pages: deque[Any] = deque(maxlen=20)
         self._user_input_event = asyncio.Event()
         self._intervention_message = ""
+        self._protect_authenticated_history = False
 
     async def _prepare_page(self, page: Any) -> None:
         """Attach AutoJev observation hooks to a newly adopted browser page."""
@@ -338,6 +339,11 @@ class PlaywrightExecutor:
 
     def notify_user_input(self) -> None:
         self._user_input_event.set()
+
+    def protect_authenticated_history(self) -> None:
+        """Keep coverage backtracking inside the authenticated application."""
+
+        self._protect_authenticated_history = True
 
     async def is_login_page(self) -> bool:
         """Checagem leve (sem screenshot) para detectar tela de login."""
@@ -625,11 +631,40 @@ class PlaywrightExecutor:
               const elements = candidates.map((el, index) => {
                 const ref = `e${index}`;
                 const box = el.getBoundingClientRect();
-                const contextNode = el.closest(
+                const explicitContext = el.closest(
                   'tr,[role="row"],li,[role="listitem"],form,[role="dialog"],nav,[role="navigation"],aside'
-                ) || el.closest('section,main');
+                );
+                // Modern component libraries often render cards as plain divs.
+                // Prefer a nearby test-marked container, excluding the control
+                // itself, so repeated labels such as "Add to cart" retain the
+                // product/card identity that makes each action distinct.
+                const dataContext = el.parentElement?.closest(
+                  '[data-testid],[data-test],[data-qa]'
+                ) || null;
+                let boundedContext = null;
+                if (!explicitContext && !dataContext) {
+                  let parent = el.parentElement;
+                  for (let depth = 0; parent && depth < 5; depth += 1, parent = parent.parentElement) {
+                    if (['BODY', 'HTML', 'MAIN'].includes(parent.tagName)) continue;
+                    const text = (parent.innerText || '').trim().replace(/\\s+/g, ' ');
+                    const controls = parent.querySelectorAll(
+                      'a,button,input,select,textarea,[aria-haspopup],[role="button"],[role="link"],[role="menuitem"]'
+                    ).length;
+                    if (text.length > 0 && text.length <= 500 && controls <= 12) {
+                      boundedContext = parent;
+                      break;
+                    }
+                  }
+                }
+                const contextNode = explicitContext || dataContext || boundedContext || el.closest('section,main');
                 const contextText = contextNode
                   ? (contextNode.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 120)
+                  : '';
+                const contextMarker = contextNode
+                  ? ['data-testid', 'data-test', 'data-qa']
+                    .map((name) => contextNode.getAttribute(name) ? `${name}=${contextNode.getAttribute(name)}` : '')
+                    .filter(Boolean)
+                    .join(' ')
                   : '';
                 return {
                   ref,
@@ -663,7 +698,7 @@ class PlaywrightExecutor:
                   in_viewport: box.bottom > 0 && box.top < window.innerHeight,
                   in_navigation: Boolean(el.closest('nav,[role="navigation"],aside')),
                   context: contextNode
-                    ? `${contextNode.tagName.toLowerCase()} ${contextNode.getAttribute('aria-label') || contextNode.getAttribute('role') || ''} ${contextText}`.trim().slice(0, 160)
+                    ? `${contextNode.tagName.toLowerCase()} ${contextMarker} ${contextNode.getAttribute('aria-label') || contextNode.getAttribute('role') || ''} ${contextText}`.trim().slice(0, 160)
                     : null,
                   _selector: selectorFor(el),
                 };
@@ -696,8 +731,14 @@ class PlaywrightExecutor:
                     element["context"] = self._redact_text(
                         str(element.get("context") or "")
                     )[:160]
-                if element.get("href"):
-                    element["href"] = self._public_url(str(element["href"]))
+                # An <a> without href exposes an empty DOM property. Normalize
+                # that exactly like the pre-action stale check (None), otherwise
+                # a valid button-like link is rejected as if it had rerendered.
+                element["href"] = (
+                    self._public_url(str(element["href"]))
+                    if element.get("href")
+                    else None
+                )
                 if element.get("ref"):
                     self._ref_semantics[str(element["ref"])] = {
                         "tag": str(element.get("tag") or "").lower(),
@@ -982,6 +1023,25 @@ class PlaywrightExecutor:
                     popup = self._page_stack.pop()
                     self._page = self._page_stack[-1]
                     await popup.close()
+                if (
+                    self._protect_authenticated_history
+                    and self._page
+                    and await self.is_login_page()
+                ):
+                    # The previous browser-history entry can still be the
+                    # authentication form even though the coverage parent is an
+                    # authenticated DOM state. Restore the forward entry and
+                    # report a policy failure so the planner can use its known
+                    # route/replay strategy instead of asking for login again.
+                    try:
+                        await self._page.go_forward(
+                            wait_until="domcontentloaded", timeout=30_000
+                        )
+                    except Exception:
+                        pass
+                    raise PermissionError(
+                        "PolicyBlocked: browser back would cross the authenticated session boundary"
+                    )
             elif action == "reload":
                 await self._page.reload(wait_until="domcontentloaded", timeout=30_000)
             elif action == "wait":

@@ -44,6 +44,7 @@ yarn-error.log*
 # Python / FastAPI
 backend/.venv/
 backend/data/
+/data/
 backend/.pytest_cache/
 **/__pycache__/
 *.py[cod]
