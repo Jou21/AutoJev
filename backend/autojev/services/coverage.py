@@ -50,6 +50,7 @@ _SAFE_REPLAY_KEYS = {
 _MAX_REPLAY_DEPTH = 12
 _MAX_REPLAY_FAILURES = 2
 _MAX_RESTORE_STEPS = 24
+_MAX_NAVIGATE_RESTORE_FAILURES = 1
 _MAX_SELECT_OPTIONS = 8
 _MAX_EXPOSED_MOVES = 30
 _EXIT_WORDS = {
@@ -188,6 +189,11 @@ class CoveragePlanner:
         self.active_states: set[str] = set()
         self.global_destinations_attempted: set[str] = set()
         self.global_navigation_attempted: set[str] = set()
+        # A semantic control only adds coverage value once per route.  Without
+        # this memory, reversible interfaces (cart add/remove, filters, menus)
+        # create a power set of equivalent DOM snapshots and the planner later
+        # tries to restore every obsolete combination.
+        self.global_route_moves_attempted: set[tuple[str, str]] = set()
         self.backtrack_failures: dict[str, int] = {}
         self.coverage_root_key: str | None = None
         self.transitions: dict[str, list[_TransitionRecipe]] = {}
@@ -195,6 +201,7 @@ class CoveragePlanner:
         self.restoration_failures: dict[tuple[str, str, str], int] = {}
         self.restoration_steps = 0
         self._issued_restore_step: _IssuedRestoreStep | None = None
+        self.unreachable_restorations: list[dict[str, Any]] = []
 
     @staticmethod
     def _clickable(element: dict[str, Any]) -> bool:
@@ -549,6 +556,8 @@ class CoveragePlanner:
         for fingerprint, element in state.candidates.items():
             if fingerprint in state.attempted or fingerprint in state.inherited:
                 continue
+            if (state.url, fingerprint) in self.global_route_moves_attempted:
+                continue
             if (
                 element.get("in_navigation")
                 and fingerprint in self.global_navigation_attempted
@@ -693,6 +702,20 @@ class CoveragePlanner:
             )
         )
 
+    def _navigate_failure_key(
+        self, target_key: str, ancestor_key: str
+    ) -> tuple[str, str, str]:
+        """Group failed restores by URL, not by volatile DOM snapshot.
+
+        Several state fingerprints can share one URL. Retrying ``goto`` for
+        every fingerprint only reloads the same document and was the source of
+        the visible restore loop in real runs.
+        """
+
+        ancestor = self.states.get(ancestor_key)
+        destination = ancestor.url if ancestor is not None else ancestor_key
+        return ("navigate", target_key, canonical_url(destination))
+
     def _register_transition(
         self,
         parent_key: str,
@@ -782,12 +805,8 @@ class CoveragePlanner:
                 ):
                     continue
                 is_focus_entry = self._is_focus_entry_recipe(recipe)
-                if (
-                    not self._is_active(recipe.child_key)
-                    or (
-                        not self._is_active(recipe.parent_key)
-                        and not is_focus_entry
-                    )
+                if not self._is_active(recipe.child_key) or (
+                    not self._is_active(recipe.parent_key) and not is_focus_entry
                 ):
                     continue
                 next_path = [*path, recipe]
@@ -822,22 +841,22 @@ class CoveragePlanner:
             return None
         ancestors = [root_key, *(recipe.child_key for recipe in path[:-1])]
         for ancestor_key in reversed(ancestors):
-            failure_key = ("navigate", target_key, ancestor_key)
+            failure_key = self._navigate_failure_key(target_key, ancestor_key)
             if (
                 self._url_restorable(ancestor_key)
-                and self.restoration_failures.get(failure_key, 0) < _MAX_REPLAY_FAILURES
+                and self.restoration_failures.get(failure_key, 0)
+                < _MAX_NAVIGATE_RESTORE_FAILURES
             ):
                 return ancestor_key
         if self.focus_entry_anchor is not None:
             anchor_path = self._find_replay_path(self.focus_entry_anchor, target_key)
-            failure_key = (
-                "navigate",
-                target_key,
-                self.focus_entry_anchor,
+            failure_key = self._navigate_failure_key(
+                target_key, self.focus_entry_anchor
             )
             if (
                 anchor_path is not None
-                and self.restoration_failures.get(failure_key, 0) < _MAX_REPLAY_FAILURES
+                and self.restoration_failures.get(failure_key, 0)
+                < _MAX_NAVIGATE_RESTORE_FAILURES
             ):
                 return self.focus_entry_anchor
         return None
@@ -856,17 +875,67 @@ class CoveragePlanner:
                 return action, reason.replace("frontier_", "focus_boundary_")
         return None
 
-    def _abandon_restoration(self, target_key: str) -> None:
-        """Settle an unreachable remote frontier as blocked, never as covered."""
+    def _abandon_restoration(self, target_key: str, *, reason: str) -> dict[str, Any]:
+        """Settle one unreachable frontier as blocked without ending the run."""
 
         state = self.states.get(target_key)
+        remaining = self._remaining(state) if state is not None else []
         if state is not None:
-            for fingerprint, _ in self._remaining(state):
+            for fingerprint, _ in remaining:
                 state.attempted.add(fingerprint)
                 state.blocked.add(fingerprint)
         self.restoration_target = None
         self.restoration_steps = 0
         self._issued_restore_step = None
+        settlement = {
+            "reason": reason,
+            "target_state": target_key,
+            "target_url": state.url if state is not None else None,
+            "blocked_candidates": len(remaining),
+            "blocked_moves": [
+                {
+                    "name": str(element.get("name") or element.get("ref") or "")[:200],
+                    "action": self._move_action(element),
+                    "href": str(element.get("href") or "")[:500] or None,
+                }
+                for _, element in remaining[:30]
+            ],
+            "remaining_frontier_states": len(self._frontier_states()),
+            "remaining_frontier_candidates": sum(
+                len(self._remaining(candidate)) for candidate in self._frontier_states()
+            ),
+        }
+        self.unreachable_restorations.append(settlement)
+        return settlement
+
+    def next_restoration_action(
+        self, observation: Observation
+    ) -> tuple[AgentDecision, str] | None:
+        """Return an already-planned mechanical restore step without an LLM call.
+
+        Restoration decisions are deterministic consequences of the coverage
+        graph.  Exposing them lets the orchestrator keep executing a known
+        replay/navigation recipe without paying for a fresh model decision on
+        every intermediate step.
+        """
+
+        key = self.observe(observation)
+        return self._continue_restoration(key)
+
+    def abandon_stalled_restoration(
+        self, *, reason: str = "stalled_restoration"
+    ) -> dict[str, Any] | None:
+        """Block only the active unreachable target so other frontiers continue.
+
+        The caller remains responsible for deciding when its anti-loop limit
+        has been reached.  This method deliberately preserves that limit while
+        turning a local restore failure into a documented coverage restriction
+        instead of a fatal error for the complete exploration.
+        """
+
+        if self.restoration_target is None:
+            return None
+        return self._abandon_restoration(self.restoration_target, reason=reason)
 
     def _replay_decision(
         self, recipe: _TransitionRecipe, target_key: str
@@ -910,7 +979,7 @@ class CoveragePlanner:
             self.restoration_steps = 0
             return None
         if self.restoration_steps >= _MAX_RESTORE_STEPS:
-            self._abandon_restoration(target_key)
+            self._abandon_restoration(target_key, reason="restore_step_limit")
             return None
 
         # Prefer continuing from the state that is already open. This avoids a
@@ -942,11 +1011,14 @@ class CoveragePlanner:
             if target.url != self.states[current_key].url:
                 ancestor_key = target_key
             else:
-                self._abandon_restoration(target_key)
+                self._abandon_restoration(target_key, reason="no_restore_route")
                 return None
-        failure_key = ("navigate", target_key, ancestor_key)
-        if self.restoration_failures.get(failure_key, 0) >= _MAX_REPLAY_FAILURES:
-            self._abandon_restoration(target_key)
+        failure_key = self._navigate_failure_key(target_key, ancestor_key)
+        if (
+            self.restoration_failures.get(failure_key, 0)
+            >= _MAX_NAVIGATE_RESTORE_FAILURES
+        ):
+            self._abandon_restoration(target_key, reason="restore_attempt_limit")
             return None
         self.restoration_steps += 1
         self._issued_restore_step = _IssuedRestoreStep(
@@ -975,17 +1047,16 @@ class CoveragePlanner:
             current_state = self.states[current]
             previous = self.states[self.path[-2]]
             failures = self.backtrack_failures.get(current, 0)
+            if failures >= 2:
+                # Browser history and a direct URL fallback both failed to
+                # recreate this logical parent. Settle only that inaccessible
+                # branch and keep walking the remaining graph.
+                for fingerprint, _ in self._remaining(previous):
+                    previous.attempted.add(fingerprint)
+                    previous.blocked.add(fingerprint)
+                self.path.pop(-2)
+                return self._backtrack_decision()
             if current_state.url == previous.url:
-                if failures >= 2:
-                    # A same-route snapshot that cannot be recreated after two
-                    # direct navigations is not an excuse for an infinite
-                    # restore loop. Preserve the gap as blocked/partial and
-                    # continue with any other reachable frontier.
-                    for fingerprint, _ in self._remaining(previous):
-                        previous.attempted.add(fingerprint)
-                        previous.blocked.add(fingerprint)
-                    self.path.pop(-2)
-                    return self._backtrack_decision()
                 return (
                     AgentDecision(
                         action="navigate",
@@ -1185,6 +1256,7 @@ class CoveragePlanner:
         before_key = self.observe(before)
         focus_was_reached = self.focus_reached
         before_state = self.states[before_key]
+        issued_restore = self._issued_restore_step
         selected_move = self._move_for_decision(
             list(before_state.candidates.items()), decision
         )
@@ -1211,6 +1283,7 @@ class CoveragePlanner:
                     before_state.blocked.add(fingerprint)
             classified = fingerprint in before_state.attempted
             if result.success or policy_blocked:
+                self.global_route_moves_attempted.add((before_state.url, fingerprint))
                 # The exact same semantic move may remain mounted while a
                 # same-route state evolves (filters, carts, toggles). If it is
                 # exercised in a descendant, settle the matching move in its
@@ -1247,6 +1320,14 @@ class CoveragePlanner:
         after_key_hint = self.state_key(after)
         child_is_new = after_key_hint not in self.states
         after_key = self.observe(after)
+        if issued_restore is not None and child_is_new:
+            # A failed restore can land on a previously unseen variant of a
+            # known route (for example, another cart combination).  That
+            # incidental snapshot is evidence, not a new exploration branch;
+            # otherwise each recovery attempt grows the frontier it is trying
+            # to reduce.
+            child_state = self.states[after_key]
+            child_state.inherited.update(child_state.candidates)
         if result.success and after_key != before_key and child_is_new:
             # A child often keeps its parent's controls mounted. Propagate only
             # moves already classified in the parent; still-untried shared
@@ -1265,15 +1346,20 @@ class CoveragePlanner:
             and not self.focus_reached
         ):
             self._activate_focus(after_key)
-        if self.focus_reached and self._url_is_inside_focus(after.url):
-            if not self.focus_area:
-                self.active_states.add(after_key)
-            elif after_key != self.focus_entry_anchor and (
-                after_key in self.active_states
-                or before_key in self.active_states
-                or self._matches_focus(after)
-            ):
-                self.active_states.add(after_key)
+        if (
+            self.focus_reached
+            and self._url_is_inside_focus(after.url)
+            and (
+                not self.focus_area
+                or after_key != self.focus_entry_anchor
+                and (
+                    after_key in self.active_states
+                    or before_key in self.active_states
+                    or self._matches_focus(after)
+                )
+            )
+        ):
+            self.active_states.add(after_key)
 
         is_focus_entry = bool(
             self.focus_area
@@ -1296,7 +1382,6 @@ class CoveragePlanner:
                 is_focus_entry=is_focus_entry,
             )
 
-        issued_restore = self._issued_restore_step
         if issued_restore is not None:
             if issued_restore.source_key == before_key:
                 if issued_restore.kind == "replay" and issued_restore.fingerprint:
@@ -1324,8 +1409,7 @@ class CoveragePlanner:
                             self.restoration_failures.get(failure_key, 0) + 1
                         )
                 elif issued_restore.kind == "navigate":
-                    failure_key = (
-                        "navigate",
+                    failure_key = self._navigate_failure_key(
                         issued_restore.target_key,
                         issued_restore.expected_key,
                     )
@@ -1413,6 +1497,12 @@ class CoveragePlanner:
             ),
             "restoration_target": self.restoration_target,
             "restoration_steps": self.restoration_steps,
+            "restorations_abandoned": len(self.unreachable_restorations),
+            "last_unreachable_restoration": (
+                self.unreachable_restorations[-1]
+                if self.unreachable_restorations
+                else None
+            ),
             "candidates_discovered": candidates_discovered,
             "candidates_attempted": candidates_attempted,
             "candidates_blocked": candidates_blocked,

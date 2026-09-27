@@ -429,12 +429,19 @@ class ExplorationManager:
         request cannot be reported as PASS.
         """
 
-        if not result.success or not state_changed or decision.action in {
-            "wait",
-            "screenshot",
-        }:
+        if (
+            not result.success
+            or not state_changed
+            or decision.action
+            in {
+                "wait",
+                "screenshot",
+            }
+        ):
             return
-        if not any(item.kind == "observable_state_change" for item in result.assertions):
+        if not any(
+            item.kind == "observable_state_change" for item in result.assertions
+        ):
             result.assertions.append(
                 AssertionResult(
                     kind="observable_state_change",
@@ -858,57 +865,82 @@ class ExplorationManager:
                             },
                         )
                     break
-                planning_attempts += 1
-                if (
-                    max_planning_attempts is not None
-                    and planning_attempts > max_planning_attempts
-                ):
-                    terminal = ExplorationStatus.PARTIAL
-                    self.repository.add_event(
-                        exploration_id,
-                        "warning",
-                        "coverage_partial",
-                        "Exploration planning limit reached before the coverage frontier was exhausted",
-                        coverage.context(observation),
-                    )
-                    break
-                try:
-                    decision = await asyncio.wait_for(
-                        agent.decide(
-                            observation,
-                            history,
-                            sorted(credentials.keys()),
+                # Replaying a known transition recipe is graph traversal, not
+                # a new QA decision. Execute it directly so a long recovery
+                # cannot spend one full JEV prompt (or grow its history) for
+                # every mechanical browser step.
+                mechanical_restore = coverage.next_restoration_action(observation)
+                decision_source = "coverage" if mechanical_restore else "jev"
+                if mechanical_restore is not None:
+                    decision, coverage_override = mechanical_restore
+                else:
+                    planning_attempts += 1
+                    if (
+                        max_planning_attempts is not None
+                        and planning_attempts > max_planning_attempts
+                    ):
+                        terminal = ExplorationStatus.PARTIAL
+                        self.repository.add_event(
+                            exploration_id,
+                            "warning",
+                            "coverage_partial",
+                            "Exploration planning limit reached before the coverage frontier was exhausted",
                             coverage.context(observation),
-                        ),
-                        timeout=self._operation_timeout(deadline),
-                    )
-                    consecutive_model_errors = 0
-                except ModelResponseError as exc:
+                        )
+                        break
+                    try:
+                        decision = await asyncio.wait_for(
+                            agent.decide(
+                                observation,
+                                # Coverage context contains the durable graph;
+                                # recent functional decisions are enough for
+                                # the model and keep token use bounded.
+                                history[-20:],
+                                sorted(credentials.keys()),
+                                coverage.context(observation),
+                            ),
+                            timeout=self._operation_timeout(deadline),
+                        )
+                        consecutive_model_errors = 0
+                    except ModelResponseError as exc:
+                        await self._record_model_usage(
+                            exploration_id, [agent_client], executor
+                        )
+                        consecutive_model_errors += 1
+                        self.repository.add_event(
+                            exploration_id,
+                            "warning",
+                            "invalid_agent_decision",
+                            str(exc),
+                        )
+                        if consecutive_model_errors >= 3:
+                            raise RuntimeError(
+                                "JEV returned three invalid decisions in sequence"
+                            ) from exc
+                        continue
                     await self._record_model_usage(
                         exploration_id, [agent_client], executor
                     )
-                    consecutive_model_errors += 1
-                    self.repository.add_event(
-                        exploration_id,
-                        "warning",
-                        "invalid_agent_decision",
-                        str(exc),
+                    decision, coverage_override = coverage.reconcile(
+                        observation, decision
                     )
-                    if consecutive_model_errors >= 3:
-                        raise RuntimeError(
-                            "JEV returned three invalid decisions in sequence"
-                        ) from exc
-                    continue
-                await self._record_model_usage(exploration_id, [agent_client], executor)
-                decision, coverage_override = coverage.reconcile(observation, decision)
                 if coverage_override:
                     self.repository.add_event(
                         exploration_id,
                         "info",
-                        "coverage_decision_overridden",
-                        "Coverage planner replaced the model decision to continue systematic exploration",
+                        (
+                            "coverage_action_planned"
+                            if decision_source == "coverage"
+                            else "coverage_decision_overridden"
+                        ),
+                        (
+                            "Coverage planner continued a deterministic recovery path"
+                            if decision_source == "coverage"
+                            else "Coverage planner replaced the model decision to continue systematic exploration"
+                        ),
                         {
                             "reason": coverage_override,
+                            "source": decision_source,
                             "action": decision.action,
                             "target": decision.target,
                             "url": decision.url,
@@ -1088,9 +1120,7 @@ class ExplorationManager:
                     and result.success
                     and not state_changed
                 ):
-                    result.message = (
-                        f"{result.message}; no new route or interactive-state change was observed"
-                    )
+                    result.message = f"{result.message}; no new route or interactive-state change was observed"
                 self._append_observable_state_evidence(
                     result,
                     decision,
@@ -1107,13 +1137,11 @@ class ExplorationManager:
                 actions_executed += 1
                 coverage.record_action(observation, decision, result, next_observation)
                 coverage_after = coverage.context(next_observation)
-                consecutive_failed_restorations = (
-                    self._next_failed_restoration_streak(
-                        consecutive_failed_restorations,
-                        is_restoration=is_restoration_action,
-                        success=result.success,
-                        state_changed=state_changed,
-                    )
+                consecutive_failed_restorations = self._next_failed_restoration_streak(
+                    consecutive_failed_restorations,
+                    is_restoration=is_restoration_action,
+                    success=result.success,
+                    state_changed=state_changed,
                 )
                 consecutive_loop_rejections = 0
                 self.repository.update_exploration(
@@ -1156,30 +1184,33 @@ class ExplorationManager:
                     f"{' ' + str(decision.target) if decision.target else ''} · "
                     f"{(result.after_url or '')[:80]}",
                 )
-                history.append(
-                    {
-                        "action": decision.action,
-                        "target": decision.target,
-                        "rationale": decision.rationale,
-                        "success": result.success,
-                        "result": result.message,
-                        "before_url": result.before_url,
-                        "after_url": result.after_url,
-                        "state_changed": state_changed,
-                        "next_page_title": next_observation.title,
-                        "new_console_errors": len(next_observation.console_errors),
-                        "new_network_errors": len(next_observation.network_errors),
-                        "coverage_after": {
-                            "known_states": coverage_after["known_states"],
-                            "frontier_states": coverage_after["frontier_states"],
-                            "frontier_candidates": coverage_after[
-                                "frontier_candidates"
+                if not is_restoration_action:
+                    history.append(
+                        {
+                            "action": decision.action,
+                            "target": decision.target,
+                            "rationale": decision.rationale,
+                            "success": result.success,
+                            "result": result.message,
+                            "before_url": result.before_url,
+                            "after_url": result.after_url,
+                            "state_changed": state_changed,
+                            "next_page_title": next_observation.title,
+                            "new_console_errors": len(next_observation.console_errors),
+                            "new_network_errors": len(next_observation.network_errors),
+                            "coverage_after": {
+                                "known_states": coverage_after["known_states"],
+                                "frontier_states": coverage_after["frontier_states"],
+                                "frontier_candidates": coverage_after[
+                                    "frontier_candidates"
+                                ],
+                                "path_depth": coverage_after["path_depth"],
+                            },
+                            "assertions": [
+                                asdict(value) for value in result.assertions
                             ],
-                            "path_depth": coverage_after["path_depth"],
-                        },
-                        "assertions": [asdict(value) for value in result.assertions],
-                    }
-                )
+                        }
+                    )
                 # Preserve evidence now and document it after navigation. The
                 # auxiliary LLM never blocks or shortens browser exploration.
                 if (
@@ -1194,24 +1225,47 @@ class ExplorationManager:
                     )
                 observation = next_observation
                 if consecutive_failed_restorations >= 2:
-                    terminal = ExplorationStatus.FAILED
-                    error_message = (
-                        "O AutoJev interrompeu duas restaurações consecutivas sem "
-                        "progresso para proteger o consumo de tokens."
+                    settlement = coverage.abandon_stalled_restoration(
+                        reason="consecutive_restore_without_progress"
                     )
+                    if settlement is not None:
+                        self.repository.add_event(
+                            exploration_id,
+                            "warning",
+                            "coverage_route_unreachable",
+                            (
+                                "Uma combinação antiga de tela não pôde ser "
+                                "recriada. O AutoJev registrou a restrição e "
+                                "continuou pela próxima opção de teste."
+                            ),
+                            {
+                                **settlement,
+                                "action": decision.action,
+                                "target": decision.target,
+                            },
+                        )
+                        consecutive_failed_restorations = 0
+                        continue
+
+                    # Backtracking has its own bounded fallback in the coverage
+                    # planner. Let the next iteration replace the failed path;
+                    # if no path can be settled, the ordinary non-restoration
+                    # loop protection remains the final safety net.
                     self.repository.add_event(
                         exploration_id,
-                        "error",
-                        "coverage_stalled",
-                        error_message,
+                        "warning",
+                        "coverage_backtrack_retry",
+                        (
+                            "O retorno não alterou a tela; o planejador vai "
+                            "descartar esse caminho e tentar a próxima fronteira."
+                        ),
                         {
-                            "reason": "consecutive_failed_restorations",
                             "action": decision.action,
                             "target": decision.target,
                             **coverage.context(observation),
                         },
                     )
-                    break
+                    consecutive_failed_restorations = 0
             else:
                 terminal = ExplorationStatus.PARTIAL
                 self.repository.add_event(
@@ -1276,9 +1330,7 @@ class ExplorationManager:
                 or (options and options.generate_html_report)
             )
             persisted_status = (
-                ExplorationStatus.POSTPROCESSING
-                if needs_postprocessing
-                else terminal
+                ExplorationStatus.POSTPROCESSING if needs_postprocessing else terminal
             )
             # Browser work has ended. Keep a distinct live phase so polling,
             # cancellation and token/cost updates continue until the report is

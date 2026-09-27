@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import pytest
-
 from autojev.adapters.playwright_executor import PlaywrightExecutor
 from autojev.domain.models import (
     ActionResult,
@@ -10,7 +9,11 @@ from autojev.domain.models import (
     Observation,
     utc_now,
 )
-from autojev.services.coverage import CoveragePlanner, semantic_element_fingerprint
+from autojev.services.coverage import (
+    CoveragePlanner,
+    _IssuedRestoreStep,
+    semantic_element_fingerprint,
+)
 
 
 def observation(
@@ -196,8 +199,7 @@ def test_select_options_are_bounded_atomic_moves_and_do_not_split_state():
     }
     page = observation("https://app.test/orders", [element])
     changed_options = [
-        {**option, "selected": option.get("value") == "status-1"}
-        for option in options
+        {**option, "selected": option.get("value") == "status-1"} for option in options
     ]
     changed = observation(
         page.url,
@@ -1191,6 +1193,144 @@ def test_repeated_global_navigation_control_is_only_covered_once():
     next_decision, _ = planner.reconcile(restored, AgentDecision("finish", "cover"))
 
     assert next_decision.target == "e8"
+
+
+def test_equivalent_move_is_covered_once_per_route_across_dom_snapshots():
+    url = "https://shop.test/inventory"
+    shared = {
+        "ref": "e0",
+        "tag": "button",
+        "name": "Add Backpack to cart",
+        "enabled": True,
+        "context": "product Sauce Labs Backpack",
+    }
+    first = observation(url, [shared])
+    later_snapshot = observation(
+        url,
+        [
+            {**shared, "ref": "e21"},
+            {
+                "ref": "e22",
+                "tag": "button",
+                "name": "Add Bike Light to cart",
+                "enabled": True,
+                "context": "product Sauce Labs Bike Light",
+            },
+        ],
+    )
+    planner = CoveragePlanner(url)
+    add_backpack = AgentDecision("click", "cover", target="e0")
+
+    planner.record_action(
+        first,
+        add_backpack,
+        result("click", url, url),
+        first,
+    )
+
+    assert [
+        move["name"] for move in planner.context(later_snapshot)["current_untried"]
+    ] == ["Add Bike Light to cart"]
+
+
+def test_restore_navigation_failures_are_grouped_by_canonical_url():
+    url = "https://shop.test/inventory"
+    first = observation(
+        url,
+        [{"ref": "e0", "tag": "button", "name": "State A", "enabled": True}],
+    )
+    second = observation(
+        url,
+        [{"ref": "e1", "tag": "button", "name": "State B", "enabled": True}],
+    )
+    planner = CoveragePlanner(url)
+    first_key = planner.observe(first)
+    second_key = planner.observe(second)
+
+    assert first_key != second_key
+    assert planner._navigate_failure_key("target", first_key) == (
+        "navigate",
+        "target",
+        url,
+    )
+    assert planner._navigate_failure_key(
+        "target", first_key
+    ) == planner._navigate_failure_key("target", second_key)
+
+
+def test_stalled_restore_blocks_only_unreachable_target_and_keeps_other_frontier():
+    cart = observation(
+        "https://shop.test/cart",
+        [{"ref": "e0", "tag": "button", "name": "Checkout", "enabled": True}],
+    )
+    inventory = observation(
+        "https://shop.test/inventory",
+        [
+            {
+                "ref": "e1",
+                "tag": "button",
+                "name": "Open product",
+                "enabled": True,
+            }
+        ],
+    )
+    planner = CoveragePlanner(inventory.url)
+    cart_key = planner.observe(cart)
+    planner.observe(inventory)
+    planner.restoration_target = cart_key
+
+    settlement = planner.abandon_stalled_restoration()
+
+    assert settlement is not None
+    assert settlement["blocked_candidates"] == 1
+    assert settlement["blocked_moves"] == [
+        {"name": "Checkout", "action": "click", "href": None}
+    ]
+    assert planner.context(cart)["current_untried"] == []
+    assert [move["name"] for move in planner.context(inventory)["current_untried"]] == [
+        "Open product"
+    ]
+    assert planner.can_finish() is False
+    assert planner.coverage_complete() is False
+
+
+def test_unexpected_restore_snapshot_does_not_expand_coverage_frontier():
+    current = observation("https://shop.test/inventory", [])
+    target = observation(
+        "https://shop.test/cart",
+        [{"ref": "e0", "tag": "button", "name": "Checkout", "enabled": True}],
+    )
+    unexpected = observation(
+        "https://shop.test/cart",
+        [
+            {
+                "ref": "e8",
+                "tag": "button",
+                "name": "Continue shopping",
+                "enabled": True,
+            }
+        ],
+    )
+    planner = CoveragePlanner(current.url)
+    current_key = planner.observe(current)
+    target_key = planner.observe(target)
+    planner.restoration_target = target_key
+    planner._issued_restore_step = _IssuedRestoreStep(
+        kind="navigate",
+        target_key=target_key,
+        source_key=current_key,
+        expected_key=target_key,
+    )
+
+    planner.record_action(
+        current,
+        AgentDecision("navigate", "restore", url=target.url),
+        result("navigate", current.url, target.url),
+        unexpected,
+    )
+
+    assert planner.context(unexpected)["current_untried"] == []
+    assert planner.context(unexpected)["frontier_states"] == 1
 
 
 def test_current_screen_controls_are_exhausted_before_global_navigation():
