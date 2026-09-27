@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from collections import deque
 from pathlib import Path
@@ -58,6 +59,7 @@ class PlaywrightExecutor:
         self._user_input_event = asyncio.Event()
         self._intervention_message = ""
         self._protect_authenticated_history = False
+        self._sidepanel_init_installed = False
 
     async def _prepare_page(self, page: Any) -> None:
         """Attach AutoJev observation hooks to a newly adopted browser page."""
@@ -155,82 +157,214 @@ class PlaywrightExecutor:
             raise BrowserUnavailableError(f"Browser could not start or navigate: {exc}") from exc
 
     _SIDEPANEL_CSS = (
-        "#autojev-sidepanel{position:fixed !important;z-index:2147483647;top:0;right:0;"
-        "width:330px;height:100vh;overflow-y:auto;margin:0;box-sizing:border-box;"
-        "padding:28px 22px;color:#e8ecec;background:#111719;border-left:1px solid #765b25;"
-        "box-shadow:-8px 0 28px rgba(0,0,0,.28);font:14px ui-sans-serif,system-ui,sans-serif;"
-        "display:block !important;visibility:visible !important;opacity:1 !important;pointer-events:none;}"
-        "#autojev-sidepanel .autojev-panel-kicker{color:#eab94e;font-size:10px;font-weight:700;"
-        "letter-spacing:.12em;}"
-        "#autojev-sidepanel h2{margin:18px 0 10px;font-size:21px;color:#fff;}"
-        "#autojev-sidepanel p{color:#aebbb9;line-height:1.55;}"
-        "#autojev-sidepanel ul{list-style:none;margin:14px 0 0;padding:0;}"
-        "#autojev-sidepanel li{margin:0 0 8px;padding:8px 10px;border-radius:6px;"
-        "background:#1a2224;color:#c8d4d2;font-size:12px;line-height:1.45;"
-        "border-left:2px solid #eab94e;word-break:break-word;}"
-        "#autojev-sidepanel button{width:100%;margin-top:18px;padding:12px 14px;border:0;"
-        "border-radius:6px;background:#eab94e;color:#17130b;font-weight:700;cursor:pointer;pointer-events:auto;}"
-        "#autojev-sidepanel button:disabled{opacity:.7;cursor:default;}"
-        "#autojev-sidepanel .autojev-live-dot{display:inline-block;width:8px;height:8px;"
-        "border-radius:50%;background:#4ade80;margin-right:6px;}"
-        "#autojev-sidepanel .autojev-usage{display:flex;gap:8px;margin:12px 0 0;color:#eab94e;"
-        "font-size:11px;font-weight:700;}"
+        "#autojev-sidepanel{all:initial;position:fixed !important;z-index:2147483647 !important;"
+        "top:18px !important;right:18px !important;width:min(356px,calc(100vw - 28px)) !important;"
+        "max-height:calc(100vh - 36px) !important;margin:0 !important;display:grid !important;"
+        "grid-template-columns:58px minmax(0,1fr) !important;box-sizing:border-box !important;"
+        "color:#f7faf9 !important;font-family:Inter,ui-sans-serif,system-ui,-apple-system,sans-serif !important;"
+        "transform:translate3d(calc(100% - 58px),0,0);opacity:.28;filter:saturate(.7);"
+        "transition:transform .24s cubic-bezier(.2,.8,.2,1),opacity .2s ease,filter .2s ease;"
+        "pointer-events:auto !important;will-change:transform,opacity;contain:layout paint style;}"
+        "#autojev-sidepanel,#autojev-sidepanel *{box-sizing:border-box !important;}"
+        "#autojev-sidepanel:hover,#autojev-sidepanel:focus-within,"
+        "#autojev-sidepanel[data-pinned='true'],#autojev-sidepanel[data-mode='attention']{"
+        "transform:translate3d(0,0,0);opacity:1;filter:saturate(1);}"
+        "#autojev-sidepanel[data-automation='true']{pointer-events:none !important;"
+        "transform:translate3d(calc(100% - 58px),0,0) !important;opacity:.28 !important;"
+        "filter:saturate(.7) !important;transition:none !important;}"
+        "#autojev-sidepanel .autojev-panel-rail{display:flex;min-height:172px;align-items:center;"
+        "flex-direction:column;gap:9px;padding:14px 8px;border:1px solid rgba(255,255,255,.12);"
+        "border-right:0;border-radius:18px 0 0 18px;background:rgba(10,16,18,.76);"
+        "box-shadow:-12px 18px 48px rgba(0,0,0,.28);backdrop-filter:blur(18px) saturate(1.25);"
+        "-webkit-backdrop-filter:blur(18px) saturate(1.25);cursor:pointer;}"
+        "#autojev-sidepanel .autojev-rail-mark{display:grid;width:38px;height:38px;place-items:center;"
+        "border:1px solid rgba(242,184,75,.5);border-radius:12px;background:linear-gradient(145deg,#2b2415,#17140e);"
+        "box-shadow:0 0 26px rgba(242,184,75,.18);color:#f6c85c;font-size:15px;font-weight:850;}"
+        "#autojev-sidepanel .autojev-rail-status{width:8px;height:8px;border-radius:50%;"
+        "background:#42e5b5;box-shadow:0 0 0 5px rgba(66,229,181,.1),0 0 18px rgba(66,229,181,.65);}"
+        "#autojev-sidepanel .autojev-rail-label{margin-top:auto;color:#aab7b4;font-size:8px;"
+        "font-weight:750;letter-spacing:.16em;text-transform:uppercase;writing-mode:vertical-rl;"
+        "transform:rotate(180deg);}"
+        "#autojev-sidepanel .autojev-panel-surface{min-width:0;max-height:calc(100vh - 36px);"
+        "overflow:hidden auto;padding:17px;border:1px solid rgba(255,255,255,.13);border-radius:0 18px 18px 0;"
+        "background:linear-gradient(155deg,rgba(18,27,29,.96),rgba(8,13,15,.94));"
+        "box-shadow:-4px 18px 48px rgba(0,0,0,.38),inset 0 1px rgba(255,255,255,.04);"
+        "backdrop-filter:blur(22px) saturate(1.35);-webkit-backdrop-filter:blur(22px) saturate(1.35);"
+        "scrollbar-width:thin;scrollbar-color:#3e4b4c transparent;opacity:0;transition:opacity .14s ease;}"
+        "#autojev-sidepanel:hover .autojev-panel-surface,#autojev-sidepanel:focus-within .autojev-panel-surface,"
+        "#autojev-sidepanel[data-pinned='true'] .autojev-panel-surface,"
+        "#autojev-sidepanel[data-mode='attention'] .autojev-panel-surface{opacity:1;}"
+        "#autojev-sidepanel[data-automation='true'] .autojev-panel-surface{opacity:0 !important;}"
+        "#autojev-sidepanel .autojev-panel-header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;}"
+        "#autojev-sidepanel .autojev-panel-kicker{display:flex;align-items:center;gap:7px;margin:0;color:#f4c65a;"
+        "font-size:9px;font-weight:800;letter-spacing:.13em;text-transform:uppercase;}"
+        "#autojev-sidepanel .autojev-live-dot{display:inline-block;width:7px;height:7px;flex:0 0 auto;"
+        "border-radius:50%;background:#42e5b5;box-shadow:0 0 12px rgba(66,229,181,.75);}"
+        "#autojev-sidepanel .autojev-panel-hint{color:#667473;font-size:8px;line-height:1.35;text-align:right;}"
+        "#autojev-sidepanel h2{margin:12px 0 0 !important;color:#fff !important;font-size:18px !important;"
+        "font-weight:720 !important;line-height:1.2 !important;letter-spacing:-.025em !important;}"
+        "#autojev-sidepanel .autojev-usage{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin:14px 0 0;}"
+        "#autojev-sidepanel .autojev-usage-chip{display:flex;min-width:0;flex-direction:column;padding:9px 10px;"
+        "border:1px solid rgba(255,255,255,.08);border-radius:10px;background:rgba(255,255,255,.035);}"
+        "#autojev-sidepanel .autojev-usage-chip small{color:#748381;font-size:7px;font-weight:750;"
+        "letter-spacing:.1em;text-transform:uppercase;}"
+        "#autojev-sidepanel .autojev-usage-chip strong{overflow:hidden;margin-top:3px;color:#eef4f2;"
+        "font:650 10px ui-monospace,SFMono-Regular,Menlo,monospace;text-overflow:ellipsis;white-space:nowrap;}"
+        "#autojev-sidepanel #autojev-panel-action{margin-top:14px;padding:12px;border:1px solid rgba(242,184,75,.38);"
+        "border-radius:12px;background:linear-gradient(145deg,rgba(242,184,75,.13),rgba(242,184,75,.055));"
+        "box-shadow:0 12px 30px rgba(0,0,0,.16);}"
+        "#autojev-sidepanel #autojev-panel-action[hidden]{display:none !important;}"
+        "#autojev-sidepanel p{margin:0 !important;color:#c2cecb !important;font-size:11px !important;line-height:1.55 !important;}"
+        "#autojev-sidepanel button{all:unset;display:flex !important;width:100% !important;min-height:42px;"
+        "align-items:center !important;justify-content:center !important;margin-top:12px !important;padding:0 12px !important;"
+        "border-radius:10px !important;background:linear-gradient(135deg,#ffd66e,#f0b33d) !important;"
+        "box-shadow:0 8px 24px rgba(242,184,75,.2) !important;color:#19140a !important;"
+        "font:800 11px Inter,ui-sans-serif,system-ui,sans-serif !important;cursor:pointer !important;}"
+        "#autojev-sidepanel button:hover{filter:brightness(1.06);transform:translateY(-1px);}"
+        "#autojev-sidepanel button:focus-visible{outline:2px solid #fff !important;outline-offset:2px !important;}"
+        "#autojev-sidepanel button:disabled{opacity:.68;cursor:default !important;transform:none;}"
+        "#autojev-sidepanel .autojev-log-heading{display:flex;align-items:center;justify-content:space-between;"
+        "margin-top:15px;padding-top:12px;border-top:1px solid rgba(255,255,255,.08);color:#71807e;"
+        "font-size:8px;font-weight:750;letter-spacing:.1em;text-transform:uppercase;}"
+        "#autojev-sidepanel ul{list-style:none !important;max-height:210px;overflow:hidden auto;margin:8px 0 0 !important;padding:0 !important;}"
+        "#autojev-sidepanel li{position:relative;margin:0 0 6px !important;padding:8px 9px 8px 11px !important;"
+        "border:1px solid rgba(255,255,255,.065);border-radius:9px;background:rgba(255,255,255,.035);"
+        "color:#aebbb8 !important;font-size:9px !important;line-height:1.45 !important;word-break:break-word;}"
+        "#autojev-sidepanel li:before{position:absolute;top:9px;bottom:9px;left:0;width:2px;border-radius:2px;"
+        "background:#f0b84b;content:'';}"
+        "#autojev-sidepanel[data-mode='attention'] .autojev-panel-rail{border-color:rgba(242,184,75,.5);"
+        "background:rgba(30,24,12,.92);box-shadow:-12px 18px 55px rgba(242,184,75,.16);}"
+        "#autojev-sidepanel[data-mode='attention'] .autojev-rail-status{background:#f6c655;"
+        "box-shadow:0 0 0 5px rgba(246,198,85,.12),0 0 20px rgba(246,198,85,.8);}"
+        "@media(max-width:620px){#autojev-sidepanel{top:10px !important;right:10px !important;"
+        "width:calc(100vw - 20px) !important;max-height:calc(100vh - 20px) !important;"
+        "grid-template-columns:52px minmax(0,1fr) !important;transform:translate3d(calc(100% - 52px),0,0);}"
+        "#autojev-sidepanel .autojev-panel-surface{max-height:calc(100vh - 20px);padding:14px;}"
+        "#autojev-sidepanel .autojev-panel-rail{padding:12px 7px;}}"
+        "@media(prefers-reduced-motion:reduce){#autojev-sidepanel{transition:none !important;}}"
     )
 
+    _SIDEPANEL_INSTALLER = r"""(css) => {
+      if (window.top !== window) return;
+      const ID = 'autojev-sidepanel';
+      const current = document.getElementById(ID);
+      if (current) {
+        const currentStyle = current.querySelector('#autojev-panel-style');
+        if (currentStyle && currentStyle.textContent !== css) currentStyle.textContent = css;
+        return;
+      }
+
+      const panel = document.createElement('aside');
+      panel.id = ID;
+      panel.dataset.mode = 'exploring';
+      panel.setAttribute('aria-label', 'Status da exploração do AutoJev');
+      panel.setAttribute('aria-live', 'polite');
+
+      const rail = document.createElement('div');
+      rail.className = 'autojev-panel-rail';
+      rail.setAttribute('role', 'button');
+      rail.setAttribute('tabindex', '0');
+      rail.setAttribute('aria-label', 'Expandir ou recolher painel do AutoJev');
+      rail.innerHTML = '<span class="autojev-rail-mark">J</span><span class="autojev-rail-status"></span><span class="autojev-rail-label">AutoJev</span>';
+      const togglePinned = () => {
+        panel.dataset.pinned = panel.dataset.pinned === 'true' ? 'false' : 'true';
+      };
+      rail.addEventListener('click', togglePinned);
+      rail.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          togglePinned();
+        }
+      });
+      panel.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+          panel.dataset.pinned = 'false';
+          rail.focus();
+        }
+      });
+
+      const surface = document.createElement('section');
+      surface.className = 'autojev-panel-surface';
+      const header = document.createElement('header');
+      header.className = 'autojev-panel-header';
+      const kicker = document.createElement('div');
+      kicker.className = 'autojev-panel-kicker';
+      kicker.innerHTML = '<span class="autojev-live-dot"></span><span id="autojev-kicker-text">AUTOJEV · EXPLORANDO</span>';
+      const hint = document.createElement('span');
+      hint.id = 'autojev-panel-hint';
+      hint.className = 'autojev-panel-hint';
+      hint.textContent = 'Passe o mouse para acompanhar';
+      header.append(kicker, hint);
+
+      const title = document.createElement('h2');
+      title.id = 'autojev-panel-title';
+      title.textContent = 'Exploração em andamento';
+
+      const usage = document.createElement('div');
+      usage.id = 'autojev-usage';
+      usage.className = 'autojev-usage';
+      usage.innerHTML = '<span class="autojev-usage-chip"><small>Tokens</small><strong id="autojev-token-value">0</strong></span><span class="autojev-usage-chip"><small>Custo</small><strong id="autojev-cost-value">—</strong></span>';
+
+      const action = document.createElement('div');
+      action.id = 'autojev-panel-action';
+      action.hidden = true;
+      const actionText = document.createElement('p');
+      actionText.id = 'autojev-action-text';
+      const button = document.createElement('button');
+      button.id = 'autojev-action-button';
+      button.type = 'button';
+      button.textContent = 'Continuar exploração';
+      button.addEventListener('click', () => {
+        try {
+          const fn = window.__autojev_resume;
+          if (typeof fn === 'function') fn();
+        } catch (error) {}
+        button.disabled = true;
+        button.textContent = 'Retomando…';
+      });
+      action.append(actionText, button);
+
+      const logHeading = document.createElement('div');
+      logHeading.className = 'autojev-log-heading';
+      logHeading.innerHTML = '<span>Atividade</span><span>ao vivo</span>';
+      const log = document.createElement('ul');
+      log.id = 'autojev-panel-log';
+
+      const style = document.createElement('style');
+      style.id = 'autojev-panel-style';
+      style.textContent = css;
+      surface.append(header, title, usage, action, logHeading, log);
+      panel.append(rail, surface, style);
+
+      const mount = () => {
+        if (!document.body) return false;
+        if (!document.getElementById(ID)) document.body.append(panel);
+        return true;
+      };
+      if (!mount()) document.addEventListener('DOMContentLoaded', mount, { once: true });
+    }"""
+
+    async def _install_sidepanel_bootstrap(self) -> None:
+        """Instala a UI antes de futuras navegações para não haver sumiço/pisca."""
+
+        if self.headless or not self._context or self._sidepanel_init_installed:
+            return
+        script = f"({self._SIDEPANEL_INSTALLER})({json.dumps(self._SIDEPANEL_CSS)});"
+        try:
+            await self._context.add_init_script(script=script)
+            self._sidepanel_init_installed = True
+        except Exception:
+            # A injeção imediata abaixo ainda mantém o teste funcional.
+            pass
+
     async def _ensure_sidepanel(self) -> bool:
-        """Cria a barra lateral única (status + ação). Retorna False se impossível."""
+        """Cria o painel único (status + ação). Retorna False se impossível."""
         if not self._page or self.headless:
             return False
+        await self._install_sidepanel_bootstrap()
         try:
             await self._page.evaluate(
-                """(css) => {
-                  const ID = 'autojev-sidepanel';
-                  if (document.getElementById(ID)) return;
-                  const panel = document.createElement('aside');
-                  panel.id = ID;
-                  const kicker = document.createElement('div');
-                  kicker.className = 'autojev-panel-kicker';
-                  kicker.innerHTML = '<span class="autojev-live-dot"></span><span id="autojev-kicker-text">AUTOJEV · EXPLORANDO</span>';
-                  const title = document.createElement('h2');
-                  title.id = 'autojev-panel-title';
-                  title.textContent = 'Exploração em andamento';
-                  const log = document.createElement('ul');
-                  log.id = 'autojev-panel-log';
-                  const action = document.createElement('div');
-                  action.id = 'autojev-panel-action';
-                  action.style.display = 'none';
-                  const actionText = document.createElement('p');
-                  actionText.id = 'autojev-action-text';
-                  const button = document.createElement('button');
-                  button.id = 'autojev-action-button';
-                  button.type = 'button';
-                  button.textContent = 'Continuar exploração';
-                  button.addEventListener('click', () => {
-                    try {
-                      const fn = window.__autojev_resume;
-                      if (typeof fn === 'function') fn();
-                    } catch (e) {}
-                    button.disabled = true;
-                    button.textContent = 'Retomando…';
-                  });
-                  action.append(actionText, button);
-                  const usage = document.createElement('div');
-                  usage.id = 'autojev-usage';
-                  usage.className = 'autojev-usage';
-                  usage.textContent = 'Tokens: 0 · Custo: —';
-                  const style = document.createElement('style');
-                  style.textContent = css;
-                  panel.append(kicker, title, usage, action, log, style);
-                  const mount = () => {
-                    if (!document.body) return false;
-                    if (!document.getElementById(ID)) document.body.append(panel);
-                    return true;
-                  };
-                  if (!mount()) {
-                    new MutationObserver((_, obs) => { if (mount()) obs.disconnect(); })
-                      .observe(document.documentElement, { childList: true, subtree: true });
-                  }
-                }""",
+                self._SIDEPANEL_INSTALLER,
                 self._SIDEPANEL_CSS,
             )
             return True
@@ -240,8 +374,24 @@ class PlaywrightExecutor:
     async def show_live_panel(self) -> None:
         await self._ensure_sidepanel()
 
+    async def _set_sidepanel_automation(self, active: bool) -> None:
+        """Mantém o overlay fora do hit testing enquanto o Playwright atua."""
+
+        if not self._page or self.headless:
+            return
+        try:
+            await self._page.evaluate(
+                """(active) => {
+                  const panel = document.getElementById('autojev-sidepanel');
+                  if (panel) panel.dataset.automation = active ? 'true' : 'false';
+                }""",
+                active,
+            )
+        except Exception:
+            pass
+
     async def update_live_panel(self, title: str, line: str) -> None:
-        """Atualiza título e acrescenta linha de log (máx. 8). Sem botões."""
+        """Atualiza título e acrescenta uma linha ao histórico compacto."""
         if not self._page or self.headless:
             return
         if not await self._ensure_sidepanel():
@@ -259,7 +409,7 @@ class PlaywrightExecutor:
                       const li = document.createElement('li');
                       li.textContent = line;
                       log.prepend(li);
-                      while (log.children.length > 8) log.lastChild.remove();
+                      while (log.children.length > 6) log.lastChild.remove();
                     }
                   }
                 }""",
@@ -276,8 +426,10 @@ class PlaywrightExecutor:
         try:
             await self._page.evaluate(
                 """([tokens, costText]) => {
-                  const usage = document.getElementById('autojev-usage');
-                  if (usage) usage.textContent = `Tokens: ${tokens.toLocaleString('pt-BR')} · Custo: ${costText}`;
+                  const tokenValue = document.getElementById('autojev-token-value');
+                  const costValue = document.getElementById('autojev-cost-value');
+                  if (tokenValue) tokenValue.textContent = tokens.toLocaleString('pt-BR');
+                  if (costValue) costValue.textContent = costText;
                 }""",
                 [total_tokens, f"${cost:.6f}" if cost_known and cost is not None else "—"],
             )
@@ -304,14 +456,21 @@ class PlaywrightExecutor:
         try:
             await self._page.evaluate(
                 """(message) => {
+                  const panel = document.getElementById('autojev-sidepanel');
                   const action = document.getElementById('autojev-panel-action');
                   const text = document.getElementById('autojev-action-text');
                   const button = document.getElementById('autojev-action-button');
                   const kicker = document.getElementById('autojev-kicker-text');
+                  const hint = document.getElementById('autojev-panel-hint');
                   if (text) text.textContent = message;
-                  if (action) action.style.display = 'block';
+                  if (action) action.hidden = false;
                   if (button) { button.disabled = false; button.textContent = 'Continuar exploração'; }
                   if (kicker) kicker.textContent = 'AUTOJEV · AÇÃO NECESSÁRIA';
+                  if (hint) hint.textContent = 'Aguardando você';
+                  if (panel) {
+                    panel.dataset.mode = 'attention';
+                    panel.setAttribute('aria-live', 'assertive');
+                  }
                   const title = document.getElementById('autojev-panel-title');
                   if (title) title.textContent = 'Faça login para continuar';
                 }""",
@@ -327,9 +486,18 @@ class PlaywrightExecutor:
         try:
             await self._page.evaluate(
                 """() => {
-                  document.getElementById('autojev-panel-action')?.style.setProperty('display', 'none');
+                  const panel = document.getElementById('autojev-sidepanel');
+                  const action = document.getElementById('autojev-panel-action');
+                  if (action) action.hidden = true;
                   const kicker = document.getElementById('autojev-kicker-text');
                   if (kicker) kicker.textContent = 'AUTOJEV · EXPLORANDO';
+                  const hint = document.getElementById('autojev-panel-hint');
+                  if (hint) hint.textContent = 'Passe o mouse para acompanhar';
+                  if (panel) {
+                    panel.dataset.mode = 'exploring';
+                    panel.dataset.pinned = 'false';
+                    panel.setAttribute('aria-live', 'polite');
+                  }
                   const button = document.getElementById('autojev-action-button');
                   if (button) { button.disabled = false; button.textContent = 'Continuar exploração'; }
                 }"""
@@ -559,7 +727,7 @@ class PlaywrightExecutor:
             except Exception:
                 continue
         # Playwright applies this stylesheet only while composing the image.
-        # It reveals the tested page below the fixed 330px panel without
+        # It reveals the tested page below the floating panel without
         # mutating the live DOM, scrolling the page or leaving an opaque mask.
         screenshot_style = f"{self.PANEL_SELECTOR}{{visibility:hidden !important;}}"
         await self._page.screenshot(
@@ -579,10 +747,16 @@ class PlaywrightExecutor:
             """() => {
               const PANEL_SELECTOR = '#autojev-sidepanel,#autojev-intervention-panel,#autojev-live-panel';
               const panels = Array.from(document.querySelectorAll(PANEL_SELECTOR));
-              const previous = panels.map((panel) => panel.style.display);
+              const previous = panels.map((panel) => ({
+                value: panel.style.getPropertyValue('visibility'),
+                priority: panel.style.getPropertyPriority('visibility'),
+              }));
               // Esconde a UI do AutoJev de forma síncrona: nem os candidatos
-              // nem o texto visível a incluem, e nenhum repaint ocorre no meio.
-              panels.forEach((panel) => { panel.style.display = 'none'; });
+              // nem o texto visível a incluem. visibility preserva a geometria
+              // do overlay e evita o pisca causado por alternar display.
+              panels.forEach((panel) => {
+                panel.style.setProperty('visibility', 'hidden', 'important');
+              });
               let result;
               try {
                 const isVisible = (el) => {
@@ -709,7 +883,14 @@ class PlaywrightExecutor:
                 elements,
               };
               } finally {
-                panels.forEach((panel, index) => { panel.style.display = previous[index]; });
+                panels.forEach((panel, index) => {
+                  const state = previous[index];
+                  if (state.value) {
+                    panel.style.setProperty('visibility', state.value, state.priority);
+                  } else {
+                    panel.style.removeProperty('visibility');
+                  }
+                });
               }
             }"""
         )
@@ -917,6 +1098,7 @@ class PlaywrightExecutor:
         message = ""
         recorded_value = decision.value
         self._blocked_navigation_url = None
+        await self._set_sidepanel_automation(True)
         try:
             action = decision.action
             if action == "navigate":
@@ -1070,6 +1252,8 @@ class PlaywrightExecutor:
             message = f"Playwright executed {action} successfully"
         except Exception as exc:
             message = self._redact_text(f"{exc.__class__.__name__}: {exc}")[:2000]
+        finally:
+            await self._set_sidepanel_automation(False)
 
         assertion_results = await self._evaluate_assertions(decision.assertions)
         observation = await self.observe(decision.action)
@@ -1146,3 +1330,4 @@ class PlaywrightExecutor:
         self._pending_pages.clear()
         self._ref_selectors.clear()
         self._ref_semantics.clear()
+        self._sidepanel_init_installed = False

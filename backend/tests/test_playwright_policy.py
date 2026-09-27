@@ -146,6 +146,8 @@ async def test_observe_restricts_candidates_and_text_to_active_dialog(tmp_path: 
             assert "activeDialog && !activeDialog.contains(el)" in script
             assert "(activeDialog || document.body)?.innerText" in script
             assert "[data-testid],[data-test],[data-qa]" in script
+            assert "setProperty('visibility', 'hidden', 'important')" in script
+            assert "panel.style.display = 'none'" not in script
             return {
                 "title": "Orders",
                 "text": "Confirm order dialog",
@@ -178,6 +180,41 @@ async def test_observe_restricts_candidates_and_text_to_active_dialog(tmp_path: 
     assert executor._ref_selectors == {
         "e0": "div:nth-of-type(1) > button:nth-of-type(1)"
     }
+
+
+def test_sidepanel_is_floating_translucent_and_expands_on_attention(tmp_path: Path):
+    executor = PlaywrightExecutor(tmp_path, ExplorationOptions(), headless=False)
+
+    assert "position:fixed !important" in executor._SIDEPANEL_CSS
+    assert "translate3d(calc(100% - 58px),0,0)" in executor._SIDEPANEL_CSS
+    assert "opacity:.28" in executor._SIDEPANEL_CSS
+    assert "#autojev-sidepanel:hover" in executor._SIDEPANEL_CSS
+    assert "[data-mode='attention']" in executor._SIDEPANEL_CSS
+    assert "[data-automation='true']{pointer-events:none !important" in executor._SIDEPANEL_CSS
+    assert "[data-automation='true'] .autojev-panel-surface{opacity:0" in executor._SIDEPANEL_CSS
+    assert "height:100vh" not in executor._SIDEPANEL_CSS
+    assert "action.hidden = true" in executor._SIDEPANEL_INSTALLER
+    assert "window.top !== window" in executor._SIDEPANEL_INSTALLER
+
+
+async def test_sidepanel_bootstrap_is_installed_only_once(tmp_path: Path):
+    class Context:
+        def __init__(self):
+            self.scripts: list[str] = []
+
+        async def add_init_script(self, *, script):
+            self.scripts.append(script)
+
+    executor = PlaywrightExecutor(tmp_path, ExplorationOptions(), headless=False)
+    context = Context()
+    executor._context = context
+
+    await executor._install_sidepanel_bootstrap()
+    await executor._install_sidepanel_bootstrap()
+
+    assert len(context.scripts) == 1
+    assert "autojev-sidepanel" in context.scripts[0]
+    assert "DOMContentLoaded" in context.scripts[0]
 
 
 async def test_observe_normalizes_empty_anchor_href_like_stale_check(tmp_path: Path):
