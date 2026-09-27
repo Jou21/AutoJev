@@ -696,7 +696,7 @@ class ExplorationManager:
             )
             # Teto de teimosia: após N rejeições seguidas sem nenhuma ação
             # nova, encerra (o resto é fumaça do modelo, não exploração).
-            MAX_CONSECUTIVE_LOOP_REJECTIONS = 8
+            MAX_CONSECUTIVE_LOOP_REJECTIONS = 3
             coverage = CoveragePlanner(item["app_url"], options.focus_area)
             coverage.observe(observation)
             self.repository.add_event(
@@ -817,6 +817,32 @@ class ExplorationManager:
                     self._record_observation_issues(
                         exploration_id, observation, known_issues
                     )
+                # Coverage owns the mechanical definition of "nothing safe is
+                # left to visit". Asking the model for one more decision here
+                # used to let it request go_back from the authenticated root
+                # forever, even though the frontier was already exhausted.
+                if coverage.can_finish():
+                    terminal = ExplorationStatus.COMPLETED
+                    if coverage.coverage_complete():
+                        self.repository.add_event(
+                            exploration_id,
+                            "info",
+                            "coverage_complete",
+                            "Coverage frontier exhausted; exploration complete",
+                            coverage.context(observation),
+                        )
+                    else:
+                        self.repository.add_event(
+                            exploration_id,
+                            "warning",
+                            "coverage_complete_with_restrictions",
+                            "Reachable coverage exhausted; blocked controls were documented as restrictions",
+                            {
+                                "reason": "blocked_candidates",
+                                **coverage.context(observation),
+                            },
+                        )
+                    break
                 planning_attempts += 1
                 if (
                     max_planning_attempts is not None
@@ -949,7 +975,7 @@ class ExplorationManager:
                     coverage.state_key(observation),
                 )
                 action_counts[fingerprint] = action_counts.get(fingerprint, 0) + 1
-                if action_counts[fingerprint] > 2 and not is_restoration_action:
+                if action_counts[fingerprint] > 2:
                     consecutive_loop_rejections += 1
                     # Direciona o modelo para elementos ainda não tentados,
                     # em vez de só dizer "não" e desistir em seguida.
@@ -982,6 +1008,25 @@ class ExplorationManager:
                             "attempt": action_counts[fingerprint],
                         },
                     )
+                    if is_restoration_action:
+                        terminal = ExplorationStatus.FAILED
+                        error_message = (
+                            "O AutoJev interrompeu uma restauração repetida sem "
+                            "progresso para proteger o consumo de tokens."
+                        )
+                        self.repository.add_event(
+                            exploration_id,
+                            "error",
+                            "coverage_stalled",
+                            error_message,
+                            {
+                                "reason": "repeated_restoration",
+                                "action": decision.action,
+                                "target": decision.target,
+                                **coverage.context(observation),
+                            },
+                        )
+                        break
                     if consecutive_loop_rejections >= MAX_CONSECUTIVE_LOOP_REJECTIONS:
                         if options.max_steps is None:
                             terminal = ExplorationStatus.FAILED

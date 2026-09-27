@@ -1092,6 +1092,21 @@ def test_back_navigation_is_delayed_until_current_state_is_exhausted():
     assert reason == "premature_navigation_replaced"
 
 
+def test_go_back_from_exhausted_coverage_root_finishes_instead_of_crossing_boundary():
+    root = observation("https://app.test/inventory", [])
+    planner = CoveragePlanner(root.url)
+    planner.observe(root)
+
+    decision, reason = planner.reconcile(
+        root,
+        AgentDecision(action="go_back", rationale="leave root"),
+    )
+
+    assert decision.action == "finish"
+    assert reason == "root_backtrack_replaced_by_finish"
+    assert planner.can_finish() is True
+
+
 def test_transient_candidate_failure_retries_once_then_blocks_completion():
     page = observation(
         "https://app.test/dashboard",

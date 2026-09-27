@@ -182,18 +182,21 @@ async def test_observe_restricts_candidates_and_text_to_active_dialog(tmp_path: 
     }
 
 
-def test_sidepanel_is_floating_translucent_and_expands_on_attention(tmp_path: Path):
+def test_sidepanel_is_stable_click_controlled_and_expands_on_attention(tmp_path: Path):
     executor = PlaywrightExecutor(tmp_path, ExplorationOptions(), headless=False)
 
     assert "position:fixed !important" in executor._SIDEPANEL_CSS
-    assert "translate3d(calc(100% - 58px),0,0)" in executor._SIDEPANEL_CSS
-    assert "opacity:.28" in executor._SIDEPANEL_CSS
-    assert "#autojev-sidepanel:hover" in executor._SIDEPANEL_CSS
+    assert "translate3d(calc(100% - 54px),0,0)" in executor._SIDEPANEL_CSS
+    assert "opacity:.42" in executor._SIDEPANEL_CSS
+    assert "#autojev-sidepanel:hover" not in executor._SIDEPANEL_CSS
+    assert "transition:none !important" in executor._SIDEPANEL_CSS
     assert "[data-mode='attention']" in executor._SIDEPANEL_CSS
-    assert "[data-automation='true']{pointer-events:none !important" in executor._SIDEPANEL_CSS
-    assert "[data-automation='true'] .autojev-panel-surface{opacity:0" in executor._SIDEPANEL_CSS
+    assert "[data-automation='true'] *{pointer-events:none !important" in executor._SIDEPANEL_CSS
+    assert "[data-automation='true'] .autojev-panel-surface{opacity:0" not in executor._SIDEPANEL_CSS
     assert "height:100vh" not in executor._SIDEPANEL_CSS
     assert "action.hidden = true" in executor._SIDEPANEL_INSTALLER
+    assert "sessionStorage.setItem(PIN_KEY" in executor._SIDEPANEL_INSTALLER
+    assert "Clique no J para abrir" in executor._SIDEPANEL_INSTALLER
     assert "window.top !== window" in executor._SIDEPANEL_INSTALLER
 
 

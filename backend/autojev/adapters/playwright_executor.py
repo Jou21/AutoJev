@@ -160,41 +160,34 @@ class PlaywrightExecutor:
         "#autojev-sidepanel{all:initial;position:fixed !important;z-index:2147483647 !important;"
         "top:18px !important;right:18px !important;width:min(356px,calc(100vw - 28px)) !important;"
         "max-height:calc(100vh - 36px) !important;margin:0 !important;display:grid !important;"
-        "grid-template-columns:58px minmax(0,1fr) !important;box-sizing:border-box !important;"
+        "grid-template-columns:54px minmax(0,1fr) !important;box-sizing:border-box !important;"
         "color:#f7faf9 !important;font-family:Inter,ui-sans-serif,system-ui,-apple-system,sans-serif !important;"
-        "transform:translate3d(calc(100% - 58px),0,0);opacity:.28;filter:saturate(.7);"
-        "transition:transform .24s cubic-bezier(.2,.8,.2,1),opacity .2s ease,filter .2s ease;"
-        "pointer-events:auto !important;will-change:transform,opacity;contain:layout paint style;}"
+        "transform:translate3d(calc(100% - 54px),0,0);opacity:.42;filter:saturate(.82);"
+        "transition:none !important;pointer-events:none !important;contain:layout paint style;}"
         "#autojev-sidepanel,#autojev-sidepanel *{box-sizing:border-box !important;}"
-        "#autojev-sidepanel:hover,#autojev-sidepanel:focus-within,"
         "#autojev-sidepanel[data-pinned='true'],#autojev-sidepanel[data-mode='attention']{"
         "transform:translate3d(0,0,0);opacity:1;filter:saturate(1);}"
-        "#autojev-sidepanel[data-automation='true']{pointer-events:none !important;"
-        "transform:translate3d(calc(100% - 58px),0,0) !important;opacity:.28 !important;"
-        "filter:saturate(.7) !important;transition:none !important;}"
-        "#autojev-sidepanel .autojev-panel-rail{display:flex;min-height:172px;align-items:center;"
-        "flex-direction:column;gap:9px;padding:14px 8px;border:1px solid rgba(255,255,255,.12);"
-        "border-right:0;border-radius:18px 0 0 18px;background:rgba(10,16,18,.76);"
-        "box-shadow:-12px 18px 48px rgba(0,0,0,.28);backdrop-filter:blur(18px) saturate(1.25);"
+        "#autojev-sidepanel[data-automation='true'] *{pointer-events:none !important;}"
+        "#autojev-sidepanel .autojev-panel-rail{position:relative;display:grid;width:54px;height:54px;"
+        "min-height:54px;place-items:center;padding:7px;border:1px solid rgba(255,255,255,.16);"
+        "border-radius:16px 0 0 16px;background:rgba(10,16,18,.82);pointer-events:auto !important;"
+        "box-shadow:-10px 12px 34px rgba(0,0,0,.25);backdrop-filter:blur(18px) saturate(1.25);"
         "-webkit-backdrop-filter:blur(18px) saturate(1.25);cursor:pointer;}"
+        "#autojev-sidepanel .autojev-panel-rail:hover{background:rgba(10,16,18,.96);filter:saturate(1.25);}"
         "#autojev-sidepanel .autojev-rail-mark{display:grid;width:38px;height:38px;place-items:center;"
         "border:1px solid rgba(242,184,75,.5);border-radius:12px;background:linear-gradient(145deg,#2b2415,#17140e);"
         "box-shadow:0 0 26px rgba(242,184,75,.18);color:#f6c85c;font-size:15px;font-weight:850;}"
-        "#autojev-sidepanel .autojev-rail-status{width:8px;height:8px;border-radius:50%;"
+        "#autojev-sidepanel .autojev-rail-status{position:absolute;right:5px;bottom:5px;width:8px;height:8px;border-radius:50%;"
         "background:#42e5b5;box-shadow:0 0 0 5px rgba(66,229,181,.1),0 0 18px rgba(66,229,181,.65);}"
-        "#autojev-sidepanel .autojev-rail-label{margin-top:auto;color:#aab7b4;font-size:8px;"
-        "font-weight:750;letter-spacing:.16em;text-transform:uppercase;writing-mode:vertical-rl;"
-        "transform:rotate(180deg);}"
+        "#autojev-sidepanel .autojev-rail-label{display:none;}"
         "#autojev-sidepanel .autojev-panel-surface{min-width:0;max-height:calc(100vh - 36px);"
         "overflow:hidden auto;padding:17px;border:1px solid rgba(255,255,255,.13);border-radius:0 18px 18px 0;"
         "background:linear-gradient(155deg,rgba(18,27,29,.96),rgba(8,13,15,.94));"
         "box-shadow:-4px 18px 48px rgba(0,0,0,.38),inset 0 1px rgba(255,255,255,.04);"
         "backdrop-filter:blur(22px) saturate(1.35);-webkit-backdrop-filter:blur(22px) saturate(1.35);"
-        "scrollbar-width:thin;scrollbar-color:#3e4b4c transparent;opacity:0;transition:opacity .14s ease;}"
-        "#autojev-sidepanel:hover .autojev-panel-surface,#autojev-sidepanel:focus-within .autojev-panel-surface,"
+        "scrollbar-width:thin;scrollbar-color:#3e4b4c transparent;opacity:0;pointer-events:none !important;transition:none !important;}"
         "#autojev-sidepanel[data-pinned='true'] .autojev-panel-surface,"
-        "#autojev-sidepanel[data-mode='attention'] .autojev-panel-surface{opacity:1;}"
-        "#autojev-sidepanel[data-automation='true'] .autojev-panel-surface{opacity:0 !important;}"
+        "#autojev-sidepanel[data-mode='attention'] .autojev-panel-surface{opacity:1;pointer-events:auto !important;}"
         "#autojev-sidepanel .autojev-panel-header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;}"
         "#autojev-sidepanel .autojev-panel-kicker{display:flex;align-items:center;gap:7px;margin:0;color:#f4c65a;"
         "font-size:9px;font-weight:800;letter-spacing:.13em;text-transform:uppercase;}"
@@ -240,7 +233,7 @@ class PlaywrightExecutor:
         "width:calc(100vw - 20px) !important;max-height:calc(100vh - 20px) !important;"
         "grid-template-columns:52px minmax(0,1fr) !important;transform:translate3d(calc(100% - 52px),0,0);}"
         "#autojev-sidepanel .autojev-panel-surface{max-height:calc(100vh - 20px);padding:14px;}"
-        "#autojev-sidepanel .autojev-panel-rail{padding:12px 7px;}}"
+        "#autojev-sidepanel .autojev-panel-rail{width:52px;height:52px;min-height:52px;padding:7px;}}"
         "@media(prefers-reduced-motion:reduce){#autojev-sidepanel{transition:none !important;}}"
     )
 
@@ -257,6 +250,10 @@ class PlaywrightExecutor:
       const panel = document.createElement('aside');
       panel.id = ID;
       panel.dataset.mode = 'exploring';
+      const PIN_KEY = 'autojev-panel-open';
+      let savedPinned = false;
+      try { savedPinned = sessionStorage.getItem(PIN_KEY) === 'true'; } catch (error) {}
+      panel.dataset.pinned = savedPinned ? 'true' : 'false';
       panel.setAttribute('aria-label', 'Status da exploração do AutoJev');
       panel.setAttribute('aria-live', 'polite');
 
@@ -265,9 +262,15 @@ class PlaywrightExecutor:
       rail.setAttribute('role', 'button');
       rail.setAttribute('tabindex', '0');
       rail.setAttribute('aria-label', 'Expandir ou recolher painel do AutoJev');
+      rail.setAttribute('aria-expanded', savedPinned ? 'true' : 'false');
       rail.innerHTML = '<span class="autojev-rail-mark">J</span><span class="autojev-rail-status"></span><span class="autojev-rail-label">AutoJev</span>';
       const togglePinned = () => {
-        panel.dataset.pinned = panel.dataset.pinned === 'true' ? 'false' : 'true';
+        const next = panel.dataset.pinned !== 'true';
+        panel.dataset.pinned = next ? 'true' : 'false';
+        rail.setAttribute('aria-expanded', next ? 'true' : 'false');
+        const hint = document.getElementById('autojev-panel-hint');
+        if (hint && panel.dataset.mode !== 'attention') hint.textContent = next ? 'Clique no J para recolher' : 'Clique no J para abrir';
+        try { sessionStorage.setItem(PIN_KEY, next ? 'true' : 'false'); } catch (error) {}
       };
       rail.addEventListener('click', togglePinned);
       rail.addEventListener('keydown', (event) => {
@@ -279,6 +282,10 @@ class PlaywrightExecutor:
       panel.addEventListener('keydown', (event) => {
         if (event.key === 'Escape') {
           panel.dataset.pinned = 'false';
+          rail.setAttribute('aria-expanded', 'false');
+          const hint = document.getElementById('autojev-panel-hint');
+          if (hint) hint.textContent = 'Clique no J para abrir';
+          try { sessionStorage.setItem(PIN_KEY, 'false'); } catch (error) {}
           rail.focus();
         }
       });
@@ -293,7 +300,7 @@ class PlaywrightExecutor:
       const hint = document.createElement('span');
       hint.id = 'autojev-panel-hint';
       hint.className = 'autojev-panel-hint';
-      hint.textContent = 'Passe o mouse para acompanhar';
+      hint.textContent = savedPinned ? 'Clique no J para recolher' : 'Clique no J para abrir';
       header.append(kicker, hint);
 
       const title = document.createElement('h2');
@@ -492,12 +499,16 @@ class PlaywrightExecutor:
                   const kicker = document.getElementById('autojev-kicker-text');
                   if (kicker) kicker.textContent = 'AUTOJEV · EXPLORANDO';
                   const hint = document.getElementById('autojev-panel-hint');
-                  if (hint) hint.textContent = 'Passe o mouse para acompanhar';
+                  let savedPinned = false;
+                  try { savedPinned = sessionStorage.getItem('autojev-panel-open') === 'true'; } catch (error) {}
+                  if (hint) hint.textContent = savedPinned ? 'Clique no J para recolher' : 'Clique no J para abrir';
                   if (panel) {
                     panel.dataset.mode = 'exploring';
-                    panel.dataset.pinned = 'false';
+                    panel.dataset.pinned = savedPinned ? 'true' : 'false';
                     panel.setAttribute('aria-live', 'polite');
                   }
+                  const rail = panel?.querySelector('.autojev-panel-rail');
+                  if (rail) rail.setAttribute('aria-expanded', savedPinned ? 'true' : 'false');
                   const button = document.getElementById('autojev-action-button');
                   if (button) { button.disabled = false; button.textContent = 'Continuar exploração'; }
                 }"""

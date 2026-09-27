@@ -1051,6 +1051,26 @@ class CoveragePlanner:
             return restoration
         remaining = self._remaining(state)
 
+        # The coverage root is an application boundary, not a browser-history
+        # invitation. Once its local work is done, go_back would leave the
+        # tested application (or cross the authenticated login gate). Prefer a
+        # known remote frontier and otherwise finish deterministically.
+        if decision.action == "go_back" and len(self.path) <= 1 and not remaining:
+            backtrack = self._backtrack_decision()
+            if backtrack:
+                return backtrack[0], backtrack[1] or "root_backtrack_replaced"
+            if self.frontier_exhausted():
+                return (
+                    AgentDecision(
+                        action="finish",
+                        rationale=(
+                            "The reachable coverage frontier is exhausted; do not "
+                            "cross the application or authenticated-session boundary."
+                        ),
+                    ),
+                    "root_backtrack_replaced_by_finish",
+                )
+
         if decision.action == "finish":
             forced = self._forced_action(
                 state,
