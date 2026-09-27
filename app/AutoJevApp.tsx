@@ -253,6 +253,15 @@ function normalizeBaseUrl(url: string) {
   return url.replace(/\/$/, "");
 }
 
+function isOpenRouterUrl(value: string) {
+  try {
+    const hostname = new URL(value).hostname.toLowerCase();
+    return hostname === "openrouter.ai" || hostname.endsWith(".openrouter.ai");
+  } catch {
+    return false;
+  }
+}
+
 function normalizeTargetUrl(value: string) {
   const trimmed = value.trim();
   if (!trimmed) return "";
@@ -1520,6 +1529,7 @@ function ProviderCard({ provider, initiallyOpen, request, toast, reload }: { pro
   const [newModelLabel, setNewModelLabel] = useState("");
   const [busy, setBusy] = useState<"save" | "test" | "discover" | "delete" | "toggle" | "">("");
   const [dirty, setDirty] = useState(false);
+  const isOpenRouter = isOpenRouterUrl(baseUrl);
 
   useEffect(() => {
     setName(provider.name);
@@ -1531,6 +1541,26 @@ function ProviderCard({ provider, initiallyOpen, request, toast, reload }: { pro
   }, [provider]);
 
   const patchProvider = async (payload: Record<string, unknown>) => request(`/providers/${encodeURIComponent(provider.id)}`, { method: "PATCH", body: JSON.stringify(payload) });
+
+  const persistDraft = async (announce = false) => {
+    const payload: Record<string, unknown> = {
+      name,
+      base_url: baseUrl,
+      enabled,
+      models: providerModels.map((model) => ({
+        id: modelValue(model),
+        model_id: modelValue(model),
+        label: model.label || null,
+        enabled: model.enabled !== false,
+      })),
+    };
+    if (apiKey.trim()) payload.api_key = apiKey.trim();
+    await patchProvider(payload);
+    if (announce) toast("Configurações do provedor salvas.", "success");
+    setApiKey("");
+    setDirty(false);
+    await reload();
+  };
 
   const toggleEnabled = async (value: boolean) => {
     setEnabled(value);
@@ -1550,23 +1580,7 @@ function ProviderCard({ provider, initiallyOpen, request, toast, reload }: { pro
   const save = async () => {
     setBusy("save");
     try {
-      const payload: Record<string, unknown> = {
-        name,
-        base_url: baseUrl,
-        enabled,
-        models: providerModels.map((model) => ({
-          id: modelValue(model),
-          model_id: modelValue(model),
-          label: model.label || null,
-          enabled: model.enabled !== false,
-        })),
-      };
-      if (apiKey.trim()) payload.api_key = apiKey.trim();
-      await patchProvider(payload);
-      toast("Configurações do provedor salvas.", "success");
-      setApiKey("");
-      setDirty(false);
-      await reload();
+      await persistDraft(true);
     } catch (error) {
       toast(errorMessage(error), "error");
     } finally {
@@ -1577,6 +1591,7 @@ function ProviderCard({ provider, initiallyOpen, request, toast, reload }: { pro
   const test = async () => {
     setBusy("test");
     try {
+      if (dirty) await persistDraft();
       const result = await request<Record<string, unknown>>(`/providers/${encodeURIComponent(provider.id)}/test`, { method: "POST" });
       if (result?.ok === false) {
         throw new Error(String(result.message || "O provedor recusou o teste de conexão."));
@@ -1593,6 +1608,7 @@ function ProviderCard({ provider, initiallyOpen, request, toast, reload }: { pro
   const discover = async () => {
     setBusy("discover");
     try {
+      if (dirty) await persistDraft();
       const result = await request<unknown>(`/providers/${encodeURIComponent(provider.id)}/discover-models`, { method: "POST" });
       const discovered = listFrom<Model>(result, ["models", "items", "data"]);
       if (discovered.length) setProviderModels(discovered);
@@ -1658,7 +1674,7 @@ function ProviderCard({ provider, initiallyOpen, request, toast, reload }: { pro
             <label className="field-group"><span>Nome</span><input value={name} onChange={(event) => change(setName, event.target.value)} /></label>
             <label className="field-group"><span>Base URL</span><input type="url" value={baseUrl} onChange={(event) => change(setBaseUrl, event.target.value)} /></label>
           </div>
-          <label className="field-group api-key-field"><span>API key <small>{provider.api_key_configured || provider.has_api_key ? "· configurada" : "· opcional"}</small></span><div className="api-key-input"><KeyRound size={16} /><input type="password" value={apiKey} onChange={(event) => { setApiKey(event.target.value); if (event.target.value) setDirty(true); }} placeholder={provider.api_key_configured || provider.has_api_key ? "Deixe vazio para manter a chave atual" : "Cole a chave do endpoint"} autoComplete="new-password" /></div><em>A chave existente nunca é retornada pela API.</em></label>
+          <label className="field-group api-key-field"><span>API key <small>{provider.api_key_configured || provider.has_api_key ? "· configurada" : isOpenRouter ? "· obrigatória" : "· opcional"}</small></span><div className="api-key-input"><KeyRound size={16} /><input type="password" value={apiKey} onChange={(event) => { setApiKey(event.target.value); if (event.target.value) setDirty(true); }} placeholder={provider.api_key_configured || provider.has_api_key ? "Deixe vazio para manter a chave atual" : "Cole a chave do endpoint"} autoComplete="new-password" /></div><em>{isOpenRouter ? "Ao testar, a chave nova é salva e validada antes de qualquer exploração." : "A chave existente nunca é retornada pela API."}</em></label>
           <div className="provider-actions">
             <button className="button secondary small" type="button" onClick={() => void test()} disabled={!!busy}>{busy === "test" ? <Spinner /> : <Zap size={15} />}Testar conexão</button>
             <button className="button secondary small" type="button" onClick={() => void discover()} disabled={!!busy}>{busy === "discover" ? <Spinner /> : <WandSparkles size={15} />}Descobrir modelos</button>
@@ -1694,6 +1710,7 @@ function ProviderCard({ provider, initiallyOpen, request, toast, reload }: { pro
 function AddProviderModal({ request, onClose, onSaved, toast }: { request: ApiRequest; onClose: () => void; onSaved: () => Promise<void>; toast: (message: string, tone?: Toast["tone"]) => void }) {
   const [draft, setDraft] = useState<ProviderDraft>({ name: "OpenRouter", base_url: "https://openrouter.ai/api/v1", api_key: "", enabled: true });
   const [saving, setSaving] = useState(false);
+  const isOpenRouter = isOpenRouterUrl(draft.base_url);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setSaving(true);
@@ -1715,7 +1732,7 @@ function AddProviderModal({ request, onClose, onSaved, toast }: { request: ApiRe
       <form className="modal-form" onSubmit={submit}>
         <label className="field-group"><span>Nome do provedor</span><input required placeholder="Ex.: LiteLLM local" value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} /></label>
         <label className="field-group"><span>Base URL</span><input type="url" required placeholder="http://localhost:4000" value={draft.base_url} onChange={(event) => setDraft({ ...draft, base_url: event.target.value })} /></label>
-        <label className="field-group"><span>API key <small>opcional</small></span><input type="password" placeholder="A chave será armazenada somente pelo backend" value={draft.api_key} onChange={(event) => setDraft({ ...draft, api_key: event.target.value })} autoComplete="new-password" /></label>
+        <label className="field-group"><span>API key <small>{isOpenRouter ? "obrigatória" : "opcional"}</small></span><input type="password" required={isOpenRouter} placeholder="A chave será armazenada somente pelo backend" value={draft.api_key} onChange={(event) => setDraft({ ...draft, api_key: event.target.value })} autoComplete="new-password" /></label>
         <div className="modal-note"><ShieldCheck size={17} /><span>O AutoJev nunca exibe novamente uma chave salva.</span></div>
         <div className="modal-actions"><button type="button" className="button ghost" onClick={onClose}>Cancelar</button><button type="submit" className="button primary" disabled={saving}>{saving ? <><Spinner />Conectando…</> : <><Plus size={16} />Adicionar endpoint</>}</button></div>
       </form>

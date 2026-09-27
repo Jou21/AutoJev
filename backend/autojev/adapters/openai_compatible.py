@@ -160,6 +160,47 @@ class OpenAICompatibleClient:
             "cost_known": False,
         }
 
+    def _is_openrouter(self) -> bool:
+        hostname = (urlsplit(self.base_url).hostname or "").lower()
+        return hostname == "openrouter.ai" or hostname.endswith(".openrouter.ai")
+
+    async def validate_credentials(self) -> None:
+        """Valida chaves do OpenRouter em um endpoint que exige autenticação.
+
+        O catálogo de modelos é público e, sozinho, não prova que a chave
+        informada funciona. Sem esta verificação uma credencial inválida só
+        aparecia depois do login, na primeira decisão do JEV.
+        """
+
+        if not self._is_openrouter():
+            return
+        if not self.api_key:
+            raise ProviderConnectionError(
+                "O OpenRouter exige uma chave de API. Cole uma chave válida no "
+                "provedor e salve antes de iniciar a exploração."
+            )
+        origin = self.base_url.split("/api/", 1)[0].rstrip("/")
+        try:
+            async with httpx.AsyncClient(
+                timeout=self.timeout, follow_redirects=True
+            ) as client:
+                response = await client.get(
+                    f"{origin}/api/v1/key", headers=_headers(self.api_key)
+                )
+                if response.status_code in {401, 403}:
+                    raise ProviderConnectionError(
+                        "A chave do OpenRouter foi recusada. Gere uma nova chave em "
+                        "openrouter.ai/settings/keys, salve-a no provedor e teste "
+                        "a conexão novamente."
+                    )
+                response.raise_for_status()
+        except ProviderConnectionError:
+            raise
+        except httpx.HTTPError as exc:
+            raise ProviderConnectionError(
+                _safe_error(exc, [self.api_key])
+            ) from exc
+
     def _record_usage(self, body: dict[str, Any]) -> None:
         usage = body.get("usage") if isinstance(body, dict) else None
         if not isinstance(usage, dict):
@@ -190,6 +231,7 @@ class OpenAICompatibleClient:
         return usage
 
     async def list_models(self) -> list[dict[str, str]]:
+        await self.validate_credentials()
         try:
             async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
                 response = await client.get(
@@ -292,6 +334,8 @@ class OpenAICompatibleClient:
 
     async def test(self, model_id: str | None = None) -> dict[str, Any]:
         started = time.perf_counter()
+        if model_id:
+            await self.validate_credentials()
         if model_id and _is_jev_model(model_id):
             answers = await self.decisions(
                 model_id,

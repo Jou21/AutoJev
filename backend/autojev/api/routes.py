@@ -331,10 +331,19 @@ async def list_providers(request: Request) -> list[dict[str, Any]]:
 
 @router.post("/providers", status_code=status.HTTP_201_CREATED)
 async def create_provider(body: ProviderCreate, request: Request) -> dict[str, Any]:
+    api_key = body.api_key.get_secret_value() if body.api_key else None
+    try:
+        await OpenAICompatibleClient(
+            body.base_url,
+            api_key,
+            request.app.state.settings.http_timeout_seconds,
+        ).validate_credentials()
+    except ProviderConnectionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     provider = _repository(request).create_provider(
         name=body.name,
         base_url=body.base_url,
-        api_key=body.api_key.get_secret_value() if body.api_key else None,
+        api_key=api_key,
         enabled=body.enabled,
         models=[
             ProviderModel(id=model.id, label=model.label or model.id, enabled=model.enabled)
@@ -362,7 +371,22 @@ async def _update_provider(
             ProviderModel(id=model.id, label=model.label or model.id, enabled=model.enabled)
             for model in (body.models or [])
         ]
+    repository = _repository(request)
     try:
+        current = repository.get_provider(provider_id)
+        if fields & {"base_url", "api_key"}:
+            effective_base_url = body.base_url or current.base_url
+            if "api_key" in fields:
+                effective_api_key = (
+                    body.api_key.get_secret_value() if body.api_key else None
+                )
+            else:
+                effective_api_key = repository.get_provider_secret(provider_id)
+            await OpenAICompatibleClient(
+                effective_base_url,
+                effective_api_key,
+                request.app.state.settings.http_timeout_seconds,
+            ).validate_credentials()
         provider = _repository(request).update_provider(
             provider_id,
             name=body.name,
@@ -374,6 +398,8 @@ async def _update_provider(
         )
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ProviderConnectionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return _provider_payload(provider)
 
 
@@ -495,6 +521,27 @@ def _validate_selection(
         )
 
 
+async def _validate_exploration_credentials(
+    repository: SQLiteRepository,
+    selections: tuple[ModelSelection, ...],
+    timeout_seconds: float,
+) -> None:
+    """Falha antes de abrir o browser quando a credencial do provedor é inválida."""
+
+    checked: set[str] = set()
+    for selection in selections:
+        if selection.provider_id in checked:
+            continue
+        checked.add(selection.provider_id)
+        provider = repository.get_provider(selection.provider_id)
+        client = OpenAICompatibleClient(
+            provider.base_url,
+            repository.get_provider_secret(provider.id),
+            timeout_seconds,
+        )
+        await client.validate_credentials()
+
+
 @router.post("/explorations", status_code=status.HTTP_202_ACCEPTED)
 async def create_exploration(
     body: ExplorationCreate, request: Request
@@ -509,6 +556,14 @@ async def create_exploration(
     )
     _validate_selection(repository, agent, "JEV")
     _validate_selection(repository, auxiliary, "Auxiliary LLM")
+    try:
+        await _validate_exploration_credentials(
+            repository,
+            (agent, auxiliary),
+            request.app.state.settings.http_timeout_seconds,
+        )
+    except ProviderConnectionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     options = ExplorationOptions(**body.options.model_dump())
     domain_request = ExplorationRequest(
         app_url=body.app_url,

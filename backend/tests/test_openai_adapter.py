@@ -5,6 +5,7 @@ from autojev.adapters.openai_compatible import (
     OpenAIAuxiliaryScenarioGenerator,
     OpenAICompatibleClient,
     OpenAIJevAgent,
+    ProviderConnectionError,
     extract_json,
 )
 from autojev.domain.models import (
@@ -43,6 +44,36 @@ async def test_list_models_uses_openrouter_model_name(monkeypatch):
     ).list_models()
 
     assert models == [{"id": "openai/gpt-4o", "label": "GPT-4o"}]
+
+
+@pytest.mark.asyncio
+async def test_openrouter_catalog_does_not_mask_rejected_api_key(monkeypatch):
+    class FakeResponse:
+        status_code = 401
+
+        def raise_for_status(self):
+            raise AssertionError("401 must be translated before raise_for_status")
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, **_kwargs):
+            assert url == "https://openrouter.ai/api/v1/key"
+            return FakeResponse()
+
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kwargs: FakeClient())
+    client = OpenAICompatibleClient(
+        "https://openrouter.ai/api/v1", "sk-or-invalid"
+    )
+
+    with pytest.raises(
+        ProviderConnectionError, match="chave do OpenRouter foi recusada"
+    ):
+        await client.list_models()
 
 
 @pytest.mark.asyncio

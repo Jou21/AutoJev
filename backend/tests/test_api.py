@@ -2,8 +2,9 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from autojev.config import Settings
+from autojev.adapters.openai_compatible import ProviderConnectionError
 from autojev.api.routes import _phase_payload
+from autojev.config import Settings
 from autojev.main import create_app
 
 
@@ -60,6 +61,33 @@ def test_health_and_provider_crud_never_return_api_key(tmp_path):
 
         assert client.delete(f"/api/providers/{provider_id}").status_code == 204
         assert client.get(f"/api/providers/{provider_id}").status_code == 404
+
+
+def test_invalid_openrouter_key_is_not_saved(tmp_path, monkeypatch):
+    app = create_app(settings(tmp_path))
+
+    async def reject_key(_client):
+        raise ProviderConnectionError(
+            "A chave do OpenRouter foi recusada. Gere uma nova chave."
+        )
+
+    monkeypatch.setattr(
+        "autojev.adapters.openai_compatible.OpenAICompatibleClient.validate_credentials",
+        reject_key,
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/providers",
+            json={
+                "name": "OpenRouter",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key": "sk-or-invalid",
+            },
+        )
+
+        assert response.status_code == 422
+        assert "chave do OpenRouter foi recusada" in response.json()["detail"]
+        assert client.get("/api/providers").json() == []
 
 
 def test_exploration_request_does_not_echo_credentials(tmp_path):
@@ -173,6 +201,54 @@ def test_exploration_defaults_to_coverage_driven_without_fixed_limits(tmp_path):
         }
         assert payload["overall_progress"] == 0
         assert payload["current_step"] == "Etapa 0 · cobrindo até esgotar"
+
+
+def test_exploration_rejects_invalid_provider_key_before_browser_login(
+    tmp_path, monkeypatch
+):
+    app = create_app(settings(tmp_path))
+    with TestClient(app) as client:
+        provider = client.post(
+            "/api/providers",
+            json={
+                "name": "Provider",
+                "base_url": "https://provider.example/v1",
+                "api_key": "sk-or-invalid",
+                "models": [{"id": "typesafe/jev-1.13"}],
+            },
+        ).json()
+
+        async def reject_key(_client):
+            raise ProviderConnectionError(
+                "A chave do OpenRouter foi recusada. Gere uma nova chave."
+            )
+
+        monkeypatch.setattr(
+            "autojev.adapters.openai_compatible.OpenAICompatibleClient.validate_credentials",
+            reject_key,
+        )
+        submitted: list[str] = []
+        app.state.exploration_manager.submit = submitted.append
+
+        response = client.post(
+            "/api/explorations",
+            json={
+                "app_url": "https://example.test",
+                "agent": {
+                    "provider_id": provider["id"],
+                    "model_id": "typesafe/jev-1.13",
+                },
+                "auxiliary_llm": {
+                    "provider_id": provider["id"],
+                    "model_id": "typesafe/jev-1.13",
+                },
+            },
+        )
+
+        assert response.status_code == 422
+        assert "chave do OpenRouter foi recusada" in response.json()["detail"]
+        assert submitted == []
+        assert client.get("/api/explorations").json() == []
 
 
 def test_validation_errors_never_echo_secrets(tmp_path):
