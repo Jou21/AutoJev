@@ -144,9 +144,10 @@ async def test_observe_restricts_candidates_and_text_to_active_dialog(tmp_path: 
         async def evaluate(self, script):
             assert "dialog[open],[role=\"dialog\"]" in script
             assert "activeDialog && !activeDialog.contains(el)" in script
-            assert "(activeDialog || document.body)?.innerText" in script
+            assert "const textRoot = activeDialog || document.body" in script
+            assert "parent.closest(PANEL_SELECTOR)" in script
             assert "[data-testid],[data-test],[data-qa]" in script
-            assert "setProperty('visibility', 'hidden', 'important')" in script
+            assert "setProperty('visibility', 'hidden', 'important')" not in script
             assert "panel.style.display = 'none'" not in script
             return {
                 "title": "Orders",
@@ -407,7 +408,7 @@ async def test_locator_rejects_stale_semantic_ref(tmp_path: Path, actual: dict):
         await executor._locator("e0")
 
 
-async def test_capture_hides_overlay_with_screenshot_only_style(tmp_path: Path):
+async def test_capture_never_mutates_live_panel_visibility(tmp_path: Path):
     class EmptyLocator:
         async def count(self):
             return 0
@@ -427,10 +428,9 @@ async def test_capture_hides_overlay_with_screenshot_only_style(tmp_path: Path):
     page = Page()
     executor._page = page
 
-    filename = await executor._capture("sem overlay")
+    filename = await executor._capture("painel estavel")
 
-    assert filename == "001-sem-overlay.png"
+    assert filename == "001-painel-estavel.png"
     assert page.screenshot_options["full_page"] is False
     assert page.screenshot_options["mask"] == []
-    assert "#autojev-sidepanel" in page.screenshot_options["style"]
-    assert "visibility:hidden !important" in page.screenshot_options["style"]
+    assert "style" not in page.screenshot_options

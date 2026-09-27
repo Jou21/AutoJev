@@ -25,8 +25,8 @@ class BrowserUnavailableError(RuntimeError):
 class PlaywrightExecutor:
     """The sole component permitted to perform browser actions."""
 
-    # IDs de UI própria injetada no site. Nunca entram em observações,
-    # candidatos de ação, texto visível ou screenshots de evidência.
+    # IDs de UI própria injetada no site. Nunca entram no texto ou nos
+    # candidatos da observação entregues ao JEV.
     PANEL_SELECTOR = "#autojev-sidepanel,#autojev-intervention-panel,#autojev-live-panel"
 
     def __init__(
@@ -751,16 +751,15 @@ class PlaywrightExecutor:
                     masks.append(text_locator)
             except Exception:
                 continue
-        # Playwright applies this stylesheet only while composing the image.
-        # It reveals the tested page below the floating panel without
-        # mutating the live DOM, scrolling the page or leaving an opaque mask.
-        screenshot_style = f"{self.PANEL_SELECTOR}{{visibility:hidden !important;}}"
+        # Do not inject screenshot-only visibility styles. Chromium briefly
+        # paints those styles in the live window and makes the panel flash.
+        # In headed runs the stable status panel may therefore appear in the
+        # evidence image; that is preferable to mutating the user's viewport.
         await self._page.screenshot(
             path=str(path),
             full_page=self.headless,
             mask=masks,
             mask_color="#101416",
-            style=screenshot_style,
             timeout=20_000,
         )
         return filename
@@ -771,28 +770,18 @@ class PlaywrightExecutor:
         snapshot = await self._page.evaluate(
             """() => {
               const PANEL_SELECTOR = '#autojev-sidepanel,#autojev-intervention-panel,#autojev-live-panel';
-              const panels = Array.from(document.querySelectorAll(PANEL_SELECTOR));
-              const previous = panels.map((panel) => ({
-                value: panel.style.getPropertyValue('visibility'),
-                priority: panel.style.getPropertyPriority('visibility'),
-              }));
-              // Esconde a UI do AutoJev de forma síncrona: nem os candidatos
-              // nem o texto visível a incluem. visibility preserva a geometria
-              // do overlay e evita o pisca causado por alternar display.
-              panels.forEach((panel) => {
-                panel.style.setProperty('visibility', 'hidden', 'important');
-              });
-              let result;
-              try {
-                const isVisible = (el) => {
-                  const style = getComputedStyle(el);
-                  const box = el.getBoundingClientRect();
-                  return el.getAttribute('aria-hidden') !== 'true'
-                    && style.visibility !== 'hidden'
-                    && style.display !== 'none'
-                    && box.width > 0
-                    && box.height > 0;
-                };
+              // Nunca altera a renderização do painel durante a observação.
+              // A UI do AutoJev é excluída apenas da cópia lógica entregue ao
+              // JEV, evitando o flash de visibility:hidden a cada etapa.
+              const isVisible = (el) => {
+                const style = getComputedStyle(el);
+                const box = el.getBoundingClientRect();
+                return el.getAttribute('aria-hidden') !== 'true'
+                  && style.visibility !== 'hidden'
+                  && style.display !== 'none'
+                  && box.width > 0
+                  && box.height > 0;
+              };
                 const visibleDialogs = Array.from(document.querySelectorAll(
                   'dialog[open],[role="dialog"]'
                 )).filter(isVisible);
@@ -902,21 +891,25 @@ class PlaywrightExecutor:
                   _selector: selectorFor(el),
                 };
               });
+              const textRoot = activeDialog || document.body;
+              const textParts = [];
+              let textLength = 0;
+              const walker = document.createTreeWalker(textRoot, NodeFilter.SHOW_TEXT);
+              let textNode;
+              while ((textNode = walker.nextNode()) && textLength < 12000) {
+                const parent = textNode.parentElement;
+                const value = (textNode.nodeValue || '').trim();
+                if (!parent || !value || parent.closest(PANEL_SELECTOR)) continue;
+                if (['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE'].includes(parent.tagName)) continue;
+                if (!isVisible(parent)) continue;
+                textParts.push(value);
+                textLength += value.length + 1;
+              }
               return {
                 title: document.title || '',
-                text: ((activeDialog || document.body)?.innerText || '').slice(0, 12000),
+                text: textParts.join(' ').replace(/\\s+/g, ' ').slice(0, 12000),
                 elements,
               };
-              } finally {
-                panels.forEach((panel, index) => {
-                  const state = previous[index];
-                  if (state.value) {
-                    panel.style.setProperty('visibility', state.value, state.priority);
-                  } else {
-                    panel.style.removeProperty('visibility');
-                  }
-                });
-              }
             }"""
         )
         screenshot = await self._capture(screenshot_label)

@@ -47,6 +47,45 @@ def test_action_fingerprint_scopes_reused_refs_to_semantic_state():
     assert modal != submenu
 
 
+def test_successful_restorations_never_accumulate_as_a_stalled_loop():
+    streak = 0
+    for _ in range(5):
+        streak = ExplorationManager._next_failed_restoration_streak(
+            streak,
+            is_restoration=True,
+            success=True,
+            state_changed=True,
+        )
+
+    assert streak == 0
+
+
+def test_only_consecutive_restorations_without_progress_trip_the_guard():
+    streak = ExplorationManager._next_failed_restoration_streak(
+        0,
+        is_restoration=True,
+        success=False,
+        state_changed=False,
+    )
+    streak = ExplorationManager._next_failed_restoration_streak(
+        streak,
+        is_restoration=True,
+        success=True,
+        state_changed=False,
+    )
+
+    assert streak == 2
+    assert (
+        ExplorationManager._next_failed_restoration_streak(
+            streak,
+            is_restoration=True,
+            success=True,
+            state_changed=True,
+        )
+        == 0
+    )
+
+
 def test_observable_state_delta_becomes_verified_pass_evidence():
     decision = AgentDecision(action="click", target="e0", rationale="Open details")
     result = ActionResult(

@@ -299,6 +299,20 @@ class ExplorationManager:
         return hashlib.sha256(raw.encode()).hexdigest()
 
     @staticmethod
+    def _next_failed_restoration_streak(
+        current: int,
+        *,
+        is_restoration: bool,
+        success: bool,
+        state_changed: bool,
+    ) -> int:
+        """Count only consecutive restoration attempts that made no progress."""
+
+        if is_restoration and (not success or not state_changed):
+            return current + 1
+        return 0
+
+    @staticmethod
     def _is_jev_model(model_id: str) -> bool:
         return model_id.removeprefix("~").startswith("typesafe/jev-")
 
@@ -688,6 +702,7 @@ class ExplorationManager:
             authentication_boundary_crossed = False
             actions_executed = 0
             consecutive_loop_rejections = 0
+            consecutive_failed_restorations = 0
             planning_attempts = 0
             max_planning_attempts = (
                 max(options.max_steps * 6, 30)
@@ -975,7 +990,7 @@ class ExplorationManager:
                     coverage.state_key(observation),
                 )
                 action_counts[fingerprint] = action_counts.get(fingerprint, 0) + 1
-                if action_counts[fingerprint] > 2:
+                if action_counts[fingerprint] > 2 and not is_restoration_action:
                     consecutive_loop_rejections += 1
                     # Direciona o modelo para elementos ainda não tentados,
                     # em vez de só dizer "não" e desistir em seguida.
@@ -1008,25 +1023,6 @@ class ExplorationManager:
                             "attempt": action_counts[fingerprint],
                         },
                     )
-                    if is_restoration_action:
-                        terminal = ExplorationStatus.FAILED
-                        error_message = (
-                            "O AutoJev interrompeu uma restauração repetida sem "
-                            "progresso para proteger o consumo de tokens."
-                        )
-                        self.repository.add_event(
-                            exploration_id,
-                            "error",
-                            "coverage_stalled",
-                            error_message,
-                            {
-                                "reason": "repeated_restoration",
-                                "action": decision.action,
-                                "target": decision.target,
-                                **coverage.context(observation),
-                            },
-                        )
-                        break
                     if consecutive_loop_rejections >= MAX_CONSECUTIVE_LOOP_REJECTIONS:
                         if options.max_steps is None:
                             terminal = ExplorationStatus.FAILED
@@ -1111,6 +1107,14 @@ class ExplorationManager:
                 actions_executed += 1
                 coverage.record_action(observation, decision, result, next_observation)
                 coverage_after = coverage.context(next_observation)
+                consecutive_failed_restorations = (
+                    self._next_failed_restoration_streak(
+                        consecutive_failed_restorations,
+                        is_restoration=is_restoration_action,
+                        success=result.success,
+                        state_changed=state_changed,
+                    )
+                )
                 consecutive_loop_rejections = 0
                 self.repository.update_exploration(
                     exploration_id,
@@ -1189,6 +1193,25 @@ class ExplorationManager:
                         (next_observation, decision, result, scenario_number)
                     )
                 observation = next_observation
+                if consecutive_failed_restorations >= 2:
+                    terminal = ExplorationStatus.FAILED
+                    error_message = (
+                        "O AutoJev interrompeu duas restaurações consecutivas sem "
+                        "progresso para proteger o consumo de tokens."
+                    )
+                    self.repository.add_event(
+                        exploration_id,
+                        "error",
+                        "coverage_stalled",
+                        error_message,
+                        {
+                            "reason": "consecutive_failed_restorations",
+                            "action": decision.action,
+                            "target": decision.target,
+                            **coverage.context(observation),
+                        },
+                    )
+                    break
             else:
                 terminal = ExplorationStatus.PARTIAL
                 self.repository.add_event(
