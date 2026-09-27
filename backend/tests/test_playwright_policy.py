@@ -193,6 +193,8 @@ def test_sidepanel_is_stable_click_controlled_and_expands_on_attention(tmp_path:
     assert "[data-mode='attention']" in executor._SIDEPANEL_CSS
     assert "[data-automation='true'] *{pointer-events:none !important" in executor._SIDEPANEL_CSS
     assert "[data-automation='true'] .autojev-panel-surface{opacity:0" not in executor._SIDEPANEL_CSS
+    assert "box-shadow:-4px 18px 48px" not in executor._SIDEPANEL_CSS
+    assert "box-shadow:-10px 12px 34px" not in executor._SIDEPANEL_CSS
     assert "height:100vh" not in executor._SIDEPANEL_CSS
     assert "action.hidden = true" in executor._SIDEPANEL_INSTALLER
     assert "sessionStorage.setItem(PIN_KEY" in executor._SIDEPANEL_INSTALLER
