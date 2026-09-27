@@ -191,10 +191,20 @@ def test_sidepanel_is_stable_click_controlled_and_expands_on_attention(tmp_path:
     assert "#autojev-sidepanel:hover" not in executor._SIDEPANEL_CSS
     assert "transition:none !important" in executor._SIDEPANEL_CSS
     assert "[data-mode='attention']" in executor._SIDEPANEL_CSS
-    assert "[data-automation='true'] *{pointer-events:none !important" in executor._SIDEPANEL_CSS
+    automation_rule = (
+        "#autojev-sidepanel[data-automation='true'] .autojev-panel-rail,"
+        "#autojev-sidepanel[data-automation='true'] .autojev-panel-surface,"
+        "#autojev-sidepanel[data-automation='true'] .autojev-panel-surface *"
+        "{pointer-events:none !important;}"
+    )
+    assert automation_rule in executor._SIDEPANEL_CSS
+    assert executor._SIDEPANEL_CSS.index(automation_rule) > executor._SIDEPANEL_CSS.index(
+        "pointer-events:auto !important"
+    )
     assert "[data-automation='true'] .autojev-panel-surface{opacity:0" not in executor._SIDEPANEL_CSS
     assert "box-shadow:-4px 18px 48px" not in executor._SIDEPANEL_CSS
     assert "box-shadow:-10px 12px 34px" not in executor._SIDEPANEL_CSS
+    assert "box-shadow:-12px 18px 55px" not in executor._SIDEPANEL_CSS
     assert "height:100vh" not in executor._SIDEPANEL_CSS
     assert "action.hidden = true" in executor._SIDEPANEL_INSTALLER
     assert "sessionStorage.setItem(PIN_KEY" in executor._SIDEPANEL_INSTALLER
@@ -220,6 +230,31 @@ async def test_sidepanel_bootstrap_is_installed_only_once(tmp_path: Path):
     assert len(context.scripts) == 1
     assert "autojev-sidepanel" in context.scripts[0]
     assert "DOMContentLoaded" in context.scripts[0]
+
+
+async def test_automation_makes_panel_hit_targets_click_through(tmp_path: Path):
+    class Page:
+        def __init__(self):
+            self.script = ""
+            self.active = None
+
+        async def evaluate(self, script, active):
+            self.script = script
+            self.active = active
+
+    executor = PlaywrightExecutor(
+        tmp_path, ExplorationOptions(capture_screenshots=False), headless=False
+    )
+    page = Page()
+    executor._page = page
+
+    await executor._set_sidepanel_automation(True)
+
+    assert page.active is True
+    assert "autojev-panel-rail" in page.script
+    assert "autojev-panel-surface" in page.script
+    assert "setProperty('pointer-events', 'none', 'important')" in page.script
+    assert "removeProperty('pointer-events')" in page.script
 
 
 async def test_observe_normalizes_empty_anchor_href_like_stale_check(tmp_path: Path):

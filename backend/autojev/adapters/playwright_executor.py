@@ -167,7 +167,6 @@ class PlaywrightExecutor:
         "#autojev-sidepanel,#autojev-sidepanel *{box-sizing:border-box !important;}"
         "#autojev-sidepanel[data-pinned='true'],#autojev-sidepanel[data-mode='attention']{"
         "transform:translate3d(0,0,0);opacity:1;filter:saturate(1);}"
-        "#autojev-sidepanel[data-automation='true'] *{pointer-events:none !important;}"
         "#autojev-sidepanel .autojev-panel-rail{position:relative;display:grid;width:54px;height:54px;"
         "min-height:54px;place-items:center;padding:7px;border:1px solid rgba(255,255,255,.16);"
         "border-radius:16px 0 0 16px;background:rgba(10,16,18,.82);pointer-events:auto !important;"
@@ -226,9 +225,12 @@ class PlaywrightExecutor:
         "#autojev-sidepanel li:before{position:absolute;top:9px;bottom:9px;left:0;width:2px;border-radius:2px;"
         "background:#f0b84b;content:'';}"
         "#autojev-sidepanel[data-mode='attention'] .autojev-panel-rail{border-color:rgba(242,184,75,.5);"
-        "background:rgba(30,24,12,.92);box-shadow:-12px 18px 55px rgba(242,184,75,.16);}"
+        "background:rgba(30,24,12,.92);box-shadow:inset 0 1px rgba(255,255,255,.04);}"
         "#autojev-sidepanel[data-mode='attention'] .autojev-rail-status{background:#f6c655;"
         "box-shadow:0 0 0 5px rgba(246,198,85,.12),0 0 20px rgba(246,198,85,.8);}"
+        "#autojev-sidepanel[data-automation='true'] .autojev-panel-rail,"
+        "#autojev-sidepanel[data-automation='true'] .autojev-panel-surface,"
+        "#autojev-sidepanel[data-automation='true'] .autojev-panel-surface *{pointer-events:none !important;}"
         "@media(max-width:620px){#autojev-sidepanel{top:10px !important;right:10px !important;"
         "width:calc(100vw - 20px) !important;max-height:calc(100vh - 20px) !important;"
         "grid-template-columns:52px minmax(0,1fr) !important;transform:translate3d(calc(100% - 52px),0,0);}"
@@ -390,7 +392,19 @@ class PlaywrightExecutor:
             await self._page.evaluate(
                 """(active) => {
                   const panel = document.getElementById('autojev-sidepanel');
-                  if (panel) panel.dataset.automation = active ? 'true' : 'false';
+                  if (!panel) return;
+                  panel.dataset.automation = active ? 'true' : 'false';
+                  const hitTargets = [
+                    panel.querySelector('.autojev-panel-rail'),
+                    panel.querySelector('.autojev-panel-surface'),
+                  ].filter(Boolean);
+                  for (const target of hitTargets) {
+                    if (active) {
+                      target.style.setProperty('pointer-events', 'none', 'important');
+                    } else {
+                      target.style.removeProperty('pointer-events');
+                    }
+                  }
                 }""",
                 active,
             )
