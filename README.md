@@ -108,9 +108,10 @@ outside the executable frontier.
 Scenario verdicts come from Playwright evidence, not from model prose. A
 successful action with verified assertions or an observable state change is
 `PASS`; a failed assertion or ordinary execution failure is `FAIL`; a policy or
-unavailable control is `BLOCKED`; and a successful action without verifiable
-evidence is `SKIPPED`. Internal backtracking/replay actions do not become test
-scenarios.
+unavailable control is `BLOCKED`. A successful no-op without verifiable
+evidence is recorded in the activity timeline but does not become a test case;
+`SKIPPED` remains supported only for historical/imported reports. Internal
+backtracking/replay actions never become test scenarios.
 
 Prompt, completion and total tokens are accumulated for both models. The live
 browser panel and React sidebar show the running usage; exploration views and

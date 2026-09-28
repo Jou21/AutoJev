@@ -162,6 +162,268 @@ def test_state_delta_with_correlated_browser_error_is_fail_evidence():
     assert scenario.status == ScenarioStatus.FAIL
 
 
+def test_new_browser_error_without_visual_delta_is_still_fail_evidence():
+    decision = AgentDecision(action="click", target="e1", rationale="Load data")
+    result = ActionResult(
+        action="click",
+        success=True,
+        started_at=utc_now(),
+        finished_at=utc_now(),
+        before_url="https://app.test/orders",
+        after_url="https://app.test/orders",
+    )
+    observation = Observation(
+        url=result.after_url,
+        title="Orders",
+        text="Orders",
+        interactive_elements=[],
+        network_errors=[
+            {
+                "type": "http",
+                "url": "https://app.test/api/orders",
+                "status_code": 500,
+            }
+        ],
+    )
+
+    ExplorationManager._append_observable_state_evidence(
+        result,
+        decision,
+        observation,
+        state_changed=False,
+        capture_console_errors=True,
+        capture_network_errors=True,
+        new_issues=observation.network_errors,
+    )
+
+    assert [item.kind for item in result.assertions] == ["no_new_browser_errors"]
+    assert result.assertions[0].passed is False
+    assert ExplorationManager._scenario_capture_policy(
+        decision_source="jev",
+        is_restoration_action=False,
+        result=result,
+    ) == (True, None)
+    assert (
+        ExplorationManager._scenario_from_evidence(
+            observation, decision, result, 3
+        ).status
+        == ScenarioStatus.FAIL
+    )
+
+
+def test_issue_emitted_while_jev_plans_does_not_fail_the_following_action():
+    class RecordingRepository:
+        def __init__(self):
+            self.issues = []
+            self.events = []
+
+        def add_issue(self, exploration_id, issue):
+            self.issues.append(issue)
+
+        def add_event(self, exploration_id, level, event_type, message, payload=None):
+            self.events.append((event_type, payload or {}))
+
+    manager = object.__new__(ExplorationManager)
+    manager.repository = RecordingRepository()
+    known = set()
+    first = Observation(
+        url="https://app.test/orders",
+        title="Orders",
+        text="Ready",
+        interactive_elements=[],
+        console_errors=[
+            {
+                "type": "console",
+                "message": (
+                    "Failed to load resource: the server responded with a "
+                    "status of 401 (Unauthorized)"
+                ),
+                "url": "https://app.test/orders",
+                "occurred_at": "2026-01-01T12:00:00.100000+00:00",
+            }
+        ],
+        network_errors=[
+            {
+                "type": "http",
+                "method": "POST",
+                "message": "POST returned HTTP 401",
+                "url": "https://telemetry.test/events",
+                "status_code": 401,
+                "occurred_at": "2026-01-01T12:00:00.120000+00:00",
+            }
+        ],
+        screenshot="initial.png",
+    )
+
+    baseline = manager._record_observation_issues("run-1", first, known)
+
+    assert len(baseline) == 1
+    assert baseline[0]["type"] == "http"
+    assert baseline[0]["evidence_channels"] == ["network", "console"]
+    assert baseline[0]["related_console_errors"][0]["type"] == "console"
+    assert len(manager.repository.issues) == 1
+
+    recurring = Observation(
+        url=first.url,
+        title=first.title,
+        text=first.text,
+        interactive_elements=[],
+        console_errors=[
+            {
+                **first.console_errors[0],
+                "occurred_at": "2026-01-01T12:01:00.100000+00:00",
+            }
+        ],
+        network_errors=[
+            {
+                **first.network_errors[0],
+                "occurred_at": "2026-01-01T12:01:00.120000+00:00",
+            }
+        ],
+    )
+    action_issues = manager._issues_relevant_to_action(
+        recurring, "2026-01-01T12:01:01+00:00"
+    )
+    new_issues = manager._record_observation_issues("run-1", recurring, known)
+    result = ActionResult(
+        action="click",
+        success=True,
+        started_at="2026-01-01T12:01:01+00:00",
+        finished_at=utc_now(),
+        before_url="https://app.test/orders",
+        after_url="https://app.test/orders/1",
+    )
+
+    manager._append_observable_state_evidence(
+        result,
+        AgentDecision(action="click", target="e1", rationale="Open order"),
+        recurring,
+        state_changed=True,
+        capture_console_errors=True,
+        capture_network_errors=True,
+        new_issues=action_issues,
+    )
+    manager._keep_only_new_observation_issues(recurring, action_issues)
+
+    assert new_issues == []
+    assert action_issues == []
+    assert len(manager.repository.issues) == 1
+    assert result.assertions[-1].passed is True
+    assert result.assertions[-1].actual == {
+        "console_errors": 0,
+        "network_errors": 0,
+    }
+    assert recurring.console_errors == []
+    assert recurring.network_errors == []
+
+
+def test_repeated_nonbaseline_first_party_failure_remains_action_evidence():
+    observation = Observation(
+        url="https://app.test/orders",
+        title="Orders",
+        text="Orders",
+        interactive_elements=[],
+        network_errors=[
+            {
+                "type": "http",
+                "method": "GET",
+                "message": "GET returned HTTP 500",
+                "url": "https://app.test/api/orders",
+                "status_code": 500,
+            }
+        ],
+    )
+    first_action = ExplorationManager._issues_relevant_to_action(observation)
+    later_action = ExplorationManager._issues_relevant_to_action(observation)
+
+    assert len(first_action) == 1
+    assert len(later_action) == 1
+
+
+def test_action_issue_attribution_excludes_errors_emitted_before_action_start():
+    observation = Observation(
+        url="https://app.test/orders",
+        title="Orders",
+        text="Orders",
+        interactive_elements=[],
+        network_errors=[
+            {
+                "type": "http",
+                "method": "POST",
+                "message": "POST returned HTTP 401",
+                "url": "https://telemetry.test/events",
+                "status_code": 401,
+                "occurred_at": "2026-01-01T12:00:00+00:00",
+            },
+            {
+                "type": "http",
+                "method": "GET",
+                "message": "GET returned HTTP 500",
+                "url": "https://app.test/api/orders",
+                "status_code": 500,
+                "occurred_at": "2026-01-01T12:00:02+00:00",
+            },
+        ],
+    )
+
+    relevant = ExplorationManager._issues_relevant_to_action(
+        observation,
+        "2026-01-01T12:00:01+00:00",
+    )
+
+    assert [issue["status_code"] for issue in relevant] == [500]
+
+
+def test_scenario_capture_policy_excludes_mechanics_and_successful_noops():
+    success_noop = ActionResult(
+        action="click",
+        success=True,
+        started_at=utc_now(),
+        finished_at=utc_now(),
+        before_url="https://app.test/cart",
+        after_url="https://app.test/cart",
+    )
+    failed = ActionResult(
+        action="click",
+        success=False,
+        started_at=utc_now(),
+        finished_at=utc_now(),
+        before_url="https://app.test/cart",
+        after_url="https://app.test/cart",
+        message="Timeout",
+    )
+    blocked = ActionResult(
+        action="go_back",
+        success=False,
+        started_at=utc_now(),
+        finished_at=utc_now(),
+        before_url="https://app.test/cart",
+        after_url="https://app.test/cart",
+        message="PolicyBlocked: authentication boundary",
+    )
+
+    assert ExplorationManager._scenario_capture_policy(
+        decision_source="coverage",
+        is_restoration_action=False,
+        result=failed,
+    ) == (False, "mechanical_coverage_action")
+    assert ExplorationManager._scenario_capture_policy(
+        decision_source="jev",
+        is_restoration_action=False,
+        result=success_noop,
+    ) == (False, "successful_action_without_verifiable_evidence")
+    assert ExplorationManager._scenario_capture_policy(
+        decision_source="jev",
+        is_restoration_action=False,
+        result=failed,
+    ) == (True, None)
+    assert ExplorationManager._scenario_capture_policy(
+        decision_source="jev",
+        is_restoration_action=False,
+        result=blocked,
+    ) == (True, None)
+
+
 @pytest.mark.asyncio
 async def test_all_local_scenarios_are_persisted_before_auxiliary_enrichment():
     class RecordingRepository:

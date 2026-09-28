@@ -1,11 +1,10 @@
 from pathlib import Path
 
-from fastapi.testclient import TestClient
-
 from autojev.adapters.openai_compatible import ProviderConnectionError
 from autojev.api.routes import _phase_payload
 from autojev.config import Settings
 from autojev.main import create_app
+from fastapi.testclient import TestClient
 
 
 def settings(tmp_path: Path) -> Settings:
@@ -323,3 +322,101 @@ def test_phase_payload_keeps_exhaustive_exploration_progress_indeterminate():
         "percentage": None,
     }
     assert payload["overall_progress"] is None
+
+
+def test_phase_payload_exposes_completed_with_restrictions():
+    payload = _phase_payload(
+        {
+            "status": "completed",
+            "steps_completed": 90,
+            "options": {"max_steps": None},
+            "scenarios": [],
+        },
+        [
+            {
+                "type": "coverage_complete_with_restrictions",
+                "message": "Reachable coverage exhausted with restrictions",
+                "payload": {
+                    "candidates_blocked": 7,
+                    "restorations_abandoned": 2,
+                },
+            }
+        ],
+    )
+
+    assert payload["phase_label"] == "Exploração concluída com restrições"
+    assert "controles" in payload["phase_description"]
+    assert payload["completion"] == {
+        "type": "coverage_complete_with_restrictions",
+        "reason": None,
+        "message": "Reachable coverage exhausted with restrictions",
+        "known_states": None,
+        "frontier_states": None,
+        "frontier_candidates": None,
+        "blocked_candidates": 7,
+        "restorations_abandoned": 2,
+    }
+
+
+def test_phase_payload_uses_history_completion_summary_without_full_event_list():
+    payload = _phase_payload(
+        {
+            "status": "completed",
+            "steps_completed": 12,
+            "options": {"max_steps": None},
+            "completion_event": {
+                "type": "coverage_complete_with_restrictions",
+                "message": "Coverage completed with restrictions",
+                "payload": {"candidates_blocked": 4},
+            },
+        },
+        [],
+    )
+
+    assert payload["phase_label"] == "Exploração concluída com restrições"
+    assert payload["completion"]["type"] == "coverage_complete_with_restrictions"
+    assert payload["completion"]["blocked_candidates"] == 4
+
+
+def test_cancelled_history_does_not_reuse_an_earlier_coverage_completion():
+    stale = {
+        "type": "coverage_complete_with_restrictions",
+        "message": "Coverage was exhausted before post-processing",
+        "payload": {"candidates_blocked": 4},
+    }
+
+    payload = _phase_payload(
+        {
+            "status": "cancelled",
+            "steps_completed": 12,
+            "options": {"max_steps": None},
+            "completion_event": stale,
+            "scenarios": [],
+        },
+        [],
+    )
+
+    assert payload["phase_label"] == "Exploração cancelada"
+    assert payload["completion"]["type"] is None
+
+
+def test_browser_closed_is_exposed_as_the_cancellation_reason():
+    payload = _phase_payload(
+        {
+            "status": "cancelled",
+            "steps_completed": 12,
+            "options": {"max_steps": None},
+            "scenarios": [],
+        },
+        [
+            {
+                "type": "browser_closed",
+                "message": "Browser page is not active",
+                "payload": {"reason": "browser_closed"},
+            }
+        ],
+    )
+
+    assert payload["phase_label"] == "Exploração cancelada"
+    assert payload["completion"]["type"] == "browser_closed"
+    assert payload["completion"]["reason"] == "browser_closed"

@@ -863,13 +863,50 @@ class PlaywrightExecutor:
               // A UI do AutoJev é excluída apenas da cópia lógica entregue ao
               // JEV, evitando o flash de visibility:hidden a cada etapa.
               const isVisible = (el) => {
-                const style = getComputedStyle(el);
                 const box = el.getBoundingClientRect();
-                return el.getAttribute('aria-hidden') !== 'true'
-                  && style.visibility !== 'hidden'
-                  && style.display !== 'none'
-                  && box.width > 0
-                  && box.height > 0;
+                if (el.closest('[aria-hidden="true"]') || box.width <= 0 || box.height <= 0) {
+                  return false;
+                }
+                // Opacity is not inherited in computed styles: a child can
+                // report opacity 1 while an opacity:0 ancestor makes it fully
+                // invisible. Walk the rendered ancestry so hidden drawers and
+                // transition shells never become executable coverage.
+                for (let owner = el; owner; owner = owner.parentElement) {
+                  const style = getComputedStyle(owner);
+                  if (style.visibility === 'hidden'
+                    || style.visibility === 'collapse'
+                    || style.display === 'none'
+                    || Number.parseFloat(style.opacity || '1') <= 0) {
+                    return false;
+                  }
+                }
+                return true;
+              };
+              // Distinguish controls that Playwright can safely target from
+              // elements that merely remain mounted off-canvas or underneath
+              // a drawer. Controls below the fold stay reachable because
+              // Playwright can scroll them into view; horizontally displaced
+              // and currently occluded controls do not enter the frontier.
+              const interactionState = (el, box) => {
+                const inHorizontalViewport = box.right > 0 && box.left < window.innerWidth;
+                const inVerticalViewport = box.bottom > 0 && box.top < window.innerHeight;
+                if (!inHorizontalViewport) {
+                  return { inHorizontalViewport, inVerticalViewport, interactable: false };
+                }
+                if (!inVerticalViewport) {
+                  return { inHorizontalViewport, inVerticalViewport, interactable: true };
+                }
+                const x = Math.max(0, Math.min(window.innerWidth - 1, box.left + box.width / 2));
+                const y = Math.max(0, Math.min(window.innerHeight - 1, box.top + box.height / 2));
+                const hit = document.elementsFromPoint(x, y).find((candidate) => (
+                  !candidate.closest(PANEL_SELECTOR)
+                  && getComputedStyle(candidate).pointerEvents !== 'none'
+                ));
+                return {
+                  inHorizontalViewport,
+                  inVerticalViewport,
+                  interactable: Boolean(hit && (hit === el || el.contains(hit))),
+                };
               };
                 const visibleDialogs = Array.from(document.querySelectorAll(
                   'dialog[open],[role="dialog"]'
@@ -908,6 +945,11 @@ class PlaywrightExecutor:
               const elements = candidates.map((el, index) => {
                 const ref = `e${index}`;
                 const box = el.getBoundingClientRect();
+                const interaction = interactionState(el, box);
+                const enabled = !el.matches(':disabled')
+                  && el.getAttribute('aria-disabled') !== 'true'
+                  && !el.closest('[inert]');
+                const ariaHiddenOwner = el.closest('[aria-hidden]');
                 const explicitContext = el.closest(
                   'tr,[role="row"],li,[role="listitem"],form,[role="dialog"],nav,[role="navigation"],aside'
                 );
@@ -950,7 +992,7 @@ class PlaywrightExecutor:
                   name: (el.getAttribute('aria-label') || el.innerText || el.getAttribute('placeholder') || el.getAttribute('name') || '').trim().slice(0, 300),
                   type: el.getAttribute('type') || null,
                   href: el instanceof HTMLAnchorElement ? el.href : null,
-                  enabled: !el.disabled,
+                  enabled,
                   read_only: Boolean(el.readOnly),
                   has_value: el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement
                     ? Boolean(el.value)
@@ -961,6 +1003,7 @@ class PlaywrightExecutor:
                   selected_index: el instanceof HTMLSelectElement ? el.selectedIndex : null,
                   aria_haspopup: el.getAttribute('aria-haspopup'),
                   aria_expanded: el.getAttribute('aria-expanded'),
+                  aria_hidden: ariaHiddenOwner?.getAttribute('aria-hidden') || null,
                   aria_pressed: el.getAttribute('aria-pressed'),
                   aria_selected: el.getAttribute('aria-selected'),
                   options: el instanceof HTMLSelectElement
@@ -972,7 +1015,9 @@ class PlaywrightExecutor:
                       }))
                     : null,
                   document_top: Math.round(box.top + window.scrollY),
-                  in_viewport: box.bottom > 0 && box.top < window.innerHeight,
+                  in_viewport: interaction.inHorizontalViewport && interaction.inVerticalViewport,
+                  in_horizontal_viewport: interaction.inHorizontalViewport,
+                  interactable: enabled && interaction.interactable,
                   in_navigation: Boolean(el.closest('nav,[role="navigation"],aside')),
                   context: contextNode
                     ? `${contextNode.tagName.toLowerCase()} ${contextMarker} ${contextNode.getAttribute('aria-label') || contextNode.getAttribute('role') || ''} ${contextText}`.trim().slice(0, 160)

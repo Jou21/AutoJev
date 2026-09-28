@@ -6,6 +6,7 @@ from autojev.adapters.playwright_executor import (
     PlaywrightExecutor,
 )
 from autojev.domain.models import AgentDecision, ExplorationOptions
+from autojev.services.coverage import CoveragePlanner
 
 
 def test_public_browser_urls_redact_secrets_and_preserve_spa_routes(tmp_path: Path):
@@ -149,6 +150,14 @@ async def test_observe_restricts_candidates_and_text_to_active_dialog(tmp_path: 
             assert "const textRoot = activeDialog || document.body" in script
             assert "parent.closest(PANEL_SELECTOR)" in script
             assert "[data-testid],[data-test],[data-qa]" in script
+            assert "elementsFromPoint" in script
+            assert "!candidate.closest(PANEL_SELECTOR)" in script
+            assert "in_horizontal_viewport" in script
+            assert "interactable" in script
+            assert "closest('[aria-hidden=\"true\"]')" in script
+            assert "for (let owner = el; owner; owner = owner.parentElement)" in script
+            assert "el.matches(':disabled')" in script
+            assert "el.closest('[inert]')" in script
             assert "setProperty('visibility', 'hidden', 'important')" not in script
             assert "panel.style.display = 'none'" not in script
             return {
@@ -183,6 +192,80 @@ async def test_observe_restricts_candidates_and_text_to_active_dialog(tmp_path: 
     assert executor._ref_selectors == {
         "e0": "div:nth-of-type(1) > button:nth-of-type(1)"
     }
+
+
+async def test_real_dom_observation_rejects_transparent_and_disabled_controls(
+    tmp_path: Path,
+):
+    playwright_api = pytest.importorskip("playwright.async_api")
+    playwright = await playwright_api.async_playwright().start()
+    browser = None
+    try:
+        try:
+            browser = await playwright.chromium.launch(headless=True)
+        except Exception as exc:
+            pytest.skip(f"Chromium is unavailable: {exc}")
+        page = await browser.new_page()
+        await page.set_content(
+            """
+            <button>Visible action</button>
+            <div style="opacity:0"><button>Transparent parent</button></div>
+            <fieldset disabled><button>Fieldset disabled</button></fieldset>
+            <div inert><button>Inert action</button></div>
+            """
+        )
+        executor = PlaywrightExecutor(
+            tmp_path, ExplorationOptions(capture_screenshots=False)
+        )
+        executor._browser = browser
+        executor._page = page
+
+        observed = await executor.observe()
+        elements = {item["name"]: item for item in observed.interactive_elements}
+
+        assert "Transparent parent" not in elements
+        assert elements["Visible action"]["enabled"] is True
+        assert elements["Visible action"]["interactable"] is True
+        assert elements["Fieldset disabled"]["enabled"] is False
+        assert elements["Fieldset disabled"]["interactable"] is False
+        assert elements["Inert action"]["enabled"] is False
+        assert elements["Inert action"]["interactable"] is False
+
+        await page.set_content(
+            """
+            <style>
+              body { margin: 0; min-height: 2400px; }
+              .cover { position: fixed; inset: 0 0 auto 0; height: 80px;
+                       z-index: 10; background: white; }
+              #top { position: absolute; top: 10px; }
+              #below { position: absolute; top: 1400px; }
+            </style>
+            <div class="cover"></div>
+            <button id="top">Top button</button>
+            <button id="below">Below button</button>
+            """
+        )
+        before_scroll = await executor.observe()
+        await page.evaluate("window.scrollTo(0, 1300)")
+        after_scroll = await executor.observe()
+        planner = CoveragePlanner("https://app.test/scroll")
+
+        before_controls = {
+            item["name"]: item["interactable"]
+            for item in before_scroll.interactive_elements
+        }
+        after_controls = {
+            item["name"]: item["interactable"]
+            for item in after_scroll.interactive_elements
+        }
+        assert before_controls == {"Top button": False, "Below button": True}
+        assert after_controls == {"Top button": True, "Below button": True}
+        assert planner.effect_key(before_scroll) == planner.effect_key(after_scroll)
+        assert planner.state_key(before_scroll) == planner.state_key(after_scroll)
+    finally:
+        if browser is not None:
+            await browser.close()
+        await playwright.stop()
 
 
 def test_sidepanel_is_stable_click_controlled_and_expands_on_attention(tmp_path: Path):

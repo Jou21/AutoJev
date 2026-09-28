@@ -75,4 +75,8 @@ test("explains navigation, test-case creation, and report as separate phases", a
   assert.match(source, /O número 67 representa os CTs gerados/);
   assert.match(source, /Linha do tempo explicada/);
   assert.match(source, /detailTab === "evidence"/);
+  assert.match(source, /coverage_complete_with_restrictions/);
+  assert.match(source, /Concluída com restrições/);
+  assert.match(source, /sinais técnicos/);
+  assert.match(source, /O relatório final correlaciona esses sinais por observação/);
 });

@@ -68,3 +68,96 @@ def test_report_is_standalone_and_escapes_model_content(tmp_path):
     assert "Cobertura parcial" in document
     assert "Motivo do encerramento:" in document
     assert "Limite de tempo; a fronteira ainda tinha itens." in document
+
+
+def test_report_explains_restricted_completion_and_correlates_browser_signals(
+    tmp_path,
+):
+    root = tmp_path / "artifacts"
+    shots = root / "run-2" / "screenshots"
+    shots.mkdir(parents=True)
+    (shots / "041.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    exploration = {
+        "id": "run-2",
+        "app_url": "https://example.test",
+        "status": "completed",
+        "events": [
+            {
+                "type": "coverage_complete_with_restrictions",
+                "message": "A cobertura alcançável terminou com controles bloqueados.",
+            }
+        ],
+        "summary": {
+            "total_scenarios": 1,
+            "pass": 0,
+            "fail": 0,
+            "blocked": 0,
+            "skipped": 1,
+        },
+        "scenarios": [
+            {
+                "id": "CT001",
+                "title": "Ação sem alteração observável",
+                "description": "A ação foi executada.",
+                "preconditions": [],
+                "steps": ["Clique"],
+                "expected_result": "Estado verificável",
+                "actual_result": "Sem alteração",
+                "status": "SKIPPED",
+                "url": "https://example.test/items",
+                "screenshots": [],
+                "evidence": {"assertions": []},
+            }
+        ],
+        "issues": [
+            {
+                "type": "console",
+                "status_code": 404,
+                "message": "Failed to load resource",
+                "url": "https://example.test/items?token=secret-one&item=1",
+                "screenshot": "041.png",
+            },
+            {
+                "type": "http",
+                "status_code": 404,
+                "message": "GET returned HTTP 404",
+                "url": "https://example.test/items?token=secret-two&item=1",
+                "screenshot": "041.png",
+            },
+        ],
+    }
+
+    output = root / "run-2" / "report.html"
+    StandaloneHtmlReport(root).generate(exploration, str(output))
+    document = output.read_text()
+
+    assert "Concluída com restrições" in document
+    assert "SEM VALIDAÇÃO" in document
+    assert "Sinais técnicos observados (1 ocorrências)" in document
+    assert "2 sinal(is) correlacionado(s)" in document
+    assert "2 registro(s) bruto(s)" in document
+    assert "secret-one" not in document
+    assert "secret-two" not in document
+    assert "item=1" in document
+    assert "%5BREDACTED%5D" in document
+
+
+def test_cancelled_report_ignores_stale_coverage_completion():
+    status, reason = StandaloneHtmlReport._completion(
+        {
+            "status": "cancelled",
+            "events": [
+                {
+                    "type": "coverage_complete_with_restrictions",
+                    "message": "Coverage ended before post-processing",
+                },
+                {
+                    "type": "browser_closed",
+                    "message": "The browser was closed",
+                },
+            ],
+        }
+    )
+
+    assert status == "Cancelada"
+    assert reason == "The browser was closed"

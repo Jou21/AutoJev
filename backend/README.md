@@ -135,10 +135,13 @@ invalid/rejected model responses use a separate bounded planning budget.
   exists, and every assertion passed. An observable URL/DOM/control-state delta
   can supply deterministic evidence.
 - `FAIL`: ordinary execution failed or a supported assertion failed. Captured
-  console/network errors correlated with a changed state also fail the evidence.
+  console/network errors newly correlated with an action also fail the evidence,
+  even when the visible screen does not change. Errors present before testing
+  begins are retained as technical findings without contaminating later CTs.
 - `BLOCKED`: an executor policy or unavailable control prevented execution.
-- `SKIPPED`: an action succeeded but no verifiable assertion exists. The model
-  cannot turn this into `PASS`.
+- A successful action without verifiable evidence is logged as a no-op and is
+  omitted from the CT inventory. `SKIPPED` remains readable for historical or
+  imported scenarios and is presented as **Sem validação**, never as `PASS`.
 
 Captured browser evidence includes console/page errors, failed requests and HTTP 4xx/5xx responses. Reports only describe actions actually returned by Playwright.
 

@@ -180,10 +180,27 @@ def _phase_payload(result: dict[str, Any], events: list[dict[str, Any]]) -> dict
                 "coverage_stalled",
                 "failed",
                 "cancelled",
+                "browser_closed",
             }
         ),
         None,
     )
+    if (
+        status_value in {"cancelled", "canceled"}
+        and completion_event is not None
+        and completion_event.get("type") not in {"cancelled", "browser_closed"}
+    ):
+        # Older runs could be cancelled during post-processing after a
+        # coverage-complete event but before a canonical cancellation event.
+        # Do not present that stale event as their terminal outcome.
+        completion_event = None
+    if completion_event is None and isinstance(result.get("completion_event"), dict):
+        completion_event = result["completion_event"]
+        if (
+            status_value in {"cancelled", "canceled"}
+            and completion_event.get("type") not in {"cancelled", "browser_closed"}
+        ):
+            completion_event = None
     completion_payload = (completion_event or {}).get("payload") or {}
     completion = {
         "type": (completion_event or {}).get("type"),
@@ -194,7 +211,19 @@ def _phase_payload(result: dict[str, Any], events: list[dict[str, Any]]) -> dict
         "frontier_candidates": completion_payload.get("frontier_candidates"),
         "blocked_candidates": completion_payload.get("blocked_candidates")
         or completion_payload.get("candidates_blocked"),
+        "restorations_abandoned": completion_payload.get(
+            "restorations_abandoned"
+        ),
     }
+    if (
+        status_value == "completed"
+        and completion["type"] == "coverage_complete_with_restrictions"
+    ):
+        label = "Exploração concluída com restrições"
+        description = (
+            "A cobertura alcançável foi esgotada; controles que não puderam "
+            "ser executados com segurança ficaram documentados."
+        )
 
     overall_percentage: int | None = percentage
     if phase in {"exploring", "waiting_input"}:

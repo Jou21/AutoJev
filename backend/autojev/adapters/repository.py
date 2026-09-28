@@ -591,7 +591,37 @@ class SQLiteRepository:
                     (SELECT type FROM exploration_events ev
                        WHERE ev.exploration_id = e.id ORDER BY ev.id DESC LIMIT 1) AS latest_event_type,
                     (SELECT message FROM exploration_events ev
-                       WHERE ev.exploration_id = e.id ORDER BY ev.id DESC LIMIT 1) AS latest_event_message
+                       WHERE ev.exploration_id = e.id ORDER BY ev.id DESC LIMIT 1) AS latest_event_message,
+                    (SELECT type FROM exploration_events ev
+                       WHERE ev.exploration_id = e.id
+                         AND ev.type IN (
+                           'limit_reached', 'coverage_partial',
+                           'coverage_scope_not_found', 'coverage_complete',
+                           'coverage_complete_with_restrictions',
+                           'coverage_stalled', 'failed', 'cancelled',
+                           'browser_closed'
+                         )
+                       ORDER BY ev.id DESC LIMIT 1) AS completion_event_type,
+                    (SELECT message FROM exploration_events ev
+                       WHERE ev.exploration_id = e.id
+                         AND ev.type IN (
+                           'limit_reached', 'coverage_partial',
+                           'coverage_scope_not_found', 'coverage_complete',
+                           'coverage_complete_with_restrictions',
+                           'coverage_stalled', 'failed', 'cancelled',
+                           'browser_closed'
+                         )
+                       ORDER BY ev.id DESC LIMIT 1) AS completion_event_message,
+                    (SELECT payload_json FROM exploration_events ev
+                       WHERE ev.exploration_id = e.id
+                         AND ev.type IN (
+                           'limit_reached', 'coverage_partial',
+                           'coverage_scope_not_found', 'coverage_complete',
+                           'coverage_complete_with_restrictions',
+                           'coverage_stalled', 'failed', 'cancelled',
+                           'browser_closed'
+                         )
+                       ORDER BY ev.id DESC LIMIT 1) AS completion_event_payload
                    FROM explorations e ORDER BY e.created_at DESC LIMIT ?""",
                 (limit,),
             ).fetchall()
@@ -621,6 +651,15 @@ class SQLiteRepository:
             item["current_action"] = (
                 row["latest_event_message"]
                 if row["latest_event_type"] == "action_started"
+                else None
+            )
+            item["completion_event"] = (
+                {
+                    "type": row["completion_event_type"],
+                    "message": row["completion_event_message"],
+                    "payload": json.loads(row["completion_event_payload"] or "{}"),
+                }
+                if row["completion_event_type"]
                 else None
             )
             item["screenshots"] = (

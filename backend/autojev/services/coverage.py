@@ -62,6 +62,9 @@ _EXIT_WORDS = {
     "return",
     "voltar",
 }
+_MENU_WORDS = {"drawer", "menu", "navigation", "navegacao", "sidebar"}
+_OPEN_WORDS = {"abrir", "open", "show"}
+_CLOSE_WORDS = {"close", "fechar", "hide"}
 _FOCUS_STOPWORDS = {
     "a",
     "area",
@@ -109,6 +112,19 @@ def _meaningful_tokens(value: str) -> list[str]:
         for token in re.findall(r"[a-z0-9]+", _normalise_text(value))
         if len(token) > 1 and token not in _FOCUS_STOPWORDS
     ]
+
+
+def _normalise_state(value: Any) -> bool | str | None:
+    """Normalise DOM/ARIA state without introducing layout coordinates."""
+
+    if value is None or isinstance(value, bool):
+        return value
+    normalised = _normalise_text(str(value))
+    if normalised == "true":
+        return True
+    if normalised == "false":
+        return False
+    return normalised
 
 
 def semantic_element_fingerprint(element: dict[str, Any]) -> str:
@@ -319,8 +335,21 @@ class CoveragePlanner:
         return str(key) if key is not None else None
 
     @classmethod
-    def _safe_candidate(cls, element: dict[str, Any], origin: tuple[str, str]) -> bool:
-        if not element.get("ref") or element.get("enabled") is False:
+    def _safe_candidate(
+        cls,
+        element: dict[str, Any],
+        origin: tuple[str, str],
+        *,
+        require_interactable: bool = True,
+    ) -> bool:
+        if (
+            not element.get("ref")
+            or element.get("enabled") is False
+            or (
+                require_interactable
+                and element.get("interactable") is False
+            )
+        ):
             return False
         tag = _normalise_text(str(element.get("tag") or ""))
         element_type = _normalise_text(str(element.get("type") or ""))
@@ -343,12 +372,91 @@ class CoveragePlanner:
                 return False
         return True
 
-    def _candidate_map(self, observation: Observation) -> dict[str, dict[str, Any]]:
+    @staticmethod
+    def _is_redundant_self_link(
+        observation: Observation, element: dict[str, Any]
+    ) -> bool:
+        """Reject an exact self-link unless it exposes a separate UI state."""
+
+        if _normalise_text(str(element.get("tag") or "")) != "a":
+            return False
+        href = str(element.get("href") or "")
+        if not href:
+            return False
+        if _normalise_text(str(element.get("aria_haspopup") or "")) not in {
+            "",
+            "false",
+            "none",
+        }:
+            return False
+        if any(
+            element.get(name) is not None
+            for name in ("aria_expanded", "aria_pressed", "aria_selected")
+        ):
+            return False
+        with suppress(ValueError):
+            return canonical_url(href) == canonical_url(observation.url)
+        return False
+
+    @staticmethod
+    def _menu_toggle_kind(element: dict[str, Any]) -> str | None:
+        surface = _normalise_text(
+            f"{element.get('name') or ''} {element.get('aria_label') or ''}"
+        )
+        tokens = set(re.findall(r"[a-z0-9]+", surface))
+        if not tokens.intersection(_MENU_WORDS):
+            return None
+        if tokens.intersection(_CLOSE_WORDS):
+            return "close"
+        if tokens.intersection(_OPEN_WORDS):
+            return "open"
+        return None
+
+    @classmethod
+    def _menu_is_open(cls, observation: Observation) -> bool:
+        """Infer an open drawer only from explicit semantic visibility state."""
+
+        for element in observation.interactive_elements:
+            if not isinstance(element, dict):
+                continue
+            toggle_kind = cls._menu_toggle_kind(element)
+            popup = _normalise_text(str(element.get("aria_haspopup") or ""))
+            role = _normalise_text(str(element.get("role") or ""))
+            if _normalise_state(element.get("aria_expanded")) is True and (
+                toggle_kind is not None
+                or popup in {"menu", "true"}
+                or role == "menuitem"
+            ):
+                return True
+            if toggle_kind != "close":
+                continue
+            if element.get("interactable") is True:
+                return True
+            # Compatibility for observations captured before hit-testing was
+            # available. Horizontal visibility changes for an off-canvas
+            # drawer, but stays stable while the document scrolls vertically.
+            if (
+                element.get("in_horizontal_viewport") is True
+                and _normalise_state(element.get("aria_hidden")) is not True
+            ):
+                return True
+        return False
+
+    def _candidate_map(
+        self, observation: Observation, *, require_interactable: bool = True
+    ) -> dict[str, dict[str, Any]]:
         candidates: dict[str, dict[str, Any]] = {}
+        menu_is_open = self._menu_is_open(observation)
         for element in observation.interactive_elements:
             if not isinstance(element, dict) or not self._safe_candidate(
-                element, self.origin
+                element,
+                self.origin,
+                require_interactable=require_interactable,
             ):
+                continue
+            if self._is_redundant_self_link(observation, element):
+                continue
+            if menu_is_open and self._menu_toggle_kind(element) == "open":
                 continue
             fingerprint = semantic_element_fingerprint(element)
             for action, value in self._candidate_actions(element):
@@ -387,7 +495,13 @@ class CoveragePlanner:
         return bool(tokens & _EXIT_WORDS)
 
     def state_key(self, observation: Observation) -> str:
-        candidate_keys = sorted(self._candidate_map(observation))
+        # State identity must survive ordinary vertical scrolling. Hit-testing
+        # still gates the executable frontier, but a control temporarily under
+        # a sticky header (or now above the viewport) cannot manufacture a new
+        # application state merely because its clickability changed.
+        candidate_keys = sorted(
+            self._candidate_map(observation, require_interactable=False)
+        )
         raw = {
             "url": canonical_url(observation.url),
             "title": _normalise_text(observation.title),
@@ -411,9 +525,15 @@ class CoveragePlanner:
                     "has_value": bool(element.get("has_value")),
                     "checked": element.get("checked"),
                     "selected_index": element.get("selected_index"),
-                    "aria_expanded": element.get("aria_expanded"),
-                    "aria_pressed": element.get("aria_pressed"),
-                    "aria_selected": element.get("aria_selected"),
+                    "aria_expanded": _normalise_state(element.get("aria_expanded")),
+                    "aria_hidden": _normalise_state(element.get("aria_hidden")),
+                    "aria_pressed": _normalise_state(element.get("aria_pressed")),
+                    "aria_selected": _normalise_state(element.get("aria_selected")),
+                    # Horizontal surface visibility and ARIA state capture
+                    # drawers/menus. Hit-testing, vertical viewport position
+                    # and document coordinates are intentionally excluded so
+                    # scrolling cannot manufacture a new application state.
+                    "in_horizontal_viewport": element.get("in_horizontal_viewport"),
                 }
             )
         raw = {
@@ -524,7 +644,12 @@ class CoveragePlanner:
             )
             self.states[key] = state
         else:
-            state.candidates.update(candidates)
+            # Refs and hit-test availability belong to the current DOM
+            # observation. Keeping a previously clickable candidate after a
+            # drawer/header starts intercepting it makes Playwright retry a
+            # stale control and can create a false FAIL. Coverage memory lives
+            # in attempted/inherited/blocked; candidate metadata is refreshed.
+            state.candidates = candidates
         state.visits += 1
         self.current_key = key
         if not self.path:
@@ -555,6 +680,14 @@ class CoveragePlanner:
         root_state = self.states.get(coverage_root_key or "")
         for fingerprint, element in state.candidates.items():
             if fingerprint in state.attempted or fingerprint in state.inherited:
+                continue
+            if (
+                self._move_action(element) == "select"
+                and element.get("_option_selected") is True
+            ):
+                # Re-selecting the active value succeeds at the browser layer
+                # but produces no verifiable effect, yielding a misleading
+                # SKIPPED scenario instead of new coverage.
                 continue
             if (state.url, fingerprint) in self.global_route_moves_attempted:
                 continue

@@ -144,6 +144,7 @@ type Exploration = {
     frontier_states?: number | null;
     frontier_candidates?: number | null;
     blocked_candidates?: number | null;
+    restorations_abandoned?: number | null;
   };
   current_step?: string;
   current_action?: string;
@@ -422,6 +423,7 @@ function activityCopy(event: ExplorationEvent) {
     scenario_enrichment_started: { title: "LLM auxiliar aprimorando os CTs", detail: event.message },
     scenario_enriched: { title: `${scenario} aprimorado`, detail: "Documentado pela LLM auxiliar a partir da evidência capturada." },
     scenario_enrichment_skipped: { title: `${scenario} preservado`, detail: "A evidência local foi mantida porque a LLM auxiliar demorou a responder." },
+    scenario_omitted_no_evidence: { title: "Ação sem evidência não virou CT", detail: "A interação foi executada, mas não mudou a tela nem produziu uma validação confiável." },
     scenario_postprocessing_completed: { title: "Casos de teste finalizados", detail: event.message },
     scenario_created: { title: `${scenario} criado`, detail: "Documentado pela LLM auxiliar." },
     scenario_documentation_fallback: { title: `${scenario} criado com evidência local`, detail: "O caso continua válido; a LLM auxiliar não concluiu o enriquecimento no tempo disponível." },
@@ -441,7 +443,10 @@ function Spinner({ size = 16 }: { size?: number }) {
   return <LoaderCircle size={size} className="spin" aria-hidden="true" />;
 }
 
-function StatusBadge({ status }: { status?: string }) {
+function StatusBadge({ status, completionType }: { status?: string; completionType?: string | null }) {
+  if ((status || "").toLowerCase() === "completed" && completionType === "coverage_complete_with_restrictions") {
+    return <span className="status-badge status-warning"><span className="status-dot" />Concluída com restrições</span>;
+  }
   const current = explorationStatus(status);
   return (
     <span className={`status-badge status-${current.tone}`}>
@@ -1037,7 +1042,7 @@ function DashboardView({
                 <button className="recent-row" key={exploration.id} onClick={() => navigate(`#/exploracoes/${encodeURIComponent(exploration.id)}`)}>
                   <span className="app-avatar"><Globe2 size={18} /></span>
                   <span className="recent-main"><strong>{hostFromUrl(exploration.app_url)}</strong><small>{exploration.app_url}</small></span>
-                  <StatusBadge status={exploration.status} />
+                  <StatusBadge status={exploration.status} completionType={exploration.completion?.type} />
                   <span className="recent-time">{formatDate(exploration.created_at)}</span>
                   <ChevronRight size={17} className="row-chevron" />
                 </button>
@@ -1472,7 +1477,7 @@ function ExplorationsView({ explorations, loading, navigate }: { explorations: E
                 return (
                   <tr key={item.id} onClick={() => navigate(`#/exploracoes/${encodeURIComponent(item.id)}`)}>
                     <td><div className="table-app"><span className="app-avatar"><Globe2 size={17} /></span><span><strong>{hostFromUrl(item.app_url)}</strong><small>{explorationFocusArea(item.options) ? `Escopo: ${explorationFocusArea(item.options)}` : "Aplicação inteira"}</small></span></div></td>
-                    <td><StatusBadge status={item.status} /></td>
+                    <td><StatusBadge status={item.status} completionType={item.completion?.type} /></td>
                     <td><div className={`table-progress ${determinate ? "" : "indeterminate"}`}><span><i style={determinate ? { width: `${Math.min(100, Math.max(0, progressValue))}%` } : undefined} /></span><small>{determinate ? `${Math.round(progressValue)}%` : "cobrindo"}</small></div></td>
                     <td><div className="scenario-cell"><strong>{item.counters?.scenarios || item.counters?.test_scenarios || item.scenarios_count || 0}</strong>{item.summary && <small>{item.summary.pass || 0} PASS · {item.summary.fail || 0} FAIL</small>}</div></td>
                     <td>{formatTokens(item.usage?.total_tokens)}</td>
@@ -1799,6 +1804,7 @@ function ExplorationDetailView({
   const postprocessing = exploration.postprocessing || {};
   const completion = exploration.completion || {};
   const actionLimitReached = completion.type === "limit_reached" || completion.reason === "action_limit";
+  const completedWithRestrictions = completion.type === "coverage_complete_with_restrictions";
   const phaseSteps = [
     { key: "exploring", label: "Explorar", detail: `${exploration.browser_progress?.current ?? counters.actions} ações` },
     { key: "documenting", label: "Criar CTs", detail: `${postprocessing.total || counters.scenarios} casos` },
@@ -1808,10 +1814,14 @@ function ExplorationDetailView({
   const currentPhaseIndex = phaseOrder[phase] ?? 0;
   const phaseHeadline = actionLimitReached
     ? `Limite de ${exploration.browser_progress?.total || configuredStepLimit || counters.actions} ações atingido`
-    : exploration.phase_label || status.label;
+    : completedWithRestrictions
+      ? "Exploração concluída com restrições"
+      : exploration.phase_label || status.label;
   const phaseDescription = actionLimitReached
     ? "A automação não falhou na ação 67: ela concluiu o limite configurado e preservou tudo o que encontrou. A cobertura ficou parcial porque ainda havia opções a explorar."
-    : exploration.phase_description || (isLive(exploration.status) ? `Atualização automática a cada ${pollInterval / 1000}s` : "Resultados preservados e prontos para consulta.");
+    : completedWithRestrictions
+      ? "A cobertura alcançável terminou. Os controles que não puderam ser executados com segurança foram preservados como restrições, sem serem contados como testes aprovados."
+      : exploration.phase_description || (isLive(exploration.status) ? `Atualização automática a cada ${pollInterval / 1000}s` : "Resultados preservados e prontos para consulta.");
 
   const cancel = async () => {
     setCancelling(true);
@@ -1872,7 +1882,7 @@ function ExplorationDetailView({
     <div className="view-stack detail-view">
       <div className="detail-breadcrumb"><button onClick={() => navigate("#/exploracoes")}><ArrowLeft size={15} />Explorações</button><ChevronRight size={14} /><span>{hostFromUrl(exploration.app_url)}</span></div>
       <header className="detail-header">
-        <div className="detail-title"><span className="app-avatar large"><Globe2 size={22} /></span><div><div className="detail-title-line"><h1>{hostFromUrl(exploration.app_url)}</h1>{actionLimitReached ? <span className="status-badge status-warning"><span className="status-dot" />Limite anterior atingido</span> : <StatusBadge status={exploration.status} />}</div><a href={exploration.app_url} target="_blank" rel="noreferrer">{exploration.app_url}<SquareArrowOutUpRight size={13} /></a></div></div>
+        <div className="detail-title"><span className="app-avatar large"><Globe2 size={22} /></span><div><div className="detail-title-line"><h1>{hostFromUrl(exploration.app_url)}</h1>{actionLimitReached ? <span className="status-badge status-warning"><span className="status-dot" />Limite anterior atingido</span> : completedWithRestrictions ? <span className="status-badge status-warning"><span className="status-dot" />Concluída com restrições</span> : <StatusBadge status={exploration.status} />}</div><a href={exploration.app_url} target="_blank" rel="noreferrer">{exploration.app_url}<SquareArrowOutUpRight size={13} /></a></div></div>
         <div className="page-actions">
           <button className="button secondary" onClick={onRefresh}><RefreshCcw size={16} />Atualizar</button>
           {isLive(exploration.status) ? (
@@ -1914,7 +1924,7 @@ function ExplorationDetailView({
             </div>
           ))}
         </div>
-        <div className="live-counters"><DetailCounter icon={Globe2} value={counters.pages} label="páginas" /><DetailCounter icon={Zap} value={counters.actions} label="ações" /><DetailCounter icon={AlertCircle} value={counters.issues} label="achados" /><DetailCounter icon={FileCheck2} value={counters.scenarios} label="CTs" /><DetailCounter icon={Hash} value={formatTokens(exploration.usage?.total_tokens)} label="tokens" /><DetailCounter icon={CircleDollarSign} value={formatCost(exploration.usage)} label="custo" /><DetailCounter icon={Clock3} value={durationBetween(exploration.started_at || exploration.created_at, isLive(exploration.status) ? undefined : exploration.updated_at || exploration.finished_at)} label="duração total" /></div>
+        <div className="live-counters"><DetailCounter icon={Globe2} value={counters.pages} label="páginas" /><DetailCounter icon={Zap} value={counters.actions} label="ações" /><DetailCounter icon={AlertCircle} value={counters.issues} label="sinais técnicos" /><DetailCounter icon={FileCheck2} value={counters.scenarios} label="CTs" /><DetailCounter icon={Hash} value={formatTokens(exploration.usage?.total_tokens)} label="tokens" /><DetailCounter icon={CircleDollarSign} value={formatCost(exploration.usage)} label="custo" /><DetailCounter icon={Clock3} value={durationBetween(exploration.started_at || exploration.created_at, isLive(exploration.status) ? undefined : exploration.updated_at || exploration.finished_at)} label="duração total" /></div>
       </section>
 
       {waitingForInput && (
@@ -1946,8 +1956,20 @@ function ExplorationDetailView({
                     <div><strong>Cobertura parcial</strong><span>{completion.frontier_candidates ?? "Algumas"} opções ainda estavam na fila de exploração quando o limite foi alcançado.</span></div>
                   </div>
                 )}
+                {completedWithRestrictions && (
+                  <div className="coverage-summary warning">
+                    <AlertCircle size={18} />
+                    <div><strong>Concluída com restrições</strong><span>{completion.blocked_candidates ?? "Alguns"} controle(s) não puderam ser executados com segurança. Isso não significa a mesma quantidade de telas ou defeitos.</span></div>
+                  </div>
+                )}
+                {counters.issues > 0 && (
+                  <div className="coverage-summary">
+                    <ShieldCheck size={18} />
+                    <div><strong>Sinais técnicos, não defeitos automaticamente</strong><span>Console e HTTP podem registrar a mesma ocorrência mais de uma vez. O relatório final correlaciona esses sinais por observação.</span></div>
+                  </div>
+                )}
                 <div className="result-facts">
-                  <div><small>Estado da cobertura</small><strong>{actionLimitReached ? "Execução antiga limitada" : status.label}</strong></div>
+                  <div><small>Estado da cobertura</small><strong>{actionLimitReached ? "Execução antiga limitada" : completedWithRestrictions ? "Concluída com restrições" : status.label}</strong></div>
                   <div><small>Estados descobertos</small><strong>{completion.known_states ?? counters.pages}</strong></div>
                   <div><small>CTs aprimorados</small><strong>{postprocessing.enriched ?? 0}</strong></div>
                   <div><small>CTs com evidência local</small><strong>{postprocessing.local_evidence || Math.max(0, counters.scenarios - (postprocessing.enriched || 0))}</strong></div>

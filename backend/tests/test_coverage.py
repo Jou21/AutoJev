@@ -96,6 +96,146 @@ def test_effect_key_tracks_visible_text_and_control_state_without_splitting_stat
     assert planner.effect_key(base) != planner.effect_key(text_changed)
 
 
+def test_effect_key_tracks_interactive_surface_state_but_ignores_vertical_scroll():
+    planner = CoveragePlanner("https://app.test/products")
+    control = {
+        "ref": "e0",
+        "tag": "button",
+        "name": "Add to cart",
+        "enabled": True,
+        "interactable": True,
+        "in_horizontal_viewport": True,
+        "in_viewport": True,
+        "document_top": 120,
+    }
+    top = observation("https://app.test/products", [control], text="Products")
+    scrolled = observation(
+        top.url,
+        [{**control, "in_viewport": False, "document_top": 1120}],
+        text="Products",
+    )
+    temporarily_occluded = observation(
+        top.url,
+        [{**control, "interactable": False, "in_viewport": True}],
+        text="Products",
+    )
+    covered = observation(
+        top.url,
+        [{**control, "interactable": False, "aria_hidden": "true"}],
+        text="Products",
+    )
+
+    assert planner.effect_key(top) == planner.effect_key(scrolled)
+    assert planner.effect_key(top) == planner.effect_key(temporarily_occluded)
+    assert planner.state_key(top) == planner.state_key(temporarily_occluded)
+    assert planner.effect_key(top) != planner.effect_key(covered)
+    assert [item["name"] for item in planner.context(top)["current_untried"]] == [
+        "Add to cart"
+    ]
+    assert planner.context(temporarily_occluded)["current_untried"] == []
+
+
+def test_offcanvas_menu_states_have_distinct_effects_and_safe_candidates():
+    planner = CoveragePlanner("https://app.test/products")
+    open_toggle = {
+        "ref": "e0",
+        "tag": "button",
+        "name": "Open Menu",
+        "enabled": True,
+        "interactable": True,
+        "in_horizontal_viewport": True,
+        "aria_hidden": False,
+    }
+    menu_link = {
+        "ref": "e1",
+        "tag": "a",
+        "role": "button",
+        "name": "All Items",
+        "href": "https://app.test/inventory",
+        "enabled": True,
+        "in_navigation": True,
+        "interactable": False,
+        "in_horizontal_viewport": False,
+        "aria_hidden": True,
+    }
+    close_toggle = {
+        "ref": "e2",
+        "tag": "button",
+        "name": "Close Menu",
+        "enabled": True,
+        "interactable": False,
+        "in_horizontal_viewport": False,
+        "aria_hidden": True,
+    }
+    closed = observation(
+        "https://app.test/products", [open_toggle, menu_link, close_toggle]
+    )
+    opened = observation(
+        closed.url,
+        [
+            {**open_toggle, "interactable": False},
+            {
+                **menu_link,
+                "interactable": True,
+                "in_horizontal_viewport": True,
+                "aria_hidden": False,
+            },
+            {
+                **close_toggle,
+                "interactable": True,
+                "in_horizontal_viewport": True,
+                "aria_hidden": False,
+            },
+        ],
+    )
+
+    assert planner.effect_key(closed) != planner.effect_key(opened)
+    assert planner.state_key(closed) != planner.state_key(opened)
+    assert {item["name"] for item in planner.context(closed)["current_untried"]} == {
+        "Open Menu"
+    }
+    assert {item["name"] for item in planner.context(opened)["current_untried"]} == {
+        "All Items",
+        "Close Menu",
+    }
+
+
+def test_exact_self_link_is_not_a_candidate_but_stateful_same_url_link_is():
+    page = observation(
+        "https://app.test/cart?tab=items",
+        [
+            {
+                "ref": "e0",
+                "tag": "a",
+                "name": "Cart, 1 item",
+                "href": "https://app.test/cart?tab=items",
+                "enabled": True,
+            },
+            {
+                "ref": "e1",
+                "tag": "a",
+                "name": "Saved items",
+                "href": "https://app.test/cart?tab=saved",
+                "enabled": True,
+            },
+            {
+                "ref": "e2",
+                "tag": "a",
+                "name": "Open cart menu",
+                "href": "https://app.test/cart?tab=items",
+                "aria_haspopup": "menu",
+                "aria_expanded": "false",
+                "enabled": True,
+            },
+        ],
+    )
+    planner = CoveragePlanner(page.url)
+
+    names = {item["name"] for item in planner.context(page)["current_untried"]}
+    assert "Cart, 1 item" not in names
+    assert names == {"Saved items", "Open cart menu"}
+
+
 def test_safe_form_controls_join_frontier_with_deterministic_typed_actions():
     page = observation(
         "https://app.test/search",
@@ -140,17 +280,12 @@ def test_safe_form_controls_join_frontier_with_deterministic_typed_actions():
 
     context = planner.context(page)
 
-    assert [item["ref"] for item in context["current_untried"]] == [
-        "e0",
-        "e1",
-        "e1",
-    ]
+    assert [item["ref"] for item in context["current_untried"]] == ["e0", "e1"]
     assert context["current_untried"][0]["suggested_action"] == "fill"
     assert context["current_untried"][0]["suggested_value"] == "AutoJev QA"
     assert context["current_untried"][1]["suggested_action"] == "select"
     assert context["current_untried"][1]["suggested_value"] == "open"
     assert context["current_untried"][1]["option_label"] == "Em aberto"
-    assert context["current_untried"][2]["suggested_value"] == "all"
 
     forced, reason = planner.reconcile(page, AgentDecision("finish", "done"))
     assert (forced.action, forced.target, forced.value) == (
@@ -211,12 +346,12 @@ def test_select_options_are_bounded_atomic_moves_and_do_not_split_state():
     assert planner.effect_key(page) != planner.effect_key(changed)
 
     moves = planner.context(page)["current_untried"]
-    assert len(moves) == 8
+    assert len(moves) == 7
     assert {move["suggested_value"] for move in moves} == {
-        f"status-{index}" for index in range(8)
+        f"status-{index}" for index in range(1, 8)
     }
     assert moves[0]["suggested_value"] == "status-1"
-    assert moves[-1]["suggested_value"] == "status-0"
+    assert moves[-1]["suggested_value"] == "status-7"
     assert all(move["suggested_action"] == "select" for move in moves)
     assert all(move["option_label"].startswith("Status ") for move in moves)
 
@@ -233,7 +368,9 @@ def test_select_options_are_bounded_atomic_moves_and_do_not_split_state():
 
     remaining = planner.context(changed)["current_untried"]
     assert "status-3" not in {move["suggested_value"] for move in remaining}
-    assert len(remaining) == 7
+    assert "status-1" not in {move["suggested_value"] for move in remaining}
+    assert "status-0" in {move["suggested_value"] for move in remaining}
+    assert len(remaining) == 6
 
 
 def test_hoverable_menu_exposes_hover_and_click_as_independent_moves():

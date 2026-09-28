@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import time
 from collections.abc import Awaitable
 from contextlib import suppress
 from dataclasses import asdict
+from datetime import datetime
 from typing import Any
 
 from autojev.adapters.openai_compatible import (
@@ -38,6 +40,11 @@ from autojev.services.coverage import CoveragePlanner, canonical_url
 
 
 class ExplorationManager:
+    _GENERIC_RESOURCE_ERROR = re.compile(
+        r"failed to load resource:.*?status(?:\s+(?:of|code))?\s+(\d{3})",
+        re.IGNORECASE,
+    )
+
     def __init__(
         self,
         repository: SQLiteRepository,
@@ -356,25 +363,112 @@ class ExplorationManager:
     def _is_jev_model(model_id: str) -> bool:
         return model_id.removeprefix("~").startswith("typesafe/jev-")
 
+    @staticmethod
+    def _issue_timestamp(issue: dict[str, Any]) -> float | None:
+        value = issue.get("occurred_at")
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _deduplicate_observation_issues(
+        cls, observation: Observation
+    ) -> list[dict[str, Any]]:
+        """Collapse two browser channels that describe the same failed response.
+
+        Chromium emits both a generic console line ("Failed to load resource")
+        and a response event for many HTTP failures.  They are useful evidence,
+        but they are not two product defects.  Pair them by status and timestamp,
+        retaining the console record inside the more precise HTTP record.
+        """
+
+        console_errors = [dict(issue) for issue in observation.console_errors]
+        network_errors = [dict(issue) for issue in observation.network_errors]
+        matched_console: set[int] = set()
+        matched_network: set[int] = set()
+
+        for console_index, console_issue in enumerate(console_errors):
+            match = cls._GENERIC_RESOURCE_ERROR.search(
+                str(console_issue.get("message") or "")
+            )
+            if match is None:
+                continue
+            status_code = int(match.group(1))
+            candidates = [
+                index
+                for index, network_issue in enumerate(network_errors)
+                if index not in matched_network
+                and network_issue.get("type") == "http"
+                and network_issue.get("status_code") == status_code
+            ]
+            if not candidates:
+                continue
+
+            console_time = cls._issue_timestamp(console_issue)
+            timed_candidates: list[tuple[float, int]] = []
+            if console_time is not None:
+                for index in candidates:
+                    network_time = cls._issue_timestamp(network_errors[index])
+                    if network_time is not None:
+                        timed_candidates.append(
+                            (abs(console_time - network_time), index)
+                        )
+            if timed_candidates:
+                delta, network_index = min(timed_candidates)
+                if delta > 2.0:
+                    continue
+            elif len(candidates) == 1:
+                network_index = candidates[0]
+            else:
+                # Without timestamps, associating one generic console line
+                # with one of several same-status requests would be guesswork.
+                continue
+
+            network_issue = network_errors[network_index]
+            related = list(network_issue.get("related_console_errors") or [])
+            related.append(console_issue)
+            network_issue["related_console_errors"] = related
+            network_issue["evidence_channels"] = ["network", "console"]
+            matched_console.add(console_index)
+            matched_network.add(network_index)
+
+        return [
+            issue
+            for index, issue in enumerate(console_errors)
+            if index not in matched_console
+        ] + network_errors
+
+    @staticmethod
+    def _issue_key(issue: dict[str, Any]) -> str:
+        stable_issue = {
+            "type": issue.get("type"),
+            "method": issue.get("method"),
+            "message": issue.get("message"),
+            "url": issue.get("url"),
+            "status_code": issue.get("status_code"),
+        }
+        return hashlib.sha256(
+            json.dumps(stable_issue, sort_keys=True).encode()
+        ).hexdigest()
+
     def _record_observation_issues(
         self,
         exploration_id: str,
         observation: Observation,
         known: set[str],
-    ) -> None:
-        for issue in observation.console_errors + observation.network_errors:
-            stable_issue = {
-                "type": issue.get("type"),
-                "message": issue.get("message"),
-                "url": issue.get("url"),
-                "status_code": issue.get("status_code"),
-            }
-            key = hashlib.sha256(
-                json.dumps(stable_issue, sort_keys=True).encode()
-            ).hexdigest()
+    ) -> list[dict[str, Any]]:
+        """Persist and return only issue signatures not seen earlier in the run."""
+
+        new_issues: list[dict[str, Any]] = []
+        for issue in self._deduplicate_observation_issues(observation):
+            key = self._issue_key(issue)
             if key in known:
                 continue
             known.add(key)
+            new_issues.append(issue)
             record = {**issue, "screenshot": observation.screenshot}
             self.repository.add_issue(exploration_id, record)
             self.repository.add_event(
@@ -384,6 +478,67 @@ class ExplorationManager:
                 str(issue.get("message", "Browser issue observed")),
                 {"type": issue.get("type"), "status_code": issue.get("status_code")},
             )
+        return new_issues
+
+    @classmethod
+    def _issues_relevant_to_action(
+        cls,
+        observation: Observation,
+        action_started_at: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return only browser issues emitted after this action began.
+
+        Storage deduplication and action attribution are deliberately separate:
+        a request that fails again during another action is still negative
+        evidence, while polling/telemetry emitted while JEV was planning must
+        not be assigned to the action that happened afterwards.
+        """
+
+        action_start = cls._issue_timestamp({"occurred_at": action_started_at})
+        relevant: list[dict[str, Any]] = []
+        for issue in cls._deduplicate_observation_issues(observation):
+            occurred_at = cls._issue_timestamp(issue)
+            if (
+                action_start is not None
+                and occurred_at is not None
+                and occurred_at < action_start
+            ):
+                # The browser can emit polling/telemetry while JEV is planning.
+                # Those records share the next observation buffer, but they
+                # were not caused by the action that followed.
+                continue
+            relevant.append(issue)
+        return relevant
+
+    @staticmethod
+    def _keep_only_new_observation_issues(
+        observation: Observation, new_issues: list[dict[str, Any]]
+    ) -> None:
+        """Keep recurring baseline noise out of later CTs and JEV prompts."""
+
+        observation.console_errors = [
+            issue
+            for issue in new_issues
+            if issue.get("type") in {"console", "pageerror"}
+        ]
+        observation.network_errors = [
+            issue for issue in new_issues if issue.get("type") in {"http", "network"}
+        ]
+
+    @staticmethod
+    def _scenario_capture_policy(
+        *,
+        decision_source: str,
+        is_restoration_action: bool,
+        result: ActionResult,
+    ) -> tuple[bool, str | None]:
+        """Decide whether an executed action is meaningful test-case evidence."""
+
+        if decision_source == "coverage" or is_restoration_action:
+            return False, "mechanical_coverage_action"
+        if result.success and not result.assertions:
+            return False, "successful_action_without_verifiable_evidence"
+        return True, None
 
     def _record_screenshot(
         self,
@@ -459,6 +614,7 @@ class ExplorationManager:
         state_changed: bool,
         capture_console_errors: bool,
         capture_network_errors: bool,
+        new_issues: list[dict[str, Any]] | None = None,
     ) -> None:
         """Turn a verified post-action delta into deterministic assertions.
 
@@ -469,17 +625,9 @@ class ExplorationManager:
         request cannot be reported as PASS.
         """
 
-        if (
-            not result.success
-            or not state_changed
-            or decision.action
-            in {
-                "wait",
-                "screenshot",
-            }
-        ):
+        if not result.success or decision.action in {"wait", "screenshot"}:
             return
-        if not any(
+        if state_changed and not any(
             item.kind == "observable_state_change" for item in result.assertions
         ):
             result.assertions.append(
@@ -493,9 +641,33 @@ class ExplorationManager:
             )
         if not (capture_console_errors or capture_network_errors):
             return
-        console_count = len(observation.console_errors) if capture_console_errors else 0
-        network_count = len(observation.network_errors) if capture_network_errors else 0
+        if new_issues is None:
+            console_count = (
+                len(observation.console_errors) if capture_console_errors else 0
+            )
+            network_count = (
+                len(observation.network_errors) if capture_network_errors else 0
+            )
+        else:
+            console_count = (
+                sum(
+                    issue.get("type") in {"console", "pageerror"}
+                    for issue in new_issues
+                )
+                if capture_console_errors
+                else 0
+            )
+            network_count = (
+                sum(issue.get("type") in {"http", "network"} for issue in new_issues)
+                if capture_network_errors
+                else 0
+            )
         error_count = console_count + network_count
+        # A request that newly fails is concrete negative evidence even when
+        # the visible page does not change. Conversely, a successful no-op
+        # with no new error stays assertion-free and is omitted as a CT.
+        if not state_changed and error_count == 0:
+            return
         result.assertions.append(
             AssertionResult(
                 kind="no_new_browser_errors",
@@ -1010,6 +1182,13 @@ class ExplorationManager:
                         or coverage_override == "focus_boundary_return"
                     )
                 )
+                # A decision emitted directly by the coverage graph is
+                # traversal/recovery machinery even when its concrete action
+                # is click or navigate. It must not enter JEV history, loop
+                # accounting, or the user-facing test-case inventory.
+                is_mechanical_action = (
+                    decision_source == "coverage" or is_restoration_action
+                )
                 if decision.action == "finish":
                     if not coverage.can_finish():
                         state = coverage.context(observation)
@@ -1078,7 +1257,7 @@ class ExplorationManager:
                     coverage.state_key(observation),
                 )
                 action_counts[fingerprint] = action_counts.get(fingerprint, 0) + 1
-                if action_counts[fingerprint] > 2 and not is_restoration_action:
+                if action_counts[fingerprint] > 2 and not is_mechanical_action:
                     consecutive_loop_rejections += 1
                     # Direciona o modelo para elementos ainda não tentados,
                     # em vez de só dizer "não" e desistir em seguida.
@@ -1177,6 +1356,12 @@ class ExplorationManager:
                     and not state_changed
                 ):
                     result.message = f"{result.message}; no new route or interactive-state change was observed"
+                action_issues = self._issues_relevant_to_action(
+                    next_observation, result.started_at
+                )
+                self._record_observation_issues(
+                    exploration_id, next_observation, known_issues
+                )
                 self._append_observable_state_evidence(
                     result,
                     decision,
@@ -1184,6 +1369,14 @@ class ExplorationManager:
                     state_changed=state_changed,
                     capture_console_errors=options.capture_console_errors,
                     capture_network_errors=options.capture_network_errors,
+                    new_issues=action_issues,
+                )
+                # The precise records are already durable in the issue table.
+                # Keep only newly observed signatures on the observation used
+                # by the CT generator and by the next JEV prompt, so periodic
+                # third-party telemetry cannot be attributed repeatedly.
+                self._keep_only_new_observation_issues(
+                    next_observation, action_issues
                 )
                 safe_decision = redact(asdict(decision), secret_values)
                 safe_result = redact(result.to_dict(), secret_values)
@@ -1195,7 +1388,7 @@ class ExplorationManager:
                 coverage_after = coverage.context(next_observation)
                 consecutive_failed_restorations = self._next_failed_restoration_streak(
                     consecutive_failed_restorations,
-                    is_restoration=is_restoration_action,
+                    is_restoration=is_mechanical_action,
                     success=result.success,
                     state_changed=state_changed,
                 )
@@ -1207,9 +1400,6 @@ class ExplorationManager:
                 )
                 self._record_screenshot(
                     exploration_id, next_observation, decision.action
-                )
-                self._record_observation_issues(
-                    exploration_id, next_observation, known_issues
                 )
                 self.repository.add_event(
                     exploration_id,
@@ -1253,7 +1443,7 @@ class ExplorationManager:
                     f"{' ' + str(decision.target) if decision.target else ''} · "
                     f"{(result.after_url or '')[:80]}",
                 )
-                if not is_restoration_action:
+                if not is_mechanical_action:
                     history.append(
                         {
                             "action": decision.action,
@@ -1284,14 +1474,42 @@ class ExplorationManager:
                 # auxiliary LLM never blocks or shortens browser exploration.
                 if (
                     options.generate_test_cases
-                    and not is_restoration_action
                     and fingerprint not in scenario_fingerprints
                 ):
-                    scenario_fingerprints.add(fingerprint)
-                    scenario_number += 1
-                    pending_scenarios.append(
-                        (next_observation, decision, result, scenario_number)
+                    capture_scenario, omission_reason = self._scenario_capture_policy(
+                        decision_source=decision_source,
+                        is_restoration_action=is_restoration_action,
+                        result=result,
                     )
+                    if capture_scenario:
+                        scenario_fingerprints.add(fingerprint)
+                        scenario_number += 1
+                        pending_scenarios.append(
+                            (next_observation, decision, result, scenario_number)
+                        )
+                    elif (
+                        omission_reason
+                        == "successful_action_without_verifiable_evidence"
+                    ):
+                        # Emit one explanation per semantic no-op, rather than
+                        # flooding the timeline if the model repeats it.
+                        scenario_fingerprints.add(fingerprint)
+                        self.repository.add_event(
+                            exploration_id,
+                            "info",
+                            "scenario_omitted_no_evidence",
+                            (
+                                "A ação foi executada, mas não produziu uma "
+                                "mudança ou asserção verificável; nenhum CT foi criado."
+                            ),
+                            {
+                                "step": actions_executed,
+                                "action": decision.action,
+                                "target": decision.target,
+                                "url": result.after_url,
+                                "reason": omission_reason,
+                            },
+                        )
                 observation = next_observation
                 if consecutive_failed_restorations >= 2:
                     settlement = coverage.abandon_stalled_restoration(
@@ -1347,6 +1565,13 @@ class ExplorationManager:
         except asyncio.CancelledError:
             terminal = ExplorationStatus.CANCELLED
             error_message = "Backend shutdown interrupted this exploration"
+            self.repository.add_event(
+                exploration_id,
+                "warning",
+                "cancelled",
+                error_message,
+                {"reason": "backend_shutdown"},
+            )
         except BrowserUnavailableError:
             terminal = ExplorationStatus.CANCELLED
             error_message = None
@@ -1359,6 +1584,13 @@ class ExplorationManager:
                     "encerrada sem novas chamadas ao JEV e os resultados "
                     "capturados foram preservados."
                 ),
+            )
+            self.repository.add_event(
+                exploration_id,
+                "warning",
+                "cancelled",
+                "Exploração cancelada porque a janela do navegador foi fechada",
+                {"reason": "browser_closed"},
             )
         except asyncio.TimeoutError:
             if options and options.max_duration_seconds is None:
@@ -1445,7 +1677,15 @@ class ExplorationManager:
                 persisted_status == ExplorationStatus.POSTPROCESSING
                 and self.repository.is_cancel_requested(exploration_id)
             ):
-                terminal = ExplorationStatus.CANCELLED
+                if terminal != ExplorationStatus.CANCELLED:
+                    terminal = ExplorationStatus.CANCELLED
+                    self.repository.add_event(
+                        exploration_id,
+                        "warning",
+                        "cancelled",
+                        "Pós-processamento cancelado pelo usuário; os resultados já capturados foram preservados",
+                        {"reason": "postprocessing_cancelled"},
+                    )
             if options and options.generate_html_report:
                 try:
                     self.repository.add_event(

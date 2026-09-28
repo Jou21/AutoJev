@@ -156,6 +156,13 @@ def test_exploration_details_and_summary(tmp_path):
         created_at=utc_now(),
     )
     repo.add_scenario(run_id, 1, scenario)
+    repo.add_event(
+        run_id,
+        "warning",
+        "coverage_complete_with_restrictions",
+        "Reachable coverage exhausted with restrictions",
+        {"candidates_blocked": 3},
+    )
 
     result = repo.get_exploration(run_id)
     assert result["options"]["max_steps"] == 3
@@ -167,3 +174,8 @@ def test_exploration_details_and_summary(tmp_path):
     assert history_item["summary"]["pass"] == 1
     assert history_item["summary"]["fail"] == 0
     assert history_item["summary"]["total_scenarios"] == 1
+    assert history_item["completion_event"] == {
+        "type": "coverage_complete_with_restrictions",
+        "message": "Reachable coverage exhausted with restrictions",
+        "payload": {"candidates_blocked": 3},
+    }

@@ -3,9 +3,11 @@ from __future__ import annotations
 import base64
 import html
 import json
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
 def _h(value: object) -> str:
@@ -81,19 +83,114 @@ class StandaloneHtmlReport:
             "coverage_scope_not_found",
             "failed",
             "cancelled",
+            "browser_closed",
         }
         for event in reversed(exploration.get("events") or []):
-            if str(event.get("type") or "") in relevant:
+            event_type = str(event.get("type") or "")
+            if (
+                status in {"cancelled", "canceled"}
+                and event_type not in {"cancelled", "browser_closed"}
+            ):
+                continue
+            if event_type in relevant:
+                if (
+                    status == "completed"
+                    and event_type == "coverage_complete_with_restrictions"
+                ):
+                    labels["completed"] = "Concluída com restrições"
                 reason = str(event.get("message") or "").strip()
                 break
         if not reason and status == "failed":
             reason = str(exploration.get("error") or "").strip()
         return labels.get(status, status or "Desconhecido"), reason
 
+    @staticmethod
+    def _public_issue_url(value: object) -> str:
+        """Preserve diagnostic routes while defensively masking secret queries."""
+
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        try:
+            parsed = urlsplit(raw)
+            sensitive = {
+                "access_token",
+                "api_key",
+                "apikey",
+                "authorization",
+                "key",
+                "password",
+                "secret",
+                "signature",
+                "token",
+            }
+            query = urlencode(
+                [
+                    (
+                        key,
+                        "[REDACTED]"
+                        if key.lower().replace("-", "_") in sensitive
+                        else item,
+                    )
+                    for key, item in parse_qsl(
+                        parsed.query, keep_blank_values=True
+                    )
+                ]
+            )
+            return urlunsplit(
+                (parsed.scheme, parsed.netloc, parsed.path, query, parsed.fragment)
+            )
+        except ValueError:
+            return raw
+
+    @classmethod
+    def _group_issues(cls, issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Correlate browser signals captured in the same observation.
+
+        Chromium commonly emits one failed request as both a generic console
+        line and an HTTP response event. They remain available inside the
+        group, while the report counts the observation once.
+        """
+
+        groups: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
+        for index, issue in enumerate(issues):
+            screenshot = str(issue.get("screenshot") or "").strip()
+            status = str(issue.get("status_code") or "")
+            public_url = cls._public_issue_url(issue.get("url"))
+            correlation = screenshot or public_url or f"issue-{index}"
+            key = (correlation, status)
+            group = groups.setdefault(
+                key,
+                {
+                    "status_code": issue.get("status_code"),
+                    "screenshot": screenshot or None,
+                    "types": [],
+                    "messages": [],
+                    "urls": [],
+                    "count": 0,
+                },
+            )
+            group["count"] += 1
+            channels = issue.get("evidence_channels")
+            kinds = (
+                [str(channel) for channel in channels if channel]
+                if isinstance(channels, list)
+                else [str(issue.get("type") or issue.get("kind") or "browser")]
+            )
+            message = str(issue.get("message") or "Sinal observado no navegador")
+            for kind in kinds:
+                if kind not in group["types"]:
+                    group["types"].append(kind)
+            for field, value in (("messages", message), ("urls", public_url)):
+                if value and value not in group[field]:
+                    group[field].append(value)
+        return list(groups.values())
+
     def generate(self, exploration: dict[str, Any], output_path: str) -> str:
         exploration_id = str(exploration["id"])
         scenarios = exploration.get("scenarios", [])
         issues = exploration.get("issues", [])
+        issue_groups = self._group_issues(issues)
         summary = exploration.get("summary", {})
         focus_area = str(
             (exploration.get("options") or {}).get("focus_area") or ""
@@ -127,9 +224,10 @@ class StandaloneHtmlReport:
                 )
                 or "<li>Sem asserção verificável; cenário não pode receber PASS.</li>"
             )
+            visible_status = "SEM VALIDAÇÃO" if status == "SKIPPED" else status
             cards.append(
                 f"""<details class="scenario" data-status="{status}">
-                  <summary><div><span class="case-id">{_h(scenario.get("id"))}</span><h2>{_h(scenario.get("title"))}</h2></div><span class="badge {status.lower()}">{status}</span></summary>
+                  <summary><div><span class="case-id">{_h(scenario.get("id"))}</span><h2>{_h(scenario.get("title"))}</h2></div><span class="badge {status.lower()}">{visible_status}</span></summary>
                   <div class="scenario-body">
                   <p>{_h(scenario.get("description"))}</p>
                   <div class="url">{_h(scenario.get("url"))}</div>
@@ -142,10 +240,13 @@ class StandaloneHtmlReport:
             )
         issue_cards = (
             "".join(
-                f"""<article class="issue"><strong>{_h(issue.get("type") or issue.get("kind"))}</strong>
-            <span>{_h(issue.get("status_code"))}</span><p>{_h(issue.get("message"))}</p><small>{_h(issue.get("url"))}</small>
-            <div class="shots">{self._screenshots(exploration_id, [issue["screenshot"]] if issue.get("screenshot") else [])}</div></article>"""
-                for issue in issues
+                f"""<article class="issue"><div class="issue-head"><strong>{_h(" + ".join(group["types"]))}</strong>
+            <span>{_h(group.get("status_code") or "")}</span></div>
+            <p class="muted">{int(group["count"])} sinal(is) correlacionado(s) nesta mesma observação.</p>
+            {''.join(f'<p>{_h(message)}</p>' for message in group["messages"])}
+            {''.join(f'<small class="issue-url">{_h(url)}</small>' for url in group["urls"])}
+            <div class="shots">{self._screenshots(exploration_id, [group["screenshot"]] if group.get("screenshot") else [])}</div></article>"""
+                for group in issue_groups
             )
             or '<p class="muted">Nenhum erro de console ou rede capturado.</p>'
         )
@@ -155,18 +256,18 @@ class StandaloneHtmlReport:
 <html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AutoJev — Exploratory Test Report</title>
 <style>
-:root{{--bg:#0b0e14;--panel:#141923;--line:#293142;--text:#edf1f7;--muted:#9ca8ba;--accent:#f0b44d;--pass:#3ddc97;--fail:#ff647c;--blocked:#ffa657;--skipped:#8b98aa}}*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 Inter,system-ui,sans-serif}}main{{max-width:1120px;margin:auto;padding:48px 24px}}.eyebrow,.case-id{{color:var(--accent);font-weight:800;letter-spacing:.12em;text-transform:uppercase}}h1{{font-size:40px;margin:.15em 0}}h2{{margin:.2em 0;font-size:22px}}h3{{font-size:13px;text-transform:uppercase;color:var(--muted)}}.muted,small{{color:var(--muted)}}.meta,.summary,.columns,.result{{display:grid;gap:12px}}.meta{{grid-template-columns:repeat(auto-fit,minmax(180px,1fr));margin:24px 0}}.summary{{grid-template-columns:repeat(auto-fit,minmax(120px,1fr));margin:20px 0 28px}}.completion{{padding:14px 16px;border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:10px;background:var(--panel);margin:0 0 24px}}.completion strong{{margin-right:8px}}.metric,.scenario,.issue{{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px}}.metric strong{{display:block;font-size:28px}}.report-tools{{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:24px 0}}.search{{flex:1;min-width:240px;background:#10151e;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:10px 13px}}.filters{{display:flex;gap:8px;flex-wrap:wrap}}button{{background:#1c2330;color:var(--text);border:1px solid var(--line);border-radius:999px;padding:8px 14px;cursor:pointer}}button.active{{border-color:var(--accent);color:var(--accent)}}.scenario{{margin:16px 0}}.scenario>summary{{display:flex;justify-content:space-between;gap:20px;cursor:pointer;list-style:none}}.scenario>summary::-webkit-details-marker{{display:none}}.scenario-body{{padding-top:12px}}.badge{{height:max-content;border-radius:999px;padding:5px 10px;font-weight:800}}.pass{{color:var(--pass);background:#143328}}.fail{{color:var(--fail);background:#3a1720}}.blocked{{color:var(--blocked);background:#3c2814}}.skipped{{color:var(--skipped);background:#252c36}}.url{{color:var(--muted);font-family:monospace;overflow-wrap:anywhere}}.columns,.result{{grid-template-columns:1fr 1fr;margin:15px 0}}.scenario-body>details{{border-top:1px solid var(--line);padding-top:12px}}.shots{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin-top:16px}}figure{{margin:0}}img{{width:100%;border-radius:9px;border:1px solid var(--line)}}figcaption{{color:var(--muted);font-size:12px}}.issue{{margin:10px 0;border-left:3px solid var(--fail)}}@media(max-width:720px){{.summary{{grid-template-columns:1fr 1fr}}.meta,.columns,.result{{grid-template-columns:1fr}}}}
+:root{{--bg:#0b0e14;--panel:#141923;--line:#293142;--text:#edf1f7;--muted:#9ca8ba;--accent:#f0b44d;--pass:#3ddc97;--fail:#ff647c;--blocked:#ffa657;--skipped:#8b98aa}}*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 Inter,system-ui,sans-serif}}main{{max-width:1120px;margin:auto;padding:48px 24px}}.eyebrow,.case-id{{color:var(--accent);font-weight:800;letter-spacing:.12em;text-transform:uppercase}}h1{{font-size:40px;margin:.15em 0}}h2{{margin:.2em 0;font-size:22px}}h3{{font-size:13px;text-transform:uppercase;color:var(--muted)}}.muted,small{{color:var(--muted)}}.meta,.summary,.columns,.result{{display:grid;gap:12px}}.meta{{grid-template-columns:repeat(auto-fit,minmax(180px,1fr));margin:24px 0}}.summary{{grid-template-columns:repeat(auto-fit,minmax(120px,1fr));margin:20px 0 28px}}.completion{{padding:14px 16px;border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:10px;background:var(--panel);margin:0 0 24px}}.completion strong{{margin-right:8px}}.metric,.scenario,.issue{{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px}}.metric strong{{display:block;font-size:28px}}.report-tools{{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:24px 0}}.search{{flex:1;min-width:240px;background:#10151e;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:10px 13px}}.filters{{display:flex;gap:8px;flex-wrap:wrap}}button{{background:#1c2330;color:var(--text);border:1px solid var(--line);border-radius:999px;padding:8px 14px;cursor:pointer}}button.active{{border-color:var(--accent);color:var(--accent)}}.scenario{{margin:16px 0}}.scenario>summary{{display:flex;justify-content:space-between;gap:20px;cursor:pointer;list-style:none}}.scenario>summary::-webkit-details-marker{{display:none}}.scenario-body{{padding-top:12px}}.badge{{height:max-content;border-radius:999px;padding:5px 10px;font-weight:800}}.pass{{color:var(--pass);background:#143328}}.fail{{color:var(--fail);background:#3a1720}}.blocked{{color:var(--blocked);background:#3c2814}}.skipped{{color:var(--skipped);background:#252c36}}.url{{color:var(--muted);font-family:monospace;overflow-wrap:anywhere}}.columns,.result{{grid-template-columns:1fr 1fr;margin:15px 0}}.scenario-body>details{{border-top:1px solid var(--line);padding-top:12px}}.shots{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin-top:16px}}figure{{margin:0}}img{{width:100%;border-radius:9px;border:1px solid var(--line)}}figcaption{{color:var(--muted);font-size:12px}}.issue{{margin:10px 0;border-left:3px solid var(--fail)}}.issue-head{{display:flex;justify-content:space-between;gap:12px}}.issue-url{{display:block;font-family:monospace;overflow-wrap:anywhere;margin-top:4px}}@media(max-width:720px){{main{{padding:28px 14px}}h1{{font-size:30px}}.summary{{grid-template-columns:1fr 1fr}}.meta,.columns,.result{{grid-template-columns:1fr}}}}
 </style></head><body><main>
 <div class="eyebrow">AutoJev</div><h1>Exploratory Test Report</h1><p class="muted">Relatório autônomo com evidências observadas pelo Playwright.</p>
 <div class="meta"><div><strong>Aplicação</strong><div class="url">{_h(exploration.get("app_url"))}</div></div><div><strong>Escopo</strong><div>{_h(scope)}</div></div><div><strong>Status</strong><div>{_h(completion_status)}</div></div><div><strong>Duração</strong><div>{_h(self._duration(exploration))}</div></div><div><strong>Gerado em</strong><div>{_h(generated)}</div></div></div>
 {f'<div class="completion"><strong>Motivo do encerramento:</strong>{_h(completion_reason)}</div>' if completion_reason else ''}
-<section class="summary"><div class="metric"><strong>{int(summary.get("total_scenarios", 0))}</strong>Total</div><div class="metric"><strong>{int(summary.get("pass", 0))}</strong>PASS</div><div class="metric"><strong>{int(summary.get("fail", 0))}</strong>FAIL</div><div class="metric"><strong>{int(summary.get("blocked", 0))}</strong>BLOCKED</div><div class="metric"><strong>{int(summary.get("skipped", 0))}</strong>SKIPPED</div><div class="metric"><strong>{_h(tokens)}</strong>Tokens</div><div class="metric"><strong>{_h(cost)}</strong>Custo</div></section>
+<section class="summary"><div class="metric"><strong>{int(summary.get("total_scenarios", 0))}</strong>Total</div><div class="metric"><strong>{int(summary.get("pass", 0))}</strong>PASS</div><div class="metric"><strong>{int(summary.get("fail", 0))}</strong>FAIL</div><div class="metric"><strong>{int(summary.get("blocked", 0))}</strong>BLOCKED</div><div class="metric"><strong>{int(summary.get("skipped", 0))}</strong>Sem validação</div><div class="metric"><strong>{_h(tokens)}</strong>Tokens</div><div class="metric"><strong>{_h(cost)}</strong>Custo</div></section>
 <div class="report-tools"><input class="search" id="search" type="search" placeholder="Buscar por cenário, URL ou evidência" aria-label="Buscar cenários"><div class="filters" id="filters"></div></div><section id="scenarios">{"".join(cards) or '<p class="muted">Nenhum cenário gerado.</p>'}</section>
-<h2>Problemas observados ({len(issues)})</h2><section>{issue_cards}</section>
+<h2>Sinais técnicos observados ({len(issue_groups)} ocorrências)</h2><p class="muted">{len(issues)} registro(s) bruto(s) de console/rede foram correlacionados por observação. Um mesmo request pode aparecer nos dois canais e não representa dois defeitos.</p><section>{issue_cards}</section>
 </main><script>
 const statuses={safe_filter_data};const root=document.getElementById('filters');const search=document.getElementById('search');let active='ALL';
 function apply(){{const term=search.value.trim().toLowerCase();document.querySelectorAll('.scenario').forEach(x=>{{x.hidden=(active!=='ALL'&&x.dataset.status!==active)||(term&&!x.textContent.toLowerCase().includes(term))}})}}
-for(const status of statuses){{const b=document.createElement('button');b.textContent=status;b.className=status==='ALL'?'active':'';b.onclick=()=>{{active=status;document.querySelectorAll('#filters button').forEach(x=>x.classList.remove('active'));b.classList.add('active');apply()}};root.appendChild(b)}}search.addEventListener('input',apply);
+for(const status of statuses){{const b=document.createElement('button');b.textContent=status==='SKIPPED'?'SEM VALIDAÇÃO':status;b.className=status==='ALL'?'active':'';b.onclick=()=>{{active=status;document.querySelectorAll('#filters button').forEach(x=>x.classList.remove('active'));b.classList.add('active');apply()}};root.appendChild(b)}}search.addEventListener('input',apply);
 </script></body></html>"""
         output = Path(output_path)
         output.parent.mkdir(parents=True, exist_ok=True)
