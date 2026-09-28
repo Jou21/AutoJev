@@ -1,9 +1,11 @@
 from pathlib import Path
 
 import pytest
-
-from autojev.adapters.playwright_executor import PlaywrightExecutor
-from autojev.domain.models import ExplorationOptions
+from autojev.adapters.playwright_executor import (
+    BrowserUnavailableError,
+    PlaywrightExecutor,
+)
+from autojev.domain.models import AgentDecision, ExplorationOptions
 
 
 def test_public_browser_urls_redact_secrets_and_preserve_spa_routes(tmp_path: Path):
@@ -209,6 +211,8 @@ def test_sidepanel_is_stable_click_controlled_and_expands_on_attention(tmp_path:
     assert "height:100vh" not in executor._SIDEPANEL_CSS
     assert "action.hidden = true" in executor._SIDEPANEL_INSTALLER
     assert "sessionStorage.setItem(PIN_KEY" in executor._SIDEPANEL_INSTALLER
+    assert "autojev-panel-usage" in executor._SIDEPANEL_INSTALLER
+    assert "savedUsage.tokens" in executor._SIDEPANEL_INSTALLER
     assert "Clique no J para abrir" in executor._SIDEPANEL_INSTALLER
     assert "window.top !== window" in executor._SIDEPANEL_INSTALLER
 
@@ -311,14 +315,16 @@ async def test_observe_normalizes_empty_anchor_href_like_stale_check(tmp_path: P
     assert executor._ref_semantics["e0"]["href"] is None
 
 
-async def test_go_back_restores_forward_page_at_authenticated_boundary(
+async def test_go_back_is_blocked_before_leaving_authenticated_root(
     tmp_path: Path,
 ):
     class Page:
-        url = "https://example.test/inventory"
+        url = "https://example.test/inventory?b=2&a=1"
+        went_back = False
         went_forward = False
 
         async def go_back(self, **_kwargs):
+            self.went_back = True
             self.url = "https://example.test/login"
             return object()
 
@@ -339,8 +345,8 @@ async def test_go_back_restores_forward_page_at_authenticated_boundary(
     executor._page = page
     executor._allowed_origin = executor._origin(page.url)
     executor.protect_authenticated_history()
-
-    from autojev.domain.models import AgentDecision
+    # Query ordering must not move the authenticated history floor.
+    page.url = "https://example.test/inventory?a=1&b=2"
 
     result, observation = await executor.execute(
         AgentDecision(action="go_back", rationale="Return to coverage parent"), {}
@@ -348,8 +354,102 @@ async def test_go_back_restores_forward_page_at_authenticated_boundary(
 
     assert result.success is False
     assert "authenticated session boundary" in result.message
+    assert page.went_back is False
+    assert page.went_forward is False
+    assert observation.url == "https://example.test/inventory?a=1&b=2"
+
+
+async def test_go_back_restores_forward_page_when_unexpected_login_is_reached(
+    tmp_path: Path,
+):
+    class Page:
+        url = "https://example.test/inventory"
+        went_back = False
+        went_forward = False
+
+        async def go_back(self, **_kwargs):
+            self.went_back = True
+            self.url = "https://example.test/login"
+            return object()
+
+        async def go_forward(self, **_kwargs):
+            self.url = "https://example.test/details"
+            self.went_forward = True
+            return object()
+
+        async def evaluate(self, script):
+            if "input[type=\"password\"]" in script:
+                return self.url.endswith("/login")
+            return {"title": "Details", "text": "Product", "elements": []}
+
+    executor = PlaywrightExecutor(
+        tmp_path, ExplorationOptions(capture_screenshots=False)
+    )
+    page = Page()
+    executor._page = page
+    executor._allowed_origin = executor._origin(page.url)
+    executor.protect_authenticated_history()
+    # The executor is away from the protected root, so it retains the
+    # post-navigation login detection as a defense-in-depth fallback.
+    page.url = "https://example.test/details"
+
+    result, observation = await executor.execute(
+        AgentDecision(action="go_back", rationale="Return to coverage parent"), {}
+    )
+
+    assert result.success is False
+    assert "authenticated session boundary" in result.message
+    assert page.went_back is True
     assert page.went_forward is True
-    assert observation.url == "https://example.test/inventory"
+    assert observation.url == "https://example.test/details"
+
+
+async def test_closing_last_page_marks_executor_inactive_and_fails_fast(
+    tmp_path: Path,
+):
+    class Page:
+        url = "https://example.test/inventory"
+
+        @staticmethod
+        def is_closed():
+            return True
+
+    executor = PlaywrightExecutor(tmp_path, ExplorationOptions())
+    page = Page()
+    executor._page = page
+    executor._page_stack = [page]
+
+    executor._on_page_close(page)
+
+    assert executor.is_active() is False
+    assert executor.inactive_event.is_set() is True
+    await executor.wait_until_inactive()
+    with pytest.raises(BrowserUnavailableError, match="not active"):
+        await executor.observe()
+    with pytest.raises(BrowserUnavailableError, match="not active"):
+        await executor.execute(AgentDecision(action="wait", rationale="wait"), {})
+
+
+def test_browser_disconnect_marks_executor_inactive(tmp_path: Path):
+    class Page:
+        url = "https://example.test/inventory"
+
+        @staticmethod
+        def is_closed():
+            return False
+
+    executor = PlaywrightExecutor(tmp_path, ExplorationOptions())
+    page = Page()
+    executor._page = page
+    executor._page_stack = [page]
+
+    assert executor.is_active() is True
+
+    executor._on_browser_disconnected()
+
+    assert executor.is_active() is False
+    assert executor.inactive_event.is_set() is True
+    assert executor._page is None
 
 
 @pytest.mark.parametrize(

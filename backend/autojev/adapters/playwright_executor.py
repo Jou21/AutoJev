@@ -59,7 +59,51 @@ class PlaywrightExecutor:
         self._user_input_event = asyncio.Event()
         self._intervention_message = ""
         self._protect_authenticated_history = False
+        self._authenticated_history_root_url: str | None = None
+        self._inactive_event = asyncio.Event()
         self._sidepanel_init_installed = False
+
+    def is_active(self) -> bool:
+        """Whether there is still a usable browser page for this run."""
+
+        if self._inactive_event.is_set() or self._page is None:
+            return False
+        try:
+            if self._page.is_closed():
+                return False
+        except (AttributeError, TypeError):
+            # Lightweight page doubles used by unit tests do not implement
+            # Playwright's complete lifecycle API.
+            pass
+        if self._browser is not None:
+            try:
+                if not self._browser.is_connected():
+                    return False
+            except (AttributeError, TypeError):
+                pass
+        return True
+
+    @property
+    def inactive_event(self) -> asyncio.Event:
+        """Event set as soon as the last page or browser becomes unavailable."""
+
+        return self._inactive_event
+
+    async def wait_until_inactive(self) -> None:
+        """Wait until the browser disconnects or its final page is closed."""
+
+        await self._inactive_event.wait()
+
+    def _mark_inactive(self) -> None:
+        self._inactive_event.set()
+        self._ref_selectors.clear()
+        self._ref_semantics.clear()
+
+    def _on_browser_disconnected(self, _browser: Any = None) -> None:
+        self._page = None
+        self._page_stack = []
+        self._pending_pages.clear()
+        self._mark_inactive()
 
     async def _prepare_page(self, page: Any) -> None:
         """Attach AutoJev observation hooks to a newly adopted browser page."""
@@ -85,13 +129,23 @@ class PlaywrightExecutor:
         self._page_stack = [item for item in self._page_stack if item is not page]
         if self._page is page:
             open_pages = [item for item in self._page_stack if not item.is_closed()]
+            if not open_pages and self._context is not None:
+                open_pages = [
+                    item
+                    for item in getattr(self._context, "pages", [])
+                    if item is not page and not item.is_closed()
+                ]
             self._page = open_pages[-1] if open_pages else None
             self._ref_selectors.clear()
             self._ref_semantics.clear()
+        if self._page is None:
+            self._mark_inactive()
 
     async def start(self, url: str) -> Observation:
         self._validate_url(url)
         self._allowed_origin = self._origin(url)
+        self._inactive_event.clear()
+        self._authenticated_history_root_url = None
         try:
             from playwright.async_api import async_playwright
         except ImportError as exc:
@@ -134,6 +188,7 @@ class PlaywrightExecutor:
             if channel:
                 launch_options["channel"] = channel
             self._browser = await browser_type.launch(**launch_options)
+            self._browser.on("disconnected", self._on_browser_disconnected)
             self._context = await self._browser.new_context(**context_options)
             await self._context.route("**/*", self._guard_navigation)
             self._page = await self._context.new_page()
@@ -253,6 +308,7 @@ class PlaywrightExecutor:
       panel.id = ID;
       panel.dataset.mode = 'exploring';
       const PIN_KEY = 'autojev-panel-open';
+      const USAGE_KEY = 'autojev-panel-usage';
       let savedPinned = false;
       try { savedPinned = sessionStorage.getItem(PIN_KEY) === 'true'; } catch (error) {}
       panel.dataset.pinned = savedPinned ? 'true' : 'false';
@@ -313,6 +369,13 @@ class PlaywrightExecutor:
       usage.id = 'autojev-usage';
       usage.className = 'autojev-usage';
       usage.innerHTML = '<span class="autojev-usage-chip"><small>Tokens</small><strong id="autojev-token-value">0</strong></span><span class="autojev-usage-chip"><small>Custo</small><strong id="autojev-cost-value">—</strong></span>';
+      try {
+        const savedUsage = JSON.parse(sessionStorage.getItem(USAGE_KEY) || 'null');
+        if (savedUsage) {
+          usage.querySelector('#autojev-token-value').textContent = savedUsage.tokens || '0';
+          usage.querySelector('#autojev-cost-value').textContent = savedUsage.cost || '—';
+        }
+      } catch (error) {}
 
       const action = document.createElement('div');
       action.id = 'autojev-panel-action';
@@ -449,8 +512,15 @@ class PlaywrightExecutor:
                 """([tokens, costText]) => {
                   const tokenValue = document.getElementById('autojev-token-value');
                   const costValue = document.getElementById('autojev-cost-value');
-                  if (tokenValue) tokenValue.textContent = tokens.toLocaleString('pt-BR');
+                  const tokenText = tokens.toLocaleString('pt-BR');
+                  if (tokenValue) tokenValue.textContent = tokenText;
                   if (costValue) costValue.textContent = costText;
+                  try {
+                    sessionStorage.setItem(
+                      'autojev-panel-usage',
+                      JSON.stringify({ tokens: tokenText, cost: costText })
+                    );
+                  } catch (error) {}
                 }""",
                 [total_tokens, f"${cost:.6f}" if cost_known and cost is not None else "—"],
             )
@@ -537,6 +607,25 @@ class PlaywrightExecutor:
         """Keep coverage backtracking inside the authenticated application."""
 
         self._protect_authenticated_history = True
+        self._authenticated_history_root_url = (
+            self._history_url_identity(self._page.url) if self._page else None
+        )
+
+    @staticmethod
+    def _history_url_identity(value: str) -> str:
+        """Canonical URL identity used only for the authenticated history floor."""
+
+        parsed = urlsplit(value)
+        query = urlencode(sorted(parse_qsl(parsed.query, keep_blank_values=True)))
+        return urlunsplit(
+            (
+                parsed.scheme.lower(),
+                parsed.netloc.lower(),
+                parsed.path or "/",
+                query,
+                parsed.fragment,
+            )
+        )
 
     async def is_login_page(self) -> bool:
         """Checagem leve (sem screenshot) para detectar tela de login."""
@@ -765,7 +854,7 @@ class PlaywrightExecutor:
         return filename
 
     async def observe(self, screenshot_label: str = "page") -> Observation:
-        if not self._page:
+        if not self.is_active():
             raise BrowserUnavailableError("Browser page is not active")
         snapshot = await self._page.evaluate(
             """() => {
@@ -1108,7 +1197,7 @@ class PlaywrightExecutor:
     async def execute(
         self, decision: AgentDecision, credentials: dict[str, str]
     ) -> tuple[ActionResult, Observation]:
-        if not self._page:
+        if not self.is_active():
             raise BrowserUnavailableError("Browser page is not active")
         started = utc_now()
         before_url = self._public_url(self._page.url)
@@ -1211,6 +1300,19 @@ class PlaywrightExecutor:
                 locator = await self._locator(decision.target)
                 await locator.hover(timeout=10_000)
             elif action == "go_back":
+                if (
+                    self._protect_authenticated_history
+                    and self._authenticated_history_root_url is not None
+                    and self._history_url_identity(self._page.url)
+                    == self._authenticated_history_root_url
+                ):
+                    # Do not briefly expose the login document and then move
+                    # forward again. Apart from the visible flash, that round
+                    # trip can run page startup effects and invalidate the
+                    # authenticated DOM state the planner is trying to keep.
+                    raise PermissionError(
+                        "PolicyBlocked: browser back would cross the authenticated session boundary"
+                    )
                 before_back_url = self._page.url
                 response = await self._page.go_back(
                     wait_until="domcontentloaded", timeout=30_000
@@ -1348,4 +1450,6 @@ class PlaywrightExecutor:
         self._pending_pages.clear()
         self._ref_selectors.clear()
         self._ref_semantics.clear()
+        self._authenticated_history_root_url = None
+        self._mark_inactive()
         self._sidepanel_init_installed = False

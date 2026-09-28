@@ -911,16 +911,25 @@ class CoveragePlanner:
     def next_restoration_action(
         self, observation: Observation
     ) -> tuple[AgentDecision, str] | None:
-        """Return an already-planned mechanical restore step without an LLM call.
+        """Return deterministic graph traversal without spending an LLM call.
 
         Restoration decisions are deterministic consequences of the coverage
         graph.  Exposing them lets the orchestrator keep executing a known
         replay/navigation recipe without paying for a fresh model decision on
-        every intermediate step.
+        every intermediate step.  Backtracking from an exhausted live state is
+        deterministic for the same reason: the model chooses *what* to test,
+        while the coverage graph owns how to reach the next known frontier.
         """
 
         key = self.observe(observation)
-        return self._continue_restoration(key)
+        restoration = self._continue_restoration(key)
+        if restoration:
+            return restoration
+
+        state = self.states[key]
+        if not self._remaining(state) and not self.frontier_exhausted():
+            return self._backtrack_decision()
+        return None
 
     def abandon_stalled_restoration(
         self, *, reason: str = "stalled_restoration"
@@ -1047,7 +1056,12 @@ class CoveragePlanner:
             current_state = self.states[current]
             previous = self.states[self.path[-2]]
             failures = self.backtrack_failures.get(current, 0)
-            if failures >= 2:
+            # Re-loading the same URL cannot recreate an older ephemeral DOM
+            # snapshot.  One attempt is enough; repeating it only burns model
+            # calls while landing on the identical live state.  Different-URL
+            # parents still get browser-history plus one direct-URL fallback.
+            failure_limit = 1 if current_state.url == previous.url else 2
+            if failures >= failure_limit:
                 # Browser history and a direct URL fallback both failed to
                 # recreate this logical parent. Settle only that inaccessible
                 # branch and keep walking the remaining graph.
@@ -1122,15 +1136,21 @@ class CoveragePlanner:
             return restoration
         remaining = self._remaining(state)
 
-        # The coverage root is an application boundary, not a browser-history
-        # invitation. Once its local work is done, go_back would leave the
-        # tested application (or cross the authenticated login gate). Prefer a
-        # known remote frontier and otherwise finish deterministically.
-        if decision.action == "go_back" and len(self.path) <= 1 and not remaining:
+        # Browser history is an execution mechanism, never a planning source.
+        # Reconcile every model-requested back navigation through the logical
+        # coverage graph regardless of path depth.  Previously only the root
+        # did this, allowing an exhausted same-route child to bounce through
+        # the authenticated login entry forever.
+        if decision.action == "go_back" and not remaining:
+            at_coverage_root = len(self.path) <= 1
             backtrack = self._backtrack_decision()
             if backtrack:
-                return backtrack[0], backtrack[1] or "root_backtrack_replaced"
-            if self.frontier_exhausted():
+                return backtrack[0], backtrack[1] or (
+                    "root_backtrack_replaced"
+                    if at_coverage_root
+                    else "model_backtrack_reconciled"
+                )
+            if self.can_finish():
                 return (
                     AgentDecision(
                         action="finish",
@@ -1139,7 +1159,11 @@ class CoveragePlanner:
                             "cross the application or authenticated-session boundary."
                         ),
                     ),
-                    "root_backtrack_replaced_by_finish",
+                    (
+                        "root_backtrack_replaced_by_finish"
+                        if at_coverage_root
+                        else "model_backtrack_replaced_by_finish"
+                    ),
                 )
 
         if decision.action == "finish":
@@ -1432,9 +1456,16 @@ class CoveragePlanner:
         if decision.action in {"go_back", "navigate"} and (
             not result.success or after_key == before_key
         ):
-            self.backtrack_failures[before_key] = (
-                self.backtrack_failures.get(before_key, 0) + 1
-            )
+            failures = self.backtrack_failures.get(before_key, 0) + 1
+            if (
+                decision.action == "go_back"
+                and "policyblocked" in result.message.lower()
+            ):
+                # Crossing an authentication/application boundary is
+                # deterministic, not transient.  Skip the identical retry and
+                # settle or restore another logical frontier immediately.
+                failures = max(failures, 2)
+            self.backtrack_failures[before_key] = failures
         elif result.success and after_key != before_key:
             self.backtrack_failures.pop(before_key, None)
 

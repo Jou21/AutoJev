@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import time
+from collections.abc import Awaitable
 from contextlib import suppress
 from dataclasses import asdict
 from typing import Any
@@ -14,7 +15,10 @@ from autojev.adapters.openai_compatible import (
     OpenAICompatibleClient,
     OpenAIJevAgent,
 )
-from autojev.adapters.playwright_executor import PlaywrightExecutor
+from autojev.adapters.playwright_executor import (
+    BrowserUnavailableError,
+    PlaywrightExecutor,
+)
 from autojev.adapters.report import StandaloneHtmlReport
 from autojev.adapters.repository import SQLiteRepository
 from autojev.adapters.secrets import EphemeralCredentialVault, redact
@@ -130,7 +134,7 @@ class ExplorationManager:
         panel_message: str | None = None,
         deadline: float | None = None,
     ) -> str:
-        """Aguarda login manual. Retorna 'manual', 'auto' ou 'timeout'."""
+        """Aguarda login manual sem ignorar o fechamento do navegador."""
         event = self.input_events.setdefault(exploration_id, asyncio.Event())
         event.clear()
         self.repository.update_exploration(
@@ -149,17 +153,22 @@ class ExplorationManager:
         app_resume = asyncio.create_task(event.wait())
         browser_resume = asyncio.create_task(executor.wait_for_user_input())
         auto_resume = asyncio.create_task(self._poll_login_gone(executor, deadline))
+        browser_closed = asyncio.create_task(executor.wait_until_inactive())
         done, pending = await asyncio.wait(
-            {app_resume, browser_resume, auto_resume},
+            {app_resume, browser_resume, auto_resume, browser_closed},
             return_when=asyncio.FIRST_COMPLETED,
         )
-        auto = auto_resume in done and auto_resume.result() is True
-        timed_out = auto_resume in done and auto_resume.result() is False
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
+        if browser_closed in done:
+            # Closing the browser is an explicit user stop signal.  Do not
+            # leave the exploration waiting for the login confirmation event.
+            return "browser_closed"
+        auto = auto_resume in done and auto_resume.result() is True
+        timed_out = auto_resume in done and auto_resume.result() is False
         for task in done:
-            if task is not auto_resume:
+            if task not in {auto_resume, browser_closed}:
                 task.result()
         if self.repository.is_cancel_requested(exploration_id):
             return "cancelled"
@@ -202,6 +211,37 @@ class ExplorationManager:
         if deadline is None:
             return 120.0
         return max(deadline - time.monotonic(), 0.1)
+
+    @staticmethod
+    async def _await_decision_while_browser_active(
+        executor: PlaywrightExecutor,
+        decision_call: Awaitable[AgentDecision],
+        timeout: float,
+    ) -> AgentDecision:
+        """Cancel an in-flight planning request when the browser is closed."""
+
+        decision_task = asyncio.ensure_future(decision_call)
+        browser_closed = asyncio.create_task(executor.wait_until_inactive())
+        try:
+            done, _ = await asyncio.wait(
+                {decision_task, browser_closed},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                raise asyncio.TimeoutError
+            if browser_closed in done:
+                raise BrowserUnavailableError(
+                    "Browser window was closed by the user"
+                )
+            return decision_task.result()
+        finally:
+            for task in (decision_task, browser_closed):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                decision_task, browser_closed, return_exceptions=True
+            )
 
     @staticmethod
     def _step_label(step: int, max_steps: int | None) -> str:
@@ -747,6 +787,10 @@ class ExplorationManager:
                         exploration_id, "warning", "cancelled", "Cancellation requested"
                     )
                     break
+                if not executor.is_active():
+                    raise BrowserUnavailableError(
+                        "Browser window was closed by the user"
+                    )
                 if deadline is not None and time.monotonic() >= deadline:
                     terminal = ExplorationStatus.PARTIAL
                     self.repository.add_event(
@@ -778,6 +822,10 @@ class ExplorationManager:
                     ):
                         terminal = ExplorationStatus.CANCELLED
                         break
+                    if outcome == "browser_closed":
+                        raise BrowserUnavailableError(
+                            "Browser window was closed by the user"
+                        )
                     if outcome == "timeout":
                         terminal = ExplorationStatus.PARTIAL
                         self.repository.add_event(
@@ -874,6 +922,13 @@ class ExplorationManager:
                 if mechanical_restore is not None:
                     decision, coverage_override = mechanical_restore
                 else:
+                    # The browser can be closed between two observations.  Do
+                    # this health check immediately before the paid model call
+                    # so a closed window never burns another JEV request.
+                    if not executor.is_active():
+                        raise BrowserUnavailableError(
+                            "Browser window was closed by the user"
+                        )
                     planning_attempts += 1
                     if (
                         max_planning_attempts is not None
@@ -889,7 +944,8 @@ class ExplorationManager:
                         )
                         break
                     try:
-                        decision = await asyncio.wait_for(
+                        decision = await self._await_decision_while_browser_active(
+                            executor,
                             agent.decide(
                                 observation,
                                 # Coverage context contains the durable graph;
@@ -899,7 +955,7 @@ class ExplorationManager:
                                 sorted(credentials.keys()),
                                 coverage.context(observation),
                             ),
-                            timeout=self._operation_timeout(deadline),
+                            self._operation_timeout(deadline),
                         )
                         consecutive_model_errors = 0
                     except ModelResponseError as exc:
@@ -1159,13 +1215,26 @@ class ExplorationManager:
                     exploration_id,
                     "info" if result.success else "error",
                     "action_completed",
-                    result.message,
+                    (
+                        result.message
+                        if result.success
+                        else (
+                            "Falha registrada nesta opção; a exploração seguirá "
+                            f"pelas demais. Detalhe: {result.message}"
+                        )
+                    ),
                     {
                         "step": actions_executed,
                         "action": decision.action,
                         "success": result.success,
                         "url": result.after_url,
                         "state_changed": state_changed,
+                        "exploration_continues": not result.success,
+                        "failure_policy": (
+                            "retry_then_continue_frontier"
+                            if not result.success
+                            else None
+                        ),
                         "coverage": {
                             "known_states": coverage_after["known_states"],
                             "frontier_states": coverage_after["frontier_states"],
@@ -1180,7 +1249,7 @@ class ExplorationManager:
                 )
                 await executor.update_live_panel(
                     self._step_label(actions_executed, options.max_steps),
-                    f"{'OK' if result.success else 'FALHA'} · {decision.action}"
+                    f"{'OK' if result.success else 'FALHA REGISTRADA — CONTINUANDO'} · {decision.action}"
                     f"{' ' + str(decision.target) if decision.target else ''} · "
                     f"{(result.after_url or '')[:80]}",
                 )
@@ -1278,6 +1347,19 @@ class ExplorationManager:
         except asyncio.CancelledError:
             terminal = ExplorationStatus.CANCELLED
             error_message = "Backend shutdown interrupted this exploration"
+        except BrowserUnavailableError:
+            terminal = ExplorationStatus.CANCELLED
+            error_message = None
+            self.repository.add_event(
+                exploration_id,
+                "warning",
+                "browser_closed",
+                (
+                    "A janela do navegador foi fechada. A exploração foi "
+                    "encerrada sem novas chamadas ao JEV e os resultados "
+                    "capturados foram preservados."
+                ),
+            )
         except asyncio.TimeoutError:
             if options and options.max_duration_seconds is None:
                 terminal = ExplorationStatus.FAILED

@@ -1,5 +1,9 @@
-import pytest
+import asyncio
+from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
+from autojev.adapters.playwright_executor import BrowserUnavailableError
 from autojev.domain.models import (
     ActionResult,
     AgentDecision,
@@ -241,3 +245,177 @@ async def test_all_local_scenarios_are_persisted_before_auxiliary_enrichment():
             "stage": "scenarios_complete",
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_waiting_for_login_stops_as_soon_as_browser_closes():
+    class Repository:
+        def __init__(self):
+            self.events = []
+
+        def update_exploration(self, *args, **kwargs):
+            return None
+
+        def add_event(self, exploration_id, level, event_type, message, payload=None):
+            self.events.append(event_type)
+
+        def is_cancel_requested(self, exploration_id):
+            return False
+
+    class Executor:
+        async def show_intervention_panel(self, message):
+            return None
+
+        async def wait_for_user_input(self):
+            await asyncio.Event().wait()
+
+        async def wait_until_inactive(self):
+            await asyncio.sleep(0)
+
+        async def is_login_page(self):
+            return True
+
+    manager = object.__new__(ExplorationManager)
+    manager.repository = Repository()
+    manager.input_events = {}
+    observation = Observation(
+        url="https://example.test/login",
+        title="Login",
+        text="Username Password",
+        interactive_elements=[],
+    )
+
+    outcome = await asyncio.wait_for(
+        manager._wait_for_user_input(
+            "run-closed-login", observation, Executor()
+        ),
+        timeout=0.5,
+    )
+
+    assert outcome == "browser_closed"
+    assert manager.repository.events == ["waiting_input"]
+
+
+@pytest.mark.asyncio
+async def test_closed_browser_cancels_run_before_any_jev_call(monkeypatch, tmp_path):
+    class Repository:
+        def __init__(self):
+            self.events = []
+            self.updates = []
+
+        def get_exploration(self, exploration_id, include_details=False):
+            return {
+                "id": exploration_id,
+                "app_url": "https://example.test/",
+                "cancel_requested": False,
+                "agent": {"provider_id": "provider", "model_id": "jev"},
+                "auxiliary_llm": {
+                    "provider_id": "provider",
+                    "model_id": "auxiliary",
+                },
+                "options": {
+                    "max_steps": None,
+                    "max_duration_seconds": None,
+                    "generate_test_cases": False,
+                    "generate_html_report": False,
+                },
+            }
+
+        def update_exploration(self, exploration_id, **values):
+            self.updates.append(values)
+
+        def add_event(self, exploration_id, level, event_type, message, payload=None):
+            self.events.append((level, event_type, message))
+
+        def is_cancel_requested(self, exploration_id):
+            return False
+
+    class Vault:
+        def __init__(self):
+            self.discarded = []
+
+        def get(self, exploration_id):
+            return {}
+
+        def discard(self, exploration_id):
+            self.discarded.append(exploration_id)
+
+    class Client:
+        async def chat_json(self, *args, **kwargs):
+            raise AssertionError("JEV must not be called after the browser closes")
+
+    class ClosedExecutor:
+        def __init__(self, *args, **kwargs):
+            self.closed = False
+
+        async def start(self, url):
+            return Observation(
+                url=url,
+                title="Home",
+                text="Ready",
+                interactive_elements=[
+                    {"ref": "e0", "tag": "button", "name": "Open"}
+                ],
+            )
+
+        async def show_live_panel(self):
+            return None
+
+        async def update_live_panel(self, *args):
+            return None
+
+        def is_active(self):
+            return False
+
+        async def close(self):
+            self.closed = True
+
+    repository = Repository()
+    vault = Vault()
+    settings = SimpleNamespace(
+        artifact_dir=Path(tmp_path),
+        headless=True,
+        browser="chromium",
+    )
+    manager = ExplorationManager(repository, vault, object(), settings)
+    manager._client_for = lambda provider_id: Client()
+    monkeypatch.setattr(
+        "autojev.services.exploration.PlaywrightExecutor", ClosedExecutor
+    )
+
+    await manager._run("run-browser-closed")
+
+    assert any(event[1] == "browser_closed" for event in repository.events)
+    assert not any(event[1] == "failed" for event in repository.events)
+    final_update = repository.updates[-1]
+    assert final_update["status"].value == "cancelled"
+    assert final_update["error"] is None
+    assert vault.discarded == ["run-browser-closed"]
+
+
+@pytest.mark.asyncio
+async def test_browser_close_cancels_an_in_flight_jev_decision():
+    inactive = asyncio.Event()
+    model_cancelled = asyncio.Event()
+
+    class Executor:
+        async def wait_until_inactive(self):
+            await inactive.wait()
+
+    async def slow_decision():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            model_cancelled.set()
+
+    task = asyncio.create_task(
+        ExplorationManager._await_decision_while_browser_active(
+            Executor(), slow_decision(), timeout=5
+        )
+    )
+    await asyncio.sleep(0)
+    inactive.set()
+
+    with pytest.raises(BrowserUnavailableError, match="closed"):
+        await task
+    assert model_cancelled.is_set() is True

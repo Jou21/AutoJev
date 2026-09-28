@@ -405,19 +405,103 @@ def test_same_route_backtrack_navigates_known_url_instead_of_browser_history():
         result("navigate", child.url, child.url, success=False),
         child,
     )
-    retry, _ = planner.reconcile(child, AgentDecision("finish", "cover"))
-    assert retry.action == "navigate"
-    planner.record_action(
-        child,
-        retry,
-        result("navigate", child.url, child.url, success=False),
-        child,
-    )
     finish, _ = planner.reconcile(child, AgentDecision("finish", "cover"))
 
     assert finish.action == "finish"
     assert planner.can_finish() is True
     assert planner.coverage_complete() is False
+
+
+def test_exhausted_child_backtracks_mechanically_before_another_model_call():
+    root = observation(
+        "https://app.test/inventory",
+        [
+            {"ref": "e0", "tag": "button", "name": "Open state", "enabled": True},
+            {"ref": "e1", "tag": "button", "name": "Root sibling", "enabled": True},
+        ],
+    )
+    child = observation(
+        root.url,
+        [{"ref": "e7", "tag": "button", "name": "Child action", "enabled": True}],
+    )
+    planner = CoveragePlanner(root.url)
+    enter = AgentDecision(action="click", target="e0", rationale="Open state")
+    planner.record_action(root, enter, result("click", root.url, root.url), child)
+    local, _ = planner.reconcile(child, AgentDecision("finish", "cover"))
+    planner.record_action(child, local, result("click", child.url, child.url), child)
+
+    mechanical = planner.next_restoration_action(child)
+
+    assert mechanical is not None
+    decision, reason = mechanical
+    assert decision.action == "navigate"
+    assert decision.url == root.url
+    assert reason == "dom_state_backtrack_navigate"
+
+
+def test_repeated_model_go_back_is_reconciled_and_never_retried_unchanged():
+    root = observation(
+        "https://app.test/inventory",
+        [
+            {"ref": "e0", "tag": "button", "name": "Open state", "enabled": True},
+            {"ref": "e1", "tag": "button", "name": "Root sibling", "enabled": True},
+        ],
+    )
+    child = observation(
+        root.url,
+        [{"ref": "e7", "tag": "button", "name": "Child action", "enabled": True}],
+    )
+    planner = CoveragePlanner(root.url)
+    enter = AgentDecision(action="click", target="e0", rationale="Open state")
+    planner.record_action(root, enter, result("click", root.url, root.url), child)
+    local, _ = planner.reconcile(child, AgentDecision("finish", "cover"))
+    planner.record_action(child, local, result("click", child.url, child.url), child)
+
+    first, _ = planner.reconcile(child, AgentDecision("go_back", "leave"))
+    assert first.action == "navigate"
+    planner.record_action(
+        child,
+        first,
+        result("navigate", child.url, child.url, success=False),
+        child,
+    )
+
+    second, reason = planner.reconcile(child, AgentDecision("go_back", "leave"))
+
+    assert second.action == "finish"
+    assert reason == "model_backtrack_replaced_by_finish"
+
+
+def test_policy_blocked_back_edge_is_not_executed_a_second_time():
+    root = observation(
+        "https://app.test/inventory",
+        [
+            {"ref": "e0", "tag": "a", "name": "Details", "href": "https://app.test/item", "enabled": True},
+            {"ref": "e1", "tag": "button", "name": "Root sibling", "enabled": True},
+        ],
+    )
+    child = observation("https://app.test/item", [])
+    planner = CoveragePlanner(root.url)
+    enter = AgentDecision(action="click", target="e0", rationale="Open details")
+    planner.record_action(
+        root,
+        enter,
+        result("click", root.url, child.url),
+        child,
+    )
+
+    first, _ = planner.reconcile(child, AgentDecision("go_back", "return"))
+    assert first.action == "go_back"
+    blocked = result("go_back", child.url, child.url, success=False)
+    blocked.message = (
+        "PermissionError: PolicyBlocked: browser back would cross the "
+        "authenticated session boundary"
+    )
+    planner.record_action(child, first, blocked, child)
+
+    second, _ = planner.reconcile(child, AgentDecision("go_back", "return"))
+
+    assert second.action != "go_back"
 
 
 def test_frontier_exposes_at_most_thirty_atomic_moves_per_decision():
@@ -1142,6 +1226,42 @@ def test_transient_candidate_failure_retries_once_then_blocks_completion():
     assert after_second["current_untried"] == []
     assert planner.can_finish() is True
     assert planner.coverage_complete() is False
+
+
+def test_permanent_action_failure_is_recorded_and_next_candidate_still_runs():
+    page = observation(
+        "https://app.test/dashboard",
+        [
+            {"ref": "e0", "tag": "button", "name": "Broken action", "enabled": True},
+            {"ref": "e1", "tag": "button", "name": "Healthy action", "enabled": True},
+        ],
+    )
+    planner = CoveragePlanner(page.url)
+
+    first, _ = planner.reconcile(
+        page, AgentDecision("click", "exercise", target="e0")
+    )
+    planner.record_action(
+        page,
+        first,
+        result("click", page.url, page.url, success=False),
+        page,
+    )
+    retry, _ = planner.reconcile(
+        page, AgentDecision("click", "retry", target="e0")
+    )
+    planner.record_action(
+        page,
+        retry,
+        result("click", page.url, page.url, success=False),
+        page,
+    )
+
+    following, reason = planner.reconcile(page, AgentDecision("finish", "done"))
+
+    assert following.action == "click"
+    assert following.target == "e1"
+    assert reason == "finish_replaced_by_frontier_action"
 
 
 def test_repeated_global_navigation_control_is_only_covered_once():
