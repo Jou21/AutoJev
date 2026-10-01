@@ -9,10 +9,14 @@ adapter can execute actions and produce observations.
 React UI
    |
    v
-FastAPI -> Exploration Engine -> Coverage planner -> JEV agent (priority/decision)
-                                               |
-                                               v
-                              -> Playwright executor -> real browser
+FastAPI -> Exploration Engine -> Coverage planner -> invocation policy
+                                                        |           |
+                                                obvious move      ambiguity
+                                                        |           v
+                                                        |      JEV agent
+                                                        |           |
+                                                        v           v
+                                              Playwright executor -> real browser
                                       |
                                       v
                            DOM, URL, console, network, screenshots
@@ -88,13 +92,19 @@ FastAPI -> Exploration Engine -> Coverage planner -> JEV agent (priority/decisio
 - Same-origin tabs opened by a control are adopted by the executor and placed
   on its page stack. Backtracking closes the tab and restores its exact parent;
   unresolved or cross-origin popups are blocked.
-- The auxiliary LLM documents captured evidence only after browser navigation,
-  so provider latency cannot consume the exploration deadline. This work runs
-  under the live, cancelable `postprocessing` lifecycle state and falls back to
-  deterministic local evidence on cancellation, provider failure or its own
-  bounded documentation window.
+- Each verified action is persisted immediately as a local CT. One bounded
+  auxiliary worker enriches CTs concurrently with later browser actions, so
+  provider latency cannot reduce coverage; postprocessing only drains any
+  remaining queue and builds the report.
 
 ## JEV decision quality
+
+- The invocation policy sends clear controls, conventional forms, known
+  navigation and restoration directly to Playwright. It calls JEV for
+  duplicate/ambiguous controls, new complex states, ambiguous business
+  controls, missing deterministic moves, or two attempts without progress.
+  Browser-detectable HTTP/console failures are recorded locally and do not need
+  an AI confirmation call.
 
 - OpenAI-compatible chat agents return a schema-validated `AgentDecision`.
   TypeSafe JEV uses its native Decisions API: AutoJev supplies one `Choice`
@@ -124,9 +134,17 @@ Agent and auxiliary selections are stored independently:
   "auxiliary_llm": {
     "provider_id": "provider-id",
     "model_id": "claude-sonnet"
+  },
+  "options": {
+    "auxiliary_evidence_mode": "text"
   }
 }
 ```
+
+`text` sends compact accessible DOM, visible text and verified results to the
+auxiliary model while retaining screenshots locally. `visual` additionally
+attaches the masked low-detail screenshot and falls back to text only when the
+provider explicitly reports that image input is unsupported.
 
 Both selections use the same OpenAI-compatible provider adapter today. New
 provider and model adapters can be introduced without changing Playwright or

@@ -40,6 +40,77 @@ def test_provider_secret_is_write_only(tmp_path):
     assert b"sk-do-not-return" not in raw
 
 
+def test_provider_model_capabilities_round_trip(tmp_path):
+    repo = repository(tmp_path)
+    provider = repo.create_provider(
+        "Vision provider",
+        "http://localhost:4000",
+        None,
+        True,
+        [
+            ProviderModel(
+                "vision-model",
+                "Vision model",
+                input_modalities=["TEXT", "image", "image"],
+            )
+        ],
+    )
+
+    assert provider.models[0].input_modalities == ["text", "image"]
+    assert provider.models[0].supports_vision is True
+    assert provider.models[0].capabilities_known is True
+
+
+def test_provider_model_capabilities_migrate_legacy_database(tmp_path):
+    database_path = tmp_path / "legacy-models.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE providers (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                base_url TEXT NOT NULL,
+                api_key_encrypted TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE provider_models (
+                provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+                model_id TEXT NOT NULL,
+                label TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY(provider_id, model_id)
+            );
+            """
+        )
+        connection.execute(
+            "INSERT INTO providers VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("provider", "Legacy", "http://localhost:4000", None, 1, "now", "now"),
+        )
+        connection.execute(
+            "INSERT INTO provider_models VALUES (?, ?, ?, ?)",
+            ("provider", "legacy-model", "Legacy model", 1),
+        )
+
+    repo = SQLiteRepository(database_path, SecretCipher(tmp_path, "legacy-model-key"))
+    repo.initialize()
+
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(provider_models)")
+        }
+    assert {
+        "input_modalities_json",
+        "supports_vision",
+        "capabilities_known",
+    } <= columns
+    model = repo.get_provider("provider").models[0]
+    assert model.input_modalities == []
+    assert model.supports_vision is False
+    assert model.capabilities_known is False
+
+
 def test_usage_columns_migrate_legacy_database_and_round_trip(tmp_path):
     database_path = tmp_path / "legacy.sqlite3"
     with sqlite3.connect(database_path) as connection:
@@ -130,6 +201,33 @@ def test_restart_fails_every_nonterminal_exploration_phase(tmp_path):
         assert "Backend restarted" in item["error"]
 
 
+def test_cancel_request_only_marks_a_still_active_exploration(tmp_path):
+    repo = repository(tmp_path)
+    provider = repo.create_provider(
+        "P", "http://localhost:4000", None, True, [ProviderModel("m", "M")]
+    )
+
+    def create_run():
+        return repo.create_exploration(
+            ExplorationRequest(
+                app_url="http://localhost:3000",
+                agent=ModelSelection(provider.id, "m"),
+                auxiliary_llm=ModelSelection(provider.id, "m"),
+                options=ExplorationOptions(max_steps=3),
+            )
+        )
+
+    active_id = create_run()
+    repo.update_exploration(active_id, status=ExplorationStatus.POSTPROCESSING)
+    repo.request_cancel(active_id)
+    assert repo.is_cancel_requested(active_id) is True
+
+    completed_id = create_run()
+    repo.update_exploration(completed_id, status=ExplorationStatus.COMPLETED)
+    repo.request_cancel(completed_id)
+    assert repo.is_cancel_requested(completed_id) is False
+
+
 def test_exploration_details_and_summary(tmp_path):
     repo = repository(tmp_path)
     provider = repo.create_provider(
@@ -179,3 +277,39 @@ def test_exploration_details_and_summary(tmp_path):
         "message": "Reachable coverage exhausted with restrictions",
         "payload": {"candidates_blocked": 3},
     }
+
+
+def test_delete_provisional_scenario_keeps_global_browser_evidence(tmp_path):
+    repo = repository(tmp_path)
+    provider = repo.create_provider(
+        "P", "http://localhost:4000", None, True, [ProviderModel("m", "M")]
+    )
+    run_id = repo.create_exploration(
+        ExplorationRequest(
+            app_url="http://localhost:3000",
+            agent=ModelSelection(provider.id, "m"),
+            auxiliary_llm=ModelSelection(provider.id, "m"),
+            options=ExplorationOptions(max_steps=3),
+        )
+    )
+    scenario = DomainScenario(
+        id="CT001",
+        title="Provisional click failure",
+        description="Retryable evidence",
+        preconditions=[],
+        steps=["Click"],
+        expected_result="Control responds",
+        actual_result="Locator became stale",
+        status=ScenarioStatus.FAIL,
+        url="http://localhost:3000",
+        created_at=utc_now(),
+    )
+    repo.add_scenario(run_id, 1, scenario)
+    repo.add_screenshot(run_id, "global.png", "Browser evidence")
+    repo.add_screenshot(run_id, "draft.png", "Draft evidence", "CT001")
+
+    repo.delete_scenario(run_id, "CT001")
+
+    result = repo.get_exploration(run_id)
+    assert result["scenarios"] == []
+    assert [item["path"] for item in result["screenshots"]] == ["global.png"]

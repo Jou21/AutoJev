@@ -376,7 +376,7 @@ class CoveragePlanner:
     def _is_redundant_self_link(
         observation: Observation, element: dict[str, Any]
     ) -> bool:
-        """Reject an exact self-link unless it exposes a separate UI state."""
+        """Reject only an exact link explicitly marked as the current page."""
 
         if _normalise_text(str(element.get("tag") or "")) != "a":
             return False
@@ -391,8 +391,23 @@ class CoveragePlanner:
             return False
         if any(
             element.get(name) is not None
-            for name in ("aria_expanded", "aria_pressed", "aria_selected")
+            for name in (
+                "aria_expanded",
+                "aria_pressed",
+                "aria_selected",
+                "aria_haspopup",
+            )
         ):
+            return False
+        # A same-URL anchor may still run application code. Suppress only the
+        # explicit HTML/ARIA declaration that this is the current navigation
+        # item; other anchors get one bounded attempt and a no-op is omitted
+        # from the CT inventory.
+        if _normalise_text(str(element.get("aria_current") or "")) not in {
+            "page",
+            "location",
+            "true",
+        }:
             return False
         with suppress(ValueError):
             return canonical_url(href) == canonical_url(observation.url)
@@ -436,7 +451,8 @@ class CoveragePlanner:
             # available. Horizontal visibility changes for an off-canvas
             # drawer, but stays stable while the document scrolls vertically.
             if (
-                element.get("in_horizontal_viewport") is True
+                element.get("interactable") is None
+                and element.get("in_horizontal_viewport") is True
                 and _normalise_state(element.get("aria_hidden")) is not True
             ):
                 return True
@@ -525,21 +541,24 @@ class CoveragePlanner:
                     "has_value": bool(element.get("has_value")),
                     "checked": element.get("checked"),
                     "selected_index": element.get("selected_index"),
+                    "selected_values": sorted(
+                        str(value)
+                        for value in (element.get("selected_values") or [])
+                    ),
                     "aria_expanded": _normalise_state(element.get("aria_expanded")),
                     "aria_hidden": _normalise_state(element.get("aria_hidden")),
                     "aria_pressed": _normalise_state(element.get("aria_pressed")),
                     "aria_selected": _normalise_state(element.get("aria_selected")),
-                    # Horizontal surface visibility and ARIA state capture
-                    # drawers/menus. Hit-testing, vertical viewport position
-                    # and document coordinates are intentionally excluded so
-                    # scrolling cannot manufacture a new application state.
-                    "in_horizontal_viewport": element.get("in_horizontal_viewport"),
+                    # Hit-testing and viewport/document coordinates are
+                    # intentionally excluded so scrolling cannot manufacture
+                    # a new application state.
                 }
             )
         raw = {
             "url": canonical_url(observation.url),
             "title": _normalise_text(observation.title),
             "text": _normalise_text(observation.text)[:12000],
+            "menu_open": self._menu_is_open(observation),
             "controls": sorted(
                 controls,
                 key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True),
@@ -684,6 +703,10 @@ class CoveragePlanner:
             if (
                 self._move_action(element) == "select"
                 and element.get("_option_selected") is True
+                and (
+                    element.get("multiple") is not True
+                    or len(element.get("selected_values") or []) == 1
+                )
             ):
                 # Re-selecting the active value succeeds at the browser layer
                 # but produces no verifiable effect, yielding a misleading
@@ -795,6 +818,16 @@ class CoveragePlanner:
                 continue
             return move_key, element
         return None
+
+    def decision_key(
+        self, observation: Observation, decision: AgentDecision
+    ) -> str | None:
+        """Return a ref-independent semantic identity for an issued move."""
+
+        selected = self._move_for_decision(
+            list(self._candidate_map(observation).items()), decision
+        )
+        return selected[0] if selected is not None else None
 
     def _frontier_states(self) -> list[_CoverageState]:
         return [
@@ -1204,6 +1237,12 @@ class CoveragePlanner:
                 self.path.pop(-2)
                 return self._backtrack_decision()
             if current_state.url == previous.url:
+                self._issued_restore_step = _IssuedRestoreStep(
+                    kind="backtrack",
+                    target_key=current,
+                    source_key=self.current_key or current,
+                    expected_key=previous.key,
+                )
                 return (
                     AgentDecision(
                         action="navigate",
@@ -1216,6 +1255,12 @@ class CoveragePlanner:
                     "dom_state_backtrack_navigate",
                 )
             if failures == 0:
+                self._issued_restore_step = _IssuedRestoreStep(
+                    kind="backtrack",
+                    target_key=current,
+                    source_key=self.current_key or current,
+                    expected_key=previous.key,
+                )
                 return (
                     AgentDecision(
                         action="go_back",
@@ -1223,6 +1268,12 @@ class CoveragePlanner:
                     ),
                     None,
                 )
+            self._issued_restore_step = _IssuedRestoreStep(
+                kind="backtrack",
+                target_key=current,
+                source_key=self.current_key or current,
+                expected_key=previous.key,
+            )
             return (
                 AgentDecision(
                     action="navigate",
@@ -1540,6 +1591,7 @@ class CoveragePlanner:
             )
 
         if issued_restore is not None:
+            backtrack_restored = False
             if issued_restore.source_key == before_key:
                 if issued_restore.kind == "replay" and issued_restore.fingerprint:
                     recipe = _TransitionRecipe(
@@ -1581,12 +1633,28 @@ class CoveragePlanner:
                         self.restoration_failures[failure_key] = (
                             self.restoration_failures.get(failure_key, 0) + 1
                         )
+                elif issued_restore.kind == "backtrack":
+                    backtrack_restored = (
+                        result.success and after_key == issued_restore.expected_key
+                    )
+                    if backtrack_restored:
+                        self.backtrack_failures.pop(issued_restore.target_key, None)
+                    else:
+                        self.backtrack_failures[issued_restore.target_key] = (
+                            self.backtrack_failures.get(
+                                issued_restore.target_key, 0
+                            )
+                            + 1
+                        )
                 if after_key == issued_restore.target_key:
                     self.restoration_target = None
                     self.restoration_steps = 0
             self._issued_restore_step = None
+        else:
+            backtrack_restored = False
 
-        if decision.action in {"go_back", "navigate"} and (
+        issued_backtrack = issued_restore is not None and issued_restore.kind == "backtrack"
+        if not issued_backtrack and decision.action in {"go_back", "navigate"} and (
             not result.success or after_key == before_key
         ):
             failures = self.backtrack_failures.get(before_key, 0) + 1
@@ -1599,10 +1667,15 @@ class CoveragePlanner:
                 # settle or restore another logical frontier immediately.
                 failures = max(failures, 2)
             self.backtrack_failures[before_key] = failures
-        elif result.success and after_key != before_key:
+        elif not issued_backtrack and result.success and after_key != before_key:
             self.backtrack_failures.pop(before_key, None)
 
-        if after_key != before_key and result.success:
+        if issued_backtrack:
+            if backtrack_restored and issued_restore is not None:
+                expected = issued_restore.expected_key
+                if expected in self.path:
+                    self.path = self.path[: self.path.index(expected) + 1]
+        elif after_key != before_key and result.success:
             if after_key in self.path:
                 self.path = self.path[: self.path.index(after_key) + 1]
             elif decision.action == "go_back" and len(self.path) > 1:

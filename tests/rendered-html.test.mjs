@@ -66,11 +66,17 @@ test("offers an optional focused exploration scope", async () => {
   assert.match(source, /Ao esgotar a cobertura/);
 });
 
-test("explains navigation, test-case creation, and report as separate phases", async () => {
+test("shows test-case creation running alongside browser exploration", async () => {
   const source = await readFile(new URL("../app/AutoJevApp.tsx", import.meta.url), "utf8");
 
   assert.match(source, /Explorar/);
   assert.match(source, /Criar CTs/);
+  assert.match(source, /scenariosRunningInParallel/);
+  assert.match(source, /parallelScenarioPipelineStarted/);
+  assert.match(source, /terminalOutcomeVisible && completedWithRestrictions/);
+  assert.match(source, /Exploração \+ criação contínua de CTs/);
+  assert.match(source, /preservados ao vivo/);
+  assert.match(source, /phase === "documenting" \|\| scenariosRunningInParallel/);
   assert.match(source, /CT \{Math\.min\(phaseProgress\.current/);
   assert.match(source, /O número 67 representa os CTs gerados/);
   assert.match(source, /Linha do tempo explicada/);
@@ -79,4 +85,24 @@ test("explains navigation, test-case creation, and report as separate phases", a
   assert.match(source, /Concluída com restrições/);
   assert.match(source, /sinais técnicos/);
   assert.match(source, /O relatório final correlaciona esses sinais por observação/);
+});
+
+test("offers economical text and optional visual auxiliary evidence modes", async () => {
+  const source = await readFile(new URL("../app/AutoJevApp.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /useState<"text" \| "visual">\("text"\)/);
+  assert.match(source, /auxiliary_evidence_mode: auxiliaryEvidenceMode/);
+  assert.match(source, /Econômico · texto/);
+  assert.match(source, /Visual · texto \+ imagem/);
+  assert.match(source, /imagem continua salva localmente/);
+  assert.match(source, /modelAcceptsImages/);
+  assert.match(source, /available\.filter\(modelAcceptsImages\)/);
+  assert.match(source, /somente modelos que aceitam imagens/);
+  assert.match(source, /Nenhum modelo com visão neste provedor/);
+  assert.match(source, /visualAuxiliaryModelMissing/);
+  assert.match(source, /supports_vision: modelAcceptsImages\(model\)/);
+  assert.match(source, /modelInputCapabilitiesKnown/);
+  assert.match(source, /!provider\.models\?\.some\(modelInputCapabilitiesKnown\)/);
+  assert.match(source, /Compatibilidade visual dos modelos atualizada/);
+  assert.match(source, /explorationEvidenceMode\(exploration\.options\)/);
 });

@@ -2,10 +2,11 @@
 
 **AI-powered exploratory testing for web applications.**
 
-AutoJev receives an application URL, asks a JEV model to choose one structured
-action at a time, executes that action with a real Playwright browser, captures
-evidence, and uses a separately configurable auxiliary LLM to document the
-observed test scenario. At the end it produces a standalone HTML report.
+AutoJev receives an application URL, uses a deterministic policy for obvious
+browser mechanics and asks a JEV model only when QA judgment is useful. A real
+Playwright browser executes every validated action, captures evidence, and a
+separately configurable auxiliary LLM documents the observed test scenario. At
+the end it produces a standalone HTML report.
 
 The important boundary is deliberate: **the JEV decides; Playwright executes;
 the auxiliary LLM interprets evidence.** No model gets direct browser control.
@@ -71,7 +72,8 @@ NEXT_PUBLIC_API_URL=https://your-autojev-api.example/api
 3. Open **Nova exploração** and choose the JEV and auxiliary models separately.
 4. Enter the target URL and choose **Aplicação inteira** or an optional focused
    screen/menu path such as `Configurações > Usuários > Permissões`.
-5. Set safety limits and, when necessary, ephemeral test credentials.
+5. Choose **Econômico · texto** (default) or **Visual · texto + imagem** for the
+   auxiliary LLM and, when necessary, add ephemeral test credentials.
 6. Start the exploration and follow Playwright evidence in the live view.
 7. Open the standalone report from the completed exploration.
 
@@ -94,9 +96,11 @@ silently counted as covered.
 Limits still bound dynamic or effectively infinite applications. A run that
 hits its action, duration or planning bound, cannot restore every safe branch,
 or cannot find the requested focus is labeled **Cobertura parcial**, never
-falsely reported as complete. After browser work ends, the live
-**Gerando relatório** phase lets the auxiliary model document already captured
-evidence without reducing the browser exploration budget.
+falsely reported as complete. Each verified action is persisted immediately as
+a local CT while browser exploration continues; one bounded auxiliary worker
+documents those CTs in parallel without reducing the JEV/Playwright exploration
+budget. After browser work ends, only any small remaining queue and the final
+report are completed.
 
 TypeSafe JEV receives atomic candidate moves instead of separate action/target
 questions. It ranks real Playwright observations using semantic DOM context,
@@ -104,6 +108,21 @@ coverage novelty, recent outcomes and browser errors; confidence is retained
 with the decision. Safe form fields/selects and same-origin new tabs are also
 covered, while password, upload, destructive and cross-origin interactions stay
 outside the executable frontier.
+
+The invocation policy does not spend a JEV call to repeat a clearly identified
+button/link/field, fill a conventional form, follow known navigation, replay a
+known route, or confirm an HTTP error already observed by Playwright. It
+escalates duplicate/ambiguous controls, a new complex state, an ambiguous
+business control, a state with no safe deterministic move, or two attempts
+without progress. The timeline records whether each choice came from the local
+policy or from JEV.
+
+In the default text mode, the auxiliary LLM receives compact accessible DOM,
+visible text and verified Playwright results; screenshots remain local and are
+still embedded in the report. Visual mode additionally sends the masked
+low-detail screenshot. If the selected model explicitly rejects image input,
+AutoJev retries that documentation call as text; authentication, rate-limit and
+generic failures are not retried, avoiding accidental double billing.
 
 Scenario verdicts come from Playwright evidence, not from model prose. A
 successful action with verified assertions or an observable state change is

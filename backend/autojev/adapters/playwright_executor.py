@@ -510,6 +510,13 @@ class PlaywrightExecutor:
         try:
             await self._page.evaluate(
                 """([tokens, costText]) => {
+                  const panel = document.getElementById('autojev-sidepanel');
+                  const previous = Number(panel?.dataset.usageTokens || '0');
+                  // JEV and the auxiliary LLM account concurrently. A slower
+                  // DOM update carrying an older snapshot must not make the
+                  // live counter move backwards.
+                  if (Number(tokens) < previous) return;
+                  if (panel) panel.dataset.usageTokens = String(tokens);
                   const tokenValue = document.getElementById('autojev-token-value');
                   const costValue = document.getElementById('autojev-cost-value');
                   const tokenText = tokens.toLocaleString('pt-BR');
@@ -886,26 +893,70 @@ class PlaywrightExecutor:
               // elements that merely remain mounted off-canvas or underneath
               // a drawer. Controls below the fold stay reachable because
               // Playwright can scroll them into view; horizontally displaced
-              // and currently occluded controls do not enter the frontier.
+              // controls remain eligible only when a real scroll surface can
+              // bring them back. Fixed/transformed off-canvas drawers cannot.
               const interactionState = (el, box) => {
                 const inHorizontalViewport = box.right > 0 && box.left < window.innerWidth;
                 const inVerticalViewport = box.bottom > 0 && box.top < window.innerHeight;
-                if (!inHorizontalViewport) {
+                const scrollableAncestor = (axis) => {
+                  for (let owner = el.parentElement; owner && owner !== document.body; owner = owner.parentElement) {
+                    const style = getComputedStyle(owner);
+                    const overflow = axis === 'x' ? style.overflowX : style.overflowY;
+                    const hasRange = axis === 'x'
+                      ? owner.scrollWidth > owner.clientWidth + 1
+                      : owner.scrollHeight > owner.clientHeight + 1;
+                    if (hasRange && ['auto', 'scroll', 'overlay'].includes(overflow)) return true;
+                  }
+                  return false;
+                };
+                const fixedOwner = (() => {
+                  for (let owner = el; owner; owner = owner.parentElement) {
+                    if (getComputedStyle(owner).position === 'fixed') return true;
+                  }
+                  return false;
+                })();
+                const root = document.scrollingElement || document.documentElement;
+                const documentX = box.left + window.scrollX;
+                const documentY = box.top + window.scrollY;
+                const horizontallyReachable = inHorizontalViewport || scrollableAncestor('x') || (
+                  !fixedOwner
+                  && root.scrollWidth > window.innerWidth + 1
+                  && documentX + box.width > 0
+                  && documentX < root.scrollWidth
+                );
+                const verticallyReachable = inVerticalViewport || scrollableAncestor('y') || (
+                  !fixedOwner
+                  && root.scrollHeight > window.innerHeight + 1
+                  && documentY + box.height > 0
+                  && documentY < root.scrollHeight
+                );
+                if (!horizontallyReachable || !verticallyReachable) {
                   return { inHorizontalViewport, inVerticalViewport, interactable: false };
                 }
-                if (!inVerticalViewport) {
+                if (!inHorizontalViewport || !inVerticalViewport) {
                   return { inHorizontalViewport, inVerticalViewport, interactable: true };
                 }
-                const x = Math.max(0, Math.min(window.innerWidth - 1, box.left + box.width / 2));
-                const y = Math.max(0, Math.min(window.innerHeight - 1, box.top + box.height / 2));
-                const hit = document.elementsFromPoint(x, y).find((candidate) => (
-                  !candidate.closest(PANEL_SELECTOR)
-                  && getComputedStyle(candidate).pointerEvents !== 'none'
-                ));
+                const inset = 2;
+                const points = [
+                  [box.left + box.width / 2, box.top + box.height / 2],
+                  [box.left + inset, box.top + inset],
+                  [box.right - inset, box.top + inset],
+                  [box.left + inset, box.bottom - inset],
+                  [box.right - inset, box.bottom - inset],
+                ];
+                const canReceivePointer = points.some(([rawX, rawY]) => {
+                  const x = Math.max(0, Math.min(window.innerWidth - 1, rawX));
+                  const y = Math.max(0, Math.min(window.innerHeight - 1, rawY));
+                  const hit = document.elementsFromPoint(x, y).find((candidate) => (
+                    !candidate.closest(PANEL_SELECTOR)
+                    && getComputedStyle(candidate).pointerEvents !== 'none'
+                  ));
+                  return Boolean(hit && (hit === el || el.contains(hit)));
+                });
                 return {
                   inHorizontalViewport,
                   inVerticalViewport,
-                  interactable: Boolean(hit && (hit === el || el.contains(hit))),
+                  interactable: canReceivePointer,
                 };
               };
                 const visibleDialogs = Array.from(document.querySelectorAll(
@@ -1001,11 +1052,16 @@ class PlaywrightExecutor:
                     ? el.checked
                     : null,
                   selected_index: el instanceof HTMLSelectElement ? el.selectedIndex : null,
+                  multiple: el instanceof HTMLSelectElement ? el.multiple : null,
+                  selected_values: el instanceof HTMLSelectElement
+                    ? Array.from(el.selectedOptions).slice(0, 100).map((option) => option.value)
+                    : null,
                   aria_haspopup: el.getAttribute('aria-haspopup'),
                   aria_expanded: el.getAttribute('aria-expanded'),
                   aria_hidden: ariaHiddenOwner?.getAttribute('aria-hidden') || null,
                   aria_pressed: el.getAttribute('aria-pressed'),
                   aria_selected: el.getAttribute('aria-selected'),
+                  aria_current: el.getAttribute('aria-current'),
                   options: el instanceof HTMLSelectElement
                     ? Array.from(el.options).slice(0, 100).map((option) => ({
                         value: option.value,

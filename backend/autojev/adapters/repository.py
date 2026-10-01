@@ -54,6 +54,10 @@ class SQLiteRepository:
             model_id TEXT NOT NULL,
             label TEXT NOT NULL,
             enabled INTEGER NOT NULL DEFAULT 1,
+            input_modalities_json TEXT NOT NULL DEFAULT '[]',
+            output_modalities_json TEXT NOT NULL DEFAULT '[]',
+            supports_vision INTEGER NOT NULL DEFAULT 0,
+            capabilities_known INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(provider_id, model_id)
         );
         CREATE TABLE IF NOT EXISTS explorations (
@@ -136,6 +140,19 @@ class SQLiteRepository:
                 except sqlite3.OperationalError as exc:
                     if "duplicate column name" not in str(exc).lower():
                         raise
+            for column, definition in (
+                ("input_modalities_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("output_modalities_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("supports_vision", "INTEGER NOT NULL DEFAULT 0"),
+                ("capabilities_known", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                try:
+                    connection.execute(
+                        f"ALTER TABLE provider_models ADD COLUMN {column} {definition}"
+                    )
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column name" not in str(exc).lower():
+                        raise
             connection.execute(
                 """UPDATE explorations
                    SET status = ?, finished_at = ?, error = ?
@@ -196,8 +213,21 @@ class SQLiteRepository:
                 continue
             seen.add(model_id)
             connection.execute(
-                "INSERT INTO provider_models VALUES (?, ?, ?, ?)",
-                (provider_id, model_id, model.label.strip() or model_id, int(model.enabled)),
+                """INSERT INTO provider_models (
+                       provider_id, model_id, label, enabled,
+                       input_modalities_json, output_modalities_json,
+                       supports_vision, capabilities_known
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    provider_id,
+                    model_id,
+                    model.label.strip() or model_id,
+                    int(model.enabled),
+                    json.dumps(model.input_modalities),
+                    json.dumps(model.output_modalities),
+                    int(model.supports_vision),
+                    int(model.capabilities_known),
+                ),
             )
 
     def update_provider(
@@ -272,13 +302,31 @@ class SQLiteRepository:
             has_api_key=bool(row["api_key_encrypted"]),
             models=[
                 ProviderModel(
-                    id=model["model_id"], label=model["label"], enabled=bool(model["enabled"])
+                    id=model["model_id"],
+                    label=model["label"],
+                    enabled=bool(model["enabled"]),
+                    input_modalities=self._decode_input_modalities(
+                        model["input_modalities_json"]
+                    ),
+                    output_modalities=self._decode_input_modalities(
+                        model["output_modalities_json"]
+                    ),
+                    supports_vision=bool(model["supports_vision"]),
+                    capabilities_known=bool(model["capabilities_known"]),
                 )
                 for model in model_rows
             ],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
+
+    @staticmethod
+    def _decode_input_modalities(value: str | None) -> list[str]:
+        try:
+            decoded = json.loads(value or "[]")
+        except (TypeError, ValueError):
+            return []
+        return [str(item) for item in decoded] if isinstance(decoded, list) else []
 
     def list_providers(self) -> list[Provider]:
         with self._lock, self._connect() as connection:
@@ -352,15 +400,27 @@ class SQLiteRepository:
             raise NotFoundError(f"Exploration {exploration_id} was not found")
 
     def request_cancel(self, exploration_id: str) -> None:
-        item = self.get_exploration(exploration_id, include_details=False)
-        if item["status"] not in {
+        cancellable = (
             ExplorationStatus.QUEUED,
             ExplorationStatus.RUNNING,
             ExplorationStatus.WAITING_INPUT,
             ExplorationStatus.POSTPROCESSING,
-        }:
-            return
-        self.update_exploration(exploration_id, cancel_requested=True)
+        )
+        placeholders = ", ".join("?" for _ in cancellable)
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                f"""UPDATE explorations
+                    SET cancel_requested = 1
+                    WHERE id = ? AND status IN ({placeholders})""",
+                (exploration_id, *cancellable),
+            )
+            if cursor.rowcount:
+                return
+            exists = connection.execute(
+                "SELECT 1 FROM explorations WHERE id = ?", (exploration_id,)
+            ).fetchone()
+        if exists is None:
+            raise NotFoundError(f"Exploration {exploration_id} was not found")
 
     def is_cancel_requested(self, exploration_id: str) -> bool:
         with self._lock, self._connect() as connection:
@@ -432,6 +492,19 @@ class SQLiteRepository:
                     json.dumps(data, ensure_ascii=False),
                     scenario.created_at,
                 ),
+            )
+
+    def delete_scenario(self, exploration_id: str, scenario_id: str) -> None:
+        """Remove a provisional CT while preserving global browser evidence."""
+
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "DELETE FROM screenshots WHERE exploration_id = ? AND scenario_id = ?",
+                (exploration_id, scenario_id),
+            )
+            connection.execute(
+                "DELETE FROM scenarios WHERE exploration_id = ? AND id = ?",
+                (exploration_id, scenario_id),
             )
 
     def add_issue(self, exploration_id: str, issue: dict[str, Any]) -> None:

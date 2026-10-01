@@ -209,6 +209,7 @@ def test_exact_self_link_is_not_a_candidate_but_stateful_same_url_link_is():
                 "tag": "a",
                 "name": "Cart, 1 item",
                 "href": "https://app.test/cart?tab=items",
+                "aria_current": "page",
                 "enabled": True,
             },
             {
@@ -227,13 +228,43 @@ def test_exact_self_link_is_not_a_candidate_but_stateful_same_url_link_is():
                 "aria_expanded": "false",
                 "enabled": True,
             },
+            {
+                "ref": "e3",
+                "tag": "a",
+                "role": "button",
+                "name": "Refresh current cart",
+                "href": "https://app.test/cart?tab=items",
+                "enabled": True,
+            },
         ],
     )
     planner = CoveragePlanner(page.url)
 
     names = {item["name"] for item in planner.context(page)["current_untried"]}
     assert "Cart, 1 item" not in names
-    assert names == {"Saved items", "Open cart menu"}
+    assert names == {"Saved items", "Open cart menu", "Refresh current cart"}
+
+
+def test_decision_key_is_stable_when_a_retry_receives_a_fresh_ref():
+    first = observation(
+        "https://app.test/orders",
+        [{"ref": "e1", "tag": "button", "name": "Retry", "enabled": True}],
+    )
+    fresh = observation(
+        first.url,
+        [{"ref": "e9", "tag": "button", "name": "Retry", "enabled": True}],
+    )
+    planner = CoveragePlanner(first.url)
+
+    first_key = planner.decision_key(
+        first, AgentDecision(action="click", target="e1", rationale="Retry")
+    )
+    fresh_key = planner.decision_key(
+        fresh, AgentDecision(action="click", target="e9", rationale="Retry")
+    )
+
+    assert first_key is not None
+    assert first_key == fresh_key
 
 
 def test_safe_form_controls_join_frontier_with_deterministic_typed_actions():
@@ -371,6 +402,51 @@ def test_select_options_are_bounded_atomic_moves_and_do_not_split_state():
     assert "status-1" not in {move["suggested_value"] for move in remaining}
     assert "status-0" in {move["suggested_value"] for move in remaining}
     assert len(remaining) == 6
+
+
+def test_multi_select_tracks_selected_values_and_keeps_state_changing_choices():
+    control = {
+        "ref": "e0",
+        "tag": "select",
+        "name": "Tags",
+        "enabled": True,
+        "multiple": True,
+        "selected_index": 0,
+        "selected_values": ["a", "b"],
+        "options": [
+            {"value": "a", "label": "A", "selected": True},
+            {"value": "b", "label": "B", "selected": True},
+            {"value": "c", "label": "C", "selected": False},
+        ],
+    }
+    before = observation("https://app.test/search", [control], text="Search")
+    after = observation(
+        before.url,
+        [
+            {
+                **control,
+                "selected_values": ["a"],
+                "options": [
+                    {"value": "a", "label": "A", "selected": True},
+                    {"value": "b", "label": "B", "selected": False},
+                    {"value": "c", "label": "C", "selected": False},
+                ],
+            }
+        ],
+        text="Search",
+    )
+    planner = CoveragePlanner(before.url)
+
+    before_values = {
+        item["suggested_value"] for item in planner.context(before)["current_untried"]
+    }
+    after_values = {
+        item["suggested_value"] for item in planner.context(after)["current_untried"]
+    }
+
+    assert before_values == {"a", "b", "c"}
+    assert after_values == {"b", "c"}
+    assert planner.effect_key(before) != planner.effect_key(after)
 
 
 def test_hoverable_menu_exposes_hover_and_click_as_independent_moves():
@@ -574,6 +650,49 @@ def test_exhausted_child_backtracks_mechanically_before_another_model_call():
     assert decision.action == "navigate"
     assert decision.url == root.url
     assert reason == "dom_state_backtrack_navigate"
+
+
+def test_same_route_backtrack_counts_a_different_wrong_snapshot_as_failure():
+    url = "https://app.test/inventory"
+    root = observation(
+        url,
+        [
+            {"ref": "e0", "tag": "button", "name": "Open state", "enabled": True},
+            {"ref": "e1", "tag": "button", "name": "Root sibling", "enabled": True},
+        ],
+        text="Root",
+    )
+    child = observation(
+        url,
+        [{"ref": "e7", "tag": "button", "name": "Child action", "enabled": True}],
+        text="Child",
+    )
+    wrong_snapshot = observation(url, [], text="Unexpected snapshot")
+    planner = CoveragePlanner(url)
+    enter = AgentDecision(action="click", target="e0", rationale="Open state")
+    planner.record_action(root, enter, result("click", url, url), child)
+    local, _ = planner.reconcile(child, AgentDecision("finish", "cover"))
+    planner.record_action(child, local, result("click", url, url), child)
+    child_key = planner.state_key(child)
+
+    restore = planner.next_restoration_action(child)
+    assert restore is not None
+    decision, reason = restore
+    assert reason == "dom_state_backtrack_navigate"
+    planner.record_action(
+        child,
+        decision,
+        result("navigate", url, url),
+        wrong_snapshot,
+    )
+
+    assert planner.backtrack_failures[child_key] == 1
+    # The same URL may land on many already-covered DOM snapshots. After the
+    # bounded miss, the inaccessible parent branch is documented as blocked
+    # instead of oscillating forever among those snapshots.
+    assert planner.next_restoration_action(wrong_snapshot) is None
+    assert planner.can_finish() is True
+    assert planner.coverage_complete() is False
 
 
 def test_repeated_model_go_back_is_reconciled_and_never_retried_unchanged():

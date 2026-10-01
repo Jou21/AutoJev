@@ -30,12 +30,21 @@ def test_health_and_provider_crud_never_return_api_key(tmp_path):
                 "name": "LiteLLM",
                 "baseUrl": "http://localhost:4000",
                 "apiKey": "sk-sensitive",
-                "models": [{"id": "jev-model", "label": "JEV"}],
+                "models": [
+                    {
+                        "id": "jev-model",
+                        "label": "JEV",
+                        "inputModalities": ["text", "image"],
+                    }
+                ],
             },
         )
         assert created.status_code == 201
         payload = created.json()
         assert payload["has_api_key"] is True
+        assert payload["models"][0]["input_modalities"] == ["text", "image"]
+        assert payload["models"][0]["supports_vision"] is True
+        assert payload["models"][0]["capabilities_known"] is True
         assert "api_key" not in payload and "apiKey" not in payload
         assert "sk-sensitive" not in created.text
 
@@ -57,6 +66,12 @@ def test_health_and_provider_crud_never_return_api_key(tmp_path):
         assert updated.status_code == 200
         assert updated.json()["enabled"] is False
         assert updated.json()["has_api_key"] is True
+        # Ordinary provider edits do not erase catalog capabilities when the
+        # client does not resend those optional fields.
+        assert updated.json()["models"][0]["supports_vision"] is True
+        catalog = client.get("/api/models?include_disabled=true").json()
+        assert catalog[0]["input_modalities"] == ["text", "image"]
+        assert catalog[0]["supports_vision"] is True
 
         assert client.delete(f"/api/providers/{provider_id}").status_code == 204
         assert client.get(f"/api/providers/{provider_id}").status_code == 404
@@ -89,6 +104,100 @@ def test_invalid_openrouter_key_is_not_saved(tmp_path, monkeypatch):
         assert client.get("/api/providers").json() == []
 
 
+def test_model_discovery_refreshes_existing_capabilities(tmp_path, monkeypatch):
+    app = create_app(settings(tmp_path))
+
+    async def catalog(_client):
+        return [
+            {
+                "id": "existing-model",
+                "label": "Catalog label",
+                "input_modalities": ["text", "image"],
+                "supports_vision": True,
+                "capabilities_known": True,
+            },
+            {
+                "id": "text-model",
+                "label": "Text model",
+                "input_modalities": ["text"],
+                "supports_vision": False,
+                "capabilities_known": True,
+            },
+        ]
+
+    monkeypatch.setattr(
+        "autojev.adapters.openai_compatible.OpenAICompatibleClient.list_models",
+        catalog,
+    )
+    with TestClient(app) as client:
+        provider = client.post(
+            "/api/providers",
+            json={
+                "name": "Compatible provider",
+                "base_url": "http://localhost:4000",
+                "models": [
+                    {
+                        "id": "existing-model",
+                        "label": "My custom label",
+                        "enabled": False,
+                    }
+                ],
+            },
+        ).json()
+
+        response = client.post(
+            f"/api/providers/{provider['id']}/discover-models"
+        )
+
+        assert response.status_code == 200
+        models = {model["id"]: model for model in response.json()["models"]}
+        assert models["existing-model"] == {
+            "id": "existing-model",
+            "label": "My custom label",
+            "enabled": False,
+            "input_modalities": ["text", "image"],
+            "supports_vision": True,
+            "capabilities_known": True,
+        }
+        assert models["text-model"]["supports_vision"] is False
+        assert models["text-model"]["capabilities_known"] is True
+
+
+def test_visual_exploration_rejects_auxiliary_model_without_image_support(tmp_path):
+    app = create_app(settings(tmp_path))
+    with TestClient(app) as client:
+        provider = client.post(
+            "/api/providers",
+            json={
+                "name": "Provider",
+                "base_url": "http://localhost:4000",
+                "models": [{"id": "text-model", "input_modalities": ["text"]}],
+            },
+        ).json()
+        submitted: list[str] = []
+        app.state.exploration_manager.submit = submitted.append
+
+        response = client.post(
+            "/api/explorations",
+            json={
+                "app_url": "http://localhost:3000",
+                "agent": {
+                    "provider_id": provider["id"],
+                    "model_id": "text-model",
+                },
+                "auxiliary_llm": {
+                    "provider_id": provider["id"],
+                    "model_id": "text-model",
+                },
+                "options": {"auxiliary_evidence_mode": "visual"},
+            },
+        )
+
+        assert response.status_code == 422
+        assert "does not declare image input support" in response.json()["detail"]
+        assert submitted == []
+
+
 def test_exploration_request_does_not_echo_credentials(tmp_path):
     app = create_app(settings(tmp_path))
     with TestClient(app) as client:
@@ -97,7 +206,9 @@ def test_exploration_request_does_not_echo_credentials(tmp_path):
             json={
                 "name": "Provider",
                 "base_url": "http://localhost:4000",
-                "models": [{"id": "model"}],
+                "models": [
+                    {"id": "model", "input_modalities": ["text", "image"]}
+                ],
             },
         ).json()
         # Keep this contract test deterministic; the engine itself is tested separately.
@@ -138,7 +249,9 @@ def test_exploration_accepts_optional_focused_scope_alias(tmp_path):
             json={
                 "name": "Provider",
                 "base_url": "http://localhost:4000",
-                "models": [{"id": "model"}],
+                "models": [
+                    {"id": "model", "input_modalities": ["text", "image"]}
+                ],
             },
         ).json()
         app.state.exploration_manager.submit = lambda exploration_id: None
@@ -155,12 +268,14 @@ def test_exploration_accepts_optional_focused_scope_alias(tmp_path):
                     "max_steps": 3,
                     "max_duration_seconds": 30,
                     "focusArea": "  Financeiro   / Faturas  ",
+                    "auxiliaryEvidenceMode": "visual",
                 },
             },
         )
 
         assert response.status_code == 202
         assert response.json()["options"]["focus_area"] == "Financeiro / Faturas"
+        assert response.json()["options"]["auxiliary_evidence_mode"] == "visual"
 
 
 def test_exploration_defaults_to_coverage_driven_without_fixed_limits(tmp_path):
@@ -192,6 +307,7 @@ def test_exploration_defaults_to_coverage_driven_without_fixed_limits(tmp_path):
         payload = response.json()
         assert payload["options"]["max_steps"] is None
         assert payload["options"]["max_duration_seconds"] is None
+        assert payload["options"]["auxiliary_evidence_mode"] == "text"
         assert payload["progress"] is None
         assert payload["browser_progress"] == {
             "current": 0,

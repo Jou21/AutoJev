@@ -86,6 +86,12 @@ type Model = {
   provider_id?: string;
   provider_name?: string;
   enabled?: boolean;
+  input_modalities?: string[];
+  supports_vision?: boolean;
+  architecture?: {
+    input_modalities?: string[];
+    output_modalities?: string[];
+  };
 };
 
 type Provider = {
@@ -274,6 +280,11 @@ function explorationFocusArea(options?: Record<string, unknown>) {
   return typeof value === "string" && value.trim() ? value.trim() : "";
 }
 
+function explorationEvidenceMode(options?: Record<string, unknown>): "text" | "visual" {
+  const value = options?.auxiliary_evidence_mode ?? options?.auxiliaryEvidenceMode;
+  return value === "visual" ? "visual" : "text";
+}
+
 function listFrom<T>(value: unknown, keys: string[]): T[] {
   if (Array.isArray(value)) return value as T[];
   if (value && typeof value === "object") {
@@ -291,6 +302,17 @@ function modelValue(model: Model) {
 
 function modelLabel(model: Model) {
   return model.label || model.name || model.model_id || model.id || "Modelo sem nome";
+}
+
+function modelAcceptsImages(model: Model) {
+  if (typeof model.supports_vision === "boolean") return model.supports_vision;
+  const inputModalities = model.input_modalities || model.architecture?.input_modalities || [];
+  return inputModalities.some((modality) => modality.toLowerCase() === "image");
+}
+
+function modelInputCapabilitiesKnown(model: Model) {
+  const inputModalities = model.input_modalities || model.architecture?.input_modalities || [];
+  return inputModalities.length > 0 || model.supports_vision === true;
 }
 
 const FREE_MODEL_PREFERENCE = [
@@ -407,10 +429,27 @@ function resolveAssetUrl(value?: string | null) {
 function activityCopy(event: ExplorationEvent) {
   const payload = event.payload || {};
   const scenario = typeof payload.scenario_id === "string" ? payload.scenario_id : "Caso de teste";
+  const routingReason = String(payload.reason || "");
+  const routingLabels: Record<string, string> = {
+    single_clear_control: "controle único e claro",
+    clear_safe_frontier: "próxima opção segura e inequívoca",
+    conventional_form: "formulário convencional",
+    known_navigation: "navegação conhecida",
+    ambiguous_duplicate_controls: "controles com o mesmo nome",
+    ambiguous_business_control: "resultado ou controle de negócio ambíguo",
+    new_complex_state: "nova tela com escolhas de naturezas diferentes",
+    two_attempts_without_progress: "duas tentativas sem progresso",
+    no_safe_deterministic_candidate: "nenhuma ação local segura conhecida",
+    action_requires_jev_judgment: "ação que exige julgamento de QA",
+  };
   const fallback: Record<string, { title: string; detail?: string }> = {
     started: { title: "Exploração iniciada", detail: "O navegador foi preparado para o JEV." },
     browser_launched: { title: "Aplicação aberta no navegador" },
     coverage_scope: { title: "Escopo de cobertura definido" },
+    auxiliary_evidence_mode: { title: "Modo de evidência configurado", detail: payload.mode === "visual" ? "A LLM auxiliar receberá texto + screenshot." : "A LLM auxiliar receberá somente texto estruturado; screenshots ficam locais." },
+    jev_invocation_policy: { title: "Política econômica do JEV ativada", detail: "Ações óbvias serão resolvidas localmente; ambiguidades e falta de progresso escalam para o JEV." },
+    decision_routed_locally: { title: "Ação resolvida sem chamar o JEV", detail: routingLabels[routingReason] || event.message },
+    jev_consulted: { title: "JEV acionado para uma decisão de QA", detail: routingLabels[routingReason] || event.message },
     action_started: { title: `Executando ação ${String(payload.step || "")}`.trim(), detail: String(payload.action || event.message || "") },
     action_completed: { title: `Ação ${String(payload.step || "")} concluída`.trim(), detail: event.message },
     waiting_input: { title: "Aguardando uma ação sua", detail: event.message },
@@ -418,11 +457,17 @@ function activityCopy(event: ExplorationEvent) {
     coverage_complete: { title: "Cobertura concluída", detail: "O JEV esgotou as opções alcançáveis." },
     coverage_complete_with_restrictions: { title: "Cobertura alcançável concluída", detail: "Os controles que não puderam ser executados com segurança foram documentados no resultado." },
     coverage_stalled: { title: "Exploração bloqueada", detail: event.message },
+    scenario_parallel_started: { title: "CTs ativados em paralelo", detail: "Cada evidência válida já começa a virar caso de teste enquanto o navegador continua." },
+    scenario_draft_created: { title: `${scenario} preservado ao vivo`, detail: "A evidência local já está segura; a LLM auxiliar pode aprimorá-la em segundo plano." },
+    scenario_draft_updated: { title: `${scenario} atualizado`, detail: "Uma tentativa mais recente substituiu a evidência provisória sem duplicar o caso." },
+    scenario_draft_removed: { title: `${scenario} provisório removido`, detail: "Uma nova tentativa mostrou que não havia falha verificável." },
+    scenario_enrichment_backlog_full: { title: `${scenario} preservado localmente`, detail: "A fila auxiliar atingiu o limite de segurança, mas o CT e sua evidência não foram perdidos." },
+    scenario_enrichment_worker_unavailable: { title: `${scenario} preservado localmente`, detail: "O worker auxiliar ficou indisponível; a exploração continuou e manteve o CT local." },
     scenario_preparation_started: { title: "Preparando os casos de teste", detail: event.message },
     scenario_drafts_ready: { title: "Todos os CTs já estão seguros", detail: event.message },
     scenario_enrichment_started: { title: "LLM auxiliar aprimorando os CTs", detail: event.message },
     scenario_enriched: { title: `${scenario} aprimorado`, detail: "Documentado pela LLM auxiliar a partir da evidência capturada." },
-    scenario_enrichment_skipped: { title: `${scenario} preservado`, detail: "A evidência local foi mantida porque a LLM auxiliar demorou a responder." },
+    scenario_enrichment_skipped: { title: `${scenario} preservado`, detail: "A evidência local foi mantida; a LLM auxiliar não concluiu esse aprimoramento." },
     scenario_omitted_no_evidence: { title: "Ação sem evidência não virou CT", detail: "A interação foi executada, mas não mudou a tela nem produziu uma validação confiável." },
     scenario_postprocessing_completed: { title: "Casos de teste finalizados", detail: event.message },
     scenario_created: { title: `${scenario} criado`, detail: "Documentado pela LLM auxiliar." },
@@ -626,9 +671,12 @@ export default function AutoJevApp() {
       const loadedProviders = listFrom<Provider>(results[0].value, ["providers", "items", "data"]);
       setProviders(loadedProviders);
       const openRouterProviders = loadedProviders.filter((provider) =>
-        provider.has_api_key
-        && !provider.models?.some((model) => modelValue(model) === "typesafe/jev-1.13")
-        && /openrouter\.ai/i.test(provider.base_url),
+        (provider.has_api_key || provider.api_key_configured)
+        && /openrouter\.ai/i.test(provider.base_url)
+        && (
+          !provider.models?.some((model) => modelValue(model) === "typesafe/jev-1.13")
+          || !provider.models?.some(modelInputCapabilitiesKnown)
+        )
       );
       if (openRouterProviders.length) {
         await Promise.allSettled(
@@ -769,6 +817,7 @@ export default function AutoJevApp() {
             request={request}
             toast={toast}
             navigate={navigate}
+            reloadModels={loadCore}
             onCreated={(exploration) => setExplorations((current) => [exploration, ...current])}
           />
         );
@@ -1097,6 +1146,7 @@ function NewExplorationView({
   request,
   toast,
   navigate,
+  reloadModels,
   onCreated,
 }: {
   providers: Provider[];
@@ -1105,6 +1155,7 @@ function NewExplorationView({
   request: ApiRequest;
   toast: (message: string, tone?: Toast["tone"]) => void;
   navigate: (hash: string) => void;
+  reloadModels: (quiet?: boolean) => Promise<void>;
   onCreated: (exploration: Exploration) => void;
 }) {
   const enabledProviders = providers.filter(providerIsEnabled);
@@ -1116,12 +1167,15 @@ function NewExplorationView({
   const [auxProvider, setAuxProvider] = useState("");
   const [auxModel, setAuxModel] = useState("");
   const [viewport, setViewport] = useState("1440x900");
+  const [auxiliaryEvidenceMode, setAuxiliaryEvidenceMode] = useState<"text" | "visual">("text");
   const [captureConsoleErrors, setCaptureConsoleErrors] = useState(true);
   const [captureNetworkErrors, setCaptureNetworkErrors] = useState(true);
   const [credentialsOpen, setCredentialsOpen] = useState(false);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [refreshingVisualModelsFor, setRefreshingVisualModelsFor] = useState("");
+  const visualDiscoveryAttempted = useRef(new Set<string>());
 
   const modelsFor = useCallback((providerId: string) => {
     const provider = providers.find((item) => item.id === providerId);
@@ -1130,6 +1184,13 @@ function NewExplorationView({
     const source = nested.length > 0 ? nested : flat;
     return source.filter((model) => model.enabled !== false);
   }, [providers, models]);
+
+  const auxiliaryModelsFor = useCallback((providerId: string) => {
+    const available = modelsFor(providerId);
+    return auxiliaryEvidenceMode === "visual"
+      ? available.filter(modelAcceptsImages)
+      : available;
+  }, [auxiliaryEvidenceMode, modelsFor]);
 
   useEffect(() => {
     if (!agentProvider && enabledProviders[0]) setAgentProvider(enabledProviders[0].id);
@@ -1142,9 +1203,39 @@ function NewExplorationView({
   }, [agentProvider, agentModel, modelsFor]);
 
   useEffect(() => {
-    const available = modelsFor(auxProvider);
+    const available = auxiliaryModelsFor(auxProvider);
     if (!available.some((model) => modelValue(model) === auxModel)) setAuxModel(defaultModel(available, "auxiliary"));
-  }, [auxProvider, auxModel, modelsFor]);
+  }, [auxProvider, auxModel, auxiliaryModelsFor]);
+
+  useEffect(() => {
+    if (auxiliaryEvidenceMode !== "visual" || !auxProvider) return;
+    const provider = providers.find((item) => item.id === auxProvider);
+    if (!provider || !isOpenRouterUrl(provider.base_url) || !(provider.has_api_key || provider.api_key_configured)) return;
+    const catalog = provider.models?.length
+      ? provider.models
+      : models.filter((model) => model.provider_id === auxProvider);
+    if (catalog.some(modelInputCapabilitiesKnown) || visualDiscoveryAttempted.current.has(auxProvider)) return;
+
+    visualDiscoveryAttempted.current.add(auxProvider);
+    setRefreshingVisualModelsFor(auxProvider);
+    void (async () => {
+      try {
+        await request(`/providers/${encodeURIComponent(auxProvider)}/discover-models`, { method: "POST" });
+        await reloadModels(true);
+        toast("Compatibilidade visual dos modelos atualizada.", "success");
+      } catch (error) {
+        visualDiscoveryAttempted.current.delete(auxProvider);
+        toast(`Não foi possível atualizar os modelos visuais: ${errorMessage(error)}`, "error");
+      } finally {
+        setRefreshingVisualModelsFor((current) => current === auxProvider ? "" : current);
+      }
+    })();
+  }, [auxProvider, auxiliaryEvidenceMode, models, providers, reloadModels, request, toast]);
+
+  const availableAuxiliaryModels = auxiliaryModelsFor(auxProvider);
+  const refreshingVisualModels = refreshingVisualModelsFor === auxProvider;
+  const visualAuxiliaryModelMissing = auxiliaryEvidenceMode === "visual"
+    && !availableAuxiliaryModels.some((model) => modelValue(model) === auxModel);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -1156,7 +1247,16 @@ function NewExplorationView({
       return;
     }
     if (!targetUrl || !agentProvider || !agentModel || !auxProvider || !auxModel) {
-      toast("Preencha a URL e selecione os dois modelos.", "error");
+      toast(
+        auxiliaryEvidenceMode === "visual" && auxProvider && availableAuxiliaryModels.length === 0
+          ? "O modo visual exige uma LLM auxiliar que aceite imagens. Escolha outro provedor ou use o modo econômico."
+          : "Preencha a URL e selecione os dois modelos.",
+        "error",
+      );
+      return;
+    }
+    if (visualAuxiliaryModelMissing) {
+      toast("Selecione uma LLM auxiliar compatível com entrada de imagem.", "error");
       return;
     }
     if (focusMode === "focused" && !focusArea.trim()) {
@@ -1173,6 +1273,7 @@ function NewExplorationView({
         max_steps: null,
         max_duration_seconds: null,
         capture_screenshots: true,
+        auxiliary_evidence_mode: auxiliaryEvidenceMode,
         capture_console_errors: captureConsoleErrors,
         capture_network_errors: captureNetworkErrors,
         generate_test_cases: true,
@@ -1261,7 +1362,7 @@ function NewExplorationView({
                 />
                 <ModelRoleCard
                   roleTitle="LLM auxiliar"
-                  description="Interpreta screenshot e DOM; não controla o navegador."
+                  description="Documenta as evidências; não controla o navegador."
                   icon={<Sparkles size={20} />}
                   accent="teal"
                   providers={enabledProviders}
@@ -1269,9 +1370,40 @@ function NewExplorationView({
                   modelValueSelected={auxModel}
                   onProvider={setAuxProvider}
                   onModel={setAuxModel}
-                  modelsFor={modelsFor}
+                  modelsFor={auxiliaryModelsFor}
+                  emptyModelMessage={auxiliaryEvidenceMode === "visual"
+                    ? refreshingVisualModels ? "Verificando modelos com visão..." : "Nenhum modelo com visão neste provedor"
+                    : undefined}
                 />
               </div>
+              <fieldset className="auxiliary-evidence-field">
+                <legend>Evidência enviada à LLM auxiliar</legend>
+                <p>O Playwright sempre preserva screenshots no relatório. Aqui você decide se a imagem também será enviada ao modelo.</p>
+                <div className="scope-mode-grid evidence-mode-grid">
+                  <label className={auxiliaryEvidenceMode === "text" ? "selected" : ""}>
+                    <input type="radio" name="auxiliary-evidence-mode" value="text" checked={auxiliaryEvidenceMode === "text"} onChange={() => setAuxiliaryEvidenceMode("text")} />
+                    <span className="evidence-mode-copy"><span className="evidence-mode-title"><Code2 size={16} /><strong>Econômico · texto</strong><em>Recomendado</em></span><small>Envia texto visível e DOM semântico compacto. A imagem continua salva localmente, sem entrar no prompt.</small></span>
+                    <i><Check size={13} /></i>
+                  </label>
+                  <label className={auxiliaryEvidenceMode === "visual" ? "selected" : ""}>
+                    <input type="radio" name="auxiliary-evidence-mode" value="visual" checked={auxiliaryEvidenceMode === "visual"} onChange={() => setAuxiliaryEvidenceMode("visual")} />
+                    <span className="evidence-mode-copy"><span className="evidence-mode-title"><Eye size={16} /><strong>Visual · texto + imagem</strong></span><small>Acrescenta o screenshot em baixa resolução. A lista da LLM auxiliar exibirá somente modelos que aceitam imagens.</small></span>
+                    <i><Check size={13} /></i>
+                  </label>
+                </div>
+                {auxiliaryEvidenceMode === "visual" && (
+                  <div className={`visual-model-filter-note ${availableAuxiliaryModels.length ? "compatible" : "unavailable"}`} role="status">
+                    {refreshingVisualModels ? <Spinner /> : availableAuxiliaryModels.length ? <CheckCircle2 size={16} /> : <AlertCircle size={16} />}
+                    <span>
+                      {refreshingVisualModels
+                        ? "Consultando o catálogo do OpenRouter para identificar os modelos que aceitam imagens..."
+                        : availableAuxiliaryModels.length
+                        ? `${availableAuxiliaryModels.length} modelo(s) com entrada de imagem disponível(is) neste provedor.`
+                        : "Este provedor não informou nenhum modelo compatível com imagens. Escolha outro provedor ou use o modo econômico."}
+                    </span>
+                  </div>
+                )}
+              </fieldset>
               <div className="separation-note"><ShieldCheck size={17} /><span>As credenciais dos providers ficam no backend. O browser só recebe comandos validados pelo executor.</span></div>
             </div>
           </section>
@@ -1316,13 +1448,14 @@ function NewExplorationView({
           <div className="launch-summary">
             <SummaryRow label="Agente JEV" value={agentModel || "Selecione um modelo"} />
             <SummaryRow label="LLM auxiliar" value={auxModel || "Selecione um modelo"} />
+            <SummaryRow label="Evidência da LLM" value={auxiliaryEvidenceMode === "visual" ? "Visual · texto + imagem" : "Econômico · somente texto"} />
             <SummaryRow label="Escopo" value={focusMode === "focused" ? focusArea.trim() || "Defina uma área" : "Aplicação inteira"} />
             <SummaryRow label="Conclusão" value="Ao esgotar a cobertura" />
             <SummaryRow label="Limite" value="Sem teto fixo" />
             <SummaryRow label="Viewport" value={viewport.replace("x", " × ")} />
           </div>
           <div className="launch-route"><BrainCircuit size={17} /><span /><Code2 size={17} /><span /><Globe2 size={17} /><span /><Sparkles size={17} /></div>
-          <button type="submit" className="button primary launch-button" disabled={submitting || noModels}>{submitting ? <><Spinner />Iniciando exploração…</> : <><Play size={17} fill="currentColor" />Iniciar exploração</>}</button>
+          <button type="submit" className="button primary launch-button" disabled={submitting || noModels || visualAuxiliaryModelMissing}>{submitting ? <><Spinner />Iniciando exploração…</> : <><Play size={17} fill="currentColor" />Iniciar exploração</>}</button>
           <p className="launch-hint"><ShieldCheck size={14} />O JEV não enviará ações diretamente à LLM auxiliar.</p>
         </aside>
       </form>
@@ -1341,6 +1474,7 @@ function ModelRoleCard({
   onProvider,
   onModel,
   modelsFor,
+  emptyModelMessage,
 }: {
   roleTitle: string;
   description: string;
@@ -1352,12 +1486,13 @@ function ModelRoleCard({
   onProvider: (value: string) => void;
   onModel: (value: string) => void;
   modelsFor: (providerId: string) => Model[];
+  emptyModelMessage?: string;
 }) {
   return (
     <div className={`model-role-card accent-${accent}`}>
       <div className="model-role-head"><span className="model-role-icon">{icon}</span><div><strong>{roleTitle}</strong><small>{description}</small></div></div>
       <label className="field-group"><span>Provedor</span><select value={providerValue} onChange={(event) => onProvider(event.target.value)} disabled={!providers.length}><option value="">Selecione o provedor</option>{providers.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select></label>
-      <div className="field-group"><span>Modelo</span><ModelCombobox models={modelsFor(providerValue)} value={modelValueSelected} onChange={onModel} disabled={!providerValue} /></div>
+      <div className="field-group"><span>Modelo</span><ModelCombobox models={modelsFor(providerValue)} value={modelValueSelected} onChange={onModel} disabled={!providerValue} emptyMessage={emptyModelMessage} /></div>
     </div>
   );
 }
@@ -1367,11 +1502,13 @@ function ModelCombobox({
   value,
   onChange,
   disabled,
+  emptyMessage = "Nenhum modelo disponível",
 }: {
   models: Model[];
   value: string;
   onChange: (value: string) => void;
   disabled: boolean;
+  emptyMessage?: string;
 }) {
   const listboxId = useId();
   const [open, setOpen] = useState(false);
@@ -1403,7 +1540,7 @@ function ModelCombobox({
         disabled={disabled || !models.length}
         role="combobox"
         value={query}
-        placeholder={models.length ? "Pesquisar modelo..." : "Nenhum modelo disponível"}
+        placeholder={models.length ? "Pesquisar modelo..." : emptyMessage}
         onFocus={() => { setOpen(true); setQuery(""); }}
         onBlur={() => window.setTimeout(() => setOpen(false), 120)}
         onChange={(event) => { setQuery(event.target.value); setOpen(true); }}
@@ -1557,6 +1694,8 @@ function ProviderCard({ provider, initiallyOpen, request, toast, reload }: { pro
         model_id: modelValue(model),
         label: model.label || null,
         enabled: model.enabled !== false,
+        input_modalities: model.input_modalities || model.architecture?.input_modalities || [],
+        supports_vision: modelAcceptsImages(model),
       })),
     };
     if (apiKey.trim()) payload.api_key = apiKey.trim();
@@ -1805,21 +1944,41 @@ function ExplorationDetailView({
   const completion = exploration.completion || {};
   const actionLimitReached = completion.type === "limit_reached" || completion.reason === "action_limit";
   const completedWithRestrictions = completion.type === "coverage_complete_with_restrictions";
+  const browserPhaseActive = ["exploring", "waiting_input"].includes(phase);
+  const terminalOutcomeVisible = phase === "complete" && !isLive(exploration.status);
+  const parallelScenarioPipelineStarted = events.some((event) => event.type === "scenario_parallel_started");
+  const scenariosRunningInParallel = isLive(exploration.status) && browserPhaseActive && parallelScenarioPipelineStarted;
   const phaseSteps = [
     { key: "exploring", label: "Explorar", detail: `${exploration.browser_progress?.current ?? counters.actions} ações` },
-    { key: "documenting", label: "Criar CTs", detail: `${postprocessing.total || counters.scenarios} casos` },
+    {
+      key: "documenting",
+      label: scenariosRunningInParallel ? "Criar CTs em paralelo" : "Criar CTs",
+      detail: scenariosRunningInParallel
+        ? `${counters.scenarios} preservados ao vivo`
+        : `${postprocessing.total || counters.scenarios} casos`,
+    },
     { key: "reporting", label: "Relatório", detail: exploration.report_available ? "pronto" : "pendente" },
   ];
-  const phaseOrder: Record<string, number> = { preparing: 0, exploring: 0, waiting_input: 0, documenting: 1, reporting: 2, complete: 3 };
-  const currentPhaseIndex = phaseOrder[phase] ?? 0;
-  const phaseHeadline = actionLimitReached
+  const phaseStepState = (stepKey: string): "done" | "active" | "pending" => {
+    if (phase === "complete") return "done";
+    if (stepKey === "exploring") {
+      if (browserPhaseActive || phase === "preparing") return "active";
+      return ["documenting", "reporting"].includes(phase) ? "done" : "pending";
+    }
+    if (stepKey === "documenting") {
+      if (phase === "documenting" || scenariosRunningInParallel) return "active";
+      return phase === "reporting" ? "done" : "pending";
+    }
+    return phase === "reporting" ? "active" : "pending";
+  };
+  const phaseHeadline = terminalOutcomeVisible && actionLimitReached
     ? `Limite de ${exploration.browser_progress?.total || configuredStepLimit || counters.actions} ações atingido`
-    : completedWithRestrictions
+    : terminalOutcomeVisible && completedWithRestrictions
       ? "Exploração concluída com restrições"
       : exploration.phase_label || status.label;
-  const phaseDescription = actionLimitReached
+  const phaseDescription = terminalOutcomeVisible && actionLimitReached
     ? "A automação não falhou na ação 67: ela concluiu o limite configurado e preservou tudo o que encontrou. A cobertura ficou parcial porque ainda havia opções a explorar."
-    : completedWithRestrictions
+    : terminalOutcomeVisible && completedWithRestrictions
       ? "A cobertura alcançável terminou. Os controles que não puderam ser executados com segurança foram preservados como restrições, sem serem contados como testes aprovados."
       : exploration.phase_description || (isLive(exploration.status) ? `Atualização automática a cada ${pollInterval / 1000}s` : "Resultados preservados e prontos para consulta.");
 
@@ -1882,7 +2041,7 @@ function ExplorationDetailView({
     <div className="view-stack detail-view">
       <div className="detail-breadcrumb"><button onClick={() => navigate("#/exploracoes")}><ArrowLeft size={15} />Explorações</button><ChevronRight size={14} /><span>{hostFromUrl(exploration.app_url)}</span></div>
       <header className="detail-header">
-        <div className="detail-title"><span className="app-avatar large"><Globe2 size={22} /></span><div><div className="detail-title-line"><h1>{hostFromUrl(exploration.app_url)}</h1>{actionLimitReached ? <span className="status-badge status-warning"><span className="status-dot" />Limite anterior atingido</span> : completedWithRestrictions ? <span className="status-badge status-warning"><span className="status-dot" />Concluída com restrições</span> : <StatusBadge status={exploration.status} />}</div><a href={exploration.app_url} target="_blank" rel="noreferrer">{exploration.app_url}<SquareArrowOutUpRight size={13} /></a></div></div>
+        <div className="detail-title"><span className="app-avatar large"><Globe2 size={22} /></span><div><div className="detail-title-line"><h1>{hostFromUrl(exploration.app_url)}</h1>{terminalOutcomeVisible && actionLimitReached ? <span className="status-badge status-warning"><span className="status-dot" />Limite anterior atingido</span> : terminalOutcomeVisible && completedWithRestrictions ? <span className="status-badge status-warning"><span className="status-dot" />Concluída com restrições</span> : <StatusBadge status={exploration.status} completionType={completion.type} />}</div><a href={exploration.app_url} target="_blank" rel="noreferrer">{exploration.app_url}<SquareArrowOutUpRight size={13} /></a></div></div>
         <div className="page-actions">
           <button className="button secondary" onClick={onRefresh}><RefreshCcw size={16} />Atualizar</button>
           {isLive(exploration.status) ? (
@@ -1906,10 +2065,19 @@ function ExplorationDetailView({
             <span className="section-kicker">{isLive(exploration.status) ? <><span className="live-pulse" />Agora no AutoJev</> : "Resultado da execução"}</span>
             <h2>{phaseHeadline}</h2>
             <p>{phaseDescription}</p>
-            {phase === "documenting" && (
+            {(phase === "documenting" || scenariosRunningInParallel) && (
               <div className="ct-live-copy">
-                <strong>CT {Math.min(phaseProgress.current || 0, phaseProgress.total || 0)} de {phaseProgress.total || counters.scenarios}</strong>
-                <span>{counters.scenarios} casos já preservados · {postprocessing.enriched || 0} aprimorados pela LLM</span>
+                {scenariosRunningInParallel ? (
+                  <>
+                    <strong>Exploração + criação contínua de CTs</strong>
+                    <span>{counters.scenarios} casos já preservados · {postprocessing.enriched || 0} aprimorados pela LLM</span>
+                  </>
+                ) : (
+                  <>
+                    <strong>CT {Math.min(phaseProgress.current || 0, phaseProgress.total || 0)} de {phaseProgress.total || counters.scenarios}</strong>
+                    <span>{counters.scenarios} casos já preservados · {postprocessing.enriched || 0} aprimorados pela LLM</span>
+                  </>
+                )}
               </div>
             )}
           </div>
@@ -1917,12 +2085,15 @@ function ExplorationDetailView({
         </div>
         <div className={`large-progress ${determinateProgress ? "" : "indeterminate"}`}><span style={determinateProgress ? { width: `${Math.min(100, Math.max(0, overallProgressValue))}%` } : undefined} /></div>
         <div className="phase-track" aria-label="Fases da execução">
-          {phaseSteps.map((step, index) => (
-            <div key={step.key} className={`phase-step ${index < currentPhaseIndex ? "done" : ""} ${index === currentPhaseIndex && phase !== "complete" ? "active" : ""}`}>
-              <span>{index < currentPhaseIndex || phase === "complete" ? <Check size={14} /> : index + 1}</span>
-              <div><strong>{step.label}</strong><small>{step.detail}</small></div>
-            </div>
-          ))}
+          {phaseSteps.map((step, index) => {
+            const stepState = phaseStepState(step.key);
+            return (
+              <div key={step.key} className={`phase-step ${stepState}`}>
+                <span>{stepState === "done" ? <Check size={14} /> : index + 1}</span>
+                <div><strong>{step.label}</strong><small>{step.detail}</small></div>
+              </div>
+            );
+          })}
         </div>
         <div className="live-counters"><DetailCounter icon={Globe2} value={counters.pages} label="páginas" /><DetailCounter icon={Zap} value={counters.actions} label="ações" /><DetailCounter icon={AlertCircle} value={counters.issues} label="sinais técnicos" /><DetailCounter icon={FileCheck2} value={counters.scenarios} label="CTs" /><DetailCounter icon={Hash} value={formatTokens(exploration.usage?.total_tokens)} label="tokens" /><DetailCounter icon={CircleDollarSign} value={formatCost(exploration.usage)} label="custo" /><DetailCounter icon={Clock3} value={durationBetween(exploration.started_at || exploration.created_at, isLive(exploration.status) ? undefined : exploration.updated_at || exploration.finished_at)} label="duração total" /></div>
       </section>
@@ -2002,7 +2173,7 @@ function ExplorationDetailView({
             <section className="browser-panel evidence-panel">
               <div className="panel-heading row-heading"><div><span className="section-kicker"><Eye size={14} />Última observação</span><h2>Evidência do navegador</h2></div>{screenshot && <a className="text-button" href={screenshot} target="_blank" rel="noreferrer">Abrir imagem <SquareArrowOutUpRight size={14} /></a>}</div>
               <div className="browser-frame"><div className="browser-chrome"><span className="window-dots"><i /><i /><i /></span><div className="browser-address"><ShieldCheck size={12} />{exploration.app_url}</div><MoreHorizontal size={16} /></div><div className="browser-canvas">{screenshot ? <img src={`${screenshot}${screenshot.includes("?") ? "&" : "?"}v=${encodeURIComponent(exploration.updated_at || "latest")}`} alt={`Último screenshot de ${hostFromUrl(exploration.app_url)}`} /> : <div className="no-screenshot"><MonitorPlay size={32} /><strong>Aguardando captura do browser</strong><span>O preview aparecerá quando o executor publicar a primeira evidência.</span></div>}</div></div>
-              <div className="evidence-strip"><span><Eye size={15} />Screenshot</span><span><Code2 size={15} />DOM estruturado</span><span><ShieldCheck size={15} />A LLM auxiliar somente interpreta</span></div>
+              <div className="evidence-strip"><span><Eye size={15} />Screenshot salvo no relatório</span><span><Code2 size={15} />DOM estruturado</span><span><ShieldCheck size={15} />{explorationEvidenceMode(exploration.options) === "visual" ? "LLM recebeu texto + imagem" : "LLM recebeu somente texto"}</span></div>
             </section>
           )}
 
@@ -2013,6 +2184,7 @@ function ExplorationDetailView({
                 <div className="exploration-scope"><span className="model-role-icon"><Focus size={18} /></span><div><small>Escopo da exploração</small><strong>{explorationFocusArea(exploration.options) || "Aplicação inteira"}</strong><em>{explorationFocusArea(exploration.options) ? "O JEV prioriza e esgota este recorte funcional." : "O JEV explora todos os recursos que conseguir descobrir."}</em></div></div>
                 <div className="config-model"><span className="model-role-icon amber"><BrainCircuit size={18} /></span><div><small>JEV · agente QA</small><strong>{exploration.agent?.model_id || exploration.agent?.model || "—"}</strong><em>{providerName(exploration.agent?.provider_id || exploration.agent?.provider)}</em></div></div>
                 <div className="config-model"><span className="model-role-icon teal"><Sparkles size={18} /></span><div><small>LLM auxiliar</small><strong>{exploration.auxiliary_llm?.model_id || exploration.auxiliary_llm?.model || "—"}</strong><em>{providerName(exploration.auxiliary_llm?.provider_id || exploration.auxiliary_llm?.provider)}</em></div></div>
+                <div className="config-model"><span className="model-role-icon teal">{explorationEvidenceMode(exploration.options) === "visual" ? <Eye size={18} /> : <Code2 size={18} />}</span><div><small>Evidência da LLM auxiliar</small><strong>{explorationEvidenceMode(exploration.options) === "visual" ? "Visual · texto + imagem" : "Econômico · somente texto"}</strong><em>O screenshot permanece salvo localmente nos dois modos.</em></div></div>
               </div>
             </section>
           )}

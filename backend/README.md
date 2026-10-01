@@ -1,6 +1,6 @@
 # AutoJev backend
 
-FastAPI service for evidence-based exploratory testing. JEV is the decision maker, but it never receives a browser object and cannot execute browser code. Only the Playwright adapter performs actions. The auxiliary LLM receives completed evidence and documents test scenarios; it cannot request browser actions or assign `PASS`.
+FastAPI service for evidence-based exploratory testing. JEV is the decision maker, but it never receives a browser object and cannot execute browser code. Only the Playwright adapter performs actions. The auxiliary LLM receives verified evidence and documents test scenarios in parallel with later browser actions; it cannot request browser actions or assign `PASS`.
 
 ## Run locally
 
@@ -38,7 +38,7 @@ FastAPI API -> ExplorationManager -> JEV adapter -> JSON AgentDecision
 ```
 
 - `domain/` contains models and ports without FastAPI or Playwright dependencies.
-- `adapters/openai_compatible.py` implements OpenAI-compatible model discovery, connectivity checks, schema-validated JEV JSON decisions and auxiliary documentation. The auxiliary model receives the redacted DOM plus a masked screenshot when it supports vision; incompatible models automatically fall back to textual evidence.
+- `adapters/openai_compatible.py` implements OpenAI-compatible model discovery, connectivity checks, schema-validated JEV JSON decisions and auxiliary documentation. The auxiliary model receives compact redacted text/DOM by default; visual mode additionally attaches a masked screenshot, with a text fallback only after an explicit vision-capability rejection.
 - `adapters/playwright_executor.py` is the only browser executor. Element targets are observation refs such as `e4`, not model-supplied selectors or JavaScript.
 - `services/coverage.py` owns route/state identity, semantic control memory,
   the atomic pending frontier, selector-free DOM-state replay and verified
@@ -104,6 +104,7 @@ Example exploration:
     "max_steps": 100,
     "max_duration_seconds": 1800,
     "capture_screenshots": true,
+    "auxiliary_evidence_mode": "text",
     "capture_console_errors": true,
     "capture_network_errors": true,
     "generate_test_cases": true,
@@ -123,11 +124,24 @@ a same-URL submenu or modal, its entry state is retained only as a replay anchor
 background controls remain out of scope.
 
 `max_duration_seconds` is enforced across browser startup, JEV decisions and
-Playwright actions. Auxiliary documentation is post-processed after navigation
-so its latency cannot reduce browser coverage; deterministic evidence is used
-as fallback when documentation reaches its own bound. Route fingerprints keep
+Playwright actions. Each deterministic local CT is persisted immediately and a
+single bounded auxiliary worker enriches it in parallel, so provider latency
+cannot reduce browser coverage; local evidence remains the fallback when the
+documentation queue reaches its own bound. Route fingerprints keep
 path, query and hash distinct for SPAs. `max_steps` counts real browser actions;
 invalid/rejected model responses use a separate bounded planning budget.
+
+`auxiliary_evidence_mode` accepts `text` (default/economical) or `visual`.
+Screenshots are still captured and retained locally when
+`capture_screenshots=true` in either mode; the option controls only whether a
+masked low-detail image is attached to the auxiliary-model request.
+
+Before every paid JEV request, the orchestrator applies an explicit invocation
+policy. Clear atomic controls, conventional forms, known navigation and graph
+restoration execute deterministically. Duplicate labels, complex new states,
+ambiguous business controls, missing safe moves and two attempts without
+progress are escalated to JEV. Console/HTTP errors are first recorded by
+Playwright and do not need a model merely to confirm that they occurred.
 
 ## Evidence and status
 
@@ -149,8 +163,8 @@ Exploration lifecycle status is separate from scenario status. `completed`
 means the discovered frontier and return stack were exhausted. `partial` means
 a time/action/planning bound was reached, the requested focus could not be
 found, or blocked candidates left the frontier incomplete. `postprocessing` is
-a live, cancelable phase after browser work in which the auxiliary model formats
-captured evidence and the report is generated; only then is the terminal status
+a live, cancelable phase after browser work that drains only any remaining
+auxiliary queue and generates the report; only then is the terminal status
 published. A backend restart marks `queued`, `running`, `waiting_input` and
 `postprocessing` runs as failed rather than leaving them orphaned. Visible-browser
 screenshots capture only the viewport and mask the AutoJev overlay without

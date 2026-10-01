@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qsl, urlparse
 
 from pydantic import (
@@ -29,6 +29,24 @@ class ProviderModelInput(ApiModel):
     )
     label: str | None = Field(default=None, max_length=300)
     enabled: bool = True
+    input_modalities: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        validation_alias=AliasChoices("input_modalities", "inputModalities"),
+    )
+    output_modalities: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        validation_alias=AliasChoices("output_modalities", "outputModalities"),
+    )
+    supports_vision: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("supports_vision", "supportsVision"),
+    )
+    capabilities_known: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("capabilities_known", "capabilitiesKnown"),
+    )
 
     @field_validator("id")
     @classmethod
@@ -37,6 +55,20 @@ class ProviderModelInput(ApiModel):
         if not value:
             raise ValueError("Model id cannot be blank")
         return value
+
+    @field_validator("input_modalities", "output_modalities")
+    @classmethod
+    def clean_input_modalities(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for modality in values:
+            value = modality.strip().casefold()
+            if not value:
+                continue
+            if len(value) > 50:
+                raise ValueError("Input modality is too long")
+            if value not in normalized:
+                normalized.append(value)
+        return normalized
 
 
 class ProviderCreate(ApiModel):
@@ -139,6 +171,15 @@ class ExplorationOptionsInput(ApiModel):
     capture_screenshots: bool = Field(
         default=True,
         validation_alias=AliasChoices("capture_screenshots", "captureScreenshots", "screenshots"),
+    )
+    auxiliary_evidence_mode: Literal["text", "visual"] = Field(
+        default="text",
+        validation_alias=AliasChoices(
+            "auxiliary_evidence_mode",
+            "auxiliaryEvidenceMode",
+            "evidence_mode",
+            "evidenceMode",
+        ),
     )
     capture_console_errors: bool = Field(
         default=True,

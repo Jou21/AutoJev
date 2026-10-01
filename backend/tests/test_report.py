@@ -19,7 +19,10 @@ def test_report_is_standalone_and_escapes_model_content(tmp_path):
                 "message": "Limite de tempo; a fronteira ainda tinha itens.",
             }
         ],
-        "options": {"focus_area": "Administração > Usuários"},
+        "options": {
+            "focus_area": "Administração > Usuários",
+            "auxiliary_evidence_mode": "visual",
+        },
         "summary": {
             "total_scenarios": 1,
             "pass": 1,
@@ -65,6 +68,7 @@ def test_report_is_standalone_and_escapes_model_content(tmp_path):
     assert ">150</strong>Tokens" in document
     assert ">$0.004200</strong>Custo" in document
     assert "Administração &gt; Usuários" in document
+    assert "Visual · texto + imagem" in document
     assert "Cobertura parcial" in document
     assert "Motivo do encerramento:" in document
     assert "Limite de tempo; a fronteira ainda tinha itens." in document
@@ -133,13 +137,56 @@ def test_report_explains_restricted_completion_and_correlates_browser_signals(
 
     assert "Concluída com restrições" in document
     assert "SEM VALIDAÇÃO" in document
-    assert "Sinais técnicos observados (1 ocorrências)" in document
+    assert "Sinais técnicos observados (1 ocorrência)" in document
     assert "2 sinal(is) correlacionado(s)" in document
-    assert "2 registro(s) bruto(s)" in document
+    assert "2 registro(s) persistido(s)" in document
     assert "secret-one" not in document
     assert "secret-two" not in document
     assert "item=1" in document
     assert "%5BREDACTED%5D" in document
+
+
+def test_report_pairs_one_generic_console_signal_without_merging_two_requests():
+    issues = [
+        {
+            "type": "console",
+            "message": (
+                "Failed to load resource: the server responded with a status "
+                "of 401 (Unauthorized)"
+            ),
+            # Chromium reports the document URL for this generic console line.
+            "url": "https://app.test/inventory",
+            "occurred_at": "2026-01-01T12:00:00.100000+00:00",
+            "screenshot": "002.png",
+        },
+        {
+            "type": "http",
+            "method": "POST",
+            "status_code": 401,
+            "message": "POST returned HTTP 401",
+            "url": "https://telemetry.test/unique-events",
+            "occurred_at": "2026-01-01T12:00:00.120000+00:00",
+            "screenshot": "002.png",
+        },
+        {
+            "type": "http",
+            "method": "POST",
+            "status_code": 401,
+            "message": "POST returned HTTP 401",
+            "url": "https://telemetry.test/summed-events",
+            "occurred_at": "2026-01-01T12:00:00.800000+00:00",
+            "screenshot": "002.png",
+        },
+    ]
+
+    grouped = StandaloneHtmlReport._group_issues(issues)
+
+    assert len(grouped) == 2
+    assert grouped[0]["count"] == 2
+    assert grouped[0]["types"] == ["http", "console"]
+    assert grouped[0]["urls"] == ["https://telemetry.test/unique-events"]
+    assert grouped[1]["count"] == 1
+    assert grouped[1]["urls"] == ["https://telemetry.test/summed-events"]
 
 
 def test_cancelled_report_ignores_stale_coverage_completion():

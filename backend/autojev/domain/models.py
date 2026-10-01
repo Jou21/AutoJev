@@ -33,6 +33,38 @@ class ProviderModel:
     id: str
     label: str
     enabled: bool = True
+    # Capabilities are supplied by provider catalogs when available.  An empty
+    # list deliberately means "not declared"; model names are never used to
+    # guess vision support.
+    input_modalities: list[str] = field(default_factory=list)
+    output_modalities: list[str] = field(default_factory=list)
+    supports_vision: bool = False
+    capabilities_known: bool = False
+
+    def __post_init__(self) -> None:
+        def normalize(values: list[str]) -> list[str]:
+            normalized: list[str] = []
+            for modality in values:
+                value = str(modality).strip().casefold()
+                if value and value not in normalized:
+                    normalized.append(value)
+            return normalized
+
+        self.input_modalities = normalize(self.input_modalities)
+        self.output_modalities = normalize(self.output_modalities)
+        if self.supports_vision and "image" not in self.input_modalities:
+            self.input_modalities.append("image")
+        produces_text = (
+            not self.output_modalities or "text" in self.output_modalities
+        )
+        self.supports_vision = (
+            self.supports_vision or "image" in self.input_modalities
+        ) and produces_text
+        self.capabilities_known = (
+            self.capabilities_known
+            or bool(self.input_modalities)
+            or self.supports_vision
+        )
 
 
 @dataclass(slots=True)
@@ -65,6 +97,10 @@ class ExplorationOptions:
     max_steps: int | None = None
     max_duration_seconds: int | None = None
     capture_screenshots: bool = True
+    # Screenshots are always kept as local evidence when capture_screenshots is
+    # enabled.  This option controls only what is sent to the auxiliary model:
+    # text is the economical default; visual also attaches the screenshot.
+    auxiliary_evidence_mode: str = "text"
     capture_console_errors: bool = True
     capture_network_errors: bool = True
     generate_test_cases: bool = True

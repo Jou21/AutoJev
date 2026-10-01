@@ -84,7 +84,10 @@ def _phase_payload(result: dict[str, Any], events: list[dict[str, Any]]) -> dict
         description = (
             "Conclua a etapa solicitada no navegador para o JEV continuar."
             if phase == "waiting_input"
-            else "O JEV decide e o Playwright executa e valida cada interação."
+            else (
+                "O JEV decide e o Playwright valida cada interação enquanto "
+                "os CTs são preservados e aprimorados em paralelo."
+            )
         )
         current, total, percentage = actions, max_steps, browser_percentage
     elif status_value == "postprocessing":
@@ -146,6 +149,12 @@ def _phase_payload(result: dict[str, Any], events: list[dict[str, Any]]) -> dict
                 "scenario_postprocessing_completed",
                 "scenario_enriched",
                 "scenario_enrichment_skipped",
+                "scenario_enrichment_backlog_full",
+                "scenario_enrichment_worker_unavailable",
+                "scenario_draft_created",
+                "scenario_draft_updated",
+                "scenario_draft_removed",
+                "scenario_parallel_started",
             }
         ),
         None,
@@ -159,7 +168,10 @@ def _phase_payload(result: dict[str, Any], events: list[dict[str, Any]]) -> dict
     local_count = int(enrichment.get("local_evidence") or legacy_local)
     postprocessing = {
         "current": current if phase == "documenting" else int(enrichment.get("current") or 0),
-        "total": int(enrichment.get("total") or len(result.get("scenarios") or [])),
+        "total": max(
+            int(enrichment.get("total") or 0),
+            len(result.get("scenarios") or []),
+        ),
         "enriched": enriched_count,
         "local_evidence": local_count,
         "stage": enrichment.get("stage"),
@@ -375,7 +387,21 @@ async def create_provider(body: ProviderCreate, request: Request) -> dict[str, A
         api_key=api_key,
         enabled=body.enabled,
         models=[
-            ProviderModel(id=model.id, label=model.label or model.id, enabled=model.enabled)
+            ProviderModel(
+                id=model.id,
+                label=model.label or model.id,
+                enabled=model.enabled,
+                input_modalities=model.input_modalities,
+                output_modalities=model.output_modalities,
+                supports_vision=model.supports_vision,
+                capabilities_known=(
+                    model.capabilities_known
+                    or bool(
+                        {"input_modalities", "output_modalities", "supports_vision"}
+                        & model.model_fields_set
+                    )
+                ),
+            )
             for model in body.models
         ],
     )
@@ -395,14 +421,50 @@ async def _update_provider(
 ) -> dict[str, Any]:
     fields = body.model_fields_set
     models = None
-    if "models" in fields:
-        models = [
-            ProviderModel(id=model.id, label=model.label or model.id, enabled=model.enabled)
-            for model in (body.models or [])
-        ]
     repository = _repository(request)
     try:
         current = repository.get_provider(provider_id)
+        if "models" in fields:
+            existing_by_id = {model.id: model for model in current.models}
+            models = []
+            for model in body.models or []:
+                existing = existing_by_id.get(model.id)
+                capability_fields = {
+                    "input_modalities",
+                    "output_modalities",
+                    "supports_vision",
+                    "capabilities_known",
+                }
+                capabilities_supplied = bool(
+                    capability_fields & model.model_fields_set
+                )
+                models.append(
+                    ProviderModel(
+                        id=model.id,
+                        label=model.label or model.id,
+                        enabled=model.enabled,
+                        input_modalities=(
+                            model.input_modalities
+                            if capabilities_supplied or existing is None
+                            else existing.input_modalities
+                        ),
+                        output_modalities=(
+                            model.output_modalities
+                            if capabilities_supplied or existing is None
+                            else existing.output_modalities
+                        ),
+                        supports_vision=(
+                            model.supports_vision
+                            if capabilities_supplied or existing is None
+                            else existing.supports_vision
+                        ),
+                        capabilities_known=(
+                            (model.capabilities_known or capabilities_supplied)
+                            if capabilities_supplied or existing is None
+                            else existing.capabilities_known
+                        ),
+                    )
+                )
         if fields & {"base_url", "api_key"}:
             effective_base_url = body.base_url or current.base_url
             if "api_key" in fields:
@@ -469,15 +531,46 @@ async def discover_models(provider_id: str, request: Request) -> dict[str, Any]:
         if "openrouter.ai" in provider.base_url.lower():
             discovered = [
                 *discovered,
-                {"id": "typesafe/jev-1.13", "label": "TypeSafe: Jev 1.13"},
+                {
+                    "id": "typesafe/jev-1.13",
+                    "label": "TypeSafe: Jev 1.13",
+                    "input_modalities": ["text"],
+                    "output_modalities": ["text"],
+                    "supports_vision": False,
+                    "capabilities_known": True,
+                },
             ]
-        old_by_id = {model.id: model for model in provider.models}
-        merged = list(provider.models)
-        for model in discovered:
-            if model["id"] not in old_by_id:
-                merged.append(
-                    ProviderModel(id=model["id"], label=model["label"], enabled=True)
+        discovered_by_id = {model["id"]: model for model in discovered}
+        merged: list[ProviderModel] = []
+        seen: set[str] = set()
+        for current in provider.models:
+            catalog_model = discovered_by_id.get(current.id)
+            if catalog_model and catalog_model.get("capabilities_known"):
+                current = ProviderModel(
+                    id=current.id,
+                    label=current.label,
+                    enabled=current.enabled,
+                    input_modalities=catalog_model.get("input_modalities") or [],
+                    output_modalities=catalog_model.get("output_modalities") or [],
+                    supports_vision=bool(catalog_model.get("supports_vision")),
+                    capabilities_known=True,
                 )
+            merged.append(current)
+            seen.add(current.id)
+        for model in discovered:
+            if model["id"] not in seen:
+                merged.append(
+                    ProviderModel(
+                        id=model["id"],
+                        label=model["label"],
+                        enabled=True,
+                        input_modalities=model.get("input_modalities") or [],
+                        output_modalities=model.get("output_modalities") or [],
+                        supports_vision=bool(model.get("supports_vision")),
+                        capabilities_known=bool(model.get("capabilities_known")),
+                    )
+                )
+                seen.add(model["id"])
         provider = repository.replace_provider_models(provider_id, merged)
         return {
             "discovered": len(discovered),
@@ -529,13 +622,21 @@ async def list_models(
                     "id": model.id,
                     "label": model.label,
                     "enabled": model.enabled and provider.enabled,
+                    "input_modalities": model.input_modalities,
+                    "output_modalities": model.output_modalities,
+                    "supports_vision": model.supports_vision,
+                    "capabilities_known": model.capabilities_known,
                 }
             )
     return result
 
 
 def _validate_selection(
-    repository: SQLiteRepository, selection: ModelSelection, role: str
+    repository: SQLiteRepository,
+    selection: ModelSelection,
+    role: str,
+    *,
+    require_vision: bool = False,
 ) -> None:
     try:
         provider = repository.get_provider(selection.provider_id)
@@ -543,10 +644,23 @@ def _validate_selection(
         raise HTTPException(status_code=422, detail=f"{role} provider was not found") from exc
     if not provider.enabled:
         raise HTTPException(status_code=422, detail=f"{role} provider is disabled")
-    if not any(model.id == selection.model_id and model.enabled for model in provider.models):
+    selected = next(
+        (
+            model
+            for model in provider.models
+            if model.id == selection.model_id and model.enabled
+        ),
+        None,
+    )
+    if selected is None:
         raise HTTPException(
             status_code=422,
             detail=f"{role} model is not configured or is disabled for this provider",
+        )
+    if require_vision and not selected.supports_vision:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{role} model does not declare image input support",
         )
 
 
@@ -584,7 +698,12 @@ async def create_exploration(
         model_id=body.auxiliary_llm.model_id,
     )
     _validate_selection(repository, agent, "JEV")
-    _validate_selection(repository, auxiliary, "Auxiliary LLM")
+    _validate_selection(
+        repository,
+        auxiliary,
+        "Auxiliary LLM",
+        require_vision=body.options.auxiliary_evidence_mode == "visual",
+    )
     try:
         await _validate_exploration_credentials(
             repository,

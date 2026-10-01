@@ -1525,6 +1525,79 @@ input::placeholder {
   gap: 12px;
 }
 
+.auxiliary-evidence-field {
+  margin: 16px 0 0;
+  padding: 0;
+  border: 0;
+}
+
+.auxiliary-evidence-field legend {
+  color: #d4d8da;
+  font-size: 10.5px;
+  font-weight: 650;
+}
+
+.auxiliary-evidence-field > p {
+  margin: 5px 0 10px;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.evidence-mode-grid > label {
+  min-height: 86px;
+  align-items: flex-start;
+}
+
+.evidence-mode-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.evidence-mode-title svg {
+  flex: 0 0 auto;
+  color: var(--teal);
+}
+
+.evidence-mode-title em {
+  margin-left: auto;
+  padding: 2px 5px;
+  border: 1px solid rgba(83, 207, 185, 0.25);
+  border-radius: 999px;
+  color: var(--teal);
+  font-size: 7px;
+  font-style: normal;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.visual-model-filter-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 9px 11px;
+  border: 1px solid #315149;
+  border-radius: 6px;
+  background: #111d1a;
+  color: #8dbcb3;
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.visual-model-filter-note svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.visual-model-filter-note.unavailable {
+  border-color: #654c2a;
+  background: #211b12;
+  color: #d8b26e;
+}
+
 .form-section.model-section {
   overflow: visible;
 }
@@ -3564,7 +3637,7 @@ input::placeholder {
 
 .configuration-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 12px;
   margin-top: 16px;
 }

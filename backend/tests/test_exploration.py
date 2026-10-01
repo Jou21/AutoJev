@@ -90,6 +90,149 @@ def test_only_consecutive_restorations_without_progress_trip_the_guard():
     )
 
 
+def _policy_observation(elements, *, network_errors=None):
+    return Observation(
+        url="https://app.test/products",
+        title="Products",
+        text="Products",
+        interactive_elements=elements,
+        network_errors=network_errors or [],
+    )
+
+
+def test_clear_control_is_routed_locally_without_a_jev_call():
+    observed = _policy_observation(
+        [{"ref": "e1", "tag": "button", "name": "Open menu"}]
+    )
+    decision, reason, consultation_key = ExplorationManager._deterministic_decision(
+        observed,
+        {
+            "state_key": "products",
+            "current_untried": [
+                {
+                    "ref": "e1",
+                    "name": "Open menu",
+                    "suggested_action": "click",
+                }
+            ],
+        },
+        consulted_policy_keys=set(),
+        consecutive_no_progress=0,
+    )
+
+    assert decision is not None
+    assert (decision.action, decision.target) == ("click", "e1")
+    assert reason == "single_clear_control"
+    assert consultation_key is None
+
+
+def test_http_error_is_recorded_locally_and_does_not_force_a_jev_call():
+    observed = _policy_observation(
+        [{"ref": "e1", "tag": "button", "name": "Retry"}],
+        network_errors=[
+            {
+                "type": "http",
+                "url": "https://app.test/api/products",
+                "status_code": 500,
+            }
+        ],
+    )
+    decision, reason, _ = ExplorationManager._deterministic_decision(
+        observed,
+        {
+            "state_key": "products-error",
+            "current_untried": [
+                {
+                    "ref": "e1",
+                    "name": "Retry",
+                    "suggested_action": "click",
+                }
+            ],
+        },
+        consulted_policy_keys=set(),
+        consecutive_no_progress=0,
+    )
+
+    assert decision is not None
+    assert reason == "single_clear_control"
+
+
+def test_duplicate_control_names_escalate_once_then_use_coverage_memory():
+    observed = _policy_observation(
+        [
+            {"ref": "e1", "tag": "button", "name": "Add to cart"},
+            {"ref": "e2", "tag": "button", "name": "Add to cart"},
+        ]
+    )
+    context = {
+        "state_key": "products",
+        "current_untried": [
+            {"ref": "e1", "name": "Add to cart", "suggested_action": "click"},
+            {"ref": "e2", "name": "Add to cart", "suggested_action": "click"},
+        ],
+    }
+
+    decision, reason, key = ExplorationManager._deterministic_decision(
+        observed,
+        context,
+        consulted_policy_keys=set(),
+        consecutive_no_progress=0,
+    )
+    assert decision is None
+    assert reason == "ambiguous_duplicate_controls"
+    assert key is not None
+
+    decision, reason, _ = ExplorationManager._deterministic_decision(
+        observed,
+        context,
+        consulted_policy_keys={key},
+        consecutive_no_progress=0,
+    )
+    assert decision is not None
+    assert reason == "clear_safe_frontier"
+
+
+def test_conventional_form_is_deterministic_but_stalled_progress_escalates():
+    observed = _policy_observation(
+        [
+            {"ref": "e1", "tag": "input", "type": "text", "name": "Name"},
+            {"ref": "e2", "tag": "button", "name": "Continue"},
+        ]
+    )
+    context = {
+        "state_key": "checkout",
+        "current_untried": [
+            {
+                "ref": "e1",
+                "name": "Name",
+                "suggested_action": "fill",
+                "suggested_value": "AutoJev QA",
+            },
+            {"ref": "e2", "name": "Continue", "suggested_action": "click"},
+        ],
+    }
+
+    decision, reason, _ = ExplorationManager._deterministic_decision(
+        observed,
+        context,
+        consulted_policy_keys=set(),
+        consecutive_no_progress=0,
+    )
+    assert decision is not None
+    assert decision.action == "fill"
+    assert reason == "conventional_form"
+
+    decision, reason, key = ExplorationManager._deterministic_decision(
+        observed,
+        context,
+        consulted_policy_keys=set(),
+        consecutive_no_progress=2,
+    )
+    assert decision is None
+    assert reason == "two_attempts_without_progress"
+    assert key == "state:checkout"
+
+
 def test_observable_state_delta_becomes_verified_pass_evidence():
     decision = AgentDecision(action="click", target="e0", rationale="Open details")
     result = ActionResult(
@@ -340,6 +483,50 @@ def test_repeated_nonbaseline_first_party_failure_remains_action_evidence():
     assert len(later_action) == 1
 
 
+def test_issue_deduplication_does_not_merge_two_same_status_requests():
+    observation = Observation(
+        url="https://app.test/orders",
+        title="Orders",
+        text="Orders",
+        interactive_elements=[],
+        console_errors=[
+            {
+                "type": "console",
+                "message": (
+                    "Failed to load resource: the server responded with a "
+                    "status of 401 (Unauthorized)"
+                ),
+                "occurred_at": "2026-01-01T12:00:00.100000+00:00",
+            }
+        ],
+        network_errors=[
+            {
+                "type": "http",
+                "method": "POST",
+                "message": "POST returned HTTP 401",
+                "url": "https://telemetry.test/unique-events",
+                "status_code": 401,
+                "occurred_at": "2026-01-01T12:00:00.120000+00:00",
+            },
+            {
+                "type": "http",
+                "method": "POST",
+                "message": "POST returned HTTP 401",
+                "url": "https://telemetry.test/summed-events",
+                "status_code": 401,
+                "occurred_at": "2026-01-01T12:00:00.800000+00:00",
+            },
+        ],
+    )
+
+    issues = ExplorationManager._deduplicate_observation_issues(observation)
+
+    assert len(issues) == 2
+    assert issues[0]["url"] == "https://telemetry.test/unique-events"
+    assert issues[0]["evidence_channels"] == ["network", "console"]
+    assert issues[1]["url"] == "https://telemetry.test/summed-events"
+
+
 def test_action_issue_attribution_excludes_errors_emitted_before_action_start():
     observation = Observation(
         url="https://app.test/orders",
@@ -424,6 +611,237 @@ def test_scenario_capture_policy_excludes_mechanics_and_successful_noops():
     ) == (True, None)
 
 
+def test_scenario_retry_replaces_provisional_failure_and_keeps_sequence():
+    pending = {}
+    omitted = set()
+    first_observation = Observation(
+        url="https://app.test/cart",
+        title="Cart",
+        text="Cart",
+        interactive_elements=[],
+    )
+    retry_observation = Observation(
+        url="https://app.test/checkout",
+        title="Checkout",
+        text="Checkout",
+        interactive_elements=[],
+    )
+    failed_decision = AgentDecision(
+        action="click", target="e1", rationale="Continue"
+    )
+    retry_decision = AgentDecision(
+        action="click", target="e19", rationale="Continue"
+    )
+    failed = ActionResult(
+        action="click",
+        success=False,
+        started_at=utc_now(),
+        finished_at=utc_now(),
+        before_url=first_observation.url,
+        after_url=first_observation.url,
+        message="Locator became stale",
+    )
+    recovered = ActionResult(
+        action="click",
+        success=True,
+        started_at=utc_now(),
+        finished_at=utc_now(),
+        before_url=first_observation.url,
+        after_url=retry_observation.url,
+        message="Opened checkout",
+    )
+    ExplorationManager._append_observable_state_evidence(
+        recovered,
+        retry_decision,
+        retry_observation,
+        state_changed=True,
+        capture_console_errors=False,
+        capture_network_errors=False,
+    )
+
+    sequence, _, _ = ExplorationManager._reconcile_pending_scenario(
+        pending,
+        omitted,
+        "semantic-continue",
+        first_observation,
+        failed_decision,
+        failed,
+        0,
+        decision_source="jev",
+        is_restoration_action=False,
+    )
+    sequence, reason, emit = ExplorationManager._reconcile_pending_scenario(
+        pending,
+        omitted,
+        "semantic-continue",
+        retry_observation,
+        retry_decision,
+        recovered,
+        sequence,
+        decision_source="jev",
+        is_restoration_action=False,
+    )
+
+    assert sequence == 1
+    assert reason is None
+    assert emit is False
+    assert pending["semantic-continue"] == (
+        retry_observation,
+        retry_decision,
+        recovered,
+        1,
+    )
+    scenario = ExplorationManager._scenario_from_evidence(
+        *pending["semantic-continue"]
+    )
+    assert scenario.status == ScenarioStatus.PASS
+
+
+def test_successful_no_evidence_retry_removes_false_failure_once():
+    pending = {}
+    omitted = set()
+    observation = Observation(
+        url="https://app.test/cart",
+        title="Cart",
+        text="Cart",
+        interactive_elements=[],
+    )
+    failed_decision = AgentDecision(
+        action="click", target="e1", rationale="Refresh cart"
+    )
+    retry_decision = AgentDecision(
+        action="click", target="e8", rationale="Refresh cart"
+    )
+    failed = ActionResult(
+        action="click",
+        success=False,
+        started_at=utc_now(),
+        finished_at=utc_now(),
+        before_url=observation.url,
+        after_url=observation.url,
+        message="Locator became stale",
+    )
+    recovered_noop = ActionResult(
+        action="click",
+        success=True,
+        started_at=utc_now(),
+        finished_at=utc_now(),
+        before_url=observation.url,
+        after_url=observation.url,
+        message="Clicked; no observable state change",
+    )
+
+    sequence, _, _ = ExplorationManager._reconcile_pending_scenario(
+        pending,
+        omitted,
+        "semantic-refresh",
+        observation,
+        failed_decision,
+        failed,
+        0,
+        decision_source="jev",
+        is_restoration_action=False,
+    )
+    sequence, reason, emit = ExplorationManager._reconcile_pending_scenario(
+        pending,
+        omitted,
+        "semantic-refresh",
+        observation,
+        retry_decision,
+        recovered_noop,
+        sequence,
+        decision_source="jev",
+        is_restoration_action=False,
+    )
+    _, repeated_reason, repeated_emit = (
+        ExplorationManager._reconcile_pending_scenario(
+            pending,
+            omitted,
+            "semantic-refresh",
+            observation,
+            retry_decision,
+            recovered_noop,
+            sequence,
+            decision_source="jev",
+            is_restoration_action=False,
+        )
+    )
+
+    assert sequence == 1
+    assert pending == {}
+    assert reason == "successful_action_without_verifiable_evidence"
+    assert emit is True
+    assert repeated_reason == reason
+    assert repeated_emit is False
+
+
+def test_redundant_noop_does_not_erase_an_assertion_backed_scenario():
+    pending = {}
+    omitted = set()
+    observation = Observation(
+        url="https://app.test/cart",
+        title="Cart",
+        text="Cart",
+        interactive_elements=[],
+    )
+    decision = AgentDecision(action="click", target="e1", rationale="Refresh cart")
+    verified = ActionResult(
+        action="click",
+        success=True,
+        started_at=utc_now(),
+        finished_at=utc_now(),
+        before_url=observation.url,
+        after_url=observation.url,
+        message="Cart refreshed",
+    )
+    ExplorationManager._append_observable_state_evidence(
+        verified,
+        decision,
+        observation,
+        state_changed=True,
+        capture_console_errors=False,
+        capture_network_errors=False,
+    )
+    redundant_noop = ActionResult(
+        action="click",
+        success=True,
+        started_at=utc_now(),
+        finished_at=utc_now(),
+        before_url=observation.url,
+        after_url=observation.url,
+        message="Clicked; no observable state change",
+    )
+
+    sequence, _, _ = ExplorationManager._reconcile_pending_scenario(
+        pending,
+        omitted,
+        "semantic-refresh",
+        observation,
+        decision,
+        verified,
+        0,
+        decision_source="jev",
+        is_restoration_action=False,
+    )
+    sequence, reason, emit = ExplorationManager._reconcile_pending_scenario(
+        pending,
+        omitted,
+        "semantic-refresh",
+        observation,
+        decision,
+        redundant_noop,
+        sequence,
+        decision_source="jev",
+        is_restoration_action=False,
+    )
+
+    assert sequence == 1
+    assert reason == "successful_action_without_verifiable_evidence"
+    assert emit is False
+    assert pending["semantic-refresh"][2] is verified
+    assert omitted == set()
+
+
 @pytest.mark.asyncio
 async def test_all_local_scenarios_are_persisted_before_auxiliary_enrichment():
     class RecordingRepository:
@@ -504,6 +922,762 @@ async def test_all_local_scenarios_are_persisted_before_auxiliary_enrichment():
             "enriched": 2,
             "local_evidence": 0,
             "reason": "documentation_complete",
+            "stage": "scenarios_complete",
+        },
+    )
+
+
+class _LiveScenarioRepository:
+    """Small in-memory contract used by the live CT pipeline tests."""
+
+    def __init__(self):
+        self.cancel_requested = False
+        self.scenarios = {}
+        self.writes = []
+        self.events = []
+
+    def add_scenario(self, exploration_id, sequence, scenario):
+        self.scenarios[sequence] = scenario
+        self.writes.append((sequence, scenario.title))
+
+    def delete_scenario(self, exploration_id, scenario_id):
+        self.scenarios = {
+            sequence: scenario
+            for sequence, scenario in self.scenarios.items()
+            if scenario.id != scenario_id
+        }
+
+    # Keep the fake compatible with either repository verb while the internal
+    # pipeline remains private to ExplorationManager.
+    remove_scenario = delete_scenario
+
+    def add_screenshot(self, *args):
+        return None
+
+    def add_event(self, exploration_id, level, event_type, message, payload=None):
+        self.events.append((event_type, payload or {}))
+
+    def is_cancel_requested(self, exploration_id):
+        return self.cancel_requested
+
+
+def _live_scenario_pipeline(repository, auxiliary, *, use_local_evidence=False):
+    from autojev.services import exploration as exploration_service
+
+    manager = object.__new__(ExplorationManager)
+    manager.repository = repository
+
+    async def ignore_usage(*args, **kwargs):
+        return None
+
+    manager._record_model_usage = ignore_usage
+    pipeline_type = exploration_service._LiveScenarioPipeline
+    return pipeline_type(
+        manager=manager,
+        exploration_id="run-live-scenarios",
+        auxiliary=auxiliary,
+        auxiliary_client=object(),
+        use_local_evidence=use_local_evidence,
+    )
+
+
+def _live_scenario_evidence(
+    *,
+    title="Cart",
+    target="e1",
+    success=True,
+    message="Cart opened",
+):
+    observation = Observation(
+        url=f"https://example.test/{title.lower()}",
+        title=title,
+        text=f"{title} ready",
+        interactive_elements=[],
+    )
+    decision = AgentDecision(
+        action="click",
+        target=target,
+        rationale=f"Open {title}",
+    )
+    result = ActionResult(
+        action="click",
+        success=success,
+        started_at=utc_now(),
+        finished_at=utc_now(),
+        before_url="https://example.test/",
+        after_url=observation.url if success else "https://example.test/",
+        message=message,
+    )
+    if success:
+        ExplorationManager._append_observable_state_evidence(
+            result,
+            decision,
+            observation,
+            state_changed=True,
+            capture_console_errors=False,
+            capture_network_errors=False,
+        )
+    return observation, decision, result
+
+
+@pytest.mark.asyncio
+async def test_live_scenario_capture_persists_draft_without_waiting_for_auxiliary():
+    repository = _LiveScenarioRepository()
+    enrichment_started = asyncio.Event()
+    release_enrichment = asyncio.Event()
+
+    class Auxiliary:
+        async def create_scenario(self, observation, decision, result, number):
+            enrichment_started.set()
+            await release_enrichment.wait()
+            scenario = ExplorationManager._scenario_from_evidence(
+                observation, decision, result, number
+            )
+            scenario.title = f"Enriched {number}"
+            return scenario
+
+    pipeline = _live_scenario_pipeline(repository, Auxiliary())
+    await pipeline.start()
+    first = _live_scenario_evidence(title="Cart", target="e1")
+
+    # capture() belongs to the browser loop. It must only persist/enqueue; a
+    # slow provider call cannot hold the next Playwright action hostage.
+    await asyncio.wait_for(
+        pipeline.capture("cart", *first, sequence=1), timeout=0.2
+    )
+    assert repository.scenarios[1].title == "Explore click on Cart"
+    await asyncio.wait_for(enrichment_started.wait(), timeout=0.2)
+
+    second = _live_scenario_evidence(title="Checkout", target="e2")
+    await asyncio.wait_for(
+        pipeline.capture("checkout", *second, sequence=2), timeout=0.2
+    )
+    assert repository.scenarios[2].title == "Explore click on Checkout"
+
+    release_enrichment.set()
+    await asyncio.wait_for(pipeline.finish(), timeout=1)
+    assert [repository.scenarios[index].title for index in (1, 2)] == [
+        "Enriched 1",
+        "Enriched 2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_exploration_loop_advances_while_first_scenario_is_being_enriched(
+    monkeypatch, tmp_path
+):
+    enrichment_started = asyncio.Event()
+    release_enrichment = asyncio.Event()
+    enrichment_finished = asyncio.Event()
+    second_planning_started = asyncio.Event()
+
+    class Repository:
+        def __init__(self):
+            self.events = []
+            self.actions = []
+            self.scenarios = {}
+            self.scenario_writes = []
+            self.updates = []
+
+        def get_exploration(self, exploration_id, include_details=False):
+            return {
+                "id": exploration_id,
+                "app_url": "https://example.test/",
+                "cancel_requested": False,
+                "agent": {"provider_id": "provider", "model_id": "jev"},
+                "auxiliary_llm": {
+                    "provider_id": "provider",
+                    "model_id": "auxiliary",
+                },
+                "options": {
+                    "max_steps": 2,
+                    "max_duration_seconds": None,
+                    "capture_screenshots": False,
+                    "capture_console_errors": False,
+                    "capture_network_errors": False,
+                    "generate_test_cases": True,
+                    "generate_html_report": False,
+                },
+            }
+
+        def update_exploration(self, exploration_id, **values):
+            self.updates.append(values)
+
+        def add_event(self, exploration_id, level, event_type, message, payload=None):
+            self.events.append((event_type, message, payload or {}))
+
+        def add_action(self, exploration_id, sequence, decision, result):
+            self.actions.append((sequence, decision, result))
+
+        def add_scenario(self, exploration_id, sequence, scenario):
+            self.scenarios[sequence] = scenario
+            self.scenario_writes.append((sequence, scenario.title))
+
+        def delete_scenario(self, exploration_id, scenario_id):
+            self.scenarios = {
+                sequence: scenario
+                for sequence, scenario in self.scenarios.items()
+                if scenario.id != scenario_id
+            }
+
+        def add_screenshot(self, *args):
+            return None
+
+        def add_issue(self, *args):
+            return None
+
+        def is_cancel_requested(self, exploration_id):
+            return False
+
+    class Vault:
+        def get(self, exploration_id):
+            return {}
+
+        def discard(self, exploration_id):
+            return None
+
+    class Agent:
+        def __init__(self, *args):
+            self.calls = 0
+
+        async def decide(self, *args):
+            self.calls += 1
+            if self.calls == 1:
+                return AgentDecision(
+                    action="click", target="e1", rationale="Open cart"
+                )
+
+            # The next JEV planning cycle must start even though the auxiliary
+            # provider is still documenting CT001.
+            await asyncio.wait_for(enrichment_started.wait(), timeout=0.5)
+            assert enrichment_finished.is_set() is False
+            second_planning_started.set()
+            return AgentDecision(
+                action="click", target="e2", rationale="Open checkout"
+            )
+
+    class Auxiliary:
+        def __init__(self, *args):
+            pass
+
+        async def create_scenario(self, observation, decision, result, number):
+            if number == 1:
+                enrichment_started.set()
+                await release_enrichment.wait()
+                enrichment_finished.set()
+            scenario = ExplorationManager._scenario_from_evidence(
+                observation, decision, result, number
+            )
+            scenario.title = f"Enriched {number}"
+            return scenario
+
+    class Executor:
+        def __init__(self, *args, **kwargs):
+            self.execute_calls = 0
+
+        async def start(self, url):
+            return Observation(
+                url=url,
+                title="Start",
+                text="Ready",
+                interactive_elements=[
+                    {"ref": "e1", "tag": "button", "name": "Cart"},
+                    {"ref": "e2", "tag": "button", "name": "Checkout"},
+                ],
+            )
+
+        async def execute(self, decision, credentials):
+            self.execute_calls += 1
+            if self.execute_calls == 2:
+                assert second_planning_started.is_set() is True
+                assert enrichment_finished.is_set() is False
+                # CT001 is already durable while its enrichment is blocked.
+                assert repository.scenarios[1].title == "Explore click on Page 1"
+                release_enrichment.set()
+            observation = Observation(
+                url=f"https://example.test/page-{self.execute_calls}",
+                title=f"Page {self.execute_calls}",
+                text="Ready",
+                interactive_elements=[
+                    {"ref": "e1", "tag": "button", "name": "Cart"},
+                    {"ref": "e2", "tag": "button", "name": "Checkout"},
+                ],
+            )
+            return (
+                ActionResult(
+                    action=decision.action,
+                    success=True,
+                    started_at=utc_now(),
+                    finished_at=utc_now(),
+                    before_url="https://example.test/",
+                    after_url=observation.url,
+                    target=decision.target,
+                    message="Opened",
+                ),
+                observation,
+            )
+
+        async def show_live_panel(self):
+            return None
+
+        async def update_live_panel(self, *args):
+            return None
+
+        async def wait_until_inactive(self):
+            await asyncio.Event().wait()
+
+        def is_active(self):
+            return True
+
+        async def close(self):
+            return None
+
+    class Coverage:
+        def __init__(self, *args):
+            pass
+
+        def observe(self, observation):
+            return None
+
+        def can_finish(self):
+            return False
+
+        def next_restoration_action(self, observation):
+            return None
+
+        def reconcile(self, observation, decision):
+            return decision, None
+
+        def state_key(self, observation):
+            return observation.title
+
+        def effect_key(self, observation):
+            return observation.title
+
+        def decision_key(self, observation, decision):
+            return f"{decision.action}:{decision.target}"
+
+        def record_action(self, *args):
+            return None
+
+        def context(self, observation):
+            return {
+                "known_states": 1,
+                "frontier_states": 1,
+                "frontier_candidates": 1,
+                "candidates_attempted": len(repository.actions),
+                "current_untried": [],
+                "path_depth": 0,
+            }
+
+    repository = Repository()
+    settings = SimpleNamespace(
+        artifact_dir=Path(tmp_path),
+        headless=True,
+        browser="chromium",
+    )
+    manager = ExplorationManager(repository, Vault(), object(), settings)
+    manager._client_for = lambda provider_id: object()
+
+    async def ignore_usage(*args, **kwargs):
+        return None
+
+    manager._record_model_usage = ignore_usage
+    monkeypatch.setattr("autojev.services.exploration.OpenAIJevAgent", Agent)
+    monkeypatch.setattr(
+        "autojev.services.exploration.OpenAIAuxiliaryScenarioGenerator", Auxiliary
+    )
+    monkeypatch.setattr("autojev.services.exploration.PlaywrightExecutor", Executor)
+    monkeypatch.setattr("autojev.services.exploration.CoveragePlanner", Coverage)
+
+    await asyncio.wait_for(manager._run("run-parallel-cts"), timeout=2)
+
+    assert [event for event in repository.events if event[0] == "failed"] == []
+    assert len(repository.actions) == 2, repository.events[-5:]
+    assert second_planning_started.is_set() is True
+    assert repository.scenario_writes[0] == (1, "Explore click on Page 1")
+    assert [repository.scenarios[index].title for index in (1, 2)] == [
+        "Enriched 1",
+        "Enriched 2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_live_scenario_retry_prevents_stale_enrichment_from_overwriting_draft():
+    repository = _LiveScenarioRepository()
+    first_enrichment_started = asyncio.Event()
+    release_first_enrichment = asyncio.Event()
+
+    class Auxiliary:
+        async def create_scenario(self, observation, decision, result, number):
+            scenario = ExplorationManager._scenario_from_evidence(
+                observation, decision, result, number
+            )
+            if result.message == "stale locator failure":
+                first_enrichment_started.set()
+                await release_first_enrichment.wait()
+                scenario.title = "STALE ENRICHMENT"
+            else:
+                scenario.title = "Fresh recovered scenario"
+            return scenario
+
+    pipeline = _live_scenario_pipeline(repository, Auxiliary())
+    await pipeline.start()
+    failed = _live_scenario_evidence(
+        success=False,
+        message="stale locator failure",
+        target="e1",
+    )
+    await pipeline.capture("checkout", *failed, sequence=1)
+    await asyncio.wait_for(first_enrichment_started.wait(), timeout=0.2)
+
+    recovered = _live_scenario_evidence(
+        success=True,
+        message="checkout opened",
+        target="e99",
+    )
+    await pipeline.capture("checkout", *recovered, sequence=1)
+    assert repository.scenarios[1].status == ScenarioStatus.PASS
+
+    # The response for revision 1 arrives after revision 2 was captured. It
+    # must be discarded instead of reverting the current PASS to a stale FAIL.
+    release_first_enrichment.set()
+    await asyncio.wait_for(pipeline.finish(), timeout=1)
+    assert repository.scenarios[1].title == "Fresh recovered scenario"
+    assert "STALE ENRICHMENT" not in [title for _sequence, title in repository.writes]
+
+
+@pytest.mark.asyncio
+async def test_live_scenario_remove_invalidates_in_flight_provisional_draft():
+    repository = _LiveScenarioRepository()
+    enrichment_started = asyncio.Event()
+    release_enrichment = asyncio.Event()
+
+    class Auxiliary:
+        async def create_scenario(self, observation, decision, result, number):
+            enrichment_started.set()
+            await release_enrichment.wait()
+            scenario = ExplorationManager._scenario_from_evidence(
+                observation, decision, result, number
+            )
+            scenario.title = "Late provisional failure"
+            return scenario
+
+    pipeline = _live_scenario_pipeline(repository, Auxiliary())
+    await pipeline.start()
+    failed = _live_scenario_evidence(
+        success=False,
+        message="temporary locator failure",
+    )
+    await pipeline.capture("refresh-cart", *failed, sequence=1)
+    await asyncio.wait_for(enrichment_started.wait(), timeout=0.2)
+    assert 1 in repository.scenarios
+
+    removal = pipeline.remove("refresh-cart", sequence=1)
+    if asyncio.iscoroutine(removal):
+        await removal
+    assert repository.scenarios == {}
+
+    release_enrichment.set()
+    await asyncio.wait_for(pipeline.finish(), timeout=1)
+    assert repository.scenarios == {}
+    assert "Late provisional failure" not in [
+        title for _sequence, title in repository.writes
+    ]
+
+
+@pytest.mark.asyncio
+async def test_live_scenario_finish_drains_current_enrichment_before_returning():
+    repository = _LiveScenarioRepository()
+    enrichment_started = asyncio.Event()
+    release_enrichment = asyncio.Event()
+
+    class Auxiliary:
+        async def create_scenario(self, observation, decision, result, number):
+            enrichment_started.set()
+            await release_enrichment.wait()
+            scenario = ExplorationManager._scenario_from_evidence(
+                observation, decision, result, number
+            )
+            scenario.title = "Documented while exploring"
+            return scenario
+
+    pipeline = _live_scenario_pipeline(repository, Auxiliary())
+    await pipeline.start()
+    evidence = _live_scenario_evidence()
+    await pipeline.capture("cart", *evidence, sequence=1)
+    await asyncio.wait_for(enrichment_started.wait(), timeout=0.2)
+
+    finish = asyncio.create_task(pipeline.finish())
+    await asyncio.sleep(0)
+    assert finish.done() is False
+    release_enrichment.set()
+    await asyncio.wait_for(finish, timeout=1)
+
+    assert repository.scenarios[1].title == "Documented while exploring"
+    assert any(
+        event_type == "scenario_postprocessing_completed"
+        for event_type, _payload in repository.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_scenario_cancel_stops_provider_and_preserves_local_draft():
+    repository = _LiveScenarioRepository()
+    enrichment_started = asyncio.Event()
+    enrichment_cancelled = asyncio.Event()
+
+    class Auxiliary:
+        async def create_scenario(self, observation, decision, result, number):
+            enrichment_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                enrichment_cancelled.set()
+
+    pipeline = _live_scenario_pipeline(repository, Auxiliary())
+    await pipeline.start()
+    evidence = _live_scenario_evidence()
+    await pipeline.capture("cart", *evidence, sequence=1)
+    await asyncio.wait_for(enrichment_started.wait(), timeout=0.2)
+
+    await asyncio.wait_for(pipeline.finish(cancelled=True), timeout=0.5)
+
+    assert enrichment_cancelled.is_set() is True
+    assert repository.scenarios[1].title == "Explore click on Cart"
+    assert repository.scenarios[1].status == ScenarioStatus.PASS
+
+
+@pytest.mark.asyncio
+async def test_live_scenario_cancelled_finish_awaits_provider_cleanup():
+    repository = _LiveScenarioRepository()
+    enrichment_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    active_provider_calls = 0
+
+    class Auxiliary:
+        async def create_scenario(self, observation, decision, result, number):
+            nonlocal active_provider_calls
+            active_provider_calls += 1
+            enrichment_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleanup_started.set()
+                await release_cleanup.wait()
+                active_provider_calls -= 1
+
+    pipeline = _live_scenario_pipeline(repository, Auxiliary())
+    await pipeline.start()
+    await pipeline.capture(
+        "cart", *_live_scenario_evidence(), sequence=1
+    )
+    await asyncio.wait_for(enrichment_started.wait(), timeout=0.2)
+
+    finish = asyncio.create_task(pipeline.finish(cancelled=True))
+    await asyncio.wait_for(cleanup_started.wait(), timeout=0.2)
+
+    # Returning before the provider coroutine unwinds would leave paid work
+    # running after AutoJev already told the user that cancellation completed.
+    assert finish.done() is False
+    assert active_provider_calls == 1
+
+    release_cleanup.set()
+    await asyncio.wait_for(finish, timeout=0.5)
+
+    assert pipeline.worker is not None
+    assert pipeline.worker.done() is True
+    assert active_provider_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_live_scenario_finish_does_not_enqueue_sentinel_for_stopped_worker():
+    repository = _LiveScenarioRepository()
+
+    class Auxiliary:
+        async def create_scenario(self, observation, decision, result, number):
+            raise AssertionError("No enrichment should start in this test")
+
+    pipeline = _live_scenario_pipeline(repository, Auxiliary())
+    await pipeline.start()
+    assert pipeline.worker is not None
+
+    # Model a worker that has already terminated unexpectedly while the
+    # producer filled its bounded backlog. finish() must inspect the worker
+    # before trying to enqueue a sentinel into a queue nobody can consume.
+    pipeline.worker.cancel()
+    await asyncio.gather(pipeline.worker, return_exceptions=True)
+    while not pipeline.queue.full():
+        pipeline.queue.put_nowait(None)
+
+    await asyncio.wait_for(pipeline.finish(), timeout=0.2)
+
+    assert any(
+        event_type == "scenario_postprocessing_completed"
+        for event_type, _payload in repository.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_scenario_cancel_drains_auxiliary_usage_before_finish_returns():
+    class UsageRepository(_LiveScenarioRepository):
+        def __init__(self):
+            super().__init__()
+            self.usage = {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "cost": None,
+                "cost_known": False,
+            }
+
+        def get_exploration(self, exploration_id, include_details=False):
+            return {"usage": dict(self.usage)}
+
+        def update_exploration(self, exploration_id, **values):
+            for source, target in (
+                ("prompt_tokens", "prompt_tokens"),
+                ("completion_tokens", "completion_tokens"),
+                ("total_tokens", "total_tokens"),
+                ("cost", "cost"),
+                ("cost_known", "cost_known"),
+            ):
+                if source in values:
+                    self.usage[target] = values[source]
+
+    class UsageClient:
+        def __init__(self):
+            self.drains = 0
+
+        def drain_usage(self):
+            self.drains += 1
+            return {
+                "prompt_tokens": 31,
+                "completion_tokens": 11,
+                "total_tokens": 42,
+                "cost": 0.0042,
+                "cost_known": True,
+            }
+
+    enrichment_started = asyncio.Event()
+
+    class Auxiliary:
+        async def create_scenario(self, observation, decision, result, number):
+            enrichment_started.set()
+            await asyncio.Event().wait()
+
+    from autojev.services import exploration as exploration_service
+
+    repository = UsageRepository()
+    manager = object.__new__(ExplorationManager)
+    manager.repository = repository
+    manager.usage_locks = {}
+    auxiliary_client = UsageClient()
+    pipeline = exploration_service._LiveScenarioPipeline(
+        manager=manager,
+        exploration_id="run-cancel-usage",
+        auxiliary=Auxiliary(),
+        auxiliary_client=auxiliary_client,
+        use_local_evidence=False,
+    )
+    await pipeline.start()
+    await pipeline.capture(
+        "cart", *_live_scenario_evidence(), sequence=1
+    )
+    await asyncio.wait_for(enrichment_started.wait(), timeout=0.2)
+
+    await asyncio.wait_for(pipeline.finish(cancelled=True), timeout=0.5)
+
+    assert auxiliary_client.drains == 1
+    assert repository.usage == {
+        "prompt_tokens": 31,
+        "completion_tokens": 11,
+        "total_tokens": 42,
+        "cost": 0.0042,
+        "cost_known": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_cancelling_postprocessing_stops_in_flight_auxiliary_enrichment():
+    class RecordingRepository:
+        def __init__(self):
+            self.cancel_requested = False
+            self.scenarios = []
+            self.events = []
+
+        def add_scenario(self, exploration_id, sequence, scenario):
+            self.scenarios.append((sequence, scenario.title))
+
+        def add_screenshot(self, *args):
+            raise AssertionError("This fixture has no screenshots")
+
+        def add_event(self, exploration_id, level, event_type, message, payload=None):
+            self.events.append((event_type, payload or {}))
+
+        def is_cancel_requested(self, exploration_id):
+            return self.cancel_requested
+
+    enrichment_started = asyncio.Event()
+    enrichment_cancelled = asyncio.Event()
+
+    class Auxiliary:
+        async def create_scenario(self, observation, decision, result, number):
+            enrichment_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                enrichment_cancelled.set()
+
+    repository = RecordingRepository()
+    manager = object.__new__(ExplorationManager)
+    manager.repository = repository
+
+    async def unexpected_usage(*args, **kwargs):
+        raise AssertionError("Usage recording must not delay a cancelled call")
+
+    manager._record_model_usage = unexpected_usage
+    observation = Observation(
+        url="https://example.test/dashboard",
+        title="Dashboard",
+        text="Dashboard ready",
+        interactive_elements=[],
+    )
+    decision = AgentDecision(action="click", target="e1", rationale="Open")
+    result = ActionResult(
+        action="click",
+        success=True,
+        started_at=utc_now(),
+        finished_at=utc_now(),
+        before_url="https://example.test/",
+        after_url=observation.url,
+        message="Opened",
+    )
+
+    materialization = asyncio.create_task(
+        manager._materialize_scenarios(
+            "run-cancel-postprocessing",
+            [(observation, decision, result, 1)],
+            Auxiliary(),
+            object(),
+            use_local_evidence=False,
+        )
+    )
+    await asyncio.wait_for(enrichment_started.wait(), timeout=0.5)
+    repository.cancel_requested = True
+    await asyncio.wait_for(materialization, timeout=0.5)
+
+    assert enrichment_cancelled.is_set() is True
+    assert len(repository.scenarios) == 1
+    assert repository.events[-1] == (
+        "scenario_postprocessing_completed",
+        {
+            "current": 1,
+            "total": 1,
+            "enriched": 0,
+            "local_evidence": 1,
+            "reason": "exploration_cancelled",
             "stage": "scenarios_complete",
         },
     )
@@ -656,6 +1830,128 @@ async def test_closed_browser_cancels_run_before_any_jev_call(monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_at", ["report", "terminal_update"])
+async def test_postprocessing_cancel_wins_over_completion(
+    monkeypatch, tmp_path, cancel_at
+):
+    class Repository:
+        def __init__(self):
+            self.cancel_requested = False
+            self.status = "queued"
+            self.events = []
+            self.updates = []
+
+        def get_exploration(self, exploration_id, include_details=True):
+            return {
+                "id": exploration_id,
+                "app_url": "https://example.test/",
+                "status": self.status,
+                "cancel_requested": self.cancel_requested,
+                "agent": {"provider_id": "provider", "model_id": "jev"},
+                "auxiliary_llm": {
+                    "provider_id": "provider",
+                    "model_id": "auxiliary",
+                },
+                "options": {
+                    "max_steps": None,
+                    "max_duration_seconds": None,
+                    "generate_test_cases": False,
+                    "generate_html_report": True,
+                },
+                "events": [
+                    {"type": event_type, "message": message, "payload": payload}
+                    for _level, event_type, message, payload in self.events
+                ],
+                "scenarios": [],
+                "issues": [],
+                "summary": {},
+                "usage": {},
+            }
+
+        def update_exploration(self, exploration_id, **values):
+            status = values.get("status")
+            if status is not None:
+                # Simulate the cancel write landing after the manager's last
+                # pre-update check, while the persisted phase was still live.
+                if (
+                    cancel_at == "terminal_update"
+                    and str(status) == "completed"
+                    and str(self.status) == "postprocessing"
+                ):
+                    self.cancel_requested = True
+                self.status = status
+            self.updates.append(values)
+
+        def add_event(self, exploration_id, level, event_type, message, payload=None):
+            self.events.append((level, event_type, message, payload or {}))
+
+        def is_cancel_requested(self, exploration_id):
+            return self.cancel_requested
+
+    class Vault:
+        def get(self, exploration_id):
+            return {}
+
+        def discard(self, exploration_id):
+            return None
+
+    class Executor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def start(self, url):
+            return Observation(
+                url=url,
+                title="Empty application",
+                text="No controls",
+                interactive_elements=[],
+            )
+
+        async def show_live_panel(self):
+            return None
+
+        async def update_live_panel(self, *args):
+            return None
+
+        def is_active(self):
+            return True
+
+        async def close(self):
+            return None
+
+    class Renderer:
+        def __init__(self, repository):
+            self.repository = repository
+            self.statuses = []
+
+        def generate(self, exploration, output_path):
+            self.statuses.append(str(exploration["status"]))
+            if cancel_at == "report" and len(self.statuses) == 1:
+                self.repository.cancel_requested = True
+            return output_path
+
+    repository = Repository()
+    renderer = Renderer(repository)
+    settings = SimpleNamespace(
+        artifact_dir=Path(tmp_path),
+        headless=True,
+        browser="chromium",
+    )
+    manager = ExplorationManager(repository, Vault(), renderer, settings)
+    manager._client_for = lambda provider_id: object()
+    monkeypatch.setattr("autojev.services.exploration.PlaywrightExecutor", Executor)
+
+    await manager._run("run-terminal-cancel-race")
+
+    assert str(repository.status) == "cancelled"
+    assert renderer.statuses == ["completed", "cancelled"]
+    assert any(
+        event_type == "cancelled" and payload["reason"] == "postprocessing_cancelled"
+        for _level, event_type, _message, payload in repository.events
+    )
+
+
+@pytest.mark.asyncio
 async def test_browser_close_cancels_an_in_flight_jev_decision():
     inactive = asyncio.Event()
     model_cancelled = asyncio.Event()
@@ -681,3 +1977,47 @@ async def test_browser_close_cancels_an_in_flight_jev_decision():
     with pytest.raises(BrowserUnavailableError, match="closed"):
         await task
     assert model_cancelled.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_guarded_run_persists_shutdown_cancellation_from_finalization():
+    class Repository:
+        def __init__(self):
+            self.events = []
+            self.updates = []
+
+        def add_event(self, exploration_id, level, event_type, message, payload=None):
+            self.events.append((event_type, payload or {}))
+
+        def update_exploration(self, exploration_id, **values):
+            self.updates.append(values)
+
+    class Vault:
+        def __init__(self):
+            self.discarded = []
+
+        def discard(self, exploration_id):
+            self.discarded.append(exploration_id)
+
+    entered = asyncio.Event()
+    manager = object.__new__(ExplorationManager)
+    manager.repository = Repository()
+    manager.credential_vault = Vault()
+    manager.input_events = {"run-shutdown": asyncio.Event()}
+    manager.semaphore = asyncio.Semaphore(1)
+
+    async def interrupted_finalization(exploration_id):
+        entered.set()
+        await asyncio.Event().wait()
+
+    manager._run = interrupted_finalization
+    task = asyncio.create_task(manager._guarded_run("run-shutdown"))
+    await entered.wait()
+    task.cancel()
+    await task
+
+    assert manager.repository.events == [
+        ("cancelled", {"reason": "backend_shutdown"})
+    ]
+    assert str(manager.repository.updates[-1]["status"]) == "cancelled"
+    assert manager.credential_vault.discarded == ["run-shutdown"]

@@ -262,6 +262,36 @@ async def test_real_dom_observation_rejects_transparent_and_disabled_controls(
         assert after_controls == {"Top button": True, "Below button": True}
         assert planner.effect_key(before_scroll) == planner.effect_key(after_scroll)
         assert planner.state_key(before_scroll) == planner.state_key(after_scroll)
+
+        await page.set_viewport_size({"width": 800, "height": 600})
+        await page.set_content(
+            """
+            <button>Open Menu</button>
+            <aside style="position:fixed;top:-220px;right:0;width:180px;height:180px">
+              <button>Close Menu</button>
+            </aside>
+            <div style="width:120px;overflow-x:auto;margin-top:100px">
+              <div style="width:1200px">
+                <button style="margin-left:1000px">Carousel action</button>
+              </div>
+            </div>
+            """
+        )
+        surfaces = await executor.observe()
+        surface_elements = {
+            item["name"]: item for item in surfaces.interactive_elements
+        }
+        surface_planner = CoveragePlanner("https://app.test/surfaces")
+        surface_names = {
+            item["name"]
+            for item in surface_planner.context(surfaces)["current_untried"]
+        }
+
+        assert surface_elements["Close Menu"]["interactable"] is False
+        assert surface_elements["Carousel action"]["interactable"] is True
+        assert "Open Menu" in surface_names
+        assert "Close Menu" not in surface_names
+        assert "Carousel action" in surface_names
     finally:
         if browser is not None:
             await browser.close()

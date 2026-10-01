@@ -1,5 +1,4 @@
 import pytest
-
 from autojev.adapters.openai_compatible import (
     ModelResponseError,
     OpenAIAuxiliaryScenarioGenerator,
@@ -10,6 +9,7 @@ from autojev.adapters.openai_compatible import (
 )
 from autojev.domain.models import (
     ActionResult,
+    AgentDecision,
     AssertionResult,
     Observation,
     ScenarioStatus,
@@ -26,7 +26,18 @@ async def test_list_models_uses_openrouter_model_name(monkeypatch):
             return None
 
         def json(self):
-            return {"data": [{"id": "openai/gpt-4o", "name": "GPT-4o"}]}
+            return {
+                "data": [
+                    {
+                        "id": "openai/gpt-4o",
+                        "name": "GPT-4o",
+                        "architecture": {
+                            "input_modalities": ["text", "image"],
+                            "output_modalities": ["text"],
+                        },
+                    }
+                ]
+            }
 
     class FakeClient:
         async def __aenter__(self):
@@ -43,7 +54,53 @@ async def test_list_models_uses_openrouter_model_name(monkeypatch):
         "https://openrouter.ai/api/v1", "sk-or-test"
     ).list_models()
 
-    assert models == [{"id": "openai/gpt-4o", "label": "GPT-4o"}]
+    assert models == [
+        {
+            "id": "openai/gpt-4o",
+            "label": "GPT-4o",
+            "input_modalities": ["text", "image"],
+            "supports_vision": True,
+            "capabilities_known": True,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_models_never_guesses_vision_from_model_name(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"id": "vendor/super-vision-model"}]}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, *args, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kwargs: FakeClient())
+
+    models = await OpenAICompatibleClient(
+        "http://provider.example/v1"
+    ).list_models()
+
+    assert models == [
+        {
+            "id": "vendor/super-vision-model",
+            "label": "vendor/super-vision-model",
+            "input_modalities": [],
+            "supports_vision": False,
+            "capabilities_known": False,
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -586,3 +643,197 @@ def test_auxiliary_receives_masked_screenshot_as_multimodal_evidence(tmp_path):
     assert isinstance(content, list)
     assert content[0] == {"type": "text", "text": "evidence"}
     assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+def _scenario_inputs(*, screenshot: str | None = None):
+    observation = Observation(
+        url="https://example.test/products",
+        title="Products",
+        text="Products page",
+        interactive_elements=[],
+        screenshot=screenshot,
+    )
+    decision = AgentDecision(
+        action="click",
+        target="e1",
+        rationale="Exercise the product control",
+        scenario_hint={"title": "Product control"},
+    )
+    result = ActionResult(
+        action="click",
+        success=True,
+        started_at=utc_now(),
+        finished_at=utc_now(),
+        before_url=observation.url,
+        after_url="https://example.test/products/1",
+        message="Product details opened",
+    )
+    return observation, decision, result
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_scenario_records_llm_documentation_provenance():
+    class FakeClient:
+        async def chat_json(self, *_args, **_kwargs):
+            return {
+                "title": "Open product details",
+                "steps": ["Open the product"],
+                "expected_result": "Details are shown",
+                "actual_result": "Details were shown",
+            }
+
+    generator = OpenAIAuxiliaryScenarioGenerator(FakeClient(), "model")
+    scenario = await generator.create_scenario(*_scenario_inputs(), 1)
+
+    assert scenario.evidence["documentation_provenance"] == {
+        "source": "auxiliary_llm",
+        "reason": "auxiliary_response_accepted",
+        "evidence_mode": "text",
+        "model_input": "text",
+    }
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_text_mode_never_sends_a_captured_screenshot(tmp_path):
+    screenshot = tmp_path / "001.png"
+    screenshot.write_bytes(b"masked-png")
+
+    class FakeClient:
+        def __init__(self):
+            self.contents = []
+
+        async def chat_json(self, _model, _system, content, **_kwargs):
+            self.contents.append(content)
+            return {"title": "Text documentation", "steps": ["Open product"]}
+
+    client = FakeClient()
+    generator = OpenAIAuxiliaryScenarioGenerator(client, "model", tmp_path)
+    observation, decision, result = _scenario_inputs(screenshot=screenshot.name)
+    result.screenshot = screenshot.name
+    scenario = await generator.create_scenario(observation, decision, result, 2)
+
+    assert len(client.contents) == 1
+    assert isinstance(client.contents[0], str)
+    assert "data:image" not in client.contents[0]
+    assert scenario.screenshots == [screenshot.name]
+    assert scenario.evidence["documentation_provenance"]["model_input"] == "text"
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_retries_text_only_after_explicit_vision_rejection(tmp_path):
+    screenshot = tmp_path / "001.png"
+    screenshot.write_bytes(b"masked-png")
+
+    class FakeClient:
+        def __init__(self):
+            self.contents = []
+
+        async def chat_json(self, _model, _system, content, **_kwargs):
+            self.contents.append(content)
+            if len(self.contents) == 1:
+                raise ProviderConnectionError(
+                    "Provider returned HTTP 400: this model does not support image input"
+                )
+            return {"title": "Text-only documentation", "steps": ["Open product"]}
+
+    client = FakeClient()
+    generator = OpenAIAuxiliaryScenarioGenerator(
+        client, "model", tmp_path, evidence_mode="visual"
+    )
+    scenario = await generator.create_scenario(
+        *_scenario_inputs(screenshot=screenshot.name), 2
+    )
+
+    assert len(client.contents) == 2
+    assert isinstance(client.contents[0], list)
+    assert isinstance(client.contents[1], str)
+    assert scenario.evidence["documentation_provenance"] == {
+        "source": "auxiliary_llm",
+        "reason": "text_only_retry_after_explicit_vision_incompatibility",
+        "evidence_mode": "visual",
+        "model_input": "visual_then_text_fallback",
+    }
+
+
+@pytest.mark.asyncio
+async def test_visual_mode_recognises_openrouter_text_only_endpoint_message(tmp_path):
+    screenshot = tmp_path / "001.png"
+    screenshot.write_bytes(b"masked-png")
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def chat_json(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise ProviderConnectionError(
+                    "Provider returned HTTP 404: No endpoints found that support image input"
+                )
+            return {"title": "Text fallback", "steps": ["Open product"]}
+
+    client = FakeClient()
+    generator = OpenAIAuxiliaryScenarioGenerator(
+        client, "model", tmp_path, evidence_mode="visual"
+    )
+    scenario = await generator.create_scenario(
+        *_scenario_inputs(screenshot=screenshot.name), 3
+    )
+
+    assert client.calls == 2
+    assert scenario.evidence["documentation_provenance"]["reason"] == (
+        "text_only_retry_after_explicit_vision_incompatibility"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_error", "fallback_reason"),
+    [
+        (
+            "Provider returned HTTP 401: unauthorized; model does not support image input",
+            "auxiliary_authentication_rejected",
+        ),
+        (
+            "Provider returned HTTP 429: rate limit; image input is unsupported",
+            "auxiliary_rate_limited",
+        ),
+        (
+            "Provider request timed out while checking image input support",
+            "auxiliary_timeout",
+        ),
+        (
+            "Provider returned HTTP 400: invalid request",
+            "auxiliary_provider_error",
+        ),
+    ],
+)
+async def test_auxiliary_does_not_retry_non_capability_failures_as_text(
+    tmp_path, provider_error, fallback_reason
+):
+    screenshot = tmp_path / "001.png"
+    screenshot.write_bytes(b"masked-png")
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def chat_json(self, *_args, **_kwargs):
+            self.calls += 1
+            raise ProviderConnectionError(provider_error)
+
+    client = FakeClient()
+    generator = OpenAIAuxiliaryScenarioGenerator(
+        client, "model", tmp_path, evidence_mode="visual"
+    )
+    scenario = await generator.create_scenario(
+        *_scenario_inputs(screenshot=screenshot.name), 3
+    )
+
+    assert client.calls == 1
+    assert scenario.evidence["documentation_provenance"] == {
+        "source": "local_fallback",
+        "reason": fallback_reason,
+        "evidence_mode": "visual",
+        "model_input": "text_and_image",
+    }
