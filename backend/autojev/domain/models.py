@@ -156,6 +156,9 @@ class ActionResult:
     message: str = ""
     assertions: list[AssertionResult] = field(default_factory=list)
     screenshot: str | None = None
+    # Local execution evidence is authoritative. It survives auxiliary-model
+    # enrichment and can include before/after observations and browser signals.
+    evidence: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

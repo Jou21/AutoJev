@@ -87,7 +87,9 @@ type Model = {
   provider_name?: string;
   enabled?: boolean;
   input_modalities?: string[];
+  output_modalities?: string[];
   supports_vision?: boolean;
+  capabilities_known?: boolean;
   architecture?: {
     input_modalities?: string[];
     output_modalities?: string[];
@@ -117,6 +119,62 @@ type ExplorationEvent = {
   created_at?: string;
   status?: string;
   payload?: Record<string, unknown>;
+};
+
+type ScenarioAssertion = {
+  kind?: string;
+  expected?: unknown;
+  actual?: unknown;
+  passed?: boolean;
+  message?: string;
+};
+
+type ScenarioTechnicalSignal = {
+  kind?: string;
+  message?: string;
+  url?: string;
+  occurred_at?: string;
+  status_code?: number | null;
+  classification?: string;
+  label?: string;
+  impact?: string;
+  classification_reason?: string;
+  affects_verdict?: boolean;
+  association?: { kind?: string; step_number?: number; scenario_id?: string };
+};
+
+type ScenarioTimelineEntry = {
+  id?: string;
+  kind: "observation" | "action" | "assertion" | "signal";
+  occurred_at?: string;
+  title?: string;
+  message?: string;
+  url?: string;
+  screenshot?: string | null;
+  signal?: ScenarioTechnicalSignal;
+  assertion?: ScenarioAssertion;
+  step_number?: number;
+  target?: string | null;
+};
+
+type ScenarioCase = {
+  id: string;
+  title: string;
+  description?: string;
+  preconditions?: string[];
+  steps?: string[];
+  expected_result?: string;
+  actual_result?: string;
+  status: string;
+  url?: string;
+  created_at?: string;
+  screenshots?: string[];
+  evidence?: {
+    timeline?: ScenarioTimelineEntry[];
+    technical_signals?: ScenarioTechnicalSignal[];
+    assertions?: ScenarioAssertion[];
+    verdict?: { kind?: string; label?: string; explanation?: string; historical?: boolean };
+  };
 };
 
 type Exploration = {
@@ -188,6 +246,8 @@ type Exploration = {
   events?: ExplorationEvent[];
   activity?: ExplorationEvent[];
   logs?: ExplorationEvent[];
+  scenarios?: ScenarioCase[];
+  scenario_contexts?: ScenarioCase[];
   error?: string | null;
   usage?: {
     prompt_tokens?: number;
@@ -307,10 +367,13 @@ function modelLabel(model: Model) {
 function modelAcceptsImages(model: Model) {
   if (typeof model.supports_vision === "boolean") return model.supports_vision;
   const inputModalities = model.input_modalities || model.architecture?.input_modalities || [];
-  return inputModalities.some((modality) => modality.toLowerCase() === "image");
+  const outputModalities = model.output_modalities || model.architecture?.output_modalities || [];
+  return inputModalities.some((modality) => modality.trim().toLowerCase() === "image")
+    && (!outputModalities.length || outputModalities.some((modality) => modality.trim().toLowerCase() === "text"));
 }
 
 function modelInputCapabilitiesKnown(model: Model) {
+  if (model.capabilities_known === true) return true;
   const inputModalities = model.input_modalities || model.architecture?.input_modalities || [];
   return inputModalities.length > 0 || model.supports_vision === true;
 }
@@ -620,6 +683,7 @@ export default function AutoJevApp() {
   const [providerModal, setProviderModal] = useState(false);
   const [reportData, setReportData] = useState<unknown | null>(null);
   const [pollInterval, setPollInterval] = useState(3000);
+  const modelCatalogRefreshes = useRef(new Set<string>());
 
   const apiBase = normalizeBaseUrl(DEFAULT_API_URL);
 
@@ -672,13 +736,15 @@ export default function AutoJevApp() {
       setProviders(loadedProviders);
       const openRouterProviders = loadedProviders.filter((provider) =>
         (provider.has_api_key || provider.api_key_configured)
-        && /openrouter\.ai/i.test(provider.base_url)
+        && isOpenRouterUrl(provider.base_url)
+        && !modelCatalogRefreshes.current.has(provider.id)
         && (
           !provider.models?.some((model) => modelValue(model) === "typesafe/jev-1.13")
-          || !provider.models?.some(modelInputCapabilitiesKnown)
+          || provider.models?.some((model) => !modelInputCapabilitiesKnown(model))
         )
       );
       if (openRouterProviders.length) {
+        openRouterProviders.forEach((provider) => modelCatalogRefreshes.current.add(provider.id));
         await Promise.allSettled(
           openRouterProviders.map((provider) => request(`/providers/${encodeURIComponent(provider.id)}/discover-models`, { method: "POST" })),
         );
@@ -1208,13 +1274,13 @@ function NewExplorationView({
   }, [auxProvider, auxModel, auxiliaryModelsFor]);
 
   useEffect(() => {
-    if (auxiliaryEvidenceMode !== "visual" || !auxProvider) return;
+    if (auxiliaryEvidenceMode !== "visual" || !auxProvider || loading) return;
     const provider = providers.find((item) => item.id === auxProvider);
     if (!provider || !isOpenRouterUrl(provider.base_url) || !(provider.has_api_key || provider.api_key_configured)) return;
     const catalog = provider.models?.length
       ? provider.models
       : models.filter((model) => model.provider_id === auxProvider);
-    if (catalog.some(modelInputCapabilitiesKnown) || visualDiscoveryAttempted.current.has(auxProvider)) return;
+    if ((catalog.length > 0 && catalog.every(modelInputCapabilitiesKnown)) || visualDiscoveryAttempted.current.has(auxProvider)) return;
 
     visualDiscoveryAttempted.current.add(auxProvider);
     setRefreshingVisualModelsFor(auxProvider);
@@ -1224,13 +1290,12 @@ function NewExplorationView({
         await reloadModels(true);
         toast("Compatibilidade visual dos modelos atualizada.", "success");
       } catch (error) {
-        visualDiscoveryAttempted.current.delete(auxProvider);
         toast(`Não foi possível atualizar os modelos visuais: ${errorMessage(error)}`, "error");
       } finally {
         setRefreshingVisualModelsFor((current) => current === auxProvider ? "" : current);
       }
     })();
-  }, [auxProvider, auxiliaryEvidenceMode, models, providers, reloadModels, request, toast]);
+  }, [auxProvider, auxiliaryEvidenceMode, loading, models, providers, reloadModels, request, toast]);
 
   const availableAuxiliaryModels = auxiliaryModelsFor(auxProvider);
   const refreshingVisualModels = refreshingVisualModelsFor === auxProvider;
@@ -1695,7 +1760,9 @@ function ProviderCard({ provider, initiallyOpen, request, toast, reload }: { pro
         label: model.label || null,
         enabled: model.enabled !== false,
         input_modalities: model.input_modalities || model.architecture?.input_modalities || [],
+        output_modalities: model.output_modalities || model.architecture?.output_modalities || [],
         supports_vision: modelAcceptsImages(model),
+        capabilities_known: modelInputCapabilitiesKnown(model),
       })),
     };
     if (apiKey.trim()) payload.api_key = apiKey.trim();
@@ -1912,7 +1979,7 @@ function ExplorationDetailView({
   const [cancelling, setCancelling] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [openingReport, setOpeningReport] = useState(false);
-  const [detailTab, setDetailTab] = useState<"overview" | "activity" | "evidence" | "config">("overview");
+  const [detailTab, setDetailTab] = useState<"overview" | "scenarios" | "activity" | "evidence" | "config">("overview");
   if (loading && !exploration) return <div className="detail-loading"><Spinner size={24} /><span>Carregando exploração…</span></div>;
   if (!exploration) {
     return <section className="panel"><EmptyState icon={AlertCircle} title="Exploração não encontrada" description="O registro pode ter sido removido ou ainda não está disponível." action={<button className="button secondary" onClick={() => navigate("#/exploracoes")}><ArrowLeft size={16} />Voltar ao histórico</button>} /></section>;
@@ -2109,6 +2176,7 @@ function ExplorationDetailView({
       <section className="detail-workspace panel">
         <div className="detail-tabs" role="tablist" aria-label="Detalhes da exploração">
           <button role="tab" aria-selected={detailTab === "overview"} className={detailTab === "overview" ? "active" : ""} onClick={() => setDetailTab("overview")}><Gauge size={16} />Visão geral</button>
+          <button role="tab" aria-selected={detailTab === "scenarios"} className={detailTab === "scenarios" ? "active" : ""} onClick={() => setDetailTab("scenarios")}><FileCheck2 size={16} />Casos de teste <span>{exploration.scenarios?.length ?? counters.scenarios}</span></button>
           <button role="tab" aria-selected={detailTab === "activity"} className={detailTab === "activity" ? "active" : ""} onClick={() => setDetailTab("activity")}><Activity size={16} />Atividade <span>{events.length}</span></button>
           <button role="tab" aria-selected={detailTab === "evidence"} className={detailTab === "evidence" ? "active" : ""} onClick={() => setDetailTab("evidence")}><Eye size={16} />Evidência</button>
           <button role="tab" aria-selected={detailTab === "config"} className={detailTab === "config" ? "active" : ""} onClick={() => setDetailTab("config")}><Settings size={16} />Configuração</button>
@@ -2136,7 +2204,7 @@ function ExplorationDetailView({
                 {counters.issues > 0 && (
                   <div className="coverage-summary">
                     <ShieldCheck size={18} />
-                    <div><strong>Sinais técnicos, não defeitos automaticamente</strong><span>Console e HTTP podem registrar a mesma ocorrência mais de uma vez. O relatório final correlaciona esses sinais por observação.</span></div>
+                    <div><strong>Sinais técnicos dentro da evidência</strong><span>Cada ocorrência aparece na linha do tempo do CT ou no contexto de navegação correspondente. Um sinal de console ou rede não confirma sozinho um defeito funcional.</span><button className="text-button" onClick={() => setDetailTab("scenarios")}>Examinar os casos de teste <ArrowRight size={14} /></button></div>
                   </div>
                 )}
                 <div className="result-facts">
@@ -2162,6 +2230,10 @@ function ExplorationDetailView({
             </div>
           )}
 
+          {detailTab === "scenarios" && (
+            <ScenarioTimelinePanel scenarios={exploration.scenarios || []} contexts={exploration.scenario_contexts || []} explorationId={exploration.id} apiBase={apiBase} isRunning={isLive(exploration.status)} />
+          )}
+
           {detailTab === "activity" && (
             <section className="activity-card activity-card-wide">
               <div className="panel-heading row-heading"><div><span className="section-kicker">Linha do tempo explicada</span><h2>Atividade da exploração</h2><p>Navegação, criação dos CTs e relatório aparecem como etapas separadas.</p></div>{isLive(exploration.status) && <span className="live-mini"><span />ao vivo</span>}</div>
@@ -2173,7 +2245,7 @@ function ExplorationDetailView({
             <section className="browser-panel evidence-panel">
               <div className="panel-heading row-heading"><div><span className="section-kicker"><Eye size={14} />Última observação</span><h2>Evidência do navegador</h2></div>{screenshot && <a className="text-button" href={screenshot} target="_blank" rel="noreferrer">Abrir imagem <SquareArrowOutUpRight size={14} /></a>}</div>
               <div className="browser-frame"><div className="browser-chrome"><span className="window-dots"><i /><i /><i /></span><div className="browser-address"><ShieldCheck size={12} />{exploration.app_url}</div><MoreHorizontal size={16} /></div><div className="browser-canvas">{screenshot ? <img src={`${screenshot}${screenshot.includes("?") ? "&" : "?"}v=${encodeURIComponent(exploration.updated_at || "latest")}`} alt={`Último screenshot de ${hostFromUrl(exploration.app_url)}`} /> : <div className="no-screenshot"><MonitorPlay size={32} /><strong>Aguardando captura do browser</strong><span>O preview aparecerá quando o executor publicar a primeira evidência.</span></div>}</div></div>
-              <div className="evidence-strip"><span><Eye size={15} />Screenshot salvo no relatório</span><span><Code2 size={15} />DOM estruturado</span><span><ShieldCheck size={15} />{explorationEvidenceMode(exploration.options) === "visual" ? "LLM recebeu texto + imagem" : "LLM recebeu somente texto"}</span></div>
+              <div className="evidence-strip"><span><Eye size={15} />Screenshot salvo no relatório</span><span><Code2 size={15} />DOM estruturado</span><span><ShieldCheck size={15} />{explorationEvidenceMode(exploration.options) === "visual" ? "Modo configurado: texto + imagem" : "Modo configurado: somente texto"}</span></div>
             </section>
           )}
 
@@ -2192,6 +2264,140 @@ function ExplorationDetailView({
       </section>
     </div>
   );
+}
+
+export function scenarioScreenshotUrl(apiBase: string, explorationId: string, screenshot?: string | null) {
+  if (!screenshot || /(^|[\\/])\.\.([\\/]|$)/.test(screenshot) || /[?#]/.test(screenshot) || [...screenshot].some((character) => character.charCodeAt(0) < 32)) return null;
+  const filename = screenshot.replace(/\\/g, "/").split("/").pop();
+  if (!filename || !/\.(?:png|jpe?g|webp)$/i.test(filename)) return null;
+  try {
+    const api = new URL(apiBase);
+    if (!["http:", "https:"].includes(api.protocol)) return null;
+    return `${apiBase.replace(/\/$/, "")}/explorations/${encodeURIComponent(explorationId)}/screenshots/${encodeURIComponent(filename)}`;
+  } catch {
+    return null;
+  }
+}
+
+function safeScenarioPageUrl(value?: string) {
+  if (!value) return null;
+  try {
+    const parsed = new URL(value);
+    return ["http:", "https:"].includes(parsed.protocol) ? parsed.href : null;
+  } catch {
+    return null;
+  }
+}
+
+function scenarioSignals(scenario: ScenarioCase) {
+  return scenario.evidence?.technical_signals || scenario.evidence?.timeline?.flatMap((entry) => entry.signal ? [entry.signal] : []) || [];
+}
+
+function scenarioTimeline(scenario: ScenarioCase): ScenarioTimelineEntry[] {
+  if (scenario.evidence?.timeline?.length) return scenario.evidence.timeline;
+  // Older servers may only expose the preserved screenshots and assertions.
+  // They are evidence, not a reconstructed execution timestamp.
+  return [
+    ...(scenario.screenshots || []).map((screenshot): ScenarioTimelineEntry => ({ kind: "observation", title: "Captura preservada", screenshot, url: scenario.url })),
+    ...(scenario.actual_result ? [{ kind: "action" as const, title: "Resultado registrado", message: scenario.actual_result, url: scenario.url }] : []),
+    ...(scenario.evidence?.assertions || []).map((assertion): ScenarioTimelineEntry => ({ kind: "assertion", title: "Verificação observada", message: assertion.message, assertion })),
+    ...scenarioSignals(scenario).map((signal): ScenarioTimelineEntry => ({ kind: "signal", title: signal.label || "Sinal técnico", message: signal.message, occurred_at: signal.occurred_at, url: signal.url, signal })),
+  ];
+}
+
+export function filterScenarioCases(scenarios: ScenarioCase[], query: string, filter: string) {
+  const normalized = query.trim().toLocaleLowerCase("pt-BR");
+  return scenarios.filter((scenario) => {
+    const matchesFilter = filter === "all" || (filter === "signals" ? scenarioSignals(scenario).length > 0 : scenario.status.toUpperCase() === filter);
+    const text = [scenario.id, scenario.title, scenario.description, scenario.url, ...scenarioSignals(scenario).map((signal) => `${signal.message || ""} ${signal.label || ""} ${signal.url || ""}`)].join(" ").toLocaleLowerCase("pt-BR");
+    return matchesFilter && (!normalized || text.includes(normalized));
+  });
+}
+
+function scenarioVerdict(scenario: ScenarioCase, context: boolean) {
+  if (context) return { label: "Contexto · não é um teste", tone: "info" };
+  const status = scenario.status.toUpperCase();
+  const verdict = scenario.evidence?.verdict;
+  const tone = verdict?.kind === "technical_failure" ? "warning" : status === "FAIL" ? "error" : status === "PASS" ? "success" : "info";
+  const fallback: Record<string, string> = { PASS: "Verificações aprovadas", FAIL: "Verificação falhou", BLOCKED: "Execução bloqueada", SKIPPED: "Não validado" };
+  return { label: `${status} · ${verdict?.label || fallback[status] || "Evidência preservada"}`, tone };
+}
+
+function technicalSignalImpact(signal: ScenarioTechnicalSignal) {
+  const labels: Record<string, string> = {
+    informational: "Registro informativo; não reprova automaticamente o CT.",
+    external_integration: "Ocorrência em uma integração externa; sem defeito funcional confirmado.",
+    unconfirmed: "Impacto no recurso testado não confirmado pelas evidências disponíveis.",
+    technical_check_failed: "Afeta a verificação técnica da aplicação; o impacto funcional depende das asserções do CT.",
+  };
+  return labels[signal.impact || ""] || signal.impact || "Este registro precisa de contexto: sozinho não confirma um defeito funcional nem reprova o CT.";
+}
+
+function ScenarioTimelineCard({ scenario, explorationId, apiBase, context = false }: { scenario: ScenarioCase; explorationId: string; apiBase: string; context?: boolean }) {
+  const verdict = scenarioVerdict(scenario, context);
+  const signals = scenarioSignals(scenario);
+  const entries = scenarioTimeline(scenario);
+  const uniqueScreenshots = new Set<string>();
+  const timeline = entries.map((entry) => {
+    const screenshot = scenarioScreenshotUrl(apiBase, explorationId, entry.screenshot);
+    const image = screenshot && !uniqueScreenshots.has(screenshot) ? screenshot : null;
+    if (screenshot) uniqueScreenshots.add(screenshot);
+    return { entry, image };
+  });
+  return (
+    <details className={`scenario-case-card verdict-${verdict.tone}`}>
+      <summary className="scenario-case-summary">
+        <ChevronRight className="scenario-expand-icon" size={17} />
+        <div className="scenario-case-heading"><span>{context ? "Contexto / navegação de apoio" : scenario.id}</span><h3>{scenario.title}</h3><div className="scenario-case-meta"><span>{timeline.length} registros na linha do tempo</span>{uniqueScreenshots.size > 0 && <span><Eye size={12} />{uniqueScreenshots.size} capturas</span>}{signals.length > 0 && <span className="scenario-signal-count"><Network size={12} />{signals.length} sinais técnicos</span>}</div></div>
+        <span className={`scenario-verdict verdict-${verdict.tone}`}>{verdict.label}</span>
+      </summary>
+      <div className="scenario-case-body">
+        {scenario.evidence?.verdict?.explanation && <p className={`scenario-verdict-explanation verdict-${verdict.tone}`}>{scenario.evidence.verdict.explanation}{scenario.evidence.verdict.historical && <small>O resultado histórico foi preservado; a classificação técnica explica a evidência, sem afirmar um defeito funcional.</small>}</p>}
+        {context && <p className="scenario-context-note">Esta evidência ocorreu fora de um CT executado. É contexto de preparação ou recuperação, não um teste aprovado ou falho.</p>}
+        {!context && (scenario.expected_result || scenario.actual_result) && <div className="scenario-outcome-grid">{scenario.expected_result && <div><small>Resultado esperado</small><p>{scenario.expected_result}</p></div>}{scenario.actual_result && <div><small>Resultado observado</small><p>{scenario.actual_result}</p></div>}</div>}
+        <h4 className="scenario-timeline-title"><History size={15} />Linha do tempo do {context ? "contexto" : "CT"}</h4>
+        {timeline.length === 0 ? <p className="scenario-context-note">Nenhum evento detalhado foi preservado para este caso.</p> : <ol className="scenario-timeline">{timeline.map(({ entry, image }, index) => {
+          const signal = entry.signal;
+          const assertion = entry.assertion;
+          const kind = entry.kind;
+          const failedAssertion = kind === "assertion" && assertion?.passed === false;
+          const technicalAssertion = ["no_new_browser_errors", "no_new_application_errors"].includes(assertion?.kind || "");
+          const link = safeScenarioPageUrl(entry.url || signal?.url);
+          const entryTone = signal ? "technical" : failedAssertion ? (technicalAssertion ? "technical" : "error") : kind === "assertion" && assertion?.passed ? "success" : "info";
+          const Icon = kind === "signal" ? Network : kind === "observation" ? Eye : kind === "assertion" ? (failedAssertion ? AlertCircle : ShieldCheck) : Play;
+          const association = signal?.association?.kind;
+          return <li className={`scenario-timeline-event event-${entryTone}`} key={entry.id || `${kind}-${entry.occurred_at || "record"}-${index}`}>
+            <span className="scenario-timeline-marker"><Icon size={14} /></span>
+            <div className="scenario-timeline-event-body">
+              <div className="scenario-timeline-event-head"><strong>{signal?.label || entry.title || ({ observation: "Observação", action: "Ação executada", assertion: "Verificação", signal: "Sinal técnico" })[kind]}</strong>{entry.occurred_at && <time dateTime={entry.occurred_at}>{formatDate(entry.occurred_at)}</time>}</div>
+              {(entry.message || signal?.message || assertion?.message) && <p>{entry.message || signal?.message || assertion?.message}</p>}
+              {kind === "action" && (entry.step_number !== undefined || entry.target) && <div className="scenario-case-meta">{entry.step_number !== undefined && <span>Etapa {entry.step_number}</span>}{entry.target && <span>Alvo observado: {entry.target}</span>}</div>}
+              {assertion && <div className={`scenario-assertion-result ${assertion.passed === false ? "not-passed" : ""}`}><span>{assertion.passed === true ? "Aprovada" : assertion.passed === false ? "Falhou" : "Sem resultado"}{technicalAssertion ? " · verificação técnica" : ""}</span>{assertion.expected !== undefined && <small>Esperado: {JSON.stringify(assertion.expected)}</small>}{assertion.actual !== undefined && <small>Observado: {JSON.stringify(assertion.actual)}</small>}</div>}
+              {signal && <div className="scenario-signal-detail">{signal.status_code && <span className="scenario-http-code">HTTP {signal.status_code}</span>}<p>{technicalSignalImpact(signal)}</p>{signal.classification_reason && <small>{signal.classification_reason}</small>}<small>{association === "before_action" ? "Observado antes da ação; contexto anterior, sem atribuição causal." : association === "after_action" ? "Observado após a ação; associação temporal, não causalidade comprovada." : association === "during_action" ? "Registrado durante a ação; associação temporal, não causalidade comprovada." : "Registrado nesta observação de contexto."}</small>{signal.affects_verdict === false && <small>Não reprova automaticamente o CT.</small>}</div>}
+              {(entry.url || signal?.url) && <div className="scenario-event-url">{link ? <a href={link} target="_blank" rel="noreferrer">{entry.url || signal?.url}<SquareArrowOutUpRight size={12} /></a> : <span>{entry.url || signal?.url}</span>}</div>}
+              {image && <figure className="scenario-timeline-screenshot"><a href={image} target="_blank" rel="noreferrer"><img src={image} loading="lazy" alt={`${scenario.id} · ${entry.title || "evidência"}`} /></a><figcaption><span>{entry.screenshot?.replace(/\\/g, "/").split("/").pop()}</span><a href={image} target="_blank" rel="noreferrer">Ampliar <SquareArrowOutUpRight size={12} /></a></figcaption></figure>}
+            </div>
+          </li>;
+        })}</ol>}
+      </div>
+    </details>
+  );
+}
+
+export function ScenarioTimelinePanel({ scenarios, contexts, explorationId, apiBase, isRunning = false }: { scenarios: ScenarioCase[]; contexts: ScenarioCase[]; explorationId: string; apiBase: string; isRunning?: boolean }) {
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState("all");
+  const filtered = filterScenarioCases(scenarios, query, filter);
+  const filteredContexts = filter === "all" || filter === "signals" ? filterScenarioCases(contexts, query, filter) : [];
+  return <section className="scenario-cases-panel">
+    <div className="scenario-cases-heading"><div><span className="section-kicker">Evidência por caso</span><h2>Casos de teste e suas linhas do tempo</h2><p>Ações, verificações, capturas e sinais técnicos juntos, na ordem em que foram observados.</p></div>{isRunning && <span className="live-mini"><span />ao vivo</span>}</div>
+    <div className="scenario-evidence-note"><ShieldCheck size={17} /><p>Sinal técnico não é sinônimo de bug. Integrações externas e requisições canceladas são distinguidas das verificações do CT; nenhuma ocorrência confirma sozinha um defeito funcional.</p></div>
+    <div className="scenario-case-tools"><label className="scenario-case-search"><Search size={16} /><input aria-label="Buscar casos de teste ou sinais técnicos" placeholder="Buscar CT, título, URL ou sinal técnico…" value={query} onChange={(event) => setQuery(event.target.value)} /></label><label className="scenario-case-filter"><span>Exibir</span><select aria-label="Filtrar casos de teste" value={filter} onChange={(event) => setFilter(event.target.value)}><option value="all">Todos os CTs</option><option value="PASS">Verificações aprovadas</option><option value="FAIL">Verificações falhas</option><option value="BLOCKED">Bloqueados</option><option value="SKIPPED">Não validados</option><option value="signals">Com sinais técnicos</option></select></label></div>
+    <div className="scenario-case-results"><span>{filtered.length} de {scenarios.length} CTs</span><small>Abra um caso para acompanhar as evidências.</small></div>
+    <div className="scenario-case-list">{filtered.map((scenario) => <ScenarioTimelineCard key={scenario.id} scenario={scenario} explorationId={explorationId} apiBase={apiBase} />)}</div>
+    {filtered.length === 0 && <div className="activity-empty"><FileCheck2 size={22} /><span>{scenarios.length === 0 ? "Os CTs aparecerão aqui conforme as evidências forem preservadas." : "Nenhum CT corresponde à busca e ao filtro."}</span></div>}
+    {filteredContexts.length > 0 && <section className="scenario-context-section"><h3>Contexto / navegação de apoio <span>{filteredContexts.length}</span></h3><p>Evidências fora de um teste executado, preservadas sem entrar na contagem de CTs ou de aprovações.</p>{filteredContexts.map((scenario) => <ScenarioTimelineCard key={scenario.id} scenario={scenario} explorationId={explorationId} apiBase={apiBase} context />)}</section>}
+  </section>;
 }
 
 function DetailCounter({ icon: Icon, value, label }: { icon: typeof Activity; value: string | number; label: string }) {

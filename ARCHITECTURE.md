@@ -155,7 +155,10 @@ the exploration engine.
 An action result records its URL before and after execution, success/failure,
 assertion results, timestamp, and screenshot. A verified route, DOM or control
 state change adds deterministic evidence; when browser-error capture is active,
-the correlated console/network result is evaluated with it. Scenario status is
+classified, temporally attributable application failures are evaluated by the
+technical-health guard. External telemetry, isolated cancellations and
+unidentified resource-console lines are preserved without independently
+failing a functional CT. Scenario status is
 derived from that evidence:
 
 - `PASS`: the action succeeded, at least one verifiable assertion exists, and
@@ -169,6 +172,16 @@ derived from that evidence:
 The auxiliary model may improve titles and descriptions, but it cannot promote
 a scenario to `PASS`. Internal backtracking and selector-free restoration steps
 are orchestration, so they are not materialized as test scenarios.
+
+`technical_signals.py` locally classifies and correlates distinct request
+occurrences; ambiguous console/network matches remain separate. The action
+evidence owns its timeline, before/after captures and signal IDs. Retries append
+to the same CT, and auxiliary documentation cannot erase this execution
+evidence. `scenario_timeline.py` provides a read-only presentation for current
+and legacy records, including context cards when no reliable CT link exists.
+The API and offline report use this same projection. Existing report artifacts
+and verdicts are retained; upgraded historical HTML is cached separately using
+atomic writes, without browser/model calls.
 
 Exploration lifecycle is independent from scenario verdicts:
 

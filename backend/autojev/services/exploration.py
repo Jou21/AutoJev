@@ -37,6 +37,13 @@ from autojev.domain.models import (
     utc_now,
 )
 from autojev.services.coverage import CoveragePlanner, canonical_url
+from autojev.services.technical_signals import (
+    build_scenario_evidence,
+    classify_signal,
+    correlate_issues,
+    scenario_screenshots,
+    signal_occurrence_id,
+)
 
 
 @dataclass(slots=True)
@@ -294,6 +301,19 @@ class _LiveScenarioPipeline:
                             continue
                         if job.fingerprint not in self.sequences:
                             continue
+                        # The model owns wording only. Preserve all local
+                        # attempts, screenshots, assertions and signal IDs even
+                        # if an adapter returns a sparse documentation payload.
+                        local_evidence = build_scenario_evidence(
+                            job.observation, job.decision, job.result
+                        )
+                        provenance = scenario.evidence.get("documentation_provenance")
+                        scenario.evidence.update(local_evidence)
+                        if provenance is not None:
+                            scenario.evidence["documentation_provenance"] = provenance
+                        scenario.screenshots = scenario_screenshots(
+                            local_evidence, job.result
+                        )
                         self.repository.add_scenario(
                             self.exploration_id, job.sequence, scenario
                         )
@@ -993,7 +1013,8 @@ class ExplorationManager:
                     "preconditions": [f"The browser is on {observation.url}"],
                     "expected_result": (
                         "The control responds consistently and introduces no "
-                        "new visible, console, or network failure."
+                        "attributable application failure. External browser "
+                        "signals are recorded separately from functional checks."
                     ),
                 },
             ),
@@ -1027,61 +1048,9 @@ class ExplorationManager:
         retaining the console record inside the more precise HTTP record.
         """
 
-        console_errors = [dict(issue) for issue in observation.console_errors]
-        network_errors = [dict(issue) for issue in observation.network_errors]
-        matched_console: set[int] = set()
-        matched_network: set[int] = set()
-
-        for console_index, console_issue in enumerate(console_errors):
-            match = cls._GENERIC_RESOURCE_ERROR.search(
-                str(console_issue.get("message") or "")
-            )
-            if match is None:
-                continue
-            status_code = int(match.group(1))
-            candidates = [
-                index
-                for index, network_issue in enumerate(network_errors)
-                if index not in matched_network
-                and network_issue.get("type") == "http"
-                and network_issue.get("status_code") == status_code
-            ]
-            if not candidates:
-                continue
-
-            console_time = cls._issue_timestamp(console_issue)
-            timed_candidates: list[tuple[float, int]] = []
-            if console_time is not None:
-                for index in candidates:
-                    network_time = cls._issue_timestamp(network_errors[index])
-                    if network_time is not None:
-                        timed_candidates.append(
-                            (abs(console_time - network_time), index)
-                        )
-            if timed_candidates:
-                delta, network_index = min(timed_candidates)
-                if delta > 2.0:
-                    continue
-            elif len(candidates) == 1:
-                network_index = candidates[0]
-            else:
-                # Without timestamps, associating one generic console line
-                # with one of several same-status requests would be guesswork.
-                continue
-
-            network_issue = network_errors[network_index]
-            related = list(network_issue.get("related_console_errors") or [])
-            related.append(console_issue)
-            network_issue["related_console_errors"] = related
-            network_issue["evidence_channels"] = ["network", "console"]
-            matched_console.add(console_index)
-            matched_network.add(network_index)
-
-        return [
-            issue
-            for index, issue in enumerate(console_errors)
-            if index not in matched_console
-        ] + network_errors
+        return correlate_issues(
+            observation.console_errors + observation.network_errors
+        )
 
     @staticmethod
     def _issue_key(issue: dict[str, Any]) -> str:
@@ -1101,32 +1070,100 @@ class ExplorationManager:
         exploration_id: str,
         observation: Observation,
         known: set[str],
+        *,
+        action_step: int | None = None,
+        action_started_at: str | None = None,
+        action_finished_at: str | None = None,
+        scenario_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Persist and return only issue signatures not seen earlier in the run."""
+        """Persist distinct occurrences; return only new signatures for prompts.
+
+        A periodic request can fail in several CTs. Those occurrences remain
+        durable, while a known signature need not repeatedly enlarge AI prompts.
+        """
 
         new_issues: list[dict[str, Any]] = []
         for issue in self._deduplicate_observation_issues(observation):
             key = self._issue_key(issue)
-            if key in known:
+            occurrence_id = signal_occurrence_id(issue, observation.captured_at)
+            occurrence_key = f"occurrence:{occurrence_id}"
+            if occurrence_key in known:
                 continue
+            first_signature = key not in known
             known.add(key)
-            new_issues.append(issue)
-            record = {**issue, "screenshot": observation.screenshot}
+            known.add(occurrence_key)
+            record = classify_signal(
+                {**issue, "occurrence_id": occurrence_id}, observation.url
+            )
+            association = {"kind": "observation_context"}
+            if action_step is not None:
+                association = self._signal_action_association(
+                    issue, action_started_at, action_finished_at, action_step, scenario_id
+                )
+            record.update(
+                screenshot=observation.screenshot,
+                page_url=observation.url,
+                step_number=action_step,
+                scenario_id=scenario_id,
+                association=association,
+                action_started_at=action_started_at,
+                action_finished_at=action_finished_at,
+                new_signature=first_signature,
+            )
+            # Association is temporal context, not a causal attribution. In
+            # particular a signal emitted while planning must not claim to
+            # reject the later CT merely because both share a screenshot.
+            record = classify_signal(record, observation.url)
+            if first_signature:
+                new_issues.append(record)
             self.repository.add_issue(exploration_id, record)
             self.repository.add_event(
                 exploration_id,
-                "error",
+                "error" if record["affects_verdict"] else "warning",
                 "issue_detected",
                 str(issue.get("message", "Browser issue observed")),
-                {"type": issue.get("type"), "status_code": issue.get("status_code")},
+                {
+                    "type": issue.get("type"),
+                    "status_code": issue.get("status_code"),
+                    "occurrence_id": occurrence_id,
+                    "classification": record["classification"],
+                    "affects_verdict": record["affects_verdict"],
+                    "step_number": action_step,
+                    "scenario_id": scenario_id,
+                },
             )
         return new_issues
+
+    @classmethod
+    def _signal_action_association(
+        cls,
+        issue: dict[str, Any],
+        action_started_at: str | None,
+        action_finished_at: str | None,
+        action_step: int | None,
+        scenario_id: str | None = None,
+    ) -> dict[str, Any]:
+        occurred = cls._issue_timestamp(issue)
+        started = cls._issue_timestamp({"occurred_at": action_started_at})
+        finished = cls._issue_timestamp({"occurred_at": action_finished_at})
+        kind = "observation_context"
+        if occurred is not None and started is not None:
+            kind = "before_action" if occurred < started else "during_action"
+            if finished is not None and occurred > finished:
+                kind = "after_action"
+        return {
+            "kind": kind,
+            "step_number": action_step,
+            "scenario_id": scenario_id,
+            "causal_link_confirmed": False,
+        }
 
     @classmethod
     def _issues_relevant_to_action(
         cls,
         observation: Observation,
         action_started_at: str | None = None,
+        action_finished_at: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return only browser issues emitted after this action began.
 
@@ -1137,6 +1174,7 @@ class ExplorationManager:
         """
 
         action_start = cls._issue_timestamp({"occurred_at": action_started_at})
+        action_finish = cls._issue_timestamp({"occurred_at": action_finished_at})
         relevant: list[dict[str, Any]] = []
         for issue in cls._deduplicate_observation_issues(observation):
             occurred_at = cls._issue_timestamp(issue)
@@ -1149,22 +1187,52 @@ class ExplorationManager:
                 # Those records share the next observation buffer, but they
                 # were not caused by the action that followed.
                 continue
+            if (
+                action_finish is not None
+                and occurred_at is not None
+                and occurred_at > action_finish
+            ):
+                continue
             relevant.append(issue)
         return relevant
 
-    @staticmethod
+    @classmethod
     def _keep_only_new_observation_issues(
-        observation: Observation, new_issues: list[dict[str, Any]]
+        cls,
+        observation: Observation,
+        new_issues: list[dict[str, Any]],
+        action_started_at: str | None = None,
+        action_finished_at: str | None = None,
     ) -> None:
-        """Keep recurring baseline noise out of later CTs and JEV prompts."""
+        """Keep only new, attributable signatures in model observation context.
+
+        The caller already persisted all occurrences and copied them into local
+        CT evidence. Clearing recurring/background prompt noise never removes
+        a timeline signal or changes an action's independently checked verdict.
+        """
+
+        started = cls._issue_timestamp({"occurred_at": action_started_at})
+        finished = cls._issue_timestamp({"occurred_at": action_finished_at})
+        prompt_issues = []
+        for raw_issue in new_issues:
+            issue = classify_signal(raw_issue, observation.url)
+            occurred = cls._issue_timestamp(issue)
+            if not issue["affects_verdict"]:
+                continue
+            if occurred is not None:
+                if started is not None and occurred < started:
+                    continue
+                if finished is not None and occurred > finished:
+                    continue
+            prompt_issues.append(issue)
 
         observation.console_errors = [
             issue
-            for issue in new_issues
+            for issue in prompt_issues
             if issue.get("type") in {"console", "pageerror"}
         ]
         observation.network_errors = [
-            issue for issue in new_issues if issue.get("type") in {"http", "network"}
+            issue for issue in prompt_issues if issue.get("type") in {"http", "network"}
         ]
 
     @staticmethod
@@ -1219,6 +1287,27 @@ class ExplorationManager:
                 # later verified attempt replaces the provisional verdict but
                 # keeps its original position among the captured scenarios.
                 scenario_sequence = existing[3]
+                old_evidence = build_scenario_evidence(*existing[:3])
+                new_evidence = build_scenario_evidence(observation, decision, result)
+                # The latest attempt determines the verdict, but it does not
+                # erase the earlier failure or the path used to recover it.
+                timeline_by_id = {
+                    entry["id"]: entry
+                    for entry in old_evidence["timeline"] + new_evidence["timeline"]
+                }
+                signals_by_id = {
+                    signal["occurrence_id"]: signal
+                    for signal in (
+                        old_evidence["technical_signals"]
+                        + new_evidence["technical_signals"]
+                    )
+                }
+                new_evidence["timeline"] = sorted(
+                    timeline_by_id.values(),
+                    key=lambda entry: cls._issue_timestamp(entry) or 0,
+                )
+                new_evidence["technical_signals"] = list(signals_by_id.values())
+                result.evidence = new_evidence
             pending[scenario_fingerprint] = (
                 observation,
                 decision,
@@ -1284,6 +1373,7 @@ class ExplorationManager:
                 else ScenarioStatus.FAIL
             )
         hint = decision.scenario_hint or {}
+        evidence = build_scenario_evidence(observation, decision, result)
         return TestScenario(
             id=f"CT{scenario_number:03d}",
             title=str(
@@ -1303,16 +1393,8 @@ class ExplorationManager:
             status=status,
             url=result.after_url,
             created_at=utc_now(),
-            screenshots=[result.screenshot] if result.screenshot else [],
-            evidence={
-                "action": decision.action,
-                "target": decision.target,
-                "before_url": result.before_url,
-                "after_url": result.after_url,
-                "action_succeeded": result.success,
-                "assertions": [asdict(assertion) for assertion in result.assertions],
-                "message": result.message,
-            },
+            screenshots=scenario_screenshots(evidence, result),
+            evidence=evidence,
         )
 
     @staticmethod
@@ -1330,9 +1412,9 @@ class ExplorationManager:
 
         JEV predicts useful behavior before execution, but Playwright owns the
         verdict. A visible route/DOM/control-state delta is concrete evidence
-        that an interaction produced an observable result; correlated browser
-        errors are evaluated alongside it so a changed screen with a failed API
-        request cannot be reported as PASS.
+        that an interaction produced an observable result. Only attributable
+        application technical failures affect the health guard; external noise
+        is preserved in the CT timeline without fabricating a functional FAIL.
         """
 
         if not result.success or decision.action in {"wait", "screenshot"}:
@@ -1351,27 +1433,31 @@ class ExplorationManager:
             )
         if not (capture_console_errors or capture_network_errors):
             return
-        if new_issues is None:
-            console_count = (
-                len(observation.console_errors) if capture_console_errors else 0
+        source_issues = (
+            ExplorationManager._deduplicate_observation_issues(observation)
+            if new_issues is None
+            else new_issues
+        )
+        classified_issues = [
+            classify_signal(issue, result.before_url or observation.url)
+            for issue in source_issues
+        ]
+        verdict_issues = [
+            issue for issue in classified_issues if issue["affects_verdict"]
+        ]
+        console_count = (
+            sum(
+                issue.get("type") in {"console", "pageerror"}
+                for issue in verdict_issues
             )
-            network_count = (
-                len(observation.network_errors) if capture_network_errors else 0
-            )
-        else:
-            console_count = (
-                sum(
-                    issue.get("type") in {"console", "pageerror"}
-                    for issue in new_issues
-                )
-                if capture_console_errors
-                else 0
-            )
-            network_count = (
-                sum(issue.get("type") in {"http", "network"} for issue in new_issues)
-                if capture_network_errors
-                else 0
-            )
+            if capture_console_errors
+            else 0
+        )
+        network_count = (
+            sum(issue.get("type") in {"http", "network"} for issue in verdict_issues)
+            if capture_network_errors
+            else 0
+        )
         error_count = console_count + network_count
         # A request that newly fails is concrete negative evidence even when
         # the visible page does not change. Conversely, a successful no-op
@@ -1381,7 +1467,7 @@ class ExplorationManager:
         result.assertions.append(
             AssertionResult(
                 kind="no_new_browser_errors",
-                expected="0 new console or network errors",
+                expected="0 attributable application runtime, HTTP or network failures",
                 actual={
                     "console_errors": console_count,
                     "network_errors": network_count,
@@ -1390,7 +1476,10 @@ class ExplorationManager:
                 message=(
                     "Observed"
                     if error_count == 0
-                    else "The action produced new browser errors"
+                    else (
+                        "An application technical check failed during this action; "
+                        "a business defect is not automatically confirmed"
+                    )
                 ),
             )
         )
@@ -1508,6 +1597,12 @@ class ExplorationManager:
                 if scenario_task not in done:
                     raise TimeoutError
                 scenario = scenario_task.result()
+                provenance = scenario.evidence.get("documentation_provenance")
+                local_evidence = build_scenario_evidence(observation, decision, result)
+                scenario.evidence.update(local_evidence)
+                if provenance is not None:
+                    scenario.evidence["documentation_provenance"] = provenance
+                scenario.screenshots = scenario_screenshots(local_evidence, result)
                 self.repository.add_scenario(exploration_id, scenario_number, scenario)
                 enriched += 1
                 event_type = "scenario_enriched"
@@ -2205,10 +2300,7 @@ class ExplorationManager:
                 ):
                     result.message = f"{result.message}; no new route or interactive-state change was observed"
                 action_issues = self._issues_relevant_to_action(
-                    next_observation, result.started_at
-                )
-                self._record_observation_issues(
-                    exploration_id, next_observation, known_issues
+                    next_observation, result.started_at, result.finished_at
                 )
                 self._append_observable_state_evidence(
                     result,
@@ -2219,12 +2311,79 @@ class ExplorationManager:
                     capture_network_errors=options.capture_network_errors,
                     new_issues=action_issues,
                 )
+                capture_scenario, _ = self._scenario_capture_policy(
+                    decision_source=decision_source,
+                    is_restoration_action=is_restoration_action,
+                    result=result,
+                )
+                existing_scenario = pending_scenarios.get(scenario_fingerprint)
+                candidate_sequence = (
+                    existing_scenario[3] if existing_scenario else scenario_number + 1
+                )
+                candidate_scenario_id = (
+                    f"CT{candidate_sequence:03d}"
+                    if options.generate_test_cases and capture_scenario
+                    else None
+                )
+                new_observation_issues = self._record_observation_issues(
+                    exploration_id,
+                    next_observation,
+                    known_issues,
+                    action_step=next_action,
+                    action_started_at=result.started_at,
+                    action_finished_at=result.finished_at,
+                    scenario_id=candidate_scenario_id,
+                )
+                new_occurrence_ids = {
+                    issue["occurrence_id"] for issue in new_observation_issues
+                }
+                local_signals = []
+                for issue in self._deduplicate_observation_issues(next_observation):
+                    signal = classify_signal(
+                        {
+                            **issue,
+                            "occurrence_id": signal_occurrence_id(
+                                issue, next_observation.captured_at
+                            ),
+                        },
+                        result.before_url or next_observation.url,
+                    )
+                    signal.update(
+                        screenshot=next_observation.screenshot,
+                        page_url=next_observation.url,
+                        step_number=next_action,
+                        scenario_id=candidate_scenario_id,
+                        association=self._signal_action_association(
+                            issue,
+                            result.started_at,
+                            result.finished_at,
+                            next_action,
+                            candidate_scenario_id,
+                        ),
+                        new_signature=signal["occurrence_id"] in new_occurrence_ids,
+                    )
+                    signal = classify_signal(
+                        signal, result.before_url or next_observation.url
+                    )
+                    local_signals.append(signal)
+                result.evidence.update(
+                    action_step=next_action,
+                    before_screenshot=observation.screenshot,
+                    before_observed_at=observation.captured_at,
+                    technical_signals=local_signals,
+                )
+                result.evidence = build_scenario_evidence(
+                    next_observation, decision, result
+                )
                 # The precise records are already durable in the issue table.
                 # Keep only newly observed signatures on the observation used
                 # by the CT generator and by the next JEV prompt, so periodic
                 # third-party telemetry cannot be attributed repeatedly.
                 self._keep_only_new_observation_issues(
-                    next_observation, action_issues
+                    next_observation,
+                    new_observation_issues,
+                    result.started_at,
+                    result.finished_at,
                 )
                 safe_decision = redact(asdict(decision), secret_values)
                 safe_result = redact(result.to_dict(), secret_values)

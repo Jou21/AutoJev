@@ -132,6 +132,16 @@ evidence is recorded in the activity timeline but does not become a test case;
 `SKIPPED` remains supported only for historical/imported reports. Internal
 backtracking/replay actions never become test scenarios.
 
+Each CT has an expandable evidence timeline in the exploration view and HTML
+report: actions, assertions, before/after captures, retries and classified
+technical signals. External telemetry and isolated request cancellations do
+not automatically fail a functional interaction. Same-origin HTTP/network
+failures and JavaScript exceptions remain technical checks, not automatically
+confirmed business defects. Unassociated startup/restoration signals appear as
+context cards outside the CT counts. Historical verdicts are preserved and
+explained rather than silently changed. Repeated signals remain local evidence
+without repeatedly enlarging model prompts.
+
 Prompt, completion and total tokens are accumulated for both models. The live
 browser panel and React sidebar show the running usage; exploration views and
 the standalone report retain the final total and provider-reported monetary

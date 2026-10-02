@@ -3,6 +3,15 @@ from pathlib import Path
 from autojev.adapters.openai_compatible import ProviderConnectionError
 from autojev.api.routes import _phase_payload
 from autojev.config import Settings
+from autojev.domain.models import (
+    ExplorationOptions,
+    ExplorationRequest,
+    ModelSelection,
+    ScenarioStatus,
+)
+from autojev.domain.models import (
+    TestScenario as StoredScenario,
+)
 from autojev.main import create_app
 from fastapi.testclient import TestClient
 
@@ -18,6 +27,66 @@ def settings(tmp_path: Path) -> Settings:
         browser="chromium",
         http_timeout_seconds=1,
     )
+
+
+def test_legacy_report_is_presented_with_ct_timeline_without_rewriting_history(tmp_path):
+    app = create_app(settings(tmp_path))
+    with TestClient(app) as client:
+        repository = app.state.repository
+        exploration_id = repository.create_exploration(ExplorationRequest(
+            app_url="https://example.test", agent=ModelSelection("local", "agent"),
+            auxiliary_llm=ModelSelection("local", "auxiliary"), options=ExplorationOptions(),
+        ))
+        scenario = StoredScenario(
+            id="CT001", title="Abrir carrinho", description="Caso histórico",
+            preconditions=[], steps=["Clicar"], expected_result="Carrinho aberto",
+            actual_result="Carrinho aberto; erro de rede registrado", status=ScenarioStatus.FAIL,
+            url="https://example.test/cart", created_at="2026-10-02T12:00:06+00:00",
+            screenshots=["after.png"], evidence={"action_succeeded": True, "assertions": [
+                {"kind": "observable_state_change", "passed": True},
+                {"kind": "no_new_browser_errors", "passed": False, "actual": {"network_errors": 1}},
+            ]},
+        )
+        repository.add_scenario(exploration_id, 1, scenario)
+        repository.add_action(exploration_id, 1, {"action": "click"}, {
+            "action": "click", "success": True, "started_at": "2026-10-02T12:00:02+00:00",
+            "finished_at": "2026-10-02T12:00:04+00:00", "before_url": "https://example.test/items",
+            "after_url": "https://example.test/cart", "screenshot": "after.png",
+            "assertions": scenario.evidence["assertions"],
+        })
+        repository.add_issue(exploration_id, {"type": "http", "status_code": 401,
+            "message": "POST returned HTTP 401", "url": "https://events.backtrace.io/api/submit",
+            "occurred_at": "2026-10-02T12:00:03+00:00", "screenshot": "after.png"})
+        directory = tmp_path / "artifacts" / exploration_id
+        directory.mkdir(parents=True)
+        original_path = directory / "report.html"
+        original_document = "<html><body>Relatório original sem linha do tempo</body></html>"
+        original_path.write_text(original_document)
+        repository.update_exploration(exploration_id, status="completed", report_path=str(original_path))
+
+        response = client.get(f"/api/explorations/{exploration_id}/report")
+        assert response.status_code == 200
+        assert 'data-report-schema="ct-timeline-v1"' in response.text
+        assert "Linha do tempo" in response.text
+        assert "Telemetria externa" in response.text
+        assert "Verificação técnica falhou" in response.text
+        assert "Sinais técnicos observados (" not in response.text
+        assert original_path.read_text() == original_document
+        assert repository.get_exploration(exploration_id)["scenarios"][0]["status"] == "FAIL"
+        assert repository.get_report_path(exploration_id) == str(original_path)
+        second = client.get(f"/api/explorations/{exploration_id}/report")
+        assert second.status_code == 200 and second.text == response.text
+        cached = directory / "report-ct-timeline-v1.html"
+        cached.write_text('<html data-report-schema="ct-timeline-v1">Interrupted write')
+        repaired = client.get(f"/api/explorations/{exploration_id}/report")
+        assert repaired.status_code == 200
+        assert repaired.text.rstrip().endswith("</html>")
+        assert "Interrupted write" not in repaired.text
+        assert original_path.read_text() == original_document
+        details = client.get(f"/api/explorations/{exploration_id}").json()
+        assert details["scenarios"][0]["evidence"]["technical_signals"][0]["affects_verdict"] is False
+        assert details["scenarios"][0]["status"] == "FAIL"
+        assert details["summary"]["total_scenarios"] == 1
 
 
 def test_health_and_provider_crud_never_return_api_key(tmp_path):
@@ -156,6 +225,7 @@ def test_model_discovery_refreshes_existing_capabilities(tmp_path, monkeypatch):
             "label": "My custom label",
             "enabled": False,
             "input_modalities": ["text", "image"],
+            "output_modalities": [],
             "supports_vision": True,
             "capabilities_known": True,
         }
@@ -196,6 +266,65 @@ def test_visual_exploration_rejects_auxiliary_model_without_image_support(tmp_pa
         assert response.status_code == 422
         assert "does not declare image input support" in response.json()["detail"]
         assert submitted == []
+
+
+def test_provider_edits_preserve_image_only_output_and_unknown_capabilities(tmp_path):
+    app = create_app(settings(tmp_path))
+    with TestClient(app) as client:
+        provider = client.post(
+            "/api/providers",
+            json={
+                "name": "Provider",
+                "base_url": "http://localhost:4000",
+                "models": [
+                    {
+                        "id": "image-generator",
+                        "input_modalities": ["text", "image"],
+                        "output_modalities": ["image"],
+                    },
+                    {"id": "unknown-model"},
+                ],
+            },
+        ).json()
+        response = client.patch(
+            f"/api/providers/{provider['id']}",
+            json={
+                "models": [
+                    {
+                        "id": "image-generator",
+                        "input_modalities": ["text", "image"],
+                        "supports_vision": False,
+                    },
+                    {
+                        "id": "unknown-model",
+                        "input_modalities": [],
+                        "output_modalities": [],
+                        "supports_vision": False,
+                        "capabilities_known": False,
+                    },
+                ]
+            },
+        )
+        assert response.status_code == 200
+        models = {model["id"]: model for model in response.json()["models"]}
+        assert models["image-generator"]["output_modalities"] == ["image"]
+        assert models["image-generator"]["supports_vision"] is False
+        assert models["unknown-model"]["capabilities_known"] is False
+
+        app.state.exploration_manager.submit = lambda _: None
+        rejected = client.post(
+            "/api/explorations",
+            json={
+                "app_url": "http://localhost:3000",
+                "agent": {"provider_id": provider["id"], "model_id": "unknown-model"},
+                "auxiliary_llm": {
+                    "provider_id": provider["id"],
+                    "model_id": "image-generator",
+                },
+                "options": {"auxiliary_evidence_mode": "visual"},
+            },
+        )
+        assert rejected.status_code == 422
 
 
 def test_exploration_request_does_not_echo_credentials(tmp_path):

@@ -1,4 +1,5 @@
 import pytest
+
 from autojev.adapters.openai_compatible import (
     ModelResponseError,
     OpenAIAuxiliaryScenarioGenerator,
@@ -59,6 +60,7 @@ async def test_list_models_uses_openrouter_model_name(monkeypatch):
             "id": "openai/gpt-4o",
             "label": "GPT-4o",
             "input_modalities": ["text", "image"],
+            "output_modalities": ["text"],
             "supports_vision": True,
             "capabilities_known": True,
         }
@@ -89,7 +91,7 @@ async def test_list_models_never_guesses_vision_from_model_name(monkeypatch):
     monkeypatch.setattr("httpx.AsyncClient", lambda **kwargs: FakeClient())
 
     models = await OpenAICompatibleClient(
-        "http://provider.example/v1"
+        "http://provider.example/v1", None
     ).list_models()
 
     assert models == [
@@ -97,6 +99,7 @@ async def test_list_models_never_guesses_vision_from_model_name(monkeypatch):
             "id": "vendor/super-vision-model",
             "label": "vendor/super-vision-model",
             "input_modalities": [],
+            "output_modalities": [],
             "supports_vision": False,
             "capabilities_known": False,
         }
@@ -837,3 +840,64 @@ async def test_auxiliary_does_not_retry_non_capability_failures_as_text(
         "evidence_mode": "visual",
         "model_input": "text_and_image",
     }
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_enrichment_preserves_local_timeline_and_multiple_captures():
+    import json
+
+    from autojev.services.technical_signals import build_scenario_evidence
+
+    class Client:
+        async def chat_json(self, _model, _system, content, **_kwargs):
+            prompt = json.loads(content)
+            assert "timeline" not in prompt["verified_evidence"]
+            assert prompt["technical_signals"] == []
+            return {"title": "Documented action", "steps": ["Open product"], "status": "FAIL", "evidence": {"timeline": []}}
+
+    observation, decision, result = _scenario_inputs(screenshot="after.png")
+    result.screenshot = "after.png"
+    result.evidence = {
+        "action_step": 4,
+        "before_screenshot": "before.png",
+        "technical_signals": [{
+            "occurrence_id": "signal-1", "classification": "external_telemetry",
+            "label": "Telemetria externa", "message": "POST returned HTTP 401",
+            "url": "https://events.backtrace.io/api/events", "affects_verdict": False,
+        }],
+    }
+    expected = build_scenario_evidence(observation, decision, result)
+    result.evidence = expected
+    scenario = await OpenAIAuxiliaryScenarioGenerator(Client(), "model").create_scenario(
+        observation, decision, result, 1,
+    )
+    assert scenario.screenshots == ["before.png", "after.png"]
+    assert scenario.evidence["timeline"] == expected["timeline"]
+    assert scenario.evidence["technical_signals"] == expected["technical_signals"]
+    assert scenario.evidence["action_step"] == 4
+    assert scenario.evidence["action_started_at"] == result.started_at
+    assert scenario.evidence["documentation_provenance"]["source"] == "auxiliary_llm"
+    assert scenario.status == OpenAIAuxiliaryScenarioGenerator.evidence_status(result)
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_prompt_omits_repeated_signals_but_preserves_them_locally():
+    import json
+
+    class Client:
+        async def chat_json(self, _model, _system, content, **_kwargs):
+            assert json.loads(content)["technical_signals"] == []
+            return {"title": "Documented action", "steps": ["Open product"]}
+
+    observation, decision, result = _scenario_inputs()
+    result.evidence = {"technical_signals": [{
+        "occurrence_id": "signal-recurring", "classification": "application_http",
+        "label": "Falha HTTP da aplicação", "message": "GET returned HTTP 500",
+        "url": "https://example.test/api/products", "affects_verdict": True,
+        "new_signature": False,
+    }]}
+    scenario = await OpenAIAuxiliaryScenarioGenerator(Client(), "model").create_scenario(
+        observation, decision, result, 1,
+    )
+    assert scenario.evidence["technical_signals"][0]["occurrence_id"] == "signal-recurring"
+    assert any(entry["kind"] == "signal" for entry in scenario.evidence["timeline"])

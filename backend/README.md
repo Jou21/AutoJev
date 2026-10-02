@@ -148,16 +148,27 @@ Playwright and do not need a model merely to confirm that they occurred.
 - `PASS`: the Playwright action succeeded, at least one verifiable assertion
   exists, and every assertion passed. An observable URL/DOM/control-state delta
   can supply deterministic evidence.
-- `FAIL`: ordinary execution failed or a supported assertion failed. Captured
-  console/network errors newly correlated with an action also fail the evidence,
-  even when the visible screen does not change. Errors present before testing
-  begins are retained as technical findings without contaminating later CTs.
+- `FAIL`: ordinary execution failed or a supported assertion failed. An
+  attributable same-origin HTTP/network failure or page exception can fail the
+  technical-health check, even if the screen changes. This is distinguished
+  from a confirmed functional defect. External telemetry, isolated cancelled
+  requests and signals outside the action window do not independently fail a CT.
 - `BLOCKED`: an executor policy or unavailable control prevented execution.
 - A successful action without verifiable evidence is logged as a no-op and is
   omitted from the CT inventory. `SKIPPED` remains readable for historical or
   imported scenarios and is presented as **Sem validação**, never as `PASS`.
 
 Captured browser evidence includes console/page errors, failed requests and HTTP 4xx/5xx responses. Reports only describe actions actually returned by Playwright.
+
+Each CT exposes `evidence.timeline`, `technical_signals` and an explanatory
+`verdict`. Timelines retain before/after screenshots and earlier retry attempts
+when the same semantic case is recovered. Signals are presented inside that
+timeline, not in a separate final issue list. Unlinked setup/restoration
+occurrences appear in `scenario_contexts`, which are not validated CTs and do
+not change scenario totals. Historical results stay unchanged; the report
+endpoint renders their new presentation to a separate atomic cache artifact.
+Only new, relevant signatures enter model prompts; repeated occurrences remain
+fully available in local evidence.
 
 Exploration lifecycle status is separate from scenario status. `completed`
 means the discovered frontier and return stack were exhausted. `partial` means

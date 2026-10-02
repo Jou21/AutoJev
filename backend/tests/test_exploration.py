@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
 from autojev.adapters.playwright_executor import BrowserUnavailableError
 from autojev.domain.models import (
     ActionResult,
@@ -450,7 +451,10 @@ def test_issue_emitted_while_jev_plans_does_not_fail_the_following_action():
 
     assert new_issues == []
     assert action_issues == []
-    assert len(manager.repository.issues) == 1
+    # Recurrences remain visible in the correct CT/context even though only a
+    # new signature is returned for model-prompt deduplication.
+    assert len(manager.repository.issues) == 2
+    assert manager.repository.issues[0]["occurrence_id"] != manager.repository.issues[1]["occurrence_id"]
     assert result.assertions[-1].passed is True
     assert result.assertions[-1].actual == {
         "console_errors": 0,
@@ -521,10 +525,13 @@ def test_issue_deduplication_does_not_merge_two_same_status_requests():
 
     issues = ExplorationManager._deduplicate_observation_issues(observation)
 
-    assert len(issues) == 2
-    assert issues[0]["url"] == "https://telemetry.test/unique-events"
-    assert issues[0]["evidence_channels"] == ["network", "console"]
-    assert issues[1]["url"] == "https://telemetry.test/summed-events"
+    # One generic console record and two plausible requests are ambiguous.
+    # Preserve all records instead of inventing a request association.
+    assert len(issues) == 3
+    assert issues[0]["type"] == "console"
+    assert issues[1]["url"] == "https://telemetry.test/unique-events"
+    assert "evidence_channels" not in issues[1]
+    assert issues[2]["url"] == "https://telemetry.test/summed-events"
 
 
 def test_action_issue_attribution_excludes_errors_emitted_before_action_start():
@@ -2021,3 +2028,283 @@ async def test_guarded_run_persists_shutdown_cancellation_from_finalization():
     ]
     assert str(manager.repository.updates[-1]["status"]) == "cancelled"
     assert manager.credential_vault.discarded == ["run-shutdown"]
+
+
+@pytest.mark.parametrize(
+    "issue",
+    [
+        {"type": "http", "url": "https://events.backtrace.io/api/unique-events/submit", "status_code": 401, "message": "POST returned HTTP 401"},
+        {"type": "network", "url": "https://app.test/api/poll", "message": "net::ERR_ABORTED"},
+        {"type": "http", "url": "https://third-party.test/widgets", "status_code": 500, "message": "GET returned HTTP 500"},
+        {"type": "console", "url": "https://app.test/orders", "message": "Failed to load resource: net::ERR_CONNECTION_RESET"},
+    ],
+)
+def test_background_signals_do_not_reject_functional_success_or_fabricate_noop_pass(issue):
+    observation = Observation(
+        url="https://app.test/orders", title="Orders", text="Orders ready",
+        interactive_elements=[],
+        console_errors=[issue] if issue["type"] == "console" else [],
+        network_errors=[issue] if issue["type"] != "console" else [],
+        screenshot="after.png",
+    )
+    decision = AgentDecision(action="click", target="e1", rationale="Open orders")
+    for state_changed in (False, True):
+        result = ActionResult(
+            action="click", success=True, started_at=utc_now(), finished_at=utc_now(),
+            before_url=observation.url, after_url=observation.url,
+            screenshot=observation.screenshot,
+            evidence={"before_screenshot": "before.png"},
+        )
+        ExplorationManager._append_observable_state_evidence(
+            result, decision, observation, state_changed=state_changed,
+            capture_console_errors=True, capture_network_errors=True,
+        )
+        scenario = ExplorationManager._scenario_from_evidence(observation, decision, result, 1)
+        assert scenario.status == (ScenarioStatus.PASS if state_changed else ScenarioStatus.SKIPPED)
+        assert scenario.evidence["technical_signals"][0]["affects_verdict"] is False
+        assert [entry["kind"] for entry in scenario.evidence["timeline"]].count("signal") == 1
+        assert scenario.screenshots == ["before.png", "after.png"]
+        if not state_changed:
+            assert not result.assertions
+            assert ExplorationManager._scenario_capture_policy(
+                decision_source="local_policy", is_restoration_action=False, result=result,
+            )[0] is False
+
+
+def test_transport_error_console_and_network_channels_form_one_occurrence():
+    observation = Observation(
+        url="https://app.test/orders", title="Orders", text="Ready", interactive_elements=[],
+        console_errors=[{
+            "type": "console", "url": "https://app.test/orders",
+            "message": "Failed to load resource: net::ERR_CONNECTION_RESET",
+            "occurred_at": "2026-01-01T12:00:00.010+00:00",
+        }],
+        network_errors=[{
+            "type": "network", "method": "POST", "url": "https://events.backtrace.io/api/events",
+            "message": "net::ERR_CONNECTION_RESET", "occurred_at": "2026-01-01T12:00:00.011+00:00",
+        }],
+    )
+    issues = ExplorationManager._deduplicate_observation_issues(observation)
+    assert len(issues) == 1
+    assert issues[0]["evidence_channels"] == ["network", "console"]
+    assert issues[0]["url"].startswith("https://events.backtrace.io/")
+
+
+def test_transport_errors_without_an_unambiguous_request_are_not_merged():
+    from autojev.services.technical_signals import correlate_issues
+
+    issues = correlate_issues([
+        {"type": "console", "message": "Failed to load resource: net::ERR_CONNECTION_RESET", "occurred_at": "2026-01-01T12:00:00+00:00"},
+        {"type": "network", "url": "https://app.test/a", "message": "net::ERR_CONNECTION_RESET", "occurred_at": "2026-01-01T12:00:00.01+00:00"},
+        {"type": "network", "url": "https://app.test/b", "message": "net::ERR_CONNECTION_RESET", "occurred_at": "2026-01-01T12:00:00.02+00:00"},
+    ])
+    assert len(issues) == 3
+
+
+@pytest.mark.parametrize("same_request", [False, True])
+def test_http_channel_correlation_respects_capture_boundaries(same_request):
+    from autojev.services.technical_signals import correlate_issues
+
+    console = {
+        "type": "console", "screenshot": "first.png", "url": "https://app.test/orders",
+        "message": "Failed to load resource: the server responded with a status of 500",
+        "occurred_at": "2026-01-01T12:00:00+00:00",
+    }
+    network = {
+        "type": "http", "status_code": 500, "screenshot": "second.png",
+        "url": "https://app.test/api/orders", "message": "GET returned HTTP 500",
+        "occurred_at": "2026-01-01T12:00:00.01+00:00",
+    }
+    if same_request:
+        console["request_id"] = network["request_id"] = "request-12"
+    assert len(correlate_issues([console, network])) == (1 if same_request else 2)
+
+
+def test_recorded_signal_keeps_step_and_temporal_association_without_claiming_causality():
+    class Repository:
+        def __init__(self):
+            self.issues = []
+
+        def add_issue(self, _exploration_id, issue):
+            self.issues.append(issue)
+
+        def add_event(self, *_args):
+            pass
+
+    manager = object.__new__(ExplorationManager)
+    manager.repository = Repository()
+    observation = Observation(
+        url="https://app.test/orders", title="Orders", text="Ready", interactive_elements=[],
+        network_errors=[{
+            "type": "http", "url": "https://app.test/api/orders", "status_code": 500,
+            "message": "GET returned HTTP 500", "occurred_at": "2026-01-01T12:00:00+00:00",
+        }],
+    )
+    known = set()
+    manager._record_observation_issues(
+        "run", observation, known, action_step=12,
+        action_started_at="2026-01-01T12:00:01+00:00",
+        action_finished_at="2026-01-01T12:00:02+00:00", scenario_id="CT003",
+    )
+    manager._record_observation_issues("run", observation, known)
+    assert len(manager.repository.issues) == 1
+    issue = manager.repository.issues[0]
+    assert issue["step_number"] == 12
+    assert issue["scenario_id"] == "CT003"
+    assert issue["association"]["kind"] == "before_action"
+    assert issue["association"]["causal_link_confirmed"] is False
+    assert issue["affects_verdict"] is False
+    assert issue["potential_technical_failure"] is True
+    assert "fora da execução" in issue["impact_message"]
+
+
+def test_retry_retains_all_attempts_and_screenshots_in_one_ct():
+    observation = Observation(
+        url="https://app.test/orders", title="Orders", text="Ready", interactive_elements=[], screenshot="first-after.png",
+    )
+    decision = AgentDecision(action="click", target="e1", rationale="Open order")
+    failed = ActionResult(
+        action="click", success=False,
+        started_at="2026-01-01T12:00:00+00:00", finished_at="2026-01-01T12:00:01+00:00",
+        before_url=observation.url, after_url=observation.url,
+        screenshot=observation.screenshot, message="Locator timeout",
+        evidence={"before_screenshot": "first-before.png", "action_step": 1},
+    )
+    pending = {}
+    number, _, _ = ExplorationManager._reconcile_pending_scenario(
+        pending, set(), "same-feature", observation, decision, failed, 0,
+        decision_source="local_policy", is_restoration_action=False,
+    )
+    observation.screenshot = "retry-after.png"
+    passed = ActionResult(
+        action="click", success=True,
+        started_at="2026-01-01T12:00:03+00:00", finished_at="2026-01-01T12:00:04+00:00",
+        before_url=observation.url, after_url="https://app.test/orders/1",
+        screenshot=observation.screenshot,
+        evidence={"before_screenshot": "retry-before.png", "action_step": 2},
+    )
+    ExplorationManager._append_observable_state_evidence(
+        passed, decision, observation, state_changed=True,
+        capture_console_errors=False, capture_network_errors=False,
+    )
+    number, _, _ = ExplorationManager._reconcile_pending_scenario(
+        pending, set(), "same-feature", observation, decision, passed, number,
+        decision_source="local_policy", is_restoration_action=False,
+    )
+    scenario = ExplorationManager._scenario_from_evidence(*pending["same-feature"])
+    assert number == 1
+    assert scenario.id == "CT001"
+    assert scenario.status == ScenarioStatus.PASS
+    assert scenario.screenshots == ["first-before.png", "first-after.png", "retry-before.png", "retry-after.png"]
+    timeline = scenario.evidence["timeline"]
+    assert len([entry for entry in timeline if entry["kind"] == "action"]) == 2
+    assert any(entry["message"] == "Locator timeout" for entry in timeline)
+    assert len({entry["id"] for entry in timeline}) == len(timeline)
+
+
+def test_real_runtime_failure_still_fails_the_application_technical_check():
+    from autojev.services.technical_signals import classify_signal
+
+    observation = Observation(
+        url="https://app.test/orders", title="Orders", text="Ready", interactive_elements=[],
+        console_errors=[{"type": "pageerror", "url": "https://app.test/orders", "message": "TypeError: Cannot read properties of null"}],
+    )
+    decision = AgentDecision(action="click", target="e1", rationale="Open order")
+    result = ActionResult(
+        action="click", success=True, started_at=utc_now(), finished_at=utc_now(),
+        before_url=observation.url, after_url=observation.url,
+    )
+    ExplorationManager._append_observable_state_evidence(
+        result, decision, observation, state_changed=True,
+        capture_console_errors=True, capture_network_errors=True,
+    )
+    scenario = ExplorationManager._scenario_from_evidence(observation, decision, result, 1)
+    assert scenario.status == ScenarioStatus.FAIL
+    assert scenario.evidence["technical_signals"][0]["classification"] == "application_runtime"
+    assert scenario.evidence["technical_signals"][0]["affects_verdict"] is True
+    own_telemetry_service = classify_signal(
+        {"type": "http", "url": "https://events.backtrace.io/api/orders", "status_code": 500},
+        "https://events.backtrace.io/",
+    )
+    assert own_telemetry_service["classification"] == "application_http"
+
+
+def test_explicit_failed_functional_assertion_is_not_hidden_by_telemetry_triage():
+    from autojev.domain.models import AssertionResult
+
+    observation = Observation(
+        url="https://app.test/orders", title="Orders", text="Ready", interactive_elements=[],
+        network_errors=[{"type": "http", "url": "https://events.backtrace.io/api/events", "status_code": 401}],
+    )
+    decision = AgentDecision(action="click", target="e1", rationale="Open order")
+    result = ActionResult(
+        action="click", success=True, started_at=utc_now(), finished_at=utc_now(),
+        before_url=observation.url, after_url=observation.url,
+        assertions=[AssertionResult(kind="text_contains", expected="Order saved", actual="Missing", passed=False, message="Not observed")],
+    )
+    ExplorationManager._append_observable_state_evidence(
+        result, decision, observation, state_changed=True,
+        capture_console_errors=True, capture_network_errors=True,
+    )
+    assert ExplorationManager._scenario_from_evidence(observation, decision, result, 1).status == ScenarioStatus.FAIL
+    assert result.assertions[0].passed is False
+    assert result.assertions[-1].passed is True
+
+
+def test_only_new_action_relevant_signatures_reach_prompts_but_recurrences_remain_ct_evidence():
+    from autojev.services.technical_signals import classify_signal
+
+    class Repository:
+        def __init__(self):
+            self.issues = []
+
+        def add_issue(self, _run, issue):
+            self.issues.append(issue)
+
+        def add_event(self, *_args):
+            pass
+
+    manager = object.__new__(ExplorationManager)
+    manager.repository = Repository()
+    known = set()
+    for step in (1, 2):
+        started = f"2026-01-01T12:00:0{step}+00:00"
+        finished = f"2026-01-01T12:00:0{step}.900+00:00"
+        observation = Observation(
+            url="https://app.test/orders", title="Orders", text="Ready", interactive_elements=[],
+            network_errors=[
+                {"type": "http", "url": "https://app.test/api/orders", "status_code": 500, "message": "GET returned HTTP 500", "occurred_at": f"2026-01-01T12:00:0{step}.100+00:00"},
+                {"type": "http", "url": "https://events.backtrace.io/api/events", "status_code": 401, "message": "POST returned HTTP 401", "occurred_at": f"2026-01-01T12:00:0{step}.200+00:00"},
+                {"type": "http", "url": "https://app.test/api/background", "status_code": 500, "message": "GET returned HTTP 500", "occurred_at": "2026-01-01T12:00:00+00:00"},
+            ],
+        )
+        all_occurrences = manager._deduplicate_observation_issues(observation)
+        new_issues = manager._record_observation_issues(
+            "run", observation, known, action_step=step,
+            action_started_at=started, action_finished_at=finished,
+        )
+        decision = AgentDecision(action="click", target="e1", rationale="Load order")
+        result = ActionResult(
+            action="click", success=True, started_at=started, finished_at=finished,
+            before_url=observation.url, after_url=observation.url,
+            evidence={"technical_signals": [classify_signal(issue, observation.url) for issue in all_occurrences]},
+        )
+        manager._append_observable_state_evidence(
+            result, decision, observation, state_changed=True,
+            capture_console_errors=True, capture_network_errors=True,
+            new_issues=manager._issues_relevant_to_action(observation, started, finished),
+        )
+        manager._keep_only_new_observation_issues(observation, new_issues, started, finished)
+        scenario = manager._scenario_from_evidence(observation, decision, result, step)
+        # The repeated same-origin error still fails the technical guard and
+        # all local signals survive, despite deduplication of model context.
+        assert scenario.status == ScenarioStatus.FAIL
+        assert len(scenario.evidence["technical_signals"]) == 3
+        assert len([entry for entry in scenario.evidence["timeline"] if entry["kind"] == "signal"]) == 3
+        assert not observation.console_errors
+        assert [issue["url"] for issue in observation.network_errors] == (
+            ["https://app.test/api/orders"] if step == 1 else []
+        )
+    # Two temporally distinct HTTP errors and telemetry occurrences, plus one
+    # unchanged background record: no occurrence is lost or persisted twice.
+    assert len(manager.repository.issues) == 5

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from inspect import getfile
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse, HTMLResponse
+from starlette.concurrency import run_in_threadpool
 
 from autojev import __version__
 from autojev.adapters.openai_compatible import (
@@ -20,6 +23,7 @@ from autojev.domain.models import (
     Provider,
     ProviderModel,
 )
+from autojev.services.scenario_timeline import prepare_scenario_timelines
 
 from .schemas import (
     ConnectionTestInput,
@@ -272,7 +276,7 @@ def _phase_payload(result: dict[str, Any], events: list[dict[str, Any]]) -> dict
 
 
 def _exploration_payload(item: dict[str, Any]) -> dict[str, Any]:
-    result = dict(item)
+    result = prepare_scenario_timelines(item) if "scenarios" in item else dict(item)
     exploration_id = result["id"]
     result["detail_url"] = f"/api/explorations/{exploration_id}"
     result["report_url"] = (
@@ -325,7 +329,9 @@ def _exploration_payload(item: dict[str, Any]) -> dict[str, Any]:
             visited.add(action_result.get("after_url"))
         result["counters"] = {
             "actions": len(actions),
-            "issues": len(issues),
+            "issues": result.get("technical_signal_summary", {}).get(
+                "occurrences", len(issues)
+            ),
             "scenarios": len(scenarios),
             "pages_visited": len({url for url in visited if url}),
         }
@@ -445,23 +451,23 @@ async def _update_provider(
                         enabled=model.enabled,
                         input_modalities=(
                             model.input_modalities
-                            if capabilities_supplied or existing is None
+                            if "input_modalities" in model.model_fields_set or existing is None
                             else existing.input_modalities
                         ),
                         output_modalities=(
                             model.output_modalities
-                            if capabilities_supplied or existing is None
+                            if "output_modalities" in model.model_fields_set or existing is None
                             else existing.output_modalities
                         ),
                         supports_vision=(
                             model.supports_vision
-                            if capabilities_supplied or existing is None
+                            if "supports_vision" in model.model_fields_set or "input_modalities" in model.model_fields_set or existing is None
                             else existing.supports_vision
                         ),
                         capabilities_known=(
-                            (model.capabilities_known or capabilities_supplied)
-                            if capabilities_supplied or existing is None
-                            else existing.capabilities_known
+                            model.capabilities_known
+                            if "capabilities_known" in model.model_fields_set
+                            else capabilities_supplied or bool(existing and existing.capabilities_known)
                         ),
                     )
                 )
@@ -792,6 +798,51 @@ async def get_report(exploration_id: str, request: Request) -> FileResponse:
     allowed = (request.app.state.settings.artifact_dir / exploration_id).resolve()
     if allowed not in path.parents or not path.is_file():
         raise HTTPException(status_code=404, detail="Report artifact was not found")
+    # Existing reports are immutable evidence. Render their updated presentation
+    # to a separate artifact, retaining original verdicts and the original HTML.
+    # No browser/model calls or historical data changes are needed.
+    marker = b'data-report-schema="ct-timeline-v1"'
+
+    def valid_presentation(candidate: Path) -> bool:
+        if not candidate.is_file() or allowed not in candidate.resolve().parents:
+            return False
+        with candidate.open("rb") as artifact:
+            if marker not in artifact.read(8192):
+                return False
+            artifact.seek(max(candidate.stat().st_size - 1024, 0))
+            return artifact.read().rstrip().endswith(b"</html>")
+
+    def current_report() -> Path:
+        if valid_presentation(path):
+            return path
+        from autojev.adapters.report import StandaloneHtmlReport
+
+        updated = allowed / "report-ct-timeline-v1.html"
+        presentation_modified = max(
+            path.stat().st_mtime,
+            Path(getfile(StandaloneHtmlReport)).stat().st_mtime,
+            Path(getfile(prepare_scenario_timelines)).stat().st_mtime,
+        )
+        if valid_presentation(updated) and updated.stat().st_mtime >= presentation_modified:
+            return updated
+
+        snapshot = _repository(request).get_exploration(exploration_id)
+        # A separate temporary artifact and atomic rename avoid serving a
+        # partially written HTML when two report requests arrive together.
+        with NamedTemporaryFile(dir=allowed, suffix=".html", delete=False) as temporary:
+            temporary_path = Path(temporary.name)
+        try:
+            StandaloneHtmlReport(request.app.state.settings.artifact_dir).generate(
+                snapshot, str(temporary_path)
+            )
+            temporary_path.replace(updated)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+        return updated
+
+    # Encoding many local captures should not block the exploration's async
+    # browser/CT pipeline while the user opens a historical report.
+    path = await run_in_threadpool(current_report)
     return FileResponse(path, media_type="text/html; charset=utf-8", filename="report.html")
 
 
