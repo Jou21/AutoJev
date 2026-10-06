@@ -14,11 +14,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from autojev.services.action_dispatch import is_stale_undispatched_action
 from autojev.services.technical_signals import (
     classify_signal,
     correlate_issues,
     signal_occurrence_id,
 )
+from autojev.services.verification_summary import NON_BUSINESS_CHECKS
 
 TIMELINE_VERSION = 1
 
@@ -178,7 +180,14 @@ def _verdict(scenario: dict[str, Any], *, historical: bool) -> dict[str, Any]:
             ),
             "historical": historical,
         }
-    if status == "FAIL" and evidence.get("action_succeeded") is False:
+    if status == "FAIL" and failed and all(a.get("kind") == "visual_model" for a in failed):
+        kind, label, explanation = (
+            "visual_failure", "Indício visual · revisão necessária",
+            ("A revisão das capturas encontrou uma divergência visual de alta confiança. "
+            "O CT foi reprovado por esse indício, não por um bug funcional confirmado; "
+            "consulte a imagem, a região indicada e a origem da expectativa."),
+        )
+    elif status == "FAIL" and evidence.get("action_succeeded") is False:
         kind, label, explanation = (
             "execution_failure",
             "Falha na execução da ação",
@@ -191,10 +200,29 @@ def _verdict(scenario: dict[str, Any], *, historical: bool) -> dict[str, Any]:
             "Uma condição esperada não foi observada. Consulte a verificação e as evidências.",
         )
     elif status == "PASS":
+        business_checks = any(
+            a.get("kind") and a.get("passed") is True
+            and a.get("kind") not in NON_BUSINESS_CHECKS
+            for a in evidence.get("assertions") or []
+        )
         kind, label, explanation = (
-            "validated",
-            "Verificações aprovadas",
-            "As verificações executadas passaram; isso não representa todas as regras de negócio.",
+            "validated" if business_checks else "interaction_only",
+            "Verificações aprovadas" if business_checks else "Interação técnica verificada",
+            "As verificações executadas passaram; isso não representa todas as regras de negócio."
+            if business_checks else "A interação alterou a tela sem novos erros atribuídos. "
+            "Não houve uma verificação específica do resultado de negócio neste CT.",
+        )
+    elif status == "BLOCKED" and any(a.get("kind") == "form_validation_probe_precondition" for a in failed):
+        kind, label, explanation = (
+            "not_validated", "Validação impedida por uma pré-condição",
+            "A tentativa foi executada, mas outro campo defeituoso impediu isolar ou atribuir o resultado esperado. "
+            "Consulte os campos bloqueadores e a resposta da aplicação na linha do tempo; não é uma aprovação.",
+        )
+    elif status == "BLOCKED" and (evidence.get("business_settle") or {}).get("status") == "api_wait_timed_out":
+        kind, label, explanation = (
+            "not_validated", "Resultado ainda pendente",
+            ("A ação foi executada, mas a API não terminou dentro da espera limitada. "
+            "Isso não comprova um defeito nem uma aprovação; as demais opções foram preservadas."),
         )
     else:
         kind, label, explanation = (
@@ -333,6 +361,39 @@ def prepare_scenario_timelines(exploration: dict[str, Any]) -> dict[str, Any]:
         evidence["verdict"] = _verdict(scenario, historical=not native_timeline)
 
     contexts: dict[str, dict[str, Any]] = {}
+    for action in actions:
+        result = action.get("result") or {}
+        if not is_stale_undispatched_action(result):
+            continue
+        step = action.get("step_number")
+        if step in owners_by_step:
+            continue  # A preserved historical CT already owns this attempt.
+        key = f"step-{step}"
+        entries = _action_entries(action, screenshots)
+        for entry in entries:
+            if entry.get("kind") == "action":
+                entry["title"] = "Automação · referência alterada antes da ação"
+                entry["message"] = (
+                    "Nenhum comando foi executado neste controle. A página foi observada "
+                    "novamente; a recuperação tem tentativa limitada. Não é um CT reprovado "
+                    "nem uma aprovação funcional."
+                )
+                entry["action_dispatch"] = dict(result["evidence"]["action_dispatch"])
+        contexts[key] = {
+            "id": "CTX-" + hashlib.sha256(key.encode()).hexdigest()[:10],
+            "title": f"Contexto de automação · referência atualizada · etapa {step}",
+            "description": "Tentativa não executada, preservada fora dos resultados dos CTs.",
+            "status": "INFO", "url": result.get("after_url") or data.get("app_url"),
+            "screenshots": [],
+            "evidence": {
+                "timeline": entries, "technical_signals": [],
+                "action_dispatch": dict(result["evidence"]["action_dispatch"]),
+                "verdict": {
+                    "kind": "context", "label": "Tentativa não executada",
+                    "explanation": "Referência obsoleta recusada antes do comando; não comprova defeito da aplicação.",
+                },
+            },
+        }
     for raw in correlate_issues(data.get("issues") or []):
         signal = classify_signal(raw, app_url)
         identity = str(signal.get("occurrence_id") or signal_occurrence_id(signal))

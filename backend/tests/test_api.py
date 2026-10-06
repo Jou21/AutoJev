@@ -29,6 +29,31 @@ def settings(tmp_path: Path) -> Settings:
     )
 
 
+def test_economical_mode_does_not_count_unrequested_visual_reviews_as_unavailable(tmp_path):
+    app = create_app(settings(tmp_path))
+    with TestClient(app) as client:
+        repository = app.state.repository
+        for mode in ("text", "visual"):
+            run_id = repository.create_exploration(ExplorationRequest(
+                app_url="https://example.test", agent=ModelSelection("local", "agent"),
+                auxiliary_llm=ModelSelection("local", "auxiliary"),
+                options=ExplorationOptions(auxiliary_evidence_mode=mode),
+            ))
+            repository.add_scenario(run_id, 1, StoredScenario(
+                id="CT001", title="Abrir carrinho", description="Evidência local",
+                preconditions=[], steps=["Clicar"], expected_result="Carrinho aberto",
+                actual_result="Carrinho aberto", status=ScenarioStatus.PASS,
+                url="https://example.test/cart", created_at="2026-10-04T12:00:00+00:00",
+                screenshots=[], evidence={},
+            ))
+            counts = client.get(f"/api/explorations/{run_id}").json()["visual_review_summary"]
+            assert counts["total"] == 1
+            assert counts["requested"] is (mode == "visual")
+            assert counts["unavailable"] == (1 if mode == "visual" else 0)
+            assert counts.get("not_requested", 0) == (1 if mode == "text" else 0)
+            assert not counts["assessed"] and not counts["rate_limited"]
+
+
 def test_legacy_report_is_presented_with_ct_timeline_without_rewriting_history(tmp_path):
     app = create_app(settings(tmp_path))
     with TestClient(app) as client:
@@ -87,6 +112,47 @@ def test_legacy_report_is_presented_with_ct_timeline_without_rewriting_history(t
         assert details["scenarios"][0]["evidence"]["technical_signals"][0]["affects_verdict"] is False
         assert details["scenarios"][0]["status"] == "FAIL"
         assert details["summary"]["total_scenarios"] == 1
+
+
+def test_current_timeline_report_refreshes_total_duration_without_changing_original_or_verdicts(tmp_path):
+    from autojev.adapters.report import StandaloneHtmlReport
+
+    app = create_app(settings(tmp_path))
+    with TestClient(app) as client:
+        repository = app.state.repository
+        exploration_id = repository.create_exploration(ExplorationRequest(
+            app_url="https://example.test", agent=ModelSelection("local", "agent"),
+            auxiliary_llm=ModelSelection("local", "auxiliary"),
+            options=ExplorationOptions(auxiliary_evidence_mode="visual"),
+        ))
+        scenario = StoredScenario(
+            id="CT001", title="Local assertion", description="Recorded evidence", preconditions=[],
+            steps=["Click"], expected_result="Visible", actual_result="Visible", status=ScenarioStatus.PASS,
+            url="https://example.test", created_at="2026-10-04T03:22:55+00:00", evidence={"visual_assessment": {
+                "requested": True, "status": "unavailable", "reason": "documentation_time_limit",
+            }},
+        )
+        repository.add_scenario(exploration_id, 1, scenario)
+        repository.update_exploration(exploration_id, status="completed",
+                                      started_at="2026-10-04T03:22:54+00:00", finished_at="2026-10-04T03:28:48+00:00")
+        directory = tmp_path / "artifacts" / exploration_id
+        original = directory / "report.html"
+        StandaloneHtmlReport(tmp_path / "artifacts").generate(repository.get_exploration(exploration_id), str(original))
+        original_document = original.read_text()
+        assert "00:05:54" in original_document
+        repository.update_exploration(exploration_id, finished_at="2026-10-04T03:38:50+00:00", report_path=str(original))
+        snapshot_before = repository.get_exploration(exploration_id)
+        response = client.get(f"/api/explorations/{exploration_id}/report")
+        assert response.status_code == 200
+        assert "00:15:56" in response.text and "00:05:54" not in response.text
+        assert "1 sem revisão antes do limite de espera das revisões auxiliares" in response.text
+        assert original.read_text() == original_document
+        assert repository.get_exploration(exploration_id) == snapshot_before
+        assert client.get(f"/api/explorations/{exploration_id}/report").text == response.text
+        details = client.get(f"/api/explorations/{exploration_id}").json()
+        assert details["duration_summary"]["total_seconds"] == 956
+        assert details["visual_review_summary"]["unavailable_reasons"][0]["reason"] == "documentation_time_limit"
+        assert details["scenarios"][0]["status"] == "PASS"
 
 
 def test_health_and_provider_crud_never_return_api_key(tmp_path):
@@ -600,6 +666,8 @@ def test_phase_payload_exposes_completed_with_restrictions():
         "frontier_candidates": None,
         "blocked_candidates": 7,
         "restorations_abandoned": 2,
+        "restrictions": [],
+        "unreachable_restorations": [],
     }
 
 
@@ -665,3 +733,70 @@ def test_browser_closed_is_exposed_as_the_cancellation_reason():
     assert payload["phase_label"] == "Exploração cancelada"
     assert payload["completion"]["type"] == "browser_closed"
     assert payload["completion"]["reason"] == "browser_closed"
+
+
+def test_queue_counters_survive_legacy_draft_events_and_explicit_zero():
+    result = {"status": "running", "steps_completed": 2, "options": {}, "scenarios": []}
+    measured = {"type": "scenario_enrichment_waiting_provider", "payload": {
+        "current": 1, "total": 7, "enriched": 1, "pending": 6,
+        "deferred": 2, "provider_requests": 3,
+    }}
+    draft = {"type": "scenario_draft_created", "payload": {"current": 1, "total": 8}}
+    queue = _phase_payload(result, [measured, draft])["postprocessing"]
+    assert queue["pending"] == 6
+    assert queue["deferred"] == 2
+    assert queue["requests"] == 3
+    done = {"type": "scenario_postprocessing_completed", "payload": {
+        "pending": 0, "deferred": 0, "provider_requests": 5,
+    }}
+    queue = _phase_payload(result, [measured, draft, done])["postprocessing"]
+    assert queue["pending"] == queue["deferred"] == 0
+    assert queue["requests"] == 5
+
+
+def test_cancelled_run_keeps_individual_restrictions_without_complete_event():
+    restriction = {"id": "r1", "reason": "no_safe_restore_route", "name": "Cancel"}
+    payload = _phase_payload(
+        {"status": "cancelled", "steps_completed": 2, "options": {}},
+        [
+            {"type": "coverage_restriction_recorded", "payload": restriction},
+            {"type": "coverage_restriction_recorded", "payload": restriction},
+            {"type": "cancelled", "payload": {}},
+        ],
+    )
+    assert payload["completion"]["restrictions"] == [restriction]
+
+
+def test_phase_payload_resolved_ledger_matches_active_count_without_rewriting_terminal_status():
+    recovered = {"id": "r1", "name": "Continue Shopping", "status": "resolved", "reason": "no_safe_restore_route",
+                 "resolution": {"source": "actual_semantic_move_execution", "action_step": 47,
+                     "occurred_at": "2026-10-04T12:00:00+00:00", "source_url": "https://shop.test/cart",
+                     "action": "click", "target": "e4", "screenshot": "047.png", "success": True,
+                     "assertions_passed": False}}
+    block = {"id": "r1", "name": "Continue Shopping", "reason": "no_safe_restore_route"}
+    masked = {"id": "r2", "name": "Continue", "reason": "required_field_validation_masked"}
+    payload = _phase_payload({"status": "completed", "steps_completed": 48, "options": {}}, [
+        {"type": "coverage_restriction_recorded", "payload": block},
+        {"type": "coverage_restriction_resolved", "payload": recovered},
+        {"type": "coverage_complete_with_restrictions", "payload": {"restrictions": [block, masked], "candidates_blocked": 2}},
+    ])
+    completion = payload["completion"]
+    assert completion["restrictions"] == [masked]
+    assert completion["blocked_candidates"] == 1
+    assert completion["resolved_restrictions"] == [recovered]
+    assert completion["resolved_restriction_count"] == 1
+    assert completion["type"] == "coverage_complete_with_restrictions"
+
+
+def test_phase_payload_explicit_resolution_snapshot_survives_history_without_event_list():
+    item = {"id": "r1", "status": "resolved", "resolution": {
+        "source": "actual_semantic_move_execution", "action_step": 3,
+        "occurred_at": "2026-10-04T12:00:00+00:00", "source_url": "https://shop.test/cart",
+        "action": "click", "success": True, "assertions_passed": True,
+    }}
+    payload = _phase_payload({"status": "completed", "options": {}, "completion_event": {
+        "type": "coverage_complete", "payload": {"restrictions": [], "resolved_restrictions": [item]},
+    }}, [])
+    assert payload["completion"]["restrictions"] == []
+    assert payload["completion"]["blocked_candidates"] == 0
+    assert payload["completion"]["resolved_restrictions"] == [item]

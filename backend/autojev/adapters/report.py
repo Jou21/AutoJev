@@ -11,10 +11,33 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from autojev.services.scenario_timeline import prepare_scenario_timelines
+from autojev.services.coverage_ledger import coverage_restriction_ledger
+from autojev.services.execution_summary import formatted_execution_duration, report_snapshot_key
+from autojev.services.visual_checks import visual_review_counts, visual_unavailability_label
+from autojev.services.verification_summary import verification_summary
 
 
 def _h(value: object) -> str:
     return html.escape(str(value or ""), quote=True)
+
+
+RESTRICTION_REASONS = {
+    "no_safe_restore_route": "Não foi encontrada uma rota segura para retomar este estado",
+    "restore_without_progress": "A retomada repetiu o estado sem progresso",
+    "replay_unavailable": "A sequência conhecida não pôde ser reproduzida",
+    "replay_without_progress": "A sequência reproduzida não recuperou o estado esperado",
+    "action_failed": "A ação não pôde ser executada",
+    "candidate_unavailable": "Controle indisponível neste estado",
+    "document_navigation_failed": "A navegação direta não carregou um documento válido",
+    "restore_step_limit": "A retomada atingiu o limite de segurança sem recuperar o estado",
+    "restore_attempt_limit": "As tentativas de retomar este estado foram esgotadas",
+    "backtrack_attempt_limit": "As tentativas de voltar a este estado foram esgotadas",
+    "policy_blocked": "A política de segurança não permitiu executar esta ação",
+    "action_retry_exhausted": "A ação continuou indisponível após as tentativas permitidas",
+    "form_validation_precondition_failed": "Não foi possível preparar os demais campos para isolar esta validação",
+    "required_field_validation_masked": "A tentativa foi executada, mas a resposta de outro campo impediu validar este campo obrigatório",
+    "form_probe_target_not_empty": "O campo continuou preenchido após as tentativas de limpeza; a validação de campo vazio não pôde ser isolada",
+}
 
 
 class StandaloneHtmlReport:
@@ -52,16 +75,111 @@ class StandaloneHtmlReport:
         return "".join(images) or '<p class="muted">Nenhuma captura associada.</p>'
 
     @staticmethod
+    def _timeline_entry_id(scenario: dict[str, Any], index: int) -> str:
+        identity = str(scenario.get("id") or "scenario").encode("utf-8").hex()
+        return f"timeline-{identity}-{index}"
+
+    def _action_anchor(self, step: Any, scenarios: list[dict[str, Any]]) -> str | None:
+        if not isinstance(step, int) or isinstance(step, bool) or step < 1:
+            return None
+        for scenario in scenarios:
+            for index, entry in enumerate((scenario.get("evidence") or {}).get("timeline") or []):
+                if (entry.get("kind") == "action"
+                        and entry.get("step_number", entry.get("action_step")) == step):
+                    return self._timeline_entry_id(scenario, index)
+        return None
+
+    def _restriction_dependency(
+        self, exploration_id: str, item: dict[str, Any], scenarios: list[dict[str, Any]],
+    ) -> str:
+        dependency = item.get("dependency")
+        if (not isinstance(dependency, dict)
+                or dependency.get("kind") != "failed_inverse_cart_toggle"
+                or dependency.get("source") != "actual_business_assertion"
+                or not dependency.get("failed_assertion_kinds")):
+            return ""
+        step = dependency.get("action_step")
+        anchor = self._action_anchor(step, scenarios)
+        step_note = (
+            f'<a href="#{anchor}">Ver falha anterior da etapa {_h(step)} na linha do tempo</a>'
+            if anchor else f'Etapa {_h(step)} · ação anterior registrada' if step is not None else
+            'Ação anterior registrada sem número de etapa'
+        )
+        screenshot = str(dependency.get("screenshot") or "")
+        image = self._image_data(exploration_id, screenshot) if screenshot else None
+        return (
+            '<div class="coverage-dependency"><p><strong>Dependência que impediu esta validação</strong></p>'
+            '<p>A remoção anterior deste item falhou em uma verificação de negócio. '
+            'Isso impediu recuperar o estado necessário para testar sua adição; '
+            'a restrição permanece aberta e não conta como aprovação.</p>'
+            + '<p>' + step_note + ' · ' + _h(dependency.get("action") or "ação")
+            + ' · Controle: ' + _h(dependency.get("name") or "Remove") + '</p>'
+            + '<p>Verificações que reprovaram: ' + _h(
+                ", ".join(str(kind) for kind in dependency["failed_assertion_kinds"])) + '</p>'
+            + '<div class="url">' + _h(self._public_issue_url(dependency.get("source_url"))) + '</div>'
+            + ('<div class="shots">' + self._screenshots(exploration_id, [screenshot]) + '</div>'
+               + f'<a href="{image}" download="{_h(Path(screenshot).name)}">Baixar captura da ação bloqueadora</a>'
+               if image else '')
+            + '</div>'
+        )
+
+    def _restriction_card(
+        self, exploration_id: str, item: dict[str, Any], scenarios: list[dict[str, Any]],
+    ) -> str:
+        probe = item.get("validation_probe") or {}
+        field_name = item.get("field_name") or probe.get("name")
+        title = (str(field_name) + " · " if field_name else "") + str(
+            item.get("name") or item.get("target") or "Controle sem nome"
+        )
+        blocking_fields = probe.get("blocking_fields") or []
+        return (
+            '<article class="context-note"><strong>' + _h(title) + '</strong><p>'
+            + _h(RESTRICTION_REASONS.get(item.get("reason"), item.get("reason") or "Motivo não informado"))
+            + '</p>'
+            + ('<p>Campos que impediram a preparação: ' + _h(
+                ", ".join(str(field.get("name") or "Campo sem nome") for field in blocking_fields
+                          if isinstance(field, dict))) + '</p>' if blocking_fields else '')
+            + '<div class="url">' + _h(self._public_issue_url(item.get("source_url") or item.get("target_url")))
+            + '</div><small>' + _h(item.get("action") or "ação") + '</small>'
+            + ('<div class="url">Estado a retomar: ' + _h(self._public_issue_url(item["target_url"])) + '</div>'
+               if item.get("target_url") and item.get("target_url") != item.get("source_url") else '')
+            + self._restriction_dependency(exploration_id, item, scenarios)
+            + '</article>'
+        )
+
+    def _resolution_card(
+        self, exploration_id: str, item: dict[str, Any], scenarios: list[dict[str, Any]],
+    ) -> str:
+        resolution = item["resolution"]
+        step = resolution["action_step"]
+        anchor = self._action_anchor(step, scenarios)
+        screenshot = str(resolution.get("screenshot") or "")
+        image = self._image_data(exploration_id, screenshot) if screenshot else None
+        result_note = (
+            "Uma verificação reprovou; consulte o resultado do CT. A cobertura foi exercitada, não aprovada."
+            if resolution.get("assertions_passed") is False else
+            "A ação foi executada; o resultado do CT permanece preservado."
+        )
+        return (
+            '<article class="context-note coverage-resolution"><strong>'
+            + _h(item.get("field_name") or item.get("name") or item.get("target") or "Controle sem nome")
+            + '</strong><p>Restrição de retomada resolvida com execução observada.</p>'
+            + '<p>Motivo original: ' + _h(RESTRICTION_REASONS.get(item.get("reason"), item.get("reason") or "Motivo não informado")) + '</p>'
+            + '<p>' + _h(result_note) + '</p>'
+            + '<p>' + (f'<a href="#{anchor}">Ver ação da etapa {_h(step)} na linha do tempo</a>'
+                       if anchor else f'Etapa {_h(step)} · ação registrada')
+            + ' · ' + _h(resolution.get("action")) + ' · Alvo: ' + _h(resolution.get("target")) + '</p>'
+            + '<time datetime="' + _h(resolution.get("occurred_at")) + '">' + _h(resolution.get("occurred_at")) + '</time>'
+            + '<div class="url">' + _h(self._public_issue_url(resolution.get("source_url"))) + '</div>'
+            + ('<div class="shots">' + self._screenshots(exploration_id, [screenshot]) + '</div>'
+               + f'<a href="{image}" download="{_h(Path(screenshot).name)}">Baixar captura da recuperação</a>'
+               if image else '<p class="muted">Captura da recuperação indisponível neste relatório.</p>')
+            + '</article>'
+        )
+
+    @staticmethod
     def _duration(exploration: dict[str, Any]) -> str:
-        try:
-            started = datetime.fromisoformat(str(exploration["started_at"]))
-            finished = datetime.fromisoformat(str(exploration["finished_at"]))
-            seconds = max(int((finished - started).total_seconds()), 0)
-            minutes, seconds = divmod(seconds, 60)
-            hours, minutes = divmod(minutes, 60)
-            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-        except (KeyError, TypeError, ValueError):
-            return "—"
+        return formatted_execution_duration(exploration)
 
     @staticmethod
     def _usage(exploration: dict[str, Any]) -> tuple[str, str]:
@@ -300,11 +418,13 @@ class StandaloneHtmlReport:
     def _assertion_detail(assertion: dict[str, Any]) -> str:
         kind = str(assertion.get("kind") or "Verificação observada")
         technical = kind in {"no_new_browser_errors", "no_new_application_errors"}
-        label = "Verificação técnica" if technical else "Verificação observada"
+        visual = kind == "visual_model"
+        label = "Indício visual da LLM" if visual else "Verificação técnica" if technical else "Verificação observada"
         note = (
             "Erros de console/rede não demonstram, isoladamente, um defeito "
             "funcional. O resultado desta verificação foi preservado."
-            if technical
+            if technical else "Reprovação baseada na imagem, não em um bug funcional confirmado. "
+            "Confira a captura e a região; a confiança é declarada pelo modelo." if visual
             else "A aprovação se aplica a esta verificação, não a toda a "
             "funcionalidade ou aplicação."
         )
@@ -410,7 +530,7 @@ class StandaloneHtmlReport:
             "assertion": "Verificação",
             "signal": "Sinal técnico",
         }
-        for entry in entries:
+        for index, entry in enumerate(entries):
             kind = str(entry.get("kind") or "observation")
             if kind not in labels:
                 kind = "observation"
@@ -427,7 +547,7 @@ class StandaloneHtmlReport:
                 f'{f" · Alvo: {_h(entry.get('target'))}" if entry.get("target") else ""}</p>'
             ) if step is not None or entry.get("target") else ""
             rendered.append(
-                f'<li class="timeline-entry {kind}"><div class="timeline-marker" aria-hidden="true"></div>'
+                f'<li id="{self._timeline_entry_id(scenario, index)}" class="timeline-entry {kind}"><div class="timeline-marker" aria-hidden="true"></div>'
                 '<div class="timeline-content"><div class="event-meta">'
                 f'<span class="event-kind">{labels[kind]}</span>'
                 f'<time datetime="{_h(timestamp)}">{_h(self._timeline_time(timestamp))}</time></div>'
@@ -457,6 +577,8 @@ class StandaloneHtmlReport:
         technical_failure = isinstance(verdict, dict) and verdict.get("kind") == "technical_failure"
         if status == "FAIL" and technical_failure:
             visible_status = "FAIL · VERIFICAÇÃO TÉCNICA"
+        elif status == "FAIL" and verdict.get("kind") == "visual_failure":
+            visible_status = "FAIL · INDÍCIO VISUAL"
         badge_class = "blocked" if technical_failure else status.lower()
         verdict_detail = (
             f'<div class="verdict-note"><strong>{_h(verdict.get("label"))}</strong>'
@@ -475,17 +597,90 @@ class StandaloneHtmlReport:
             <details class="case-documentation"><summary>Descrição e passos do caso</summary>
             <div class="columns"><section><h3>Pré-condições</h3><ul>{preconditions}</ul></section><section><h3>Passos</h3><ol>{steps}</ol></section></div>
             <div class="result"><section><h3>Esperado</h3><p>{_h(scenario.get("expected_result"))}</p></section><section><h3>Obtido</h3><p>{_h(scenario.get("actual_result"))}</p></section></div></details>"""
+        visual_detail = ""
+        visual_meta = ""
+        visual = evidence.get("visual_assessment") or {}
+        if not context and visual.get("requested"):
+            visual_meta = " · visual: " + ("analisado" if visual.get("status") == "assessed" else "em análise" if visual.get("status") == "pending" else "indisponível")
+            if visual.get("status") == "assessed":
+                text = (f"{visual.get('accepted_count', 0)} indício(s) visual(is) · revisão necessária"
+                        if visual.get("accepted_count") else "Capturas analisadas · nenhum indício visual aceito")
+                note = "A confiança é declarada pelo modelo. Não há aprovação visual completa nem bug funcional confirmado apenas pela imagem."
+            elif visual.get("status") == "pending":
+                text, note = "Análise visual em andamento", "O resultado visual ainda não foi concluído."
+            else:
+                text = "Análise visual indisponível · CT baseado nas verificações locais"
+                reason = str(visual.get("reason") or "")
+                note = (
+                    "O provedor limitou as chamadas; as verificações locais foram preservadas."
+                    if reason.startswith("auxiliary_rate_limit") else
+                    "O orçamento de chamadas auxiliares desta execução foi esgotado."
+                    if reason == "auxiliary_request_budget_exhausted" else
+                    "O modelo não devolveu uma análise visual no formato obrigatório. A documentação recebida não é uma validação visual."
+                    if reason in {"visual_assessment_not_returned", "visual_assessment_schema_invalid"} else
+                    visual_unavailability_label(reason).capitalize() + ". As verificações locais foram preservadas."
+                )
+            visual_detail = f'<div class="context-note"><strong>{_h(text)}</strong><p>{_h(note)}</p></div>'
         return f"""<details class="scenario{' scenario-context' if context else ''}" data-status="{status}">
-          <summary><div><span class="case-id">{_h(case_label)}</span><h2>{_h(scenario.get("title"))}</h2><span class="case-meta">{signal_count} sinal(is) técnico(s) · clique para ver a linha do tempo</span></div><span class="badge {badge_class}">{visible_status}</span></summary>
+          <summary><div><span class="case-id">{_h(case_label)}</span><h2>{_h(scenario.get("title"))}</h2><span class="case-meta">{signal_count} sinal(is) técnico(s){visual_meta} · clique para ver a linha do tempo</span></div><span class="badge {badge_class}">{visible_status}</span></summary>
           <div class="scenario-body">{description}<p>{_h(scenario.get("description"))}</p>
           <div class="url">{_h(self._public_issue_url(scenario.get("url")))}</div>
-          {verdict_detail}{details}<h3 class="timeline-heading">Linha do tempo · ações e evidências</h3>
+          {verdict_detail}{visual_detail}{details}<h3 class="timeline-heading">Linha do tempo · ações e evidências</h3>
           {self._timeline(exploration_id, scenario)}</div></details>"""
 
     def generate(self, exploration: dict[str, Any], output_path: str) -> str:
         exploration = prepare_scenario_timelines(exploration)
         exploration_id = str(exploration["id"])
         scenarios = exploration.get("scenarios", [])
+        strength = verification_summary(scenarios)
+        strength_summary = (
+            '<section class="completion" aria-label="Força das verificações"><strong>O que foi realmente verificado</strong>'
+            f'<p>{strength["business_verified"]} PASS com asserção de negócio · '
+            f'{strength["interaction_only"]} PASS apenas de interação técnica.</p>'
+            f'<p>{strength["business_failures"]} falha(s) de asserção de negócio · '
+            f'{strength["execution_failures"]} falha(s) na execução da automação · '
+            f'{strength["technical_failures"]} falha(s) técnica(s) · '
+            f'{strength["visual_findings"]} indício(s) visual(is) a revisar · '
+            f'{strength["interaction_failures"]} interação(ões) sem resultado esperado.</p>'
+            '<p class="muted">Processamento concluído não significa todos os cenários possíveis. '
+            'PASS apenas de interação não valida o resultado de negócio. O escopo depende do usuário, '
+            'dos estados alcançados, dos valores de entrada e do viewport.</p></section>'
+        )
+        coverage = (exploration.get("completion") or {})
+        blocked_count = int(coverage.get("blocked_candidates") or 0)
+        for event in reversed(exploration.get("events") or []):
+            if str(event.get("type") or "").startswith("coverage_complete"):
+                coverage = {**coverage, **(event.get("payload") or {})}
+                blocked_count = int(coverage.get("candidates_blocked") or coverage.get("blocked_candidates") or blocked_count)
+                break
+        ledger = coverage_restriction_ledger(coverage, exploration.get("events"))
+        restrictions = ledger["restrictions"]
+        if ledger["has_individual_records"]:
+            blocked_count = ledger["restriction_count"]
+        restriction_cards = "".join(
+            self._restriction_card(exploration_id, item, scenarios) for item in restrictions
+        )
+        restriction_note = (
+            f'Execução histórica: {blocked_count} controles bloqueados sem detalhes individuais. '
+            'Não é possível reconstruir seus motivos com segurança.'
+            if blocked_count and not restriction_cards else
+            'Nenhuma restrição individual registrada. Isso não garante cobertura de todas as combinações e perfis.'
+        )
+        coverage_summary = (
+            '<details class="completion"><summary><strong>Cobertura e restrições · '
+            f'{len(restrictions)} registros</strong></summary>'
+            '<p>São lacunas de cobertura, não testes aprovados nem bugs confirmados.</p>'
+            + (restriction_cards or '<p class="muted">' + restriction_note + '</p>') + '</details>'
+        )
+        if ledger["resolved_restrictions"]:
+            coverage_summary += (
+                '<details class="completion coverage-recovered"><summary><strong>Restrições resolvidas com evidência · '
+                + str(ledger["resolved_restriction_count"]) + ' registros</strong></summary>'
+                '<p>Impedimentos temporários de retomada foram superados por ações realmente executadas. '
+                'Este histórico não aprova o CT nem altera falhas registradas.</p>'
+                + "".join(self._resolution_card(exploration_id, item, scenarios)
+                          for item in ledger["resolved_restrictions"]) + '</details>'
+            )
         summary = exploration.get("summary", {})
         focus_area = str(
             (exploration.get("options") or {}).get("focus_area") or ""
@@ -500,6 +695,23 @@ class StandaloneHtmlReport:
             if evidence_mode == "visual"
             else "Econômico · somente texto"
         )
+        visual_summary = ""
+        if evidence_mode == "visual":
+            visual_counts = visual_review_counts(scenarios)
+            title = ("Análise visual em andamento" if visual_counts["pending"]
+                     else "Análise visual não realizada" if not visual_counts["assessed"]
+                     else "Análise visual parcial" if visual_counts["unavailable"] else "Capturas analisadas")
+            visual_summary = (
+                f'<section class="completion visual-review-summary" aria-label="Resultado da análise visual"><strong>{title}</strong>'
+                f'<p>{visual_counts["assessed"]} de {visual_counts["total"]} CTs receberam uma análise visual válida · '
+                f'{visual_counts["pending"]} em análise · {visual_counts["unavailable"]} indisponíveis.</p>'
+                + "".join(
+                    f'<p>{item["count"]} {_h(item["label"])}. <small>Código: {_h(item["reason"])}</small></p>'
+                    for item in visual_counts["unavailable_reasons"]
+                ) +
+                '<p class="muted">PASS/FAIL das verificações locais continua válido. Análise visual indisponível não significa aprovação visual; '
+                'ausência de indícios não garante cobertura visual completa.</p></section>'
+            )
         tokens, cost = self._usage(exploration)
         completion_status, completion_reason = self._completion(exploration)
         cards = [self._scenario_card(exploration_id, scenario) for scenario in scenarios]
@@ -510,7 +722,7 @@ class StandaloneHtmlReport:
         generated = datetime.now().astimezone().strftime("%d/%m/%Y %H:%M:%S %Z")
         safe_filter_data = json.dumps(["ALL", "PASS", "FAIL", "BLOCKED", "SKIPPED", "INFO"])
         document = f"""<!doctype html>
-<html lang="pt-BR" data-report-schema="ct-timeline-v1"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="pt-BR" data-report-schema="ct-timeline-v1" data-report-summary="execution-v2" data-coverage-ledger="execution-evidence-v1" data-report-snapshot="{report_snapshot_key(exploration)}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AutoJev — Exploratory Test Report</title>
 <style>
 :root{{--bg:#0b0e14;--panel:#141923;--line:#293142;--text:#edf1f7;--muted:#9ca8ba;--accent:#f0b44d;--pass:#3ddc97;--fail:#ff647c;--blocked:#ffa657;--skipped:#8b98aa;--info:#83bffc}}
@@ -525,15 +737,18 @@ class StandaloneHtmlReport:
 @media(max-width:720px){{main{{padding:28px 14px}}h1{{font-size:30px}}.summary{{grid-template-columns:1fr 1fr}}.meta,.columns,.result{{grid-template-columns:1fr}}.scenario{{padding:14px}}.scenario h2{{font-size:18px}}.scenario>summary{{gap:10px}}.timeline-entry{{gap:10px}}.timeline-content{{padding:12px}}.search{{min-width:0;width:100%;flex-basis:100%}}}}@media(prefers-reduced-motion:reduce){{*{{scroll-behavior:auto}}}}
 </style></head><body data-report-schema="ct-timeline-v1"><main>
 <div class="eyebrow">AutoJev</div><h1>Exploratory Test Report</h1><p class="muted">Relatório autônomo com evidências observadas pelo Playwright.</p>
-<div class="meta"><div><strong>Aplicação</strong><div class="url">{_h(exploration.get("app_url"))}</div></div><div><strong>Escopo</strong><div>{_h(scope)}</div></div><div><strong>Evidência da LLM</strong><div>{_h(evidence_mode_label)}</div></div><div><strong>Status</strong><div>{_h(completion_status)}</div></div><div><strong>Duração</strong><div>{_h(self._duration(exploration))}</div></div><div><strong>Gerado em</strong><div>{_h(generated)}</div></div></div>
+<div class="meta"><div><strong>Aplicação</strong><div class="url">{_h(exploration.get("app_url"))}</div></div><div><strong>Escopo</strong><div>{_h(scope)}</div></div><div><strong>Evidência da LLM</strong><div>{_h(evidence_mode_label)}</div></div><div><strong>Status</strong><div>{_h(completion_status)}</div></div><div><strong>Duração total</strong><div>{_h(self._duration(exploration))}</div><small>Inclui revisões auxiliares e geração do relatório.</small></div><div><strong>Gerado em</strong><div>{_h(generated)}</div></div></div>
 {f'<div class="completion"><strong>Motivo do encerramento:</strong>{_h(completion_reason)}</div>' if completion_reason else ''}
 <section class="summary"><div class="metric"><strong>{int(summary.get("total_scenarios", 0))}</strong>Total</div><div class="metric"><strong>{int(summary.get("pass", 0))}</strong>PASS</div><div class="metric"><strong>{int(summary.get("fail", 0))}</strong>FAIL</div><div class="metric"><strong>{int(summary.get("blocked", 0))}</strong>BLOCKED</div><div class="metric"><strong>{int(summary.get("skipped", 0))}</strong>Sem validação</div><div class="metric"><strong>{_h(tokens)}</strong>Tokens</div><div class="metric"><strong>{_h(cost)}</strong>Custo</div></section>
+{visual_summary}
+{strength_summary}{coverage_summary}
 <div class="reading-guide"><strong>Cada caso conta sua história.</strong> Abra um CT para ver ações, capturas, verificações e sinais técnicos no momento em que foram registrados. Um sinal de console/rede não é automaticamente um defeito funcional. Registros sem vínculo confiável ficam em cartões de contexto, sem contar como CTs.</div>
 <div class="report-tools"><input class="search" id="search" type="search" placeholder="Buscar por CT, URL, sinal ou evidência" aria-label="Buscar cenários"><div class="filters" id="filters"></div></div><section id="scenarios">{"".join(cards) or '<p class="muted">Nenhum cenário gerado.</p>'}</section>
 </main><script>
 const statuses={safe_filter_data};const root=document.getElementById('filters');const search=document.getElementById('search');let active='ALL';
 function apply(){{const term=search.value.trim().toLowerCase();document.querySelectorAll('.scenario').forEach(x=>{{x.hidden=(active!=='ALL'&&x.dataset.status!==active)||(term&&!x.textContent.toLowerCase().includes(term))}})}}
 for(const status of statuses){{const b=document.createElement('button');b.textContent=status==='SKIPPED'?'SEM VALIDAÇÃO':status==='INFO'?'CONTEXTO':status==='ALL'?'TODOS':status;b.className=status==='ALL'?'active':'';b.onclick=()=>{{active=status;document.querySelectorAll('#filters button').forEach(x=>x.classList.remove('active'));b.classList.add('active');apply()}};root.appendChild(b)}}search.addEventListener('input',apply);
+document.querySelectorAll('.coverage-resolution a[href^="#"],.coverage-dependency a[href^="#"]').forEach(link=>link.addEventListener('click',()=>{{const target=document.getElementById(link.hash.slice(1));if(!target)return;let parent=target.parentElement;while(parent){{if(parent.tagName==='DETAILS')parent.open=true;parent=parent.parentElement}}}}));
 </script></body></html>"""
         output = Path(output_path)
         output.parent.mkdir(parents=True, exist_ok=True)

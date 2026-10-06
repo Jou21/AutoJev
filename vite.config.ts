@@ -45,6 +45,9 @@ export default defineConfig(async () => {
 
   return {
     server: {
+      // Keep browser errors local. Forwarding a rejection over a disconnected
+      // HMR socket can itself reject and recursively flood the error overlay.
+      forwardConsole: false,
       watch: {
         ignored: [
           "**/backend/.venv/**",

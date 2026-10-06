@@ -38,7 +38,7 @@ FastAPI API -> ExplorationManager -> JEV adapter -> JSON AgentDecision
 ```
 
 - `domain/` contains models and ports without FastAPI or Playwright dependencies.
-- `adapters/openai_compatible.py` implements OpenAI-compatible model discovery, connectivity checks, schema-validated JEV JSON decisions and auxiliary documentation. The auxiliary model receives compact redacted text/DOM by default; visual mode additionally attaches a masked screenshot, with a text fallback only after an explicit vision-capability rejection.
+- `adapters/openai_compatible.py` implements OpenAI-compatible model discovery, connectivity checks, schema-validated JEV JSON decisions and auxiliary documentation. Text mode receives compact redacted text/DOM. In visual mode the CT description and executed checks are documented locally; the model receives text plus masked captures and returns only grounded visual findings, without rewriting the CT. Missing captures or explicitly unsupported vision are marked unavailable without a redundant text-only request.
 - `adapters/playwright_executor.py` is the only browser executor. Element targets are observation refs such as `e4`, not model-supplied selectors or JavaScript.
 - `services/coverage.py` owns route/state identity, semantic control memory,
   the atomic pending frontier, selector-free DOM-state replay and verified
@@ -116,6 +116,16 @@ Example exploration:
 
 Credential aliases—not their values—are shown to JEV. The executor resolves the alias in memory. Credentials are discarded at the end, redacted from actions/errors, and never inserted into SQLite. Inputs filled from credentials are masked in subsequent screenshots.
 
+Supplying both `username` and `password` enables one deterministic automatic
+login attempt by Playwright, independent of whether the UI credentials section
+is expanded. Only an unambiguous same-origin login form is accepted; no LLM is
+called for authentication. Password whitespace is preserved. Rejection,
+CAPTCHA/MFA, unsafe requests, changed fields or ambiguous forms fall back to
+manual intervention, with no automatic resubmission during the run. The first
+confirmed authenticated page becomes the coverage/history root. Omit both
+values for manual login; other credential aliases remain available to the
+executor but are never guessed as login credentials.
+
 `focus_area` is optional. Without it, the planner covers every safe reachable
 same-origin branch it can discover. With it, navigation may traverse the menus
 needed to reach the requested screen, then the selected route becomes the
@@ -134,7 +144,136 @@ invalid/rejected model responses use a separate bounded planning budget.
 `auxiliary_evidence_mode` accepts `text` (default/economical) or `visual`.
 Screenshots are still captured and retained locally when
 `capture_screenshots=true` in either mode; the option controls only whether a
-masked low-detail image is attached to the auxiliary-model request.
+masked low-detail image is attached to the auxiliary-model request. Model-only
+previews are JPEGs (quality 75), aspect-preserving and at most 768 pixels on the
+long edge; the original screenshots in the CT timeline are not rewritten.
+Auxiliary documentation is bounded to 3,072 output tokens. Optional OpenRouter
+reasoning is disabled only when declared supported; mandatory reasoning uses
+the lowest declared effort. JEV planning requests keep their separate policy.
+
+Visual mode requests **only** a compact structured visual assessment; CT
+wording and executed expectations/results come from local browser evidence,
+not a model rewrite. Documentation and visual review have separate provenance.
+Only an accepted review counts as visual enrichment; malformed/missing replies
+remain unavailable even when the provider returned JSON successfully.
+When available, masked before/after captures are
+sent at low detail. Accepted findings carry a screenshot, normalized region,
+visible identity/expectation, category and model-declared confidence (minimum
+0.90). AutoJev admits only grounded negative findings from the after image; the
+model cannot assign a status or erase a local business failure. A visual-only
+failure is labelled **FAIL · INDÍCIO VISUAL / revisão necessária**, not a
+confirmed functional defect. No design baseline is supplied: an empty findings
+list is not a blanket visual PASS. Missing images, invalid assessments,
+timeouts and provider limits are exposed per CT as analysis unavailable, with a
+prominent reviewed/pending/unavailable summary in the dashboard and new reports.
+An unavailable after capture prevents sending a before-only image payload or
+making a redundant text-only request; the before capture remains in the local
+CT timeline for context. Exact-cache and no-request paths do not add artificial
+free-model pacing. Actual review latency and HTTP-attempt count are recorded
+separately from the run's cumulative request count.
+The visual prompt uses one complete response contract. For OpenRouter models
+declaring `structured_outputs` in the public catalog, the same request uses a
+strict JSON Schema and routes only to endpoints supporting its parameters. The
+public capability lookup is cached per client/run; no model names are used to
+guess support and no additional inference is used to repair omitted fields.
+Other compatible providers retain the explicit prompt contract and local
+validation. Malformed findings are unavailable, not a successful empty review;
+sent screenshot references remain preserved even when review is unavailable.
+Findings attributed to the AutoJev panel are rejected locally, not merely by
+the model prompt. Application-owned overlays remain eligible for review.
+Text mode never attaches images or admits visual-model assertions.
+HTTP 429 honors `Retry-After` (60-second fallback); local CTs continue without
+provider calls during it. Authentication rejection stops auxiliary calls for
+the run; explicit vision incompatibility is remembered after its first rejected
+request, with no text retry and no repeated unusable vision calls.
+Only an explicit JSON-format rejection permits one format compatibility retry;
+strict schema, generic request, auth, timeout and rate-limit errors do not
+trigger silent format downgrades or a request burst.
+
+The local frontend disables recursive browser-error forwarding over HMR.
+Screenshot loading errors have a clear placeholder and manual retry, separate
+from the exploration result; retry does not call the model or change history.
+
+## Result-based checks and form recovery
+
+`services/business_checks.py` checks observable semantic before/after facts:
+field value retention and other-field preservation, selected option and actual
+product sort order, selected product identity/price in the detail, cart count,
+membership/control transitions and declared required-form validation/progress.
+Missing semantics do not manufacture a business PASS. Generic state deltas
+remain explicitly labelled technical interactions when no specific oracle is
+available. Field comparisons use per-run HMACs; private values/credentials are
+not saved in these semantic facts or sent to the auxiliary model.
+Removal is permitted only for a semantically recognized product's reversible
+cart control with the exact Remove/Remove from cart label (or Portuguese
+equivalent). The executor rechecks the live DOM; account/data deletion,
+payments and other transactional actions stay blocked by the existing policy.
+
+The coverage planner completes safe fields and submits before header/navigation
+links, uses distinct synthetic field values, and resolves restoration moves in
+the fresh DOM. A different live cart/menu variant is not automatically marked
+covered. Blank previously exercised fields may be refilled once as setup for
+an untried submit. A verified failed business outcome is still an exercised
+candidate, so it is recorded as FAIL and exploration continues without buying
+the same diagnosis repeatedly. Limits, blocked actions and unavailable returns
+remain honest coverage restrictions, not approved tests.
+
+Required-field negatives run before a departing happy-path submit once the
+ordinary non-secret fields have been exercised. Preparation retries are bounded
+per target and peer. Broken input behavior does not blanket-block other fields:
+each target receives an actual submission when preparation permits. A response
+attributable only to a broken peer leaves that target BLOCKED, with the observed
+dependency, instead of guessing its rule. Probe titles/results stay grounded in
+the attempted target even when an auxiliary model summarizes another error.
+Planner-owned probes/replays do not consume the separate repeated-JEV-action
+budget. Authentication forms remain excluded from these synthetic negatives.
+
+An explicitly harmless button inside visible form-owned validation feedback is
+tested while it exists, before a later submission removes it. Its checks verify
+that the message closes and observed field tokens stay unchanged. A matching
+label outside this DOM-owned error, a reset/submit, or an order cancellation
+does not receive that priority or permission.
+
+Restoration prefers fresh observed same-origin navigation or learned safe
+semantic paths. Exhausted logical parents are skipped without navigating the
+browser back through covered screens. Restriction records are immutable history
+events: a later successful execution of the exact same semantic move on the
+same route may resolve temporary restoration debt, with its step and capture.
+Merely reaching the route, matching a label, or running a different product's
+control cannot resolve it. API/UI/offline reports distinguish active gaps from
+explicit recovered history; a business FAIL still stays FAIL. Failed inverse
+cart toggles can explain missing setup without resetting application data or
+bypassing the site. This finite observed frontier is not proof of every possible
+input, user profile, or combination of application states.
+Route shortcuts never skip a known same-route business prerequisite (for
+example, adding the expected item before entering its cart). Replay selects a
+shorter learned safe path only if its first semantic move exists in the current
+DOM; reaching a URL still does not approve a scenario. Unique observed DOM
+markers stabilize existing controls across sibling text changes, while entity
+owners and ambiguous-marker fallbacks keep distinct product/row actions separate.
+
+Placeholder JavaScript links (`href="#"`) are replayed only after their actual
+same-origin destination has been observed; their labels never invent a URL.
+A known checkout continuation may be used as a route prerequisite only after
+native `form_progress` passed and planner-generated field setup is available.
+Fresh blank fields are filled before Continue, without replaying credentials.
+Cancel is exercised in both the information form and the order review, for
+empty and populated carts. Review cancellation may return to the catalog;
+selection/count are checked there, and contents/prices are checked when the
+actual cart is subsequently opened. A drawer already open on a newly reached
+route can be closed as bounded local setup for its still-untested opener; the
+setup itself never approves that opener or its remaining work.
+
+Offline regressions in `tests/test_business_checks.py` reproduce the observable
+mutations in the official [Sauce Labs sample app](https://github.com/saucelabs/sample-app-web):
+no-op add/remove and wrong product links (`InventoryListItem.jsx`), ineffective
+sorting (`Inventory.jsx`), and overwritten/cleared Last Name (`CheckOutStepOne.jsx`).
+Real headless Chromium fixtures verify the complete standard checkout versus
+these failure variants, including a usable SPA document returned with HTTP 404.
+`tests/test_visual_checks.py` validates visual evidence admission, status merge,
+timeline/report output and provider cooldown with fixture responses, without
+paid calls. These fixtures do not claim to evaluate a real vision model's
+accuracy or to retrospectively rerun stored explorations.
 
 Before every paid JEV request, the orchestrator applies an explicit invocation
 policy. Clear atomic controls, conventional forms, known navigation and graph
@@ -147,13 +286,16 @@ Playwright and do not need a model merely to confirm that they occurred.
 
 - `PASS`: the Playwright action succeeded, at least one verifiable assertion
   exists, and every assertion passed. An observable URL/DOM/control-state delta
-  can supply deterministic evidence.
+  can supply basic interaction evidence, but is not a business outcome check.
 - `FAIL`: ordinary execution failed or a supported assertion failed. An
   attributable same-origin HTTP/network failure or page exception can fail the
   technical-health check, even if the screen changes. This is distinguished
   from a confirmed functional defect. External telemetry, isolated cancelled
   requests and signals outside the action window do not independently fail a CT.
-- `BLOCKED`: an executor policy or unavailable control prevented execution.
+- `BLOCKED`: an executor policy/unavailable control prevented execution, or the
+  action was dispatched but its API result remained pending beyond a bounded
+  settling window. A pending API outcome is neither a verified PASS nor a
+  proven business failure.
 - A successful action without verifiable evidence is logged as a no-op and is
   omitted from the CT inventory. `SKIPPED` remains readable for historical or
   imported scenarios and is presented as **Sem validação**, never as `PASS`.
@@ -170,6 +312,18 @@ endpoint renders their new presentation to a separate atomic cache artifact.
 Only new, relevant signatures enter model prompts; repeated occurrences remain
 fully available in local evidence.
 
+For asynchronous actions, the executor waits up to five seconds for same-origin
+XHR/fetch requests started by that action, then a short stable DOM window.
+Pre-existing requests and third-party telemetry are not a global network-idle
+gate. A still-pending result is explicitly unavailable, without replaying the
+click or asking a model to guess its business outcome.
+
+`tests/test_exploration_integration.py` runs the complete explorer with real
+Chromium and isolated SQLite/artifacts in both evidence modes. In-process HTTP
+fixtures and fake model clients verify that business failures are preserved,
+other flows continue, and CT documentation runs beside browser work. No user
+provider credentials, production history or credits are used.
+
 Exploration lifecycle status is separate from scenario status. `completed`
 means the discovered frontier and return stack were exhausted. `partial` means
 a time/action/planning bound was reached, the requested focus could not be
@@ -178,8 +332,11 @@ a live, cancelable phase after browser work that drains only any remaining
 auxiliary queue and generates the report; only then is the terminal status
 published. A backend restart marks `queued`, `running`, `waiting_input` and
 `postprocessing` runs as failed rather than leaving them orphaned. Visible-browser
-screenshots capture only the viewport and mask the AutoJev overlay without
-toggling it, avoiding full-page scroll oscillation.
+screenshots capture only the viewport, avoiding full-page scroll oscillation.
+The AutoJev overlay may remain visible in the capture; it is never hidden,
+removed or restyled for screenshots. Sensitive password, username, token,
+API-key and OTP fields are masked with Playwright's screenshot compositor,
+including values filled manually rather than supplied through the vault.
 
 Token usage is accumulated for both JEV and auxiliary calls as prompt,
 completion and total tokens. Monetary cost is persisted only when the provider

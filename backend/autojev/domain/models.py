@@ -119,6 +119,8 @@ class Observation:
     network_errors: list[dict[str, Any]] = field(default_factory=list)
     screenshot: str | None = None
     captured_at: str = field(default_factory=utc_now)
+    # Sanitized semantic state supports deterministic before/after checks.
+    page_state: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

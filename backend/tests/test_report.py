@@ -4,6 +4,218 @@ from copy import deepcopy
 from autojev.adapters.report import StandaloneHtmlReport
 
 
+def test_report_names_masked_field_and_escapes_blocking_field(tmp_path):
+    run = {"id": "fixture", "status": "completed", "app_url": "https://shop.test",
+           "completion": {"restrictions": [{"name": "Continue", "field_name": "Zip/Postal Code",
+               "reason": "required_field_validation_masked", "action": "click", "source_url": "https://shop.test/form",
+               "validation_probe": {"blocking_fields": [{"name": "<script>Last Name</script>"}]}}]}}
+    path = tmp_path / "report.html"
+    StandaloneHtmlReport(tmp_path).generate(run, str(path))
+    document = path.read_text()
+    assert "Zip/Postal Code · Continue" in document
+    assert "A tentativa foi executada" in document
+    assert "Campos que impediram a preparação" in document
+    assert "&lt;script&gt;Last Name&lt;/script&gt;" in document
+    assert "<script>Last Name</script>" not in document
+
+
+def test_report_separates_active_restrictions_from_evidenced_recovery_and_keeps_ct_fail(tmp_path):
+    shots = tmp_path / "fixture" / "screenshots"
+    shots.mkdir(parents=True)
+    (shots / "047.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    block = {"id": "route-1", "name": "<b>Continue Shopping</b>", "reason": "no_safe_restore_route"}
+    resolved = {**block, "status": "resolved", "resolution": {
+        "source": "actual_semantic_move_execution", "action_step": 47,
+        "occurred_at": "2026-10-04T12:00:00+00:00", "source_url": "https://shop.test/cart?token=secret-recovery",
+        "action": "click", "target": "<script>e4</script>", "screenshot": "screenshots/047.png",
+        "success": True, "assertions_passed": False,
+    }}
+    masked = {"id": "postal-1", "name": "Continue", "field_name": "Zip/Postal Code",
+              "reason": "required_field_validation_masked"}
+    run = {"id": "fixture", "status": "completed", "app_url": "https://shop.test",
+           "events": [
+               {"type": "coverage_restriction_recorded", "payload": block},
+               {"type": "coverage_restriction_resolved", "payload": resolved},
+               {"type": "coverage_complete_with_restrictions", "payload": {"restrictions": [block, masked]}},
+           ], "scenarios": [{"id": "CT047", "title": "Cart", "status": "FAIL", "evidence": {
+               "timeline": [{"kind": "action", "step_number": 47, "title": "Click", "screenshot": "047.png"}],
+               "assertions": [{"kind": "cart_count", "passed": False}],
+           }}]}
+    before = deepcopy(run)
+    path = tmp_path / "report.html"
+    StandaloneHtmlReport(tmp_path).generate(run, str(path))
+    document = path.read_text()
+    assert "Cobertura e restrições · 1 registros" in document
+    assert "Restrições resolvidas com evidência · 1 registros" in document
+    assert "Uma verificação reprovou; consulte o resultado do CT" in document
+    assert 'data-status="FAIL"' in document
+    assert '<a href="#timeline-4354303437-0">Ver ação da etapa 47' in document
+    assert 'id="timeline-4354303437-0"' in document
+    assert 'download="047.png"' in document
+    assert "data:image/png;base64," in document
+    assert "secret-recovery" not in document
+    assert "&lt;b&gt;Continue Shopping&lt;/b&gt;" in document
+    assert "&lt;script&gt;e4&lt;/script&gt;" in document
+    assert run == before
+
+
+def test_report_cannot_infer_recovery_and_never_links_missing_timeline_or_screenshot(tmp_path):
+    block = {"id": "r1", "name": "Continue Shopping", "reason": "no_safe_restore_route"}
+    run = {"id": "fixture", "status": "cancelled", "app_url": "https://shop.test", "events": [
+        {"type": "coverage_restriction_recorded", "payload": block},
+        {"type": "action_completed", "payload": {"name": "Continue Shopping", "success": True}},
+    ]}
+    path = tmp_path / "report.html"
+    report = StandaloneHtmlReport(tmp_path)
+    report.generate(run, str(path))
+    document = path.read_text()
+    assert "Cobertura e restrições · 1 registros" in document
+    assert "Restrições resolvidas com evidência" not in document
+    run["events"].append({"type": "coverage_restriction_resolved", "payload": {
+        **block, "status": "resolved", "resolution": {
+            "source": "actual_semantic_move_execution", "action_step": 47,
+            "occurred_at": "2026-10-04T12:00:00+00:00", "source_url": "https://shop.test/cart",
+            "action": "click", "target": "e4", "screenshot": "../../missing.png",
+            "success": True, "assertions_passed": True,
+        },
+    }})
+    report.generate(run, str(path))
+    document = path.read_text()
+    assert "Cobertura e restrições · 0 registros" in document
+    assert "Restrições resolvidas com evidência · 1 registros" in document
+    assert "Etapa 47 · ação registrada" in document
+    assert "Captura da recuperação indisponível" in document
+    assert 'href="#timeline-' not in document
+    assert 'download="missing.png"' not in document
+
+
+def test_report_names_form_probe_target_that_could_not_be_emptied(tmp_path):
+    run = {"id": "fixture", "status": "completed", "app_url": "https://shop.test", "completion": {
+        "restrictions": [{"name": "Continue", "reason": "form_probe_target_not_empty"}],
+    }}
+    path = tmp_path / "report.html"
+    StandaloneHtmlReport(tmp_path).generate(run, str(path))
+    assert "O campo continuou preenchido após as tentativas de limpeza" in path.read_text()
+
+
+def test_report_keeps_add_restriction_open_and_links_real_failed_remove_dependency(tmp_path):
+    shots = tmp_path / "fixture" / "screenshots"
+    shots.mkdir(parents=True)
+    (shots / "022-remove.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    block = {"id": "r-add", "name": "Add to cart", "reason": "no_safe_restore_route", "status": "active",
+             "dependency": {"kind": "failed_inverse_cart_toggle", "source": "actual_business_assertion",
+                 "item_id": "4", "surface": "inventory", "source_url": "https://shop.test/inventory?token=private-token",
+                 "required_action": "add", "name": "<script>Remove</script>", "action": "click", "action_step": 22,
+                 "screenshot": "screenshots/022-remove.png", "failed_assertion_kinds": ["cart_item_removed", "<b>cart_count</b>"]}}
+    run = {"id": "fixture", "status": "completed", "app_url": "https://shop.test", "completion": {"restrictions": [block]},
+           "scenarios": [{"id": "CT022", "title": "Remove item", "status": "FAIL", "evidence": {
+               "assertions": [{"kind": "cart_item_removed", "passed": False}],
+               "timeline": [{"kind": "action", "step_number": 22, "title": "Remove", "screenshot": "022-remove.png"}],
+           }}]}
+    before = deepcopy(run)
+    path = tmp_path / "report.html"
+    StandaloneHtmlReport(tmp_path).generate(run, str(path))
+    document = path.read_text()
+    assert "Cobertura e restrições · 1 registros" in document
+    assert "Restrições resolvidas com evidência" not in document
+    assert "Dependência que impediu esta validação" in document
+    assert "a restrição permanece aberta e não conta como aprovação" in document
+    assert '<a href="#timeline-4354303232-0">Ver falha anterior da etapa 22' in document
+    assert 'id="timeline-4354303232-0"' in document
+    assert 'data-status="FAIL"' in document
+    assert 'download="022-remove.png"' in document
+    assert "&lt;script&gt;Remove&lt;/script&gt;" in document
+    assert "&lt;b&gt;cart_count&lt;/b&gt;" in document
+    assert "private-token" not in document
+    assert run == before
+
+
+def test_report_dependency_does_not_fabricate_links_or_images_and_requires_local_provenance(tmp_path):
+    dependency = {"kind": "failed_inverse_cart_toggle", "source": "actual_business_assertion",
+                  "action_step": 22, "screenshot": "../../missing.png", "failed_assertion_kinds": ["cart_count"]}
+    run = {"id": "fixture", "status": "completed", "app_url": "https://shop.test", "completion": {
+        "restrictions": [{"name": "Add to cart", "reason": "no_safe_restore_route", "dependency": dependency}],
+    }}
+    path = tmp_path / "report.html"
+    report = StandaloneHtmlReport(tmp_path)
+    report.generate(run, str(path))
+    document = path.read_text()
+    assert "Dependência que impediu esta validação" in document
+    assert "Etapa 22 · ação anterior registrada" in document
+    assert 'href="#timeline-' not in document
+    assert 'download="missing.png"' not in document
+    dependency["source"] = "model_guess"
+    report.generate(run, str(path))
+    assert "Dependência que impediu esta validação" not in path.read_text()
+
+
+def test_report_distinguishes_strength_and_lists_individual_restrictions(tmp_path):
+    run = {"id": "fixture", "status": "completed", "app_url": "https://shop.test",
+           "scenarios": [
+               {"id": "CT001", "title": "Click", "status": "PASS", "evidence": {"assertions": [{"kind": "observable_state_change", "passed": True}]}},
+               {"id": "CT002", "title": "Cart", "status": "PASS", "evidence": {"assertions": [{"kind": "cart_count", "passed": True}]}},
+           ], "events": [{"type": "coverage_complete_with_restrictions", "payload": {
+               "restrictions": [{"name": "<script>bad</script>", "reason": "no_safe_restore_route", "action": "click", "source_url": "https://shop.test/cart?token=private"}], "candidates_blocked": 1,
+           }}]}
+    path = tmp_path / "report.html"
+    StandaloneHtmlReport(tmp_path).generate(run, str(path))
+    document = path.read_text()
+    assert "1 PASS com asserção de negócio" in document
+    assert "1 PASS apenas de interação técnica" in document
+    assert "Cobertura e restrições · 1 registros" in document
+    assert "&lt;script&gt;bad&lt;/script&gt;" in document
+    assert "token=private" not in document
+
+
+def test_visual_report_prominently_explains_unavailable_reviews_without_changing_pass(tmp_path):
+    scenarios = [{
+        "id": f"CT{i:03d}", "title": "Local assertion passed", "status": "PASS",
+        "evidence": {"visual_assessment": {"requested": True, "status": "unavailable", "reason": reason}},
+    } for i, reason in enumerate(["auxiliary_rate_limited", "visual_assessment_not_returned"], 1)]
+    run = {"id": "fixture", "status": "completed", "app_url": "http://fixture.test/",
+           "options": {"auxiliary_evidence_mode": "visual"}, "summary": {"total_scenarios": 2, "pass": 2}, "scenarios": scenarios}
+    before = deepcopy(run)
+    output = tmp_path / "report.html"
+    StandaloneHtmlReport(tmp_path).generate(run, str(output))
+    html = output.read_text()
+    assert "Análise visual não realizada" in html
+    assert "0 de 2 CTs receberam uma análise visual válida" in html
+    assert "1 limitados pelo provedor" in html
+    assert "1 com resposta visual ausente ou inválida" in html
+    assert "Análise visual indisponível não significa aprovação visual" in html
+    assert html.index('class="completion visual-review-summary"') < html.index('id="scenarios"')
+    assert html.count('data-status="PASS"') == 2
+    assert run == before
+
+
+def test_report_total_duration_and_unavailable_reasons_include_postprocessing_tail(tmp_path):
+    run = {
+        "id": "fixture", "status": "completed", "app_url": "https://shop.test",
+        "started_at": "2026-10-04T03:22:54+00:00", "finished_at": "2026-10-04T03:28:48+00:00",
+        "events": [{"type": "report_generation_started", "created_at": "2026-10-04T03:38:49+00:00"}],
+        "options": {"auxiliary_evidence_mode": "visual"},
+        "scenarios": [
+            {"id": f"CT{i:03d}", "title": "Local", "status": "PASS", "evidence": {
+                "visual_assessment": {"requested": True, "status": "unavailable", "reason": reason},
+            }} for i, reason in enumerate(["documentation_time_limit", "TimeoutError", "unknown_reason"], 1)
+        ],
+    }
+    before = deepcopy(run)
+    path = tmp_path / "report.html"
+    StandaloneHtmlReport(tmp_path).generate(run, str(path))
+    document = path.read_text()
+    assert "Duração total" in document and "00:15:55" in document
+    assert "00:05:54" not in document
+    assert "Inclui revisões auxiliares e geração do relatório" in document
+    assert "1 sem revisão antes do limite de espera das revisões auxiliares" in document
+    assert "1 com tempo de resposta da LLM auxiliar excedido" in document
+    assert "Código: unknown_reason" in document
+    assert "0 limitados pelo provedor" not in document
+    assert 'data-report-summary="execution-v2"' in document
+    assert document.count('data-status="PASS"') == 3
+    assert run == before
+
+
 def test_report_is_standalone_and_escapes_model_content(tmp_path):
     root = tmp_path / "artifacts"
     shots = root / "run-1" / "screenshots"

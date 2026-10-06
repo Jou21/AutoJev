@@ -22,6 +22,10 @@ class Settings:
     headless: bool
     browser: str
     http_timeout_seconds: float
+    auxiliary_max_requests: int = 120
+    auxiliary_max_rate_limits: int = 6
+    auxiliary_tail_timeout_seconds: float = 600.0
+    auxiliary_request_interval_seconds: float = 3.1
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -47,6 +51,10 @@ class Settings:
             headless=_bool_env("AUTOJEV_HEADLESS", False),
             browser=os.getenv("AUTOJEV_BROWSER", "chromium").lower(),
             http_timeout_seconds=float(os.getenv("AUTOJEV_HTTP_TIMEOUT_SECONDS", "45")),
+            auxiliary_max_requests=max(0, int(os.getenv("AUTOJEV_AUXILIARY_MAX_REQUESTS", "120"))),
+            auxiliary_max_rate_limits=max(1, int(os.getenv("AUTOJEV_AUXILIARY_MAX_RATE_LIMITS", "6"))),
+            auxiliary_tail_timeout_seconds=max(1.0, float(os.getenv("AUTOJEV_AUXILIARY_TAIL_TIMEOUT_SECONDS", "600"))),
+            auxiliary_request_interval_seconds=max(0.0, float(os.getenv("AUTOJEV_AUXILIARY_REQUEST_INTERVAL_SECONDS", "3.1"))),
         )
 
 

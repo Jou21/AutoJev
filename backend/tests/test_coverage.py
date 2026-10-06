@@ -40,6 +40,33 @@ def result(
     )
 
 
+@pytest.mark.parametrize("already_exercised", [False, True])
+def test_live_variant_adopts_historical_frontier_without_restoration_loop(already_exercised):
+    control = {"ref": "e1", "tag": "button", "name": "Add to cart", "enabled": True}
+    old = observation("https://app.test/inventory", [control])
+    live = observation(old.url, [{**control, "ref": "e8"},
+                                {"ref": "e9", "tag": "button", "name": "Close menu", "enabled": True}])
+    planner = CoveragePlanner(old.url)
+    old_key = planner.observe(old)
+    live_key = planner.observe(live)
+    old_moves = set(planner.states[old_key].candidates)
+    planner.states[live_key].attempted.update(set(planner.states[live_key].candidates) - old_moves)
+    if already_exercised:
+        planner.states[live_key].inherited.update(old_moves)
+    planner.path = [live_key]
+    planner.restoration_target = old_key
+    assert planner.next_restoration_action(live) is None
+    assert planner.restoration_target is None
+    assert not planner._remaining(planner.states[old_key])
+    live_remaining = planner.context(live)["current_untried"]
+    if already_exercised:
+        assert planner.can_finish()  # no old snapshot silently left pending
+        assert not live_remaining
+    else:
+        assert not planner.can_finish()
+        assert [item["name"] for item in live_remaining] == ["Add to cart"]
+
+
 def test_state_and_element_identity_are_semantic_and_preserve_route_parts():
     first = {
         "ref": "e0",
@@ -1670,7 +1697,7 @@ def test_stalled_restore_blocks_only_unreachable_target_and_keeps_other_frontier
     assert planner.coverage_complete() is False
 
 
-def test_unexpected_restore_snapshot_does_not_expand_coverage_frontier():
+def test_unexpected_restore_snapshot_keeps_untested_live_controls_eligible():
     current = observation("https://shop.test/inventory", [])
     target = observation(
         "https://shop.test/cart",
@@ -1705,8 +1732,75 @@ def test_unexpected_restore_snapshot_does_not_expand_coverage_frontier():
         unexpected,
     )
 
-    assert planner.context(unexpected)["current_untried"] == []
-    assert planner.context(unexpected)["frontier_states"] == 1
+    assert [item["name"] for item in planner.context(unexpected)["current_untried"]] == ["Continue shopping"]
+    assert planner.context(unexpected)["frontier_states"] == 2
+
+
+def test_restored_checkout_variant_keeps_form_and_setup_before_header_cart():
+    root = observation("https://shop.test/inventory", [])
+    elements = [
+        {"ref": "e0", "tag": "a", "name": "Cart, 6 items", "href": "https://shop.test/cart", "document_top": 0, "enabled": True},
+        *[{"ref": f"e{i}", "tag": "input", "type": "text", "name": name, "form": "checkout", "has_value": True, "enabled": True, "document_top": 100 + i} for i, name in enumerate(["First Name", "Last Name", "Postal Code"], 1)],
+        {"ref": "e4", "tag": "input", "type": "submit", "name": "Continue", "form": "checkout", "enabled": True, "document_top": 400},
+    ]
+    checkout = observation("https://shop.test/checkout", elements, title="Checkout")
+    planner = CoveragePlanner(root.url)
+    root_key = planner.observe(root)
+    target_key = planner.observe(checkout)
+    target_state = planner.states[target_key]
+    for fingerprint, candidate in target_state.candidates.items():
+        if planner._move_action(candidate) == "fill":
+            target_state.attempted.add(fingerprint)
+            planner.global_route_moves_attempted.add((target_state.url, fingerprint))
+    blank_variant = observation(checkout.url, [
+        {**item, "has_value": False} if item["tag"] == "input" and item.get("type") == "text" else {**item, "name": "Cart, empty"} if item["tag"] == "a" else item
+        for item in elements
+    ] + [{"ref": "e5", "tag": "button", "name": "Help", "enabled": True}], title="Checkout")
+    planner.restoration_target = target_key
+    planner._issued_restore_step = _IssuedRestoreStep(kind="navigate", target_key=target_key, source_key=root_key, expected_key=target_key)
+    planner.record_action(root, AgentDecision("navigate", "restore", url=checkout.url), result("navigate", root.url, checkout.url), blank_variant)
+    assert planner.restoration_target is None
+    assert {item["name"] for item in planner.context(blank_variant)["current_untried"]} >= {"First Name", "Last Name", "Postal Code", "Continue", "Help"}
+    current = blank_variant
+    for field_ref in ("e1", "e2", "e3", "e4"):
+        decision, _ = planner.reconcile(current, AgentDecision("click", "leave prematurely", target="e0"))
+        assert decision.target == field_ref
+        after = observation(current.url, [{**item, "has_value": True} if item["ref"] == field_ref else item for item in current.interactive_elements], title="Checkout")
+        planner.record_action(current, decision, result(decision.action, current.url, after.url), after)
+        current = after
+    assert planner.states[planner.current_key].form_setup_required == set()
+
+
+def test_cart_badge_count_is_not_a_new_navigation_target_or_state():
+    planner = CoveragePlanner("https://shop.test/inventory")
+    empty = {"ref": "e0", "tag": "a", "name": "Cart, empty", "href": "https://shop.test/cart", "context": "header Cart, empty"}
+    full = {**empty, "ref": "e90", "name": "Cart, 6 items", "context": "header Cart, 6 items"}
+    assert semantic_element_fingerprint(empty) == semantic_element_fingerprint(full)
+    assert planner.state_key(observation(planner.start_url, [empty])) == planner.state_key(observation(planner.start_url, [full]))
+
+
+def test_form_validation_messages_do_not_create_duplicate_fill_or_submit_moves():
+    planner = CoveragePlanner("https://shop.test/checkout")
+    base = [{"ref": "e0", "tag": "input", "type": "text", "name": "Last Name", "form": "form#checkout", "context": "form checkout Continue"},
+            {"ref": "e1", "tag": "input", "type": "submit", "name": "Continue", "form": "form#checkout", "context": "form checkout Continue"}]
+    failed = [{**el, "ref": f"e{n+9}", "context": "form checkout Error Last Name is required Continue"} for n, el in enumerate(base)]
+    assert planner.state_key(observation(planner.start_url, base)) == planner.state_key(observation(planner.start_url, failed))
+    row = {**base[0], "context": "tr Product A Amount"}
+    other_row = {**row, "context": "tr Product B Amount"}
+    assert semantic_element_fingerprint(row) != semantic_element_fingerprint(other_row)
+
+
+def test_form_dismiss_control_is_not_reinvented_for_each_validation_message():
+    dismiss = {"ref": "e0", "tag": "button", "type": "button", "name": "Dismiss error",
+               "form": "form#checkout", "context": "form checkout Error First name is required Continue"}
+    another = {**dismiss, "ref": "e9", "context": "form checkout Error Last name is required Continue"}
+    assert semantic_element_fingerprint(dismiss) == semantic_element_fingerprint(another)
+    assert semantic_element_fingerprint(dismiss) != semantic_element_fingerprint(
+        {**dismiss, "form": "form#delivery"})
+    # Row-specific controls in a form still preserve their contextual identity.
+    row = {**dismiss, "name": "Cancel item", "context": "tr Product A Cancel item"}
+    assert semantic_element_fingerprint(row) != semantic_element_fingerprint(
+        {**row, "context": "tr Product B Cancel item"})
 
 
 def test_current_screen_controls_are_exhausted_before_global_navigation():
@@ -1842,3 +1936,721 @@ async def test_observed_ref_uses_stored_selector_without_dom_marker(tmp_path):
 
     assert executor._page.selector == executor._ref_selectors["e0"]
     assert "data-autojev-ref" not in executor._page.selector
+
+
+def test_all_abandoned_candidates_are_individually_auditable_without_truncation():
+    target = observation("https://app.test/branch", [
+        {"ref": f"e{i}", "tag": "button", "name": f"Option {i}", "enabled": True}
+        for i in range(45)
+    ])
+    planner = CoveragePlanner("https://app.test/")
+    key = planner.observe(target)
+    planner.restoration_target = key
+    settlement = planner.abandon_stalled_restoration(reason="no_safe_restore_route")
+    assert settlement["blocked_candidates"] == 45
+    assert len(settlement["blocked_moves"]) == 45
+    context = planner.context(target)
+    assert len(context["restrictions"]) == 45
+    assert context["unreachable_restorations"] == [settlement]
+    assert context["coverage_complete"] is False
+    assert len(planner.drain_restrictions()) == 45
+    assert planner.drain_restrictions() == []
+    planner.restoration_target = key
+    planner.abandon_stalled_restoration(reason="no_safe_restore_route")
+    assert len(planner.restrictions) == 45
+
+
+def test_action_retry_restriction_is_not_lost_when_no_restoration_happens():
+    page = observation("https://app.test/", [
+        {"ref": "e0", "tag": "button", "name": "Unavailable action", "enabled": True}
+    ])
+    planner = CoveragePlanner(page.url)
+    decision = AgentDecision("click", "exercise", target="e0")
+    for _ in range(2):
+        planner.record_action(page, decision, result("click", page.url, page.url, success=False), page)
+    records = planner.drain_restrictions()
+    assert len(records) == 1
+    assert records[0]["reason"] == "action_retry_exhausted"
+    assert records[0]["name"] == "Unavailable action"
+    assert planner.can_finish() and not planner.coverage_complete()
+
+
+def test_spa_deep_link_is_not_assumed_to_support_document_get():
+    root = observation("https://app.test/", [
+        {"ref": "e0", "tag": "a", "name": "Open details", "href": "https://app.test/items/1"}
+    ])
+    detail = observation("https://app.test/items/1", [
+        {"ref": "e1", "tag": "button", "name": "Read more"}
+    ])
+    planner = CoveragePlanner(root.url)
+    click = AgentDecision("click", "open", target="e0")
+    planner.record_action(root, click, result("click", root.url, detail.url), detail)
+    key = planner.state_key(detail)
+    assert not planner._url_restorable(key)
+    planner._observe_document_response({"url": detail.url, "status_code": 200})
+    assert planner._url_restorable(key)
+    planner._observe_document_response({"url": detail.url, "status_code": 404})
+    assert not planner._url_restorable(key)
+
+
+def test_authenticated_exploration_root_does_not_imply_get_supported():
+    planner = CoveragePlanner("https://app.test/")
+    authenticated = observation("https://app.test/inventory.html", [
+        {"ref": "e0", "tag": "button", "name": "Open Menu"},
+    ])
+    authenticated.page_state["document_response"] = {"url": "https://app.test/", "status_code": 200}
+    key = planner.observe(authenticated)
+    assert key == planner.coverage_root_key
+    assert not planner._url_restorable(key)
+    planner._observe_document_response({"url": authenticated.url, "status_code": 200})
+    assert planner._url_restorable(key)
+
+
+def test_focus_anchor_requires_document_proof_when_login_changed_route():
+    planner = CoveragePlanner("https://app.test/", "Orders")
+    authenticated = observation("https://app.test/inventory.html", [
+        {"ref": "e0", "tag": "button", "name": "Open Orders"},
+    ])
+    key = planner.observe(authenticated)
+    planner.focus_entry_anchor = key
+    assert not planner._url_restorable(key)
+    planner._observe_document_response({"url": authenticated.url, "status_code": 200})
+    assert planner._url_restorable(key)
+
+
+def test_authenticated_root_backtrack_does_not_issue_unproven_deep_get():
+    planner = CoveragePlanner("https://app.test/")
+    authenticated = observation("https://app.test/inventory.html", [])
+    other = observation("https://app.test/cart.html", [])
+    root_key = planner.observe(authenticated)
+    other_key = planner.observe(other)
+    planner.path = [root_key, other_key]
+    planner.backtrack_failures[other_key] = 1
+    choice = planner._backtrack_decision()
+    assert choice is None or choice[0].action != "navigate"
+    assert authenticated.url not in planner.failed_document_urls
+
+
+def test_known_reverse_transition_is_replayed_before_history_or_get():
+    home = observation("https://app.test/home", [
+        {"ref": "e0", "tag": "button", "name": "Open product"},
+        {"ref": "e1", "tag": "button", "name": "Open second product"},
+    ])
+    detail = observation("https://app.test/detail/1", [
+        {"ref": "e2", "tag": "button", "name": "Back to products"}
+    ])
+    planner = CoveragePlanner(home.url)
+    enter = AgentDecision("click", "open", target="e0")
+    back = AgentDecision("click", "return", target="e2")
+    planner.record_action(home, enter, result("click", home.url, detail.url), detail)
+    planner.record_action(detail, back, result("click", detail.url, home.url), home)
+    planner.record_action(home, enter, result("click", home.url, detail.url), detail)
+    restore = planner.next_restoration_action(detail)
+    assert restore[0].action == "click"
+    assert restore[0].target == "e2"
+    assert restore[1] == "frontier_restore_replay"
+
+
+def test_obstructing_menu_is_closed_even_when_close_move_was_already_covered():
+    page = observation("https://app.test/cart", [
+        {"ref": "e0", "tag": "button", "name": "Continue Shopping", "interactable": False, "obstructed_by_overlay": True},
+        {"ref": "e1", "tag": "button", "name": "Close Menu", "interactable": True, "in_overlay": True, "overlay_dismiss": True},
+    ])
+    planner = CoveragePlanner(page.url)
+    state = planner.states[planner.observe(page)]
+    state.attempted.update(state.candidates)
+    action, reason = planner.next_restoration_action(page)
+    assert action.target == "e1"
+    assert reason == "obstructing_overlay_dismissed"
+    # A dialog with entered fields must never be auto-dismissed by inference.
+    unsafe = observation(page.url, [page.interactive_elements[0],
+                                  {"ref": "e2", "tag": "button", "name": "Close Dialog", "interactable": True, "in_overlay": True}])
+    planner.observe(unsafe)
+    assert planner._overlay_dismissal(unsafe) is None
+
+
+def test_each_required_field_is_tested_empty_before_departing_happy_form_path():
+    url = "https://app.test/profile"
+    elements = [
+        {"ref": f"e{i}", "tag": "input", "type": "text", "name": name,
+         "form": "profile", "required": True, "has_value": False}
+        for i, name in enumerate(["Given name", "Family name", "Postal code"])
+    ] + [{"ref": "e3", "tag": "button", "type": "submit", "name": "Continue", "form": "profile"}]
+    current = observation(url, elements)
+    planner = CoveragePlanner(url)
+    assert planner.next_restoration_action(current) is None
+    # First exercise ordinary inputs. Negatives stay hidden until those real
+    # attempts, then run before a positive submit can leave this live form.
+    for index in range(3):
+        decision, _ = planner.reconcile(current, AgentDecision("finish", "cover"))
+        assert decision.target == f"e{index}"
+        assert not decision.scenario_hint
+        updated = observation(url, [
+            {**field, "has_value": True} if field["ref"] == decision.target and decision.action == "fill" else field
+            for field in current.interactive_elements
+        ])
+        planner.record_action(current, decision, result(decision.action, url, url), updated)
+        current = updated
+    assert not planner.form_happy_paths_completed
+    assert len(planner.context(current)["current_untried"]) == 4
+    probed = []
+    for _ in range(12):
+        mechanical = planner.next_restoration_action(current)
+        if mechanical is None:
+            break
+        decision, reason = mechanical
+        assert reason == "isolated_required_field_probe"
+        if decision.action == "click":
+            empty = [field["name"] for field in current.interactive_elements
+                     if field.get("required") and not field["has_value"]]
+            assert len(empty) == 1
+            assert decision.scenario_hint["validation_probe"]["name"] == empty[0]
+            probed.append(empty[0])
+        updated = observation(url, [
+            {**field, "has_value": bool(decision.value)}
+            if field["ref"] == decision.target and decision.action == "fill" else field
+            for field in current.interactive_elements
+        ], text="Required field rejected" if decision.action == "click" else "")
+        planner.record_action(current, decision, result(decision.action, url, url), updated)
+        current = updated
+    assert probed == ["Given name", "Family name", "Postal code"]
+    assert planner.next_restoration_action(current) is None
+    assert not planner.can_finish()
+    refill, _ = planner.reconcile(current, AgentDecision("finish", "cover"))
+    assert refill.action == "fill" and refill.target == "e2" and refill.value
+    restored = observation(url, [{**field, "has_value": True} if field["ref"] == "e2" else field
+                                 for field in current.interactive_elements])
+    planner.record_action(current, refill, result("fill", url, url), restored)
+    submit, _ = planner.reconcile(restored, AgentDecision("finish", "cover"))
+    assert submit.action == "click" and submit.target == "e3" and not submit.scenario_hint
+    assert not planner.form_happy_paths_completed
+    planner.record_action(restored, submit, result("click", url, url), restored)
+    assert planner.form_happy_paths_completed == {(url, "profile")}
+    assert planner.can_finish()
+
+
+def test_form_submit_replay_restores_only_generated_synthetic_values():
+    form = observation("https://app.test/start", [
+        {"ref": "e0", "tag": "input", "type": "text", "name": "Search", "form": "search", "has_value": False},
+        {"ref": "e1", "tag": "button", "type": "submit", "name": "Search", "form": "search"},
+    ])
+    results = observation("https://app.test/results", [{"ref": "e2", "tag": "button", "name": "Inspect results"}])
+    planner = CoveragePlanner(form.url)
+    fill, _ = planner.reconcile(form, AgentDecision("finish", "cover"))
+    filled = observation(form.url, [{**field, "has_value": True} if field["ref"] == "e0" else field for field in form.interactive_elements])
+    planner.record_action(form, fill, result("fill", form.url, form.url), filled)
+    submit, _ = planner.reconcile(filled, AgentDecision("finish", "cover"))
+    planner.record_action(filled, submit, result("click", form.url, results.url), results)
+    planner.observe(form)
+    planner.path = [planner.state_key(form)]
+    planner.restoration_target = planner.state_key(results)
+    replay, reason = planner.next_restoration_action(form)
+    assert reason == "frontier_restore_form_setup"
+    assert replay.action == "fill" and replay.target == "e0"
+    assert replay.value == "AutoJev QA search"
+    planner.record_action(form, replay, result("fill", form.url, form.url), filled)
+    replay, reason = planner.next_restoration_action(filled)
+    assert reason == "frontier_restore_replay"
+    assert replay.target == "e1"
+
+
+def test_invalid_fill_precondition_does_not_create_infinite_negative_probe_retry():
+    form = observation("https://app.test/form", [
+        {"ref": "e0", "tag": "input", "name": "Given name", "form": "f", "required": True, "has_value": False},
+        {"ref": "e1", "tag": "input", "name": "Family name", "form": "f", "required": True, "has_value": False},
+        {"ref": "e2", "tag": "button", "type": "submit", "name": "Continue", "form": "f"},
+    ])
+    planner = CoveragePlanner(form.url)
+    current = form
+    for ref in ["e0", "e1"]:
+        decision, _ = planner.reconcile(current, AgentDecision("finish", "cover"))
+        assert decision.target == ref
+        # The broken application always clears Family name after its fill.
+        after = observation(form.url, [
+            {**field, "has_value": True} if field["ref"] == ref == "e0" else field
+            for field in current.interactive_elements
+        ])
+        planner.record_action(current, decision, result(decision.action, form.url, form.url), after)
+        current = after
+    probed = []
+    for _ in range(8):
+        selected = planner.next_restoration_action(current)
+        if selected is None:
+            break
+        decision, _ = selected
+        assert not (decision.action == "fill" and decision.target == "e1" and decision.value)
+        if decision.action == "click":
+            probed.append(decision.scenario_hint["validation_probe"])
+        after = observation(form.url, [
+            {**field, "has_value": bool(decision.value)}
+            if decision.action == "fill" and field["ref"] == decision.target else field
+            for field in current.interactive_elements
+        ])
+        planner.record_action(current, decision, result(decision.action, form.url, form.url), after)
+        current = after
+    # A broken peer must not stop testing the intentionally empty field or
+    # another target whose feedback remains attributable. Native attribution
+    # and masked-probe BLOCKED verdicts are covered by test_form_probe_coverage.
+    assert [probe["name"] for probe in probed] == ["Given name", "Family name"]
+    assert [probe["strategy"] for probe in probed] == ["blocked_peer_observed", "isolated_required_field"]
+    assert planner.drain_restrictions() == []
+    assert planner.next_restoration_action(current) is None
+    assert not planner.can_finish()
+    submit, _ = planner.reconcile(current, AgentDecision("finish", "cover"))
+    assert submit.action == "click" and submit.target == "e2" and not submit.scenario_hint
+    planner.record_action(current, submit, result("click", form.url, form.url), current)
+    assert planner.can_finish() and planner.coverage_complete()
+
+
+def test_document_404_prevents_repeated_get_recovery_for_any_dom_variant():
+    root = observation("https://app.test/spa", [
+        {"ref": "e0", "tag": "button", "name": "Root action"}
+    ])
+    current = observation("https://app.test/other", [])
+    planner = CoveragePlanner(root.url)
+    root_key = planner.observe(root)
+    current_key = planner.observe(current)
+    planner.path = [current_key]
+    planner.restoration_target = root_key
+    restore, reason = planner.next_restoration_action(current)
+    assert restore.action == "navigate" and reason == "frontier_restore_navigate"
+    not_found = observation(root.url, [], text="Not found")
+    outcome = result("navigate", current.url, root.url)
+    outcome.evidence["navigation_response"] = {"url": root.url, "status_code": 404}
+    planner.record_action(current, restore, outcome, not_found)
+    assert planner.next_restoration_action(not_found) is None
+    assert root.url in planner.failed_document_urls
+    assert not planner._url_restorable(root_key)
+    assert planner.can_finish() and not planner.coverage_complete()
+    assert planner.restrictions[0]["reason"] == "no_safe_restore_route"
+
+
+def test_overlay_dismissal_does_not_undo_an_intentional_menu_replay():
+    root = observation("https://app.test/", [
+        {"ref": "e0", "tag": "button", "name": "Open Menu", "interactable": True},
+        {"ref": "e1", "tag": "button", "name": "Background action", "interactable": True},
+    ])
+    menu = observation(root.url, [
+        {"ref": "e1", "tag": "button", "name": "Background action", "interactable": False, "obstructed_by_overlay": True},
+        {"ref": "e2", "tag": "button", "name": "Close Menu", "interactable": True, "in_overlay": True, "overlay_dismiss": True},
+        {"ref": "e3", "tag": "a", "name": "Open workspace", "href": "https://app.test/workspace", "interactable": True, "in_overlay": True},
+    ])
+    workspace = observation("https://app.test/workspace", [
+        {"ref": "e4", "tag": "button", "name": "Explore workspace"}
+    ])
+    planner = CoveragePlanner(root.url)
+    open_menu = AgentDecision("click", "menu", target="e0")
+    open_workspace = AgentDecision("click", "workspace", target="e3")
+    planner.record_action(root, open_menu, result("click", root.url, menu.url), menu)
+    planner.record_action(menu, open_workspace, result("click", menu.url, workspace.url), workspace)
+    planner.observe(root)
+    planner.path = [planner.state_key(root)]
+    planner.restoration_target = planner.state_key(workspace)
+    replay, _ = planner.next_restoration_action(root)
+    planner.record_action(root, replay, result("click", root.url, menu.url), menu)
+    replay, reason = planner.next_restoration_action(menu)
+    assert replay.target == "e3", "Do not close the menu before its safe recipe continuation"
+    assert reason == "frontier_restore_replay"
+
+
+def test_known_404_model_navigation_is_replaced_without_sending_another_get():
+    page = observation("https://app.test/cart", [
+        {"ref": "e0", "tag": "button", "name": "Safe local action"}
+    ])
+    planner = CoveragePlanner(page.url)
+    planner.observe(page)
+    planner.failed_document_urls.add("https://app.test/unsupported")
+    decision, reason = planner.reconcile(page, AgentDecision("navigate", "guess", url="https://app.test/unsupported"))
+    assert decision.action == "click" and decision.target == "e0"
+    assert reason == "unsupported_document_navigation_replaced"
+
+
+def test_successful_restore_cycles_are_bounded_even_when_steps_reset():
+    root = observation("https://app.test/", [
+        {"ref": "e0", "tag": "button", "name": "Open panel"}
+    ])
+    panel = observation(root.url, [{"ref": "e1", "tag": "button", "name": "Open nested"}], title="Panel")
+    nested = observation(root.url, [{"ref": "e2", "tag": "button", "name": "Pending action"}], title="Nested")
+    planner = CoveragePlanner(root.url)
+    enter = AgentDecision("click", "enter", target="e0")
+    planner.record_action(root, enter, result("click", root.url, panel.url), panel)
+    planner.record_action(panel, AgentDecision("click", "nested", target="e1"), result("click", panel.url, nested.url), nested)
+    planner.observe(root)
+    target_key = planner.state_key(nested)
+    for _ in range(2):
+        planner.restoration_target = target_key
+        planner.restoration_steps = 0
+        replay, reason = planner.next_restoration_action(root)
+        assert reason == "frontier_restore_replay"
+        planner.record_action(root, replay, result("click", root.url, panel.url), panel)
+        # External app interaction closes the intermediate state without
+        # reaching the intended nested target. This used to reset the debt.
+        planner.observe(root)
+        planner.path = [planner.state_key(root)]
+    planner.restoration_target = target_key
+    planner.restoration_steps = 0
+    replay = planner.next_restoration_action(root)
+    assert replay is None or replay[0].action != "click"
+
+
+def test_distinct_product_handlers_with_shared_placeholder_href_are_all_covered():
+    inventory = observation("https://app.test/inventory", [
+        {"ref": f"e{i}", "tag": "a", "name": f"Product {i}",
+         "context": f"Product card {i}", "href": "https://app.test/inventory#"}
+        for i in range(6)
+    ])
+    planner = CoveragePlanner(inventory.url)
+    visited = []
+    for i in range(6):
+        decision, _ = planner.reconcile(inventory, AgentDecision("finish", "cover"))
+        assert decision.target == f"e{i}"
+        detail = observation(f"https://app.test/detail?id={i}", [])
+        planner.record_action(inventory, decision, result("click", inventory.url, detail.url), detail)
+        visited.append(detail.url)
+        planner.observe(inventory)
+        planner.path = [planner.state_key(inventory)]
+    assert len(set(visited)) == 6
+    assert not planner.global_destinations_attempted
+    assert planner.context(inventory)["current_untried"] == []
+
+
+def test_different_named_entity_links_to_same_real_url_are_not_silently_skipped():
+    page = observation("https://app.test/catalog", [
+        {"ref": "e0", "tag": "a", "name": "Correct product", "href": "https://app.test/detail/1", "context": "Card A"},
+        {"ref": "e1", "tag": "a", "name": "Different product", "href": "https://app.test/detail/1", "context": "Card B"},
+    ])
+    detail = observation("https://app.test/detail/1", [])
+    planner = CoveragePlanner(page.url)
+    planner.record_action(page, AgentDecision("click", "exercise first", target="e0"), result("click", page.url, detail.url), detail)
+    planner.observe(page)
+    assert [move["ref"] for move in planner.context(page)["current_untried"]] == ["e1"]
+
+
+def test_expanding_navigation_does_not_reinvent_its_existing_controls():
+    parent = {"ref": "e0", "tag": "a", "name": "Catalog", "enabled": True,
+              "in_navigation": True, "raw_href": "#",
+              "href": "https://app.test/cart#", "navigation_owner": "nav:id=main-menu",
+              "context": "nav Main menu Products Catalog Reset"}
+    reset = {**parent, "ref": "e1", "name": "Reset demo state"}
+    base = observation("https://app.test/cart", [parent, reset])
+    expanded = observation(base.url, [
+        {**parent, "ref": "e8", "context": "nav Main menu Products Catalog Lazy Spinner Reset"},
+        {**reset, "ref": "e9", "context": "nav Main menu Products Catalog Lazy Spinner Reset"},
+        {**parent, "ref": "e10", "name": "Lazy", "context": "nav Main menu Products Catalog Lazy Spinner Reset"},
+        {**parent, "ref": "e11", "name": "Spinner", "context": "nav Main menu Products Catalog Lazy Spinner Reset"},
+    ])
+    planner = CoveragePlanner(base.url)
+    planner.record_action(base, AgentDecision("click", "expand", target="e0"),
+                          result("click", base.url, expanded.url), expanded)
+    remaining = planner.context(expanded)["current_untried"]
+    assert {move["name"] for move in remaining} == {"Lazy", "Spinner"}
+    # Existing sibling debt stays at its logical root, not in every expanded
+    # submenu snapshot. Newly revealed children must still be visited here.
+    assert {move["name"] for _, move in planner._remaining(planner.states[planner.state_key(base)])} == {"Reset demo state"}
+    assert semantic_element_fingerprint(parent) == semantic_element_fingerprint(expanded.interactive_elements[0])
+
+
+def test_placeholder_global_menu_is_stable_across_route_and_cart_variants():
+    menu = {"ref": "e0", "tag": "a", "name": "All items", "enabled": True,
+            "in_navigation": True, "raw_href": "#", "href": "https://app.test/cart#",
+            "navigation_owner": "nav:id=main-menu", "context": "nav All items Catalog Reset"}
+    cart = observation("https://app.test/cart", [menu])
+    catalog = observation("https://app.test/catalog", [
+        {**menu, "ref": "e7", "href": "https://app.test/catalog#",
+         "context": "nav All items Catalog Lazy Spinner Slider Reset"}
+    ])
+    planner = CoveragePlanner(cart.url)
+    planner.record_action(cart, AgentDecision("click", "open inventory", target="e0"),
+                          result("click", cart.url, catalog.url), catalog)
+    assert planner.context(catalog)["current_untried"] == []
+    assert planner.can_finish()
+    legacy = {key: value for key, value in menu.items() if key not in {"raw_href", "navigation_owner"}}
+    other_legacy = {**legacy, "href": "https://app.test/catalog#", "context": "nav All items Catalog Lazy Spinner Reset"}
+    assert semantic_element_fingerprint(legacy) == semantic_element_fingerprint(other_legacy)
+
+
+def test_navigation_stable_owner_and_real_destinations_remain_distinct():
+    menu = {"tag": "a", "name": "Details", "in_navigation": True,
+            "raw_href": "/orders/1", "href": "https://app.test/orders/1",
+            "navigation_owner": "nav:id=main", "context": "nav Details"}
+    assert semantic_element_fingerprint(menu) != semantic_element_fingerprint(
+        {**menu, "navigation_owner": "nav:id=account"})
+    assert semantic_element_fingerprint(menu) != semantic_element_fingerprint(
+        {**menu, "raw_href": "/orders/2", "href": "https://app.test/orders/2"})
+    assert semantic_element_fingerprint(menu) != semantic_element_fingerprint(
+        {**menu, "raw_href": "#/orders/1", "href": "https://app.test/#/orders/1"})
+    homonym = {**menu, "href": "https://app.test/#", "raw_href": "#",
+               "navigation_control": "a:id=primary-details"}
+    assert semantic_element_fingerprint(homonym) != semantic_element_fingerprint(
+        {**homonym, "navigation_control": "a:id=secondary-details"})
+
+
+def test_menu_toggle_identity_does_not_depend_on_header_badge_or_submenu_text():
+    toggle = {"ref": "e0", "tag": "button", "name": "Open Menu", "enabled": True,
+              "context": "div Header Swag Labs Cart 1"}
+    full = {**toggle, "ref": "e9", "context": "div Header Swag Labs Cart 2"}
+    assert semantic_element_fingerprint(toggle) == semantic_element_fingerprint(full)
+    close = {**toggle, "name": "Close Menu", "overlay_group": "aside:nth-of-type(1)",
+             "context": "aside All items Catalog Reset Close Menu"}
+    expanded = {**close, "context": "aside All items Catalog Lazy Spinner Slider Reset Close Menu"}
+    assert semantic_element_fingerprint(close) == semantic_element_fingerprint(expanded)
+    assert semantic_element_fingerprint(close) != semantic_element_fingerprint(
+        {**close, "overlay_group": "aside:nth-of-type(2)"})
+
+
+def test_covered_global_menu_does_not_restore_every_historical_cart_variant():
+    planner = CoveragePlanner("https://app.test/cart")
+
+    def menu(url, badge, expanded=False):
+        names = ["All items", "Catalog", "Close Menu"]
+        if expanded:
+            names.extend(["Lazy", "Spinner", "Slider"])
+        context = f"nav {badge} " + " ".join(names)
+        return observation(url, [
+            {"ref": f"e{i}", "tag": "a" if name != "Close Menu" else "button",
+             "name": name, "enabled": True, "in_navigation": name != "Close Menu",
+             "href": f"{url}#" if name != "Close Menu" else None,
+             "raw_href": "#" if name != "Close Menu" else None,
+             "navigation_owner": "nav:id=global-menu", "context": context,
+             "overlay_group": "aside:nth-of-type(1)"}
+            for i, name in enumerate(names)
+        ])
+
+    # These observed snapshots used to retain different menu identities solely
+    # because expansion, route or cart badge changed. They must not demand a
+    # replay of all the add/remove prerequisites once their controls are done.
+    variants = [menu(url, count, expanded) for url in
+                ["https://app.test/cart", "https://app.test/lazy", "https://app.test/spinner"]
+                for count in range(3) for expanded in [False, True]]
+    for page in variants:
+        planner.observe(page)
+    for page in variants:
+        for element in page.interactive_elements:
+            if element["name"] == "Slider":
+                continue
+            decision = AgentDecision("click", "exercise semantic control", target=element["ref"])
+            planner.record_action(page, decision, result("click", page.url, page.url), page)
+    assert {move["name"] for state in planner._frontier_states()
+            for _, move in planner._remaining(state)} == {"Slider"}
+    # Cover the genuinely new child once, then none of the 18 old snapshots
+    # has outstanding coverage. No hard action ceiling or silent abandon.
+    page = variants[-1]
+    slider = next(item for item in page.interactive_elements if item["name"] == "Slider")
+    planner.record_action(page, AgentDecision("click", "exercise child", target=slider["ref"]),
+                          result("click", page.url, page.url), page)
+    assert planner.can_finish()
+    assert not planner._frontier_states()
+    assert not planner.restrictions
+
+
+def shopping_observation(url: str, elements: list[dict], count: int, *, checkout: dict | None = None) -> Observation:
+    page = observation(url, elements, title="Checkout" if "checkout" in url else "Products")
+    page.page_state = {
+        "cart": {"count": count, "items_known": False,
+                 "link_refs": [item["ref"] for item in elements if str(item.get("name", "")).startswith("Cart")]},
+        "checkout": checkout,
+    }
+    return page
+
+
+def test_checkout_journey_identity_distinguishes_empty_from_populated_not_each_basket():
+    url = "https://shop.test/cart"
+    elements = [{"ref": "e0", "tag": "button", "name": "Checkout"}]
+    planner = CoveragePlanner(url)
+    empty = shopping_observation(url, elements, 0)
+    populated = [shopping_observation(url, elements, count) for count in (1, 2, 6, 99)]
+    empty_key = planner.state_key(empty)
+    assert all(planner.state_key(page) != empty_key for page in populated)
+    assert len({planner.state_key(page) for page in populated}) == 1
+    planner.record_action(empty, AgentDecision("click", "empty-cart probe", target="e0"),
+                          result("click", url, url), empty)
+    assert planner.context(empty)["current_untried"] == []
+    assert [item["name"] for item in planner.context(populated[0])["current_untried"]] == ["Checkout"]
+    planner.record_action(populated[0], AgentDecision("click", "populated-cart probe", target="e0"),
+                          result("click", url, url), populated[0])
+    assert all(planner.context(page)["current_untried"] == [] for page in populated)
+
+
+def test_cart_entry_reopens_populated_lane_after_empty_navigation_was_covered():
+    url = "https://shop.test/inventory"
+    element = {"ref": "e0", "tag": "a", "name": "Cart, empty", "href": "https://shop.test/cart",
+               "in_navigation": True, "navigation_owner": "nav:header"}
+    empty = shopping_observation(url, [element], 0)
+    cart = shopping_observation(element["href"], [], 0)
+    planner = CoveragePlanner(url)
+    planner.record_action(empty, AgentDecision("click", "empty cart", target="e0"),
+                          result("click", url, cart.url), cart)
+    assert cart.url in planner.global_destinations_attempted
+    populated = shopping_observation(url, [{**element, "ref": "e9", "name": "Cart, 2 items"}], 2)
+    decision, reason = planner.next_restoration_action(populated)
+    assert decision.target == "e9"
+    assert reason == "populated_checkout_prioritized"
+
+
+def test_checkout_with_products_is_prioritized_before_removals_reset_or_cancel():
+    url = "https://shop.test/cart"
+    page = shopping_observation(url, [
+        {"ref": "e0", "tag": "button", "name": "Remove", "reversible_cart_action": "remove"},
+        {"ref": "e1", "tag": "button", "name": "Reset App State"},
+        {"ref": "e2", "tag": "button", "name": "Cancel"},
+        {"ref": "e3", "tag": "button", "name": "Checkout"},
+    ], 2)
+    planner = CoveragePlanner(url)
+    decision, reason = planner.reconcile(page, AgentDecision("click", "remove next", target="e0"))
+    assert decision.target == "e3"
+    assert reason == "populated_checkout_prioritized"
+    planner.record_action(page, decision, result("click", url, url), page)
+    decision, reason = planner.reconcile(page, AgentDecision("click", "remove next", target="e0"))
+    assert decision.target == "e0"  # Covered lane does not block later removal tests.
+    assert reason is None
+
+
+def test_populated_checkout_form_is_new_after_the_empty_form_happy_path():
+    url = "https://shop.test/checkout-step-one"
+    elements = [
+        {"ref": "e0", "tag": "input", "type": "text", "name": "First Name", "form": "checkout", "has_value": False},
+        {"ref": "e1", "tag": "button", "type": "submit", "name": "Continue", "form": "checkout"},
+    ]
+    planner = CoveragePlanner(url)
+    empty = shopping_observation(url, elements, 0)
+    empty_state = planner.states[planner.observe(empty)]
+    for key, move in empty_state.candidates.items():
+        empty_state.attempted.add(key)
+        planner.global_route_moves_attempted.add((url, key))
+        if planner._is_form_submit(move):
+            planner.form_happy_paths_completed.add((url, planner._form_group(move)))
+    populated = shopping_observation(url, elements, 1)
+    assert {item["name"] for item in planner.context(populated)["current_untried"]} == {"First Name", "Continue"}
+    decision, reason = planner.next_restoration_action(populated)
+    assert decision.target == "e0" and decision.action == "fill"
+    assert reason == "populated_checkout_prioritized"
+    assert planner._form_probe_action(planner.states[planner.current_key]) is None
+    filled = shopping_observation(url, [{**item, "has_value": True} if item["ref"] == "e0" else item for item in elements], 1)
+    planner.record_action(populated, decision, result("fill", url, url), filled)
+    submit, _ = planner.next_restoration_action(filled)
+    assert submit.target == "e1"
+
+
+def test_nonempty_finish_is_not_inherited_from_an_empty_checkout():
+    url = "https://shop.test/checkout-step-two"
+    elements = [{"ref": "e0", "tag": "button", "name": "Finish"},
+                {"ref": "e1", "tag": "button", "name": "Cancel"}]
+    checkout = {"stage": "review", "finish_refs": ["e0"]}
+    empty = shopping_observation(url, elements, 0, checkout=checkout)
+    populated = shopping_observation(url, elements, 2, checkout=checkout)
+    planner = CoveragePlanner(url)
+    planner.record_action(empty, AgentDecision("click", "empty cancellation", target="e1"), result("click", url, url), empty)
+    planner.record_action(empty, AgentDecision("click", "empty order", target="e0"), result("click", url, url), empty)
+    decision, reason = planner.reconcile(populated, AgentDecision("click", "cancel", target="e1"))
+    assert decision.target == "e1" and reason == "checkout_cancellation_prioritized"
+    assert any(move["name"] == "Finish" for _, move in planner._remaining(planner.states[planner.current_key]))
+    planner.record_action(populated, decision, result("click", url, url), populated)
+    decision, reason = planner.next_restoration_action(populated)
+    assert decision.target == "e0" and reason == "populated_checkout_prioritized"
+    planner.record_action(populated, decision, result("click", url, url), populated)
+    assert planner.next_restoration_action(populated) is None
+
+
+def test_checkout_review_cancellation_is_one_actual_test_per_empty_and_populated_lane():
+    url = "https://shop.test/checkout-step-two"
+    elements = [{"ref": "e0", "tag": "button", "name": "Finish"},
+                {"ref": "e1", "tag": "a", "name": "Cancel", "href": "https://shop.test/cart"}]
+    checkout = {"stage": "review", "finish_refs": ["e0"]}
+    planner = CoveragePlanner(url)
+    empty = shopping_observation(url, elements, 0, checkout=checkout)
+    first, reason = planner.next_restoration_action(empty)
+    assert first.target == "e1" and reason == "checkout_cancellation_prioritized"
+    empty_review_key = planner.state_key(empty)
+    assert planner.restoration_target == empty_review_key
+    assert planner._issued_restore_step is None  # a native test, not mechanical replay
+    planner.record_action(empty, first, result("click", url, url), empty)
+    assert planner._checkout_review_exit_action(planner.states[planner.observe(empty)]) is None
+    assert any(move["name"] == "Finish" for _, move in planner._remaining(planner.states[empty_review_key]))
+
+    populated = shopping_observation(url, elements, 1, checkout=checkout)
+    second, reason = planner.next_restoration_action(populated)
+    assert second.target == "e1" and reason == "checkout_cancellation_prioritized"
+    planner.record_action(populated, second, result("click", url, url), populated)
+    for count in (1, 2, 6, 99):
+        other_basket = shopping_observation(url, elements, count, checkout=checkout)
+        state = planner.states[planner.observe(other_basket)]
+        assert planner._checkout_review_exit_action(state) is None
+        assert any(move["name"] == "Finish" for _, move in planner._remaining(state))
+    assert not planner.restrictions
+
+
+def test_checkout_review_cancellation_priority_requires_grounded_review_and_cart_lane():
+    url = "https://shop.test/checkout"
+    controls = [{"ref": "e0", "tag": "button", "name": "Cancel"},
+                {"ref": "e1", "tag": "button", "name": "Finish"}]
+    planner = CoveragePlanner(url)
+    ordinary = shopping_observation(url, controls, 2, checkout={"stage": "information"})
+    unknown_cart = observation(url, controls)
+    unknown_cart.page_state = {"checkout": {"stage": "review"}}
+    for page in (ordinary, unknown_cart):
+        state = planner.states[planner.observe(page)]
+        assert planner._checkout_review_exit_action(state) is None
+        assert all(move.get("_cart_journey_role") != "checkout_review_exit"
+                   for move in state.candidates.values())
+
+
+def test_cart_journey_uses_intent_without_mutating_observations_or_claiming_restore():
+    url = "https://shop.test/checkout-step-one"
+    elements = [{"ref": "e0", "tag": "input", "type": "text", "name": "First Name", "form": "checkout", "has_value": False},
+                {"ref": "e1", "tag": "button", "type": "submit", "name": "Continue", "form": "checkout"}]
+    empty = shopping_observation(url, elements, 0)
+    populated_intent = shopping_observation(url, elements, 0)
+    populated_intent.page_state["cart_expectation"] = {"items_known": True, "items": [{"name": "Backpack"}]}
+    planner = CoveragePlanner(url)
+    empty_key = planner.observe(empty)
+    populated_key = planner.observe(populated_intent)
+    assert populated_key != empty_key
+    assert not planner._matches_pending_state(empty_key, populated_key)
+    assert populated_intent.page_state["cart"]["count"] == 0
+    assert populated_intent.page_state["cart_expectation"]["items"] == [{"name": "Backpack"}]
+    assert planner._cart_journey_bucket(populated_intent) == "populated"
+
+
+def test_nonshopping_form_and_global_menu_do_not_gain_cart_variants():
+    url = "https://shop.test/account"
+    elements = [{"ref": "e0", "tag": "input", "type": "text", "name": "Name", "form": "profile", "has_value": False},
+                {"ref": "e1", "tag": "button", "type": "submit", "name": "Save", "form": "profile"},
+                {"ref": "e2", "tag": "button", "name": "Open Menu"}]
+    planner = CoveragePlanner(url)
+    assert len({planner.state_key(shopping_observation(url, elements, count)) for count in (0, 1, 2, 6)}) == 1
+
+
+def test_unknown_cart_never_invents_a_populated_checkout_lane():
+    url = "https://shop.test/cart"
+    page = observation(url, [{"ref": "e0", "tag": "button", "name": "Checkout"}])
+    planner = CoveragePlanner(url)
+    assert planner._cart_journey_bucket(page) is None
+    assert planner.next_restoration_action(page) is None
+
+
+def test_required_checkout_probe_is_scoped_to_each_cart_lane_happy_path():
+    url = "https://shop.test/checkout-step-one"
+    elements = [{"ref": "e0", "tag": "input", "type": "text", "name": "First Name", "form": "checkout",
+                 "required": True, "has_value": True},
+                {"ref": "e1", "tag": "button", "type": "submit", "name": "Continue", "form": "checkout"}]
+    planner = CoveragePlanner(url)
+    empty = shopping_observation(url, elements, 0)
+    planner.record_action(empty, AgentDecision("click", "empty form submit", target="e1"),
+                          result("click", url, url), empty)
+    empty_probe = planner._form_probe_action(planner.states[planner.current_key])
+    assert empty_probe.action == "fill" and empty_probe.value == ""
+    populated = shopping_observation(url, elements, 1)
+    planner.observe(populated)
+    assert planner._form_probe_action(planner.states[planner.current_key]) is None
+    planner.record_action(populated, AgentDecision("click", "populated form submit", target="e1"),
+                          result("click", url, url), populated)
+    clear = planner._form_probe_action(planner.states[planner.current_key])
+    blank = shopping_observation(url, [{**elements[0], "has_value": False}, elements[1]], 1)
+    planner.record_action(populated, clear, result("fill", url, url), blank)
+    probe = planner._form_probe_action(planner.states[planner.current_key])
+    assert probe.scenario_hint["validation_probe"]["form"] == "checkout::cart_journey:populated"
+    planner.record_action(blank, probe, result("click", url, url), blank)
+    assert planner._form_probe_action(planner.states[planner.current_key]) is None
+    # The distinct empty lane probe was not silently classified by this one.
+    planner.observe(empty)
+    assert planner._form_probe_action(planner.states[planner.current_key]) is not None

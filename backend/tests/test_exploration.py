@@ -1028,6 +1028,520 @@ def _live_scenario_evidence(
 
 
 @pytest.mark.asyncio
+async def test_live_pipeline_defers_rate_limited_cts_instead_of_discarding_backlog():
+    import time
+    from types import SimpleNamespace
+    repository = _LiveScenarioRepository()
+
+    class Auxiliary:
+        model = "fixture:free"
+        request_count = 0
+        rate_limit_count = 0
+        until = 0.0
+        @property
+        def cooldown_remaining_seconds(self):
+            return max(0.0, self.until - time.monotonic())
+        async def create_scenario(self, observation, decision, result, number):
+            self.request_count += 1
+            scenario = ExplorationManager._scenario_from_evidence(observation, decision, result, number)
+            if self.request_count == 1:
+                self.rate_limit_count += 1
+                self.until = time.monotonic() + 0.03
+                scenario.evidence["documentation_provenance"] = {"source": "local_fallback", "reason": "auxiliary_rate_limited"}
+            else:
+                scenario.title = f"Reviewed {number}"
+                scenario.evidence["documentation_provenance"] = {"source": "auxiliary_llm", "reason": "auxiliary_response_accepted"}
+            return scenario
+
+    auxiliary = Auxiliary()
+    pipeline = _live_scenario_pipeline(repository, auxiliary)
+    pipeline.manager.settings = SimpleNamespace(auxiliary_request_interval_seconds=0)
+    await pipeline.start()
+    for number in (1, 2):
+        await pipeline.capture(str(number), *_live_scenario_evidence(title=f"Page{number}"), sequence=number)
+    assert len(repository.scenarios) == 2  # local drafts immediately available
+    await asyncio.wait_for(pipeline.finish(), timeout=1)
+    assert auxiliary.request_count == 3
+    assert auxiliary.rate_limit_count == 1
+    assert len(pipeline.enriched) == 2
+    assert not pipeline.skipped
+    assert all(not scenario.evidence.get("visual_assessment", {}).get("requested") for scenario in repository.scenarios.values())
+    assert {scenario.title for scenario in repository.scenarios.values()} == {"Reviewed 1", "Reviewed 2"}
+    assert any(event == "scenario_enrichment_deferred" for event, _ in repository.events)
+    for event, payload in repository.events:
+        if event in {"scenario_enrichment_deferred", "scenario_enrichment_waiting_provider"}:
+            assert payload["total"] == 2
+            assert {"current", "enriched", "local_evidence", "pending", "deferred", "provider_requests"} <= payload.keys()
+
+
+@pytest.mark.asyncio
+async def test_live_pipeline_provider_pause_is_cancel_responsive_and_never_calls_provider():
+    repository = _LiveScenarioRepository()
+
+    class Auxiliary:
+        model = "fixture:free"
+        cooldown_remaining_seconds = 60.0
+        async def create_scenario(self, *_args):
+            pytest.fail("No provider call is allowed while paused")
+
+    pipeline = _live_scenario_pipeline(repository, Auxiliary())
+    await pipeline.start()
+    evidence = _live_scenario_evidence()
+    evidence[2].evidence["visual_assessment"] = {"requested": True, "status": "pending"}
+    await pipeline.capture("cart", *evidence, sequence=1)
+    await asyncio.sleep(0)
+    repository.cancel_requested = True
+    await asyncio.wait_for(pipeline.finish(cancelled=True), timeout=0.3)
+    assert repository.scenarios[1].evidence["visual_assessment"]["status"] == "unavailable"
+    assert repository.scenarios[1].evidence["visual_assessment"]["reason"] == "exploration_cancelled"
+
+
+@pytest.mark.asyncio
+async def test_live_pipeline_persistent_quota_stops_at_global_budget():
+    from types import SimpleNamespace
+    repository = _LiveScenarioRepository()
+
+    class Auxiliary:
+        model = "fixture"
+        request_count = 0
+        rate_limit_count = 0
+        async def create_scenario(self, observation, decision, result, number):
+            self.request_count += 1
+            self.rate_limit_count += 1
+            scenario = ExplorationManager._scenario_from_evidence(observation, decision, result, number)
+            scenario.evidence["documentation_provenance"] = {"source": "local_fallback", "reason": "auxiliary_rate_limited"}
+            return scenario
+
+    auxiliary = Auxiliary()
+    pipeline = _live_scenario_pipeline(repository, auxiliary)
+    pipeline.manager.settings = SimpleNamespace(auxiliary_max_rate_limits=2)
+    await pipeline.start()
+    for number in (1, 2, 3):
+        evidence = _live_scenario_evidence()
+        evidence[2].evidence["visual_assessment"] = {"requested": True, "status": "pending"}
+        await pipeline.capture(str(number), *evidence, sequence=number)
+    await asyncio.wait_for(pipeline.finish(), timeout=1)
+    assert auxiliary.request_count == 2
+    assert len(pipeline.skipped) == 3
+    assert all(s.evidence["visual_assessment"]["reason"] == "auxiliary_rate_limit_budget_exhausted" for s in repository.scenarios.values())
+
+
+def test_restoration_business_checks_and_negative_technical_checks_become_cts():
+    from autojev.domain.models import AssertionResult
+    _, _, result = _live_scenario_evidence()
+    result.assertions = [AssertionResult("form_validation_rejected", "Reject missing surname", "Surname required", True, "Observed")]
+    assert ExplorationManager._scenario_capture_policy(decision_source="coverage", is_restoration_action=True, result=result) == (True, None)
+
+
+def test_failed_recovery_does_not_omit_new_attributable_http_failure():
+    from autojev.domain.models import AssertionResult
+    observation, decision, result = _live_scenario_evidence(success=False)
+    decision.action = "navigate"
+    result.before_url = observation.url
+    issue = {"type": "http", "status": 404, "url": observation.url, "message": "GET returned HTTP 404"}
+    ExplorationManager._append_observable_state_evidence(
+        result, decision, observation, state_changed=False,
+        capture_console_errors=True, capture_network_errors=True, new_issues=[issue],
+    )
+    assert any(a.kind == "no_new_browser_errors" and not a.passed for a in result.assertions)
+    assert ExplorationManager._scenario_capture_policy(decision_source="coverage", is_restoration_action=True, result=result) == (True, None)
+    result.assertions = [AssertionResult("no_new_browser_errors", "0", {"http": 404}, False, "Document request failed")]
+    assert ExplorationManager._scenario_capture_policy(decision_source="coverage", is_restoration_action=True, result=result) == (True, None)
+
+
+def test_coverage_restrictions_are_persisted_individually_once():
+    repository = _LiveScenarioRepository()
+    manager = object.__new__(ExplorationManager)
+    manager.repository = repository
+
+    class Planner:
+        pending = [{"id": "restriction-a", "reason": "policy_blocked", "name": "Logout"},
+                   {"id": "restriction-b", "reason": "restore_attempt_limit", "name": "Checkout"}]
+        def drain_restrictions(self):
+            result, self.pending = self.pending, []
+            return result
+
+    planner = Planner()
+    manager._record_coverage_restrictions("run", planner, None)
+    manager._record_coverage_restrictions("run", planner, None)
+    assert [payload["id"] for event, payload in repository.events if event == "coverage_restriction_recorded"] == ["restriction-a", "restriction-b"]
+
+
+def test_coverage_resolution_event_keeps_actual_execution_provenance_once():
+    repository = _LiveScenarioRepository()
+    manager = object.__new__(ExplorationManager)
+    manager.repository = repository
+
+    class Planner:
+        pending = [{"id": "route-a", "status": "resolved", "reason": "no_safe_restore_route",
+                    "resolution": {"action_step": 12, "source": "actual_semantic_move_execution",
+                                   "success": True, "assertions_passed": False, "screenshot": "012-click.png"}}]
+        def drain_restriction_resolutions(self):
+            result, self.pending = self.pending, []
+            return result
+
+    planner = Planner()
+    manager._record_coverage_restrictions("run", planner, None)
+    manager._record_coverage_restrictions("run", planner, None)
+    events = [payload for event, payload in repository.events if event == "coverage_restriction_resolved"]
+    assert len(events) == 1
+    assert events[0]["resolution"]["action_step"] == 12
+    assert events[0]["resolution"]["assertions_passed"] is False
+    assert events[0]["resolution"]["screenshot"] == "012-click.png"
+
+
+def test_required_field_probe_gets_specific_title_without_changing_verdict():
+    observation, decision, result = _live_scenario_evidence()
+    decision.scenario_hint = {"title": "Click Continue", "validation_probe": {"kind": "required_field", "name": "Sobrenome", "field_identity": "last-name", "expected": "validation_rejected"}}
+    scenario = ExplorationManager._scenario_from_evidence(observation, decision, result, 1)
+    assert scenario.title == "Validação obrigatória: Sobrenome"
+    assert scenario.status == ScenarioStatus.PASS
+
+
+@pytest.mark.asyncio
+async def test_live_pipeline_coalesces_obsolete_jobs_during_provider_pause():
+    repository = _LiveScenarioRepository()
+    started, release = asyncio.Event(), asyncio.Event()
+
+    class Auxiliary:
+        async def create_scenario(self, observation, decision, result, number):
+            started.set()
+            await release.wait()
+            scenario = ExplorationManager._scenario_from_evidence(observation, decision, result, number)
+            scenario.title = f"Reviewed {observation.title}"
+            return scenario
+
+    pipeline = _live_scenario_pipeline(repository, Auxiliary())
+    pipeline.queue = asyncio.Queue(maxsize=2)
+    await pipeline.start()
+    await pipeline.capture("cart", *_live_scenario_evidence(), sequence=1)
+    await started.wait()
+    for revision in range(6):
+        await pipeline.capture("cart", *_live_scenario_evidence(title=f"Cart{revision}"), sequence=1)
+    await pipeline.capture("checkout", *_live_scenario_evidence(title="Checkout"), sequence=2)
+    assert pipeline.queue.qsize() == 2  # latest cart + checkout, no obsolete jobs
+    assert not any(event == "scenario_enrichment_backlog_full" for event, _ in repository.events)
+    release.set()
+    await asyncio.wait_for(pipeline.finish(), timeout=1)
+    assert repository.scenarios[1].title == "Reviewed Cart5"
+    assert repository.scenarios[2].title == "Reviewed Checkout"
+    assert not pipeline.skipped
+
+
+def test_cancel_after_success_does_not_erase_completed_review_or_double_count_progress():
+    from autojev.services.exploration import _ScenarioEnrichmentJob
+    repository = _LiveScenarioRepository()
+    pipeline = _live_scenario_pipeline(repository, object())
+    observation, decision, result = _live_scenario_evidence()
+    pipeline.revisions["cart"] = 1
+    pipeline.sequences["cart"] = 1
+    pipeline.enriched.add("cart")
+    pipeline.drafts["cart"] = ExplorationManager._scenario_from_evidence(observation, decision, result, 1)
+    pipeline._mark_skipped(_ScenarioEnrichmentJob("cart", 1, observation, decision, result, 1), "exploration_cancelled")
+    assert not pipeline.skipped
+    assert pipeline._progress_payload()["pending"] == 0
+    assert pipeline._progress_payload()["current"] == 1
+
+
+@pytest.mark.asyncio
+async def test_local_evidence_only_pipeline_has_no_phantom_pending_jobs():
+    repository = _LiveScenarioRepository()
+    pipeline = _live_scenario_pipeline(repository, object(), use_local_evidence=True)
+    await pipeline.start()
+    await pipeline.capture("cart", *_live_scenario_evidence(), sequence=1)
+    await pipeline.finish()
+    assert pipeline._progress_payload()["pending"] == 0
+    assert pipeline._progress_payload()["current"] == pipeline.total == 1
+    assert repository.scenarios[1].status == ScenarioStatus.PASS
+
+
+@pytest.mark.asyncio
+async def test_visual_review_prioritizes_business_failure_and_checkout_after_provider_pause():
+    from autojev.domain.models import AssertionResult
+
+    repository = _LiveScenarioRepository()
+    paused, release = asyncio.Event(), asyncio.Event()
+
+    class Auxiliary:
+        evidence_mode = "visual"
+        calls = []
+
+        async def create_scenario(self, observation, decision, result, number):
+            self.calls.append(number)
+            scenario = ExplorationManager._scenario_from_evidence(observation, decision, result, number)
+            scenario.evidence["documentation_provenance"] = {
+                "source": "auxiliary_llm", "model_input": "text_and_image",
+            }
+            scenario.evidence["visual_assessment"] = {
+                "requested": True, "status": "assessed", "findings": [],
+                "images": [{"ref": "after", "url": observation.url,
+                            "screenshot": f"{number}.png"}],
+            }
+            return scenario
+
+    auxiliary = Auxiliary()
+    pipeline = _live_scenario_pipeline(repository, auxiliary)
+    original_gate = pipeline._provider_gate
+
+    async def wait_first_gate(job):
+        if not paused.is_set():
+            paused.set()
+            await release.wait()
+        return await original_gate(job)
+
+    pipeline._provider_gate = wait_first_gate
+    await pipeline.start()
+
+    async def capture(number, title, state=None, negative=False):
+        observation, decision, result = _live_scenario_evidence(title=title)
+        observation.page_state = state or {}
+        observation.screenshot = f"{number}.png"
+        result.evidence["visual_assessment"] = {"requested": True, "status": "pending"}
+        if negative:
+            result.assertions.append(AssertionResult("checkout_total", "20.00", "30.00", False, "Incorrect total"))
+        await pipeline.capture(str(number), observation, decision, result, sequence=number)
+
+    # A repeated catalog review is already waiting when more valuable evidence
+    # arrives. The pause must not reserve the next request for that old job.
+    pipeline._visually_reviewed_pages.add("https://example.test/catalog")
+    await capture(1, "Catalog")
+    await asyncio.wait_for(paused.wait(), timeout=0.3)
+    await capture(2, "New page")
+    await capture(3, "Detail", {"product_detail": {"name": "Backpack"}})
+    await capture(4, "Checkout", {"checkout": {"stage": "review"}})
+    await capture(5, "Incorrect order", negative=True)
+    await capture(6, "Other page")
+    assert not auxiliary.calls  # neither prioritization nor cooldown sends HTTP
+    assert all(s.evidence["visual_assessment"]["status"] == "pending" for s in repository.scenarios.values())
+
+    release.set()
+    await asyncio.wait_for(pipeline.finish(), timeout=1)
+
+    assert auxiliary.calls == [5, 4, 3, 2, 6, 1]  # FIFO ties: 2 before 6
+    assert len(pipeline.enriched) == 6 and not pipeline.skipped
+    assert pipeline.queue.empty() and pipeline.queue._unfinished_tasks == 0
+    assert repository.scenarios[5].status == ScenarioStatus.FAIL  # local business failure stays authoritative
+    assert all(s.evidence["visual_assessment"]["status"] == "assessed" for s in repository.scenarios.values())
+    assert all(not s.evidence["visual_assessment"].get("reused_identical_evidence") for s in repository.scenarios.values())
+    assert not any(event == "scenario_enrichment_skipped" for event, _ in repository.events)
+
+
+@pytest.mark.asyncio
+async def test_text_documentation_preserves_fifo_even_when_later_ct_has_business_failure():
+    from autojev.domain.models import AssertionResult
+
+    repository = _LiveScenarioRepository()
+
+    class Auxiliary:
+        evidence_mode = "text"
+        calls = []
+
+        async def create_scenario(self, observation, decision, result, number):
+            self.calls.append(number)
+            return ExplorationManager._scenario_from_evidence(observation, decision, result, number)
+
+    auxiliary = Auxiliary()
+    pipeline = _live_scenario_pipeline(repository, auxiliary)
+    await pipeline.start()
+    for number in (1, 2, 3):
+        observation, decision, result = _live_scenario_evidence(title=f"Page{number}")
+        if number == 3:
+            result.assertions.append(AssertionResult("checkout_total", "20.00", "30.00", False, "Incorrect total"))
+        await pipeline.capture(str(number), observation, decision, result, sequence=number)
+    await asyncio.wait_for(pipeline.finish(), timeout=1)
+    assert auxiliary.calls == [1, 2, 3]
+    assert len(pipeline.enriched) == 3 and not pipeline.skipped
+
+
+@pytest.mark.asyncio
+async def test_compact_visual_review_keeps_local_docs_and_counts_review_separately():
+    from autojev.domain.models import AssertionResult
+
+    repository = _LiveScenarioRepository()
+
+    class Auxiliary:
+        evidence_mode = "visual"
+        request_count = 0
+
+        async def create_scenario(self, observation, decision, result, number):
+            self.request_count += 1
+            scenario = ExplorationManager._scenario_from_evidence(observation, decision, result, number)
+            scenario.title = "An unsupported model rewrite"
+            scenario.expected_result = "The whole application works"
+            scenario.evidence["documentation_provenance"] = {
+                "source": "local_evidence", "reason": "deterministic_browser_evidence", "model_input": "none",
+            }
+            scenario.evidence["visual_review_provenance"] = {
+                "source": "auxiliary_llm", "reason": "auxiliary_response_accepted",
+                "model_input": "text_and_image", "response_contract": "visual_findings_v1",
+            }
+            scenario.evidence["visual_assessment"] = {
+                "requested": True, "status": "assessed", "findings": [],
+                "images": [{"ref": "after", "url": observation.url, "screenshot": "cart.png"}],
+            }
+            return scenario
+
+    pipeline = _live_scenario_pipeline(repository, Auxiliary())
+    await pipeline.start()
+    observation, decision, result = _live_scenario_evidence()
+    observation.screenshot = "cart.png"
+    result.evidence["visual_assessment"] = {"requested": True, "status": "pending"}
+    result.assertions.append(AssertionResult("cart_count", 1, 0, False, "Cart count must increase."))
+    await pipeline.capture("cart", observation, decision, result, sequence=1)
+    await pipeline.capture("cart-second-checkpoint", observation, decision, result, sequence=2)
+    await asyncio.wait_for(pipeline.finish(), timeout=1)
+
+    scenario = repository.scenarios[1]
+    assert scenario.title == "Explore click on Cart"
+    assert "Cart count must increase." in scenario.expected_result
+    assert "whole application" not in scenario.expected_result
+    assert scenario.status == ScenarioStatus.FAIL
+    assert scenario.evidence["visual_assessment"]["status"] == "assessed"
+    assert scenario.evidence["documentation_provenance"]["source"] == "local_evidence"
+    assert scenario.evidence["visual_review_provenance"]["response_contract"] == "visual_findings_v1"
+    assert len(pipeline.enriched) == 2 and not pipeline.skipped
+    event = [payload for kind, payload in repository.events if kind == "scenario_enriched"][-1]
+    assert event["provider_requests"] == 2 and event["review_provider_requests"] == 1
+    assert event["review_elapsed_seconds"] >= 0
+    assert pipeline._progress_payload()["provider_requests"] == 2
+    assert pipeline.queue._unfinished_tasks == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["visual_assessment_not_returned", "visual_assessment_schema_invalid"])
+async def test_compact_invalid_visual_review_is_unavailable_not_enriched(reason):
+    repository = _LiveScenarioRepository()
+
+    class Auxiliary:
+        model = "fixture"
+        response_contract = "visual_findings_v1"
+        request_count = 0
+
+        async def create_scenario(self, observation, decision, result, number):
+            self.request_count += 1
+            scenario = ExplorationManager._scenario_from_evidence(observation, decision, result, number)
+            scenario.evidence["documentation_provenance"] = {"source": "local_evidence"}
+            scenario.evidence["visual_review_provenance"] = {
+                "source": "auxiliary_llm", "reason": "auxiliary_response_accepted",
+                "model_input": "text_and_image", "response_contract": self.response_contract,
+                "provider_requests": 1,
+            }
+            scenario.evidence["visual_assessment"] = {
+                "requested": True, "status": "unavailable", "reason": reason,
+                "images": [{"ref": "after", "url": observation.url, "screenshot": "cart.png"}],
+            }
+            return scenario
+
+    pipeline = _live_scenario_pipeline(repository, Auxiliary())
+    await pipeline.start()
+    observation, decision, result = _live_scenario_evidence()
+    observation.screenshot = "cart.png"
+    result.evidence["visual_assessment"] = {"requested": True, "status": "pending"}
+    await pipeline.capture("cart", observation, decision, result, sequence=1)
+    await asyncio.wait_for(pipeline.finish(), timeout=1)
+    scenario = repository.scenarios[1]
+    assert not pipeline.enriched and pipeline.skipped == {"cart"}
+    assert scenario.status == ScenarioStatus.PASS  # Local observable check only.
+    assert scenario.evidence["visual_assessment"]["reason"] == reason
+    assert scenario.evidence["visual_assessment"]["images"] == [{"ref": "after", "url": observation.url, "screenshot": "cart.png"}]
+    assert scenario.evidence["documentation_provenance"]["source"] == "local_evidence"
+    assert scenario.evidence["visual_review_provenance"]["status"] == "unavailable"
+    assert scenario.evidence["visual_review_provenance"]["reason"] == reason
+    assert scenario.evidence["auxiliary_review_metrics"]["provider_requests"] == 1
+    assert not any(kind == "scenario_enriched" for kind, _ in repository.events)
+    assert pipeline._progress_payload()["pending"] == 0
+
+
+def test_compact_visual_defer_keeps_local_document_and_marks_pending_review():
+    from autojev.services.exploration import _ScenarioEnrichmentJob
+    from types import SimpleNamespace
+
+    repository = _LiveScenarioRepository()
+    pipeline = _live_scenario_pipeline(repository, SimpleNamespace(response_contract="visual_findings_v1"))
+    observation, decision, result = _live_scenario_evidence()
+    result.evidence["visual_assessment"] = {"requested": True, "status": "pending"}
+    scenario = ExplorationManager._scenario_from_evidence(observation, decision, result, 1)
+    scenario.evidence["documentation_provenance"] = {"source": "local_evidence"}
+    scenario.evidence["visual_review_provenance"] = {
+        "source": "local_fallback", "reason": "auxiliary_rate_limited",
+        "model_input": "text_and_image", "response_contract": "visual_findings_v1", "provider_requests": 1,
+    }
+    pipeline.revisions["cart"] = 1
+    pipeline.sequences["cart"] = 1
+    pipeline.drafts["cart"] = scenario
+    assert pipeline._defer_rate_limited(_ScenarioEnrichmentJob("cart", 1, observation, decision, result, 1))
+    assert scenario.evidence["documentation_provenance"]["source"] == "local_evidence"
+    assert scenario.evidence["documentation_provenance"]["provider_requests"] == 0
+    assert scenario.evidence["visual_review_provenance"]["status"] == "pending"
+    assert scenario.evidence["visual_review_provenance"]["reason"] == "awaiting_provider_retry"
+    assert scenario.evidence["visual_review_provenance"]["provider_requests"] == 1
+    assert pipeline._progress_payload()["deferred"] == 1
+
+
+def test_compact_pending_tail_skip_retains_local_docs_without_inventing_sent_images():
+    from autojev.services.exploration import _ScenarioEnrichmentJob
+    from types import SimpleNamespace
+
+    repository = _LiveScenarioRepository()
+    pipeline = _live_scenario_pipeline(repository, SimpleNamespace(model="fixture", response_contract="visual_findings_v1"))
+    observation, decision, result = _live_scenario_evidence()
+    observation.screenshot = "cart.png"
+    result.evidence["visual_assessment"] = {"requested": True, "status": "pending"}
+    scenario = ExplorationManager._scenario_from_evidence(observation, decision, result, 1)
+    pipeline.revisions["cart"] = 1
+    pipeline.sequences["cart"] = 1
+    pipeline.drafts["cart"] = scenario
+    pipeline._mark_skipped(_ScenarioEnrichmentJob("cart", 1, observation, decision, result, 1), "documentation_time_limit")
+    assert scenario.evidence["documentation_provenance"]["source"] == "local_evidence"
+    assert scenario.evidence["visual_review_provenance"]["provider_requests"] == 0
+    assert scenario.evidence["visual_review_provenance"]["reason"] == "documentation_time_limit"
+    assert scenario.evidence["visual_assessment"]["images"] == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_visual_reply_still_counts_received_documentation_when_review_missing():
+    repository = _LiveScenarioRepository()
+
+    class Auxiliary:
+        async def create_scenario(self, observation, decision, result, number):
+            scenario = ExplorationManager._scenario_from_evidence(observation, decision, result, number)
+            scenario.evidence["documentation_provenance"] = {"source": "auxiliary_llm", "model_input": "text_and_image"}
+            scenario.evidence["visual_assessment"] = {"requested": True, "status": "unavailable", "reason": "visual_assessment_not_returned"}
+            return scenario
+
+    pipeline = _live_scenario_pipeline(repository, Auxiliary())
+    await pipeline.start()
+    observation, decision, result = _live_scenario_evidence()
+    result.evidence["visual_assessment"] = {"requested": True, "status": "pending"}
+    await pipeline.capture("cart", observation, decision, result, sequence=1)
+    await asyncio.wait_for(pipeline.finish(), timeout=1)
+    assert pipeline.enriched == {"cart"} and not pipeline.skipped
+    assert repository.scenarios[1].evidence["visual_assessment"]["status"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_free_model_no_request_reviews_do_not_start_an_artificial_pacing_delay():
+    from types import SimpleNamespace
+    repository = _LiveScenarioRepository()
+
+    class Auxiliary:
+        model = "fixture:free"
+        request_count = 0
+
+        async def create_scenario(self, observation, decision, result, number):
+            return ExplorationManager._scenario_from_evidence(observation, decision, result, number)
+
+    pipeline = _live_scenario_pipeline(repository, Auxiliary())
+    pipeline.manager.settings = SimpleNamespace(auxiliary_request_interval_seconds=30)
+    await pipeline.start()
+    await pipeline.capture("cart", *_live_scenario_evidence(), sequence=1)
+    await pipeline.capture("checkout", *_live_scenario_evidence(title="Checkout"), sequence=2)
+    await asyncio.wait_for(pipeline.finish(), timeout=0.5)
+    assert len(pipeline.enriched) == 2
+    assert pipeline._next_request_at == 0
+
+
+@pytest.mark.asyncio
 async def test_live_scenario_capture_persists_draft_without_waiting_for_auxiliary():
     repository = _LiveScenarioRepository()
     enrichment_started = asyncio.Event()
@@ -1067,6 +1581,56 @@ async def test_live_scenario_capture_persists_draft_without_waiting_for_auxiliar
         "Enriched 1",
         "Enriched 2",
     ]
+
+
+@pytest.mark.asyncio
+async def test_visual_review_survives_retry_draft_and_auxiliary_replacement():
+    repository = _LiveScenarioRepository()
+    release = asyncio.Event()
+
+    class Auxiliary:
+        async def create_scenario(self, observation, decision, result, number):
+            await release.wait()
+            return ExplorationManager._scenario_from_evidence(
+                observation, decision, result, number
+            )
+
+    pipeline = _live_scenario_pipeline(repository, Auxiliary())
+    first = _live_scenario_evidence()
+    previous = ExplorationManager._scenario_from_evidence(*first, 1)
+    previous.status = ScenarioStatus.FAIL
+    previous.evidence["action_step"] = 1
+    previous.evidence["visual_assessment"] = {
+        "status": "assessed", "requested": True, "accepted_count": 1,
+    }
+    visual_assertion = {"kind": "visual_model", "passed": False,
+                        "message": "Concrete image deviation on previous attempt"}
+    previous.evidence["assertions"].append(visual_assertion)
+    previous.evidence["timeline"].append({
+        "id": "visual-first", "kind": "assertion", "occurred_at": utc_now(),
+        "title": "Visual review", "assertion": visual_assertion,
+        "screenshot": "previous.png", "step_number": 1,
+    })
+    pipeline.drafts["cart"] = previous
+    pipeline.sequences["cart"] = 1
+    pipeline.revisions["cart"] = 1
+    await pipeline.start()
+    retry = _live_scenario_evidence()
+    retry[2].evidence["action_step"] = 2
+    await pipeline.capture("cart", *retry, sequence=1)
+    draft = repository.scenarios[1]
+    assert draft.status == ScenarioStatus.PASS
+    assert not any(a["kind"] == "visual_model" for a in draft.evidence["assertions"])
+    assert any(e["id"] == "visual-first" and e["previous_attempt"]
+               for e in draft.evidence["timeline"])
+    release.set()
+    await asyncio.wait_for(pipeline.finish(), timeout=1)
+    current = repository.scenarios[1]
+    assert current.status == ScenarioStatus.PASS  # latest local attempt only
+    assert any(e["id"] == "visual-first" for e in current.evidence["timeline"])
+    assert current.evidence["visual_assessment_history"][0]["action_step"] == 1
+    assert "previous.png" in current.screenshots
+    assert "visual_assessment_history" not in retry[2].evidence
 
 
 @pytest.mark.asyncio

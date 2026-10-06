@@ -2934,6 +2934,38 @@ input::placeholder {
   line-height: 1.5;
 }
 
+.screenshot-load-error {
+  padding: 24px 18px;
+  gap: 12px;
+}
+
+.screenshot-load-error strong { font-size: 1rem; }
+.screenshot-load-error span { font-size: .875rem; }
+
+.visual-review-summary {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  padding: 18px 22px;
+  border-color: rgba(240, 180, 77, .32);
+}
+
+.visual-review-summary > svg {
+  flex-shrink: 0;
+  color: var(--amber);
+  margin-top: 2px;
+}
+
+.visual-review-summary p {
+  margin: 7px 0;
+  overflow-wrap: anywhere;
+}
+
+.visual-review-summary small {
+  color: var(--muted);
+  line-height: 1.6;
+}
+
 .evidence-strip {
   display: flex;
   align-items: center;
@@ -3981,10 +4013,16 @@ input::placeholder {
   line-height: 1.65;
 }
 
-.scenario-verdict-explanation small {
+.scenario-verdict-explanation small,
+.scenario-context-note > small {
   display: block;
   margin-top: 5px;
   color: #829298;
+}
+
+.scenario-context-note > strong {
+  display: block;
+  overflow-wrap: anywhere;
 }
 
 .scenario-outcome-grid {
@@ -5024,3 +5062,12 @@ input::placeholder {
     transition-duration: .01ms !important;
   }
 }
+/* Verification strength is independent of the workflow progress indicator. */
+.verification-strength { padding: 22px 24px; }
+.verification-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 16px; margin: 16px 0; }
+.verification-metrics strong { display: block; font-size: 24px; }
+.verification-metrics span, .verification-strength p, .coverage-restrictions .panel-heading p { color: var(--text-muted, #93a4aa); font-size: 13px; line-height: 1.6; }
+.restriction-list { display: grid; gap: 12px; }
+.restriction-card { padding: 16px; border: 1px solid var(--border, #293334); border-radius: 12px; border-left: 3px solid #f0b44d; }
+.restriction-card p { margin: 8px 0; }
+.restriction-card small { display: block; color: var(--text-muted, #93a4aa); overflow-wrap: anywhere; }

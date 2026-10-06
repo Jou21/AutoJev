@@ -1,4 +1,6 @@
+import httpx
 import pytest
+from PIL import Image
 
 from autojev.adapters.openai_compatible import (
     ModelResponseError,
@@ -6,8 +8,13 @@ from autojev.adapters.openai_compatible import (
     OpenAICompatibleClient,
     OpenAIJevAgent,
     ProviderConnectionError,
+    _visual_document_schema,
     extract_json,
 )
+
+
+def _png(path, color="green", size=(64, 48)):
+    Image.new("RGB", size, color).save(path, format="PNG")
 from autojev.domain.models import (
     ActionResult,
     AgentDecision,
@@ -16,6 +23,242 @@ from autojev.domain.models import (
     ScenarioStatus,
     utc_now,
 )
+
+
+@pytest.mark.parametrize("catalog", ["supported", "unknown", "unavailable"])
+async def test_visual_strict_output_is_enabled_only_from_declared_openrouter_capability(monkeypatch, catalog):
+    posts, gets = [], []
+
+    def respond(request):
+        import json
+        if request.method == "GET":
+            gets.append(request.url.path)
+            return httpx.Response(503 if catalog == "unavailable" else 200, json={"data": [
+                {"id": "fixture/vision", "supported_parameters": ["structured_outputs"] if catalog == "supported" else []}
+            ]})
+        posts.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"visual_assessment":{"findings":[]}}'}}]})
+
+    original_client = httpx.AsyncClient
+    transport = httpx.MockTransport(respond)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original_client(transport=transport, **kwargs))
+    client = OpenAICompatibleClient("https://openrouter.ai/api/v1", "fixture-only")
+    schema = {"type": "object", "properties": {"visual_assessment": {"type": "object"}}, "required": ["visual_assessment"], "additionalProperties": False}
+    for _ in range(2):
+        await client.chat_json("fixture/vision", "system", "user", response_schema=schema)
+    assert gets == ["/api/v1/models"]  # metadata cached; no key request/inference
+    assert len(posts) == 2
+    for payload in posts:
+        assert payload["response_format"]["type"] == ("json_schema" if catalog == "supported" else "json_object")
+        if catalog == "supported":
+            assert payload["provider"] == {"require_parameters": True}
+            assert payload["response_format"]["json_schema"]["schema"] == schema
+            assert payload["response_format"]["json_schema"]["strict"] is True
+        else:
+            assert "provider" not in payload
+
+
+@pytest.mark.parametrize("status,message,expected_calls", [
+    (400, "unsupported response_format parameter", 2),
+    (400, "invalid request", 1),
+    (404, "unknown model", 1),
+    (429, "rate limit", 1),
+    (401, "unauthorized", 1),
+    (503, "unsupported response_format temporary server error", 1),
+])
+async def test_chat_format_retry_requires_explicit_capability_rejection(monkeypatch, status, message, expected_calls):
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(status, json={"error": {"message": message}}, headers={"Retry-After": "120"})
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"ok":true}'}}]})
+
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original_client(transport=httpx.MockTransport(respond), **kwargs))
+    client = OpenAICompatibleClient("http://fixture.test/v1", None)
+    if expected_calls == 2:
+        assert await client.chat_json("fixture", "system", "user") == {"ok": True}
+    else:
+        with pytest.raises(ProviderConnectionError) as caught:
+            await client.chat_json("fixture", "system", "user")
+        assert caught.value.retry_after_seconds == (120 if status == 429 else None)
+    assert len(calls) == expected_calls
+
+
+async def test_strict_visual_schema_rejection_does_not_retry_or_downgrade(monkeypatch):
+    import json
+
+    posts = []
+
+    def respond(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": [{
+                "id": "fixture/vision", "supported_parameters": ["structured_outputs"],
+            }]})
+        posts.append(json.loads(request.content))
+        return httpx.Response(400, json={"error": {
+            "message": "This vision model does not support response_format json_schema",
+        }})
+
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original_client(transport=httpx.MockTransport(respond), **kwargs))
+    client = OpenAICompatibleClient("https://openrouter.ai/api/v1", "fixture-only")
+    with pytest.raises(ProviderConnectionError):
+        await client.chat_json("fixture/vision", "system", "user", response_schema={"type": "object"})
+    assert len(posts) == 1
+    assert posts[0]["response_format"]["type"] == "json_schema"
+
+
+async def test_gemini_visual_transport_retains_strict_shape_without_expensive_decoding_constraints(monkeypatch):
+    import json
+
+    posts = []
+
+    def respond(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": [{
+                "id": "google/gemini-2.5-flash-lite",
+                "supported_parameters": ["structured_outputs", "reasoning"],
+                "reasoning": {"mandatory": False},
+            }]})
+        posts.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {
+            "content": '{"visual_assessment":{"findings":[]}}',
+        }}]})
+
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original_client(transport=httpx.MockTransport(respond), **kwargs))
+    client = OpenAICompatibleClient("https://openrouter.ai/api/v1", "fixture-only")
+    schema = _visual_document_schema()
+    assert await client.chat_json(
+        "google/gemini-2.5-flash-lite", "Review supplied images only", "fixture evidence",
+        response_schema=schema, max_output_tokens=3072, disable_reasoning=True,
+    ) == {"visual_assessment": {"findings": []}}
+    assert len(posts) == 1
+    payload = posts[0]
+    assert payload["provider"] == {"require_parameters": True}
+    assert payload["response_format"]["type"] == "json_schema"
+    assert payload["response_format"]["json_schema"] == {
+        "name": "autojev_visual_case", "strict": True, "schema": schema,
+    }
+    assert payload["max_tokens"] == 3072
+    assert payload["reasoning"] == {"enabled": False, "exclude": True}
+
+
+async def test_auxiliary_rate_limit_honors_retry_after_without_retry_burst(monkeypatch):
+    now, calls = [10.0], []
+    monkeypatch.setattr("autojev.adapters.openai_compatible.time.monotonic", lambda: now[0])
+
+    class Client:
+        async def chat_json(self, *_args, **_kwargs):
+            calls.append(now[0])
+            if len(calls) == 1:
+                raise ProviderConnectionError("HTTP 429 rate limit", retry_after_seconds=120)
+            return {"title": "Documentation"}
+
+    generator = OpenAIAuxiliaryScenarioGenerator(Client(), "fixture")
+    first = await generator.create_scenario(*_scenario_inputs(), 1)
+    assert first.evidence["documentation_provenance"]["reason"] == "auxiliary_rate_limited"
+    now[0] = 100.0
+    await generator.create_scenario(*_scenario_inputs(), 2)
+    assert calls == [10.0]
+    now[0] = 131.0
+    resumed = await generator.create_scenario(*_scenario_inputs(), 3)
+    assert calls == [10.0, 131.0]
+    assert resumed.evidence["documentation_provenance"]["source"] == "auxiliary_llm"
+
+
+async def test_daily_quota_is_non_retryable_and_reset_header_is_respected(monkeypatch):
+    from autojev.adapters.openai_compatible import _retry_after_seconds
+    monkeypatch.setattr("autojev.adapters.openai_compatible.time.time", lambda: 100.0)
+    response = httpx.Response(429, headers={"X-RateLimit-Reset": "140"})
+    assert _retry_after_seconds(response) == 40
+    response = httpx.Response(429, headers={"Retry-After": "50", "X-RateLimit-Reset": "140"})
+    assert _retry_after_seconds(response) == 50
+
+    class Client:
+        calls = 0
+        async def chat_json(self, *_args, **_kwargs):
+            self.calls += 1
+            raise ProviderConnectionError("HTTP 429 Rate limit exceeded: free-models-per-day")
+
+    client = Client()
+    generator = OpenAIAuxiliaryScenarioGenerator(client, "fixture:free")
+    first = await generator.create_scenario(*_scenario_inputs(), 1)
+    second = await generator.create_scenario(*_scenario_inputs(), 2)
+    assert first.evidence["documentation_provenance"]["reason"] == "auxiliary_rate_limited_daily_quota"
+    assert second.evidence["documentation_provenance"]["model_input"] == "none"
+    assert generator.non_retryable_reason == "auxiliary_rate_limited_daily_quota"
+    assert client.calls == 1
+
+
+@pytest.mark.parametrize("budget,expected_calls,expected_source", [(1, 1, "local_fallback"), (2, 2, "auxiliary_llm")])
+async def test_auxiliary_transport_budget_also_bounds_explicit_format_retry(monkeypatch, budget, expected_calls, expected_source):
+    calls = []
+    def respond(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(400, json={"error": {"message": "unsupported response_format parameter"}})
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"title":"Documented"}'}}]})
+
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original_client(transport=httpx.MockTransport(respond), **kwargs))
+    client = OpenAICompatibleClient("http://fixture.test/v1", None)
+    client.chat_request_budget = budget
+    generator = OpenAIAuxiliaryScenarioGenerator(client, "fixture")
+    scenario = await generator.create_scenario(*_scenario_inputs(), 1)
+    assert len(calls) == expected_calls
+    assert generator.request_count == expected_calls == client.chat_request_count
+    assert scenario.evidence["documentation_provenance"]["source"] == expected_source
+    if budget == 1:
+        assert scenario.evidence["documentation_provenance"]["reason"] == "auxiliary_request_budget_exhausted"
+
+
+async def test_visual_cache_requires_identical_pixels_and_semantics_and_rebinds_capture_ids(tmp_path):
+    for name in ("first.png", "same.png"):
+        _png(tmp_path / name)
+    _png(tmp_path / "different.png", color="blue")
+
+    class Client:
+        calls = 0
+        async def chat_json(self, *_args, **_kwargs):
+            self.calls += 1
+            return {"title": "Visual review", "visual_assessment": {"findings": []}}
+
+    client = Client()
+    generator = OpenAIAuxiliaryScenarioGenerator(client, "fixture", tmp_path, "visual")
+    first = await generator.create_scenario(*_scenario_inputs(screenshot="first.png"), 1)
+    cached = await generator.create_scenario(*_scenario_inputs(screenshot="same.png"), 2)
+    assert client.calls == 1
+    assert first.evidence["visual_assessment"]["status"] == "assessed"
+    assert cached.evidence["documentation_provenance"]["source"] == "local_evidence"
+    assert cached.evidence["visual_review_provenance"]["source"] == "auxiliary_cache"
+    assert cached.evidence["visual_assessment"]["reused_identical_evidence"] is True
+    assert cached.evidence["visual_assessment"]["images"][0]["screenshot"] == "same.png"
+    await generator.create_scenario(*_scenario_inputs(screenshot="different.png"), 3)
+    observation, decision, result = _scenario_inputs(screenshot="same.png")
+    observation.text = "Different product identity"
+    await generator.create_scenario(observation, decision, result, 4)
+    assert client.calls == 3
+
+
+async def test_invalid_visual_response_is_never_cached(tmp_path):
+    _png(tmp_path / "image.png")
+
+    class Client:
+        calls = 0
+        async def chat_json(self, *_args, **_kwargs):
+            self.calls += 1
+            return {"title": "Review", "visual_assessment": {"findings": [{}]}}
+
+    client = Client()
+    generator = OpenAIAuxiliaryScenarioGenerator(client, "fixture", tmp_path, "visual")
+    for number in range(2):
+        scenario = await generator.create_scenario(*_scenario_inputs(screenshot="image.png"), number)
+        assert scenario.evidence["visual_assessment"]["status"] == "unavailable"
+    assert client.calls == 2
 
 
 @pytest.mark.asyncio
@@ -632,7 +875,7 @@ async def test_typesafe_agent_rejects_malformed_or_unknown_atomic_move():
 
 def test_auxiliary_receives_masked_screenshot_as_multimodal_evidence(tmp_path):
     screenshot = tmp_path / "001.png"
-    screenshot.write_bytes(b"masked-png")
+    _png(screenshot)
     generator = OpenAIAuxiliaryScenarioGenerator(object(), "model", tmp_path)
     observation = Observation(
         url="https://example.test",
@@ -645,7 +888,108 @@ def test_auxiliary_receives_masked_screenshot_as_multimodal_evidence(tmp_path):
     content = generator._multimodal_content(observation, "evidence")
     assert isinstance(content, list)
     assert content[0] == {"type": "text", "text": "evidence"}
-    assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
+@pytest.mark.parametrize("size,expected", [
+    ((1440, 900), (768, 480)),
+    ((900, 1440), (480, 768)),
+    ((320, 200), (320, 200)),
+])
+def test_auxiliary_preview_really_downscales_without_overwriting_original(tmp_path, size, expected):
+    import base64
+    from io import BytesIO
+
+    screenshot = tmp_path / "masked.png"
+    Image.new("RGBA", size, (255, 0, 0, 0)).save(screenshot, format="PNG")
+    original = screenshot.read_bytes()
+    generator = OpenAIAuxiliaryScenarioGenerator(object(), "model", tmp_path)
+    observation, _, _ = _scenario_inputs(screenshot=screenshot.name)
+    content = generator._multimodal_content(observation, "evidence")
+    assert isinstance(content, list)
+    url = content[1]["image_url"]["url"]
+    assert url.startswith("data:image/jpeg;base64,")
+    with Image.open(BytesIO(base64.b64decode(url.split(",", 1)[1]))) as preview:
+        assert preview.size == expected
+        assert preview.mode == "RGB"
+        assert preview.getpixel((0, 0)) == (255, 255, 255)
+    assert screenshot.read_bytes() == original
+    with Image.open(screenshot) as saved:
+        assert saved.size == size and saved.mode == "RGBA"
+
+
+def test_invalid_image_is_not_sent_as_visual_evidence(tmp_path):
+    screenshot = tmp_path / "invalid.png"
+    screenshot.write_bytes(b"not an actual PNG")
+    generator = OpenAIAuxiliaryScenarioGenerator(object(), "model", tmp_path)
+    observation, _, _ = _scenario_inputs(screenshot=screenshot.name)
+    assert generator._multimodal_content(observation, "evidence") == "evidence"
+
+
+async def test_visual_cache_does_not_merge_originals_with_identical_lossy_previews(tmp_path):
+    from PIL.PngImagePlugin import PngInfo
+
+    for name in ("first.png", "second.png"):
+        metadata = PngInfo()
+        metadata.add_text("capture", name)
+        Image.new("RGB", (64, 48), "green").save(tmp_path / name, pnginfo=metadata)
+
+    class Client:
+        calls = 0
+        async def chat_json(self, *_args, **_kwargs):
+            self.calls += 1
+            return {"title": "Review", "visual_assessment": {"findings": []}}
+
+    client = Client()
+    generator = OpenAIAuxiliaryScenarioGenerator(client, "fixture", tmp_path, "visual")
+    first_content = generator._multimodal_content(_scenario_inputs(screenshot="first.png")[0], "evidence")
+    second_content = generator._multimodal_content(_scenario_inputs(screenshot="second.png")[0], "evidence")
+    assert first_content == second_content  # metadata stripped from the JPEG
+    await generator.create_scenario(*_scenario_inputs(screenshot="first.png"), 1)
+    await generator.create_scenario(*_scenario_inputs(screenshot="second.png"), 2)
+    assert client.calls == 2  # original bytes differ: no approximate cache reuse
+
+
+@pytest.mark.parametrize("base_url,parameters,reasoning,expected", [
+    ("https://openrouter.ai/api/v1", ["reasoning"], None, {"enabled": False, "exclude": True}),
+    ("https://openrouter.ai/api/v1", [], {"mandatory": False}, {"enabled": False, "exclude": True}),
+    ("https://openrouter.ai/api/v1", ["reasoning"], {"mandatory": True, "supported_efforts": ["high", "minimal"]}, {"effort": "minimal", "exclude": True}),
+    ("https://openrouter.ai/api/v1", ["reasoning"], {"mandatory": True, "supported_efforts": ["low", "high"]}, {"effort": "low", "exclude": True}),
+    ("https://openrouter.ai/api/v1", ["reasoning"], {"mandatory": True}, None),
+    ("https://openrouter.ai/api/v1", [], None, None),
+    ("http://fixture.test/v1", ["reasoning"], None, None),
+])
+async def test_auxiliary_bounds_output_and_declared_reasoning_without_changing_jev(
+    monkeypatch, base_url, parameters, reasoning, expected,
+):
+    import json
+
+    gets, posts = [], []
+    model = {"id": "fixture/model", "supported_parameters": parameters}
+    if reasoning is not None:
+        model["reasoning"] = reasoning
+
+    def respond(request):
+        if request.method == "GET":
+            gets.append(request.url.path)
+            assert "authorization" not in request.headers
+            return httpx.Response(200, json={"data": [model]})
+        posts.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"title":"Documented"}'}}]})
+
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original_client(transport=httpx.MockTransport(respond), **kwargs))
+    client = OpenAICompatibleClient(base_url, "fixture-only")
+    await client.chat_json("fixture/model", "JEV", "observation")
+    assert "max_tokens" not in posts[0] and "reasoning" not in posts[0]
+    generator = OpenAIAuxiliaryScenarioGenerator(client, "fixture/model")
+    await generator._document_request("Documentation", "{}")
+    await generator._document_request("Documentation", "{}")
+    for payload in posts[1:]:
+        assert payload["max_tokens"] == 3072
+        assert payload.get("reasoning") == expected
+    assert gets == (["/api/v1/models"] if "openrouter.ai" in base_url else [])
+    assert len(posts) == 3 and generator.request_count == 2
 
 
 def _scenario_inputs(*, screenshot: str | None = None):
@@ -693,13 +1037,15 @@ async def test_auxiliary_scenario_records_llm_documentation_provenance():
         "reason": "auxiliary_response_accepted",
         "evidence_mode": "text",
         "model_input": "text",
+        "provider_requests": 1,
+        "cache_key": None,
     }
 
 
 @pytest.mark.asyncio
 async def test_auxiliary_text_mode_never_sends_a_captured_screenshot(tmp_path):
     screenshot = tmp_path / "001.png"
-    screenshot.write_bytes(b"masked-png")
+    _png(screenshot)
 
     class FakeClient:
         def __init__(self):
@@ -723,9 +1069,9 @@ async def test_auxiliary_text_mode_never_sends_a_captured_screenshot(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_auxiliary_retries_text_only_after_explicit_vision_rejection(tmp_path):
+async def test_visual_review_does_not_spend_text_retry_after_explicit_vision_rejection(tmp_path):
     screenshot = tmp_path / "001.png"
-    screenshot.write_bytes(b"masked-png")
+    _png(screenshot)
 
     class FakeClient:
         def __init__(self):
@@ -747,21 +1093,26 @@ async def test_auxiliary_retries_text_only_after_explicit_vision_rejection(tmp_p
         *_scenario_inputs(screenshot=screenshot.name), 2
     )
 
-    assert len(client.contents) == 2
+    assert len(client.contents) == 1
     assert isinstance(client.contents[0], list)
-    assert isinstance(client.contents[1], str)
-    assert scenario.evidence["documentation_provenance"] == {
-        "source": "auxiliary_llm",
-        "reason": "text_only_retry_after_explicit_vision_incompatibility",
+    assert scenario.title == "Product control"
+    assert scenario.evidence["documentation_provenance"]["source"] == "local_evidence"
+    assert scenario.evidence["visual_review_provenance"] == {
+        "source": "local_fallback",
+        "reason": "vision_input_not_supported",
         "evidence_mode": "visual",
-        "model_input": "visual_then_text_fallback",
+        "model_input": "text_and_image",
+        "provider_requests": 1,
+        "cache_key": None,
+        "response_contract": "visual_findings_v1",
     }
+    assert scenario.evidence["visual_assessment"]["status"] == "unavailable"
 
 
 @pytest.mark.asyncio
 async def test_visual_mode_recognises_openrouter_text_only_endpoint_message(tmp_path):
     screenshot = tmp_path / "001.png"
-    screenshot.write_bytes(b"masked-png")
+    _png(screenshot)
 
     class FakeClient:
         def __init__(self):
@@ -783,10 +1134,8 @@ async def test_visual_mode_recognises_openrouter_text_only_endpoint_message(tmp_
         *_scenario_inputs(screenshot=screenshot.name), 3
     )
 
-    assert client.calls == 2
-    assert scenario.evidence["documentation_provenance"]["reason"] == (
-        "text_only_retry_after_explicit_vision_incompatibility"
-    )
+    assert client.calls == 1
+    assert scenario.evidence["visual_review_provenance"]["reason"] == "vision_input_not_supported"
 
 
 @pytest.mark.asyncio
@@ -809,13 +1158,21 @@ async def test_visual_mode_recognises_openrouter_text_only_endpoint_message(tmp_
             "Provider returned HTTP 400: invalid request",
             "auxiliary_provider_error",
         ),
+        (
+            "Provider returned HTTP 400: This vision model does not support response_format json_schema",
+            "auxiliary_provider_error",
+        ),
+        (
+            "Provider returned HTTP 422: This multimodal model does not support structured_outputs",
+            "auxiliary_provider_error",
+        ),
     ],
 )
 async def test_auxiliary_does_not_retry_non_capability_failures_as_text(
     tmp_path, provider_error, fallback_reason
 ):
     screenshot = tmp_path / "001.png"
-    screenshot.write_bytes(b"masked-png")
+    _png(screenshot)
 
     class FakeClient:
         def __init__(self):
@@ -834,12 +1191,41 @@ async def test_auxiliary_does_not_retry_non_capability_failures_as_text(
     )
 
     assert client.calls == 1
-    assert scenario.evidence["documentation_provenance"] == {
+    assert scenario.evidence["documentation_provenance"]["source"] == "local_evidence"
+    assert scenario.evidence["visual_review_provenance"] == {
         "source": "local_fallback",
         "reason": fallback_reason,
         "evidence_mode": "visual",
         "model_input": "text_and_image",
+        "provider_requests": 1,
+        "cache_key": None,
+        "response_contract": "visual_findings_v1",
     }
+
+
+async def test_visual_mode_does_not_send_before_only_image_payload(tmp_path):
+    _png(tmp_path / "before.png")
+
+    class Client:
+        def __init__(self):
+            self.contents = []
+
+        async def chat_json(self, _model, _system, content, **kwargs):
+            self.contents.append(content)
+            assert "response_schema" not in kwargs
+            return {"title": "Local cart verification", "steps": ["Open cart"]}
+
+    client = Client()
+    generator = OpenAIAuxiliaryScenarioGenerator(client, "fixture", tmp_path, evidence_mode="visual")
+    observation, decision, result = _scenario_inputs(screenshot="missing-after.png")
+    result.evidence = {"before_screenshot": "before.png", "before_url": result.before_url}
+    scenario = await generator.create_scenario(observation, decision, result, 1)
+    assert client.contents == []
+    assert scenario.evidence["visual_review_provenance"]["provider_requests"] == 0
+    assert scenario.evidence["visual_review_provenance"]["reason"] == "screenshot_not_available"
+    assert scenario.evidence["visual_assessment"]["status"] == "unavailable"
+    assert scenario.evidence["visual_assessment"]["images"] == []
+    assert "before.png" in scenario.screenshots
 
 
 @pytest.mark.asyncio

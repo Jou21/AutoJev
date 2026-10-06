@@ -1,3 +1,4 @@
+import base64
 from pathlib import Path
 
 import pytest
@@ -296,6 +297,97 @@ async def test_real_dom_observation_rejects_transparent_and_disabled_controls(
         if browser is not None:
             await browser.close()
         await playwright.stop()
+
+
+async def test_observe_rejects_center_occlusion_even_when_button_corner_is_free(tmp_path: Path):
+    from playwright.async_api import async_playwright
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page(viewport={"width": 800, "height": 600})
+            await page.set_content("""
+              <style>body{margin:0}#background{position:absolute;left:20px;top:200px;width:220px;height:40px}
+              .bm-menu-wrap{position:fixed;left:80px;top:0;width:100px;height:600px;background:white;z-index:20}</style>
+              <button id="background">Continue Shopping</button>
+              <div class="bm-menu-wrap"><nav><button onclick="this.closest('.bm-menu-wrap').remove()">Close Menu</button></nav></div>
+            """)
+            executor = PlaywrightExecutor(tmp_path, ExplorationOptions(capture_screenshots=False))
+            executor._page, executor._browser = page, browser
+            before = await executor.observe()
+            elements = {item["name"]: item for item in before.interactive_elements}
+            assert elements["Continue Shopping"]["interactable"] is False
+            assert elements["Continue Shopping"]["obstructed_by_overlay"] is True
+            assert elements["Close Menu"]["in_overlay"] is True
+            assert elements["Close Menu"]["overlay_dismiss"] is True
+            await page.get_by_role("button", name="Close Menu").click()
+            after = await executor.observe()
+            background = next(item for item in after.interactive_elements if item["name"] == "Continue Shopping")
+            assert background["interactable"] is True
+            assert background["obstructed_by_overlay"] is False
+        finally:
+            await browser.close()
+
+
+async def test_overlay_dismiss_never_discards_entered_form_data(tmp_path: Path):
+    from playwright.async_api import async_playwright
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page()
+            executor = PlaywrightExecutor(tmp_path, ExplorationOptions(capture_screenshots=False))
+            executor._page, executor._browser = page, browser
+            await page.set_content('<section role="dialog"><input value="draft"><button>Cancel</button></section>')
+            observation = await executor.observe()
+            close = next(item for item in observation.interactive_elements if item["name"] == "Cancel")
+            assert close["in_overlay"] is True
+            assert close["overlay_dismiss"] is False
+            await page.locator("input").fill("")
+            observation = await executor.observe()
+            close = next(item for item in observation.interactive_elements if item["name"] == "Cancel")
+            assert close["overlay_dismiss"] is True
+        finally:
+            await browser.close()
+
+
+async def test_navigation_owner_and_bare_href_survive_menu_content_changes(tmp_path: Path):
+    from playwright.async_api import async_playwright
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page()
+            await page.set_content('<nav id="menu" aria-label="Site menu"><a href="#">Dynamic Catalog</a></nav>')
+            executor = PlaywrightExecutor(tmp_path, ExplorationOptions(capture_screenshots=False))
+            executor._page, executor._browser = page, browser
+            before = (await executor.observe()).interactive_elements[0]
+            await page.evaluate("document.querySelector('nav').insertAdjacentHTML('beforeend','<a href=\"#\">Lazy Load</a>')")
+            after = (await executor.observe()).interactive_elements[0]
+            assert before["raw_href"] == after["raw_href"] == "#"
+            assert before["navigation_owner"] == after["navigation_owner"] == "nav id=menu aria-label=Site menu"
+            assert before["context"] != after["context"]
+        finally:
+            await browser.close()
+
+
+@pytest.mark.parametrize("host,blocked", [("production.example", True), ("www.saucedemo.com", False), ("shop.test", False)])
+async def test_finish_checkout_is_only_automatic_on_known_sandbox_origins(tmp_path: Path, host, blocked):
+    class Page:
+        url = f"https://{host}/review"
+    class Locator:
+        async def evaluate(self, script):
+            if "order|complete order" in script:
+                return True
+            return ""
+        async def inner_text(self, **_kwargs):
+            return "Finish"
+        async def get_attribute(self, _attribute, **_kwargs):
+            return None
+    executor = PlaywrightExecutor(tmp_path, ExplorationOptions())
+    executor._page = Page()
+    if blocked:
+        with pytest.raises(PermissionError, match="real order"):
+            await executor._enforce_safe_interaction(Locator())
+    else:
+        await executor._enforce_safe_interaction(Locator())
 
 
 def test_sidepanel_is_stable_click_controlled_and_expands_on_attention(tmp_path: Path):
@@ -646,4 +738,104 @@ async def test_capture_never_mutates_live_panel_visibility(tmp_path: Path):
     assert filename == "001-painel-estavel.png"
     assert page.screenshot_options["full_page"] is False
     assert page.screenshot_options["mask"] == []
+    assert page.screenshot_options["caret"] == "initial"
     assert "style" not in page.screenshot_options
+
+
+async def test_real_capture_masks_manual_credentials_without_changing_panel_or_inputs(
+    tmp_path: Path,
+):
+    playwright_api = pytest.importorskip("playwright.async_api")
+    playwright = await playwright_api.async_playwright().start()
+    browser = None
+    try:
+        try:
+            browser = await playwright.chromium.launch(headless=True)
+        except playwright_api.Error as exc:
+            pytest.skip(f"Chromium is unavailable: {exc}")
+        page = await browser.new_page(viewport={"width": 800, "height": 600})
+        await page.set_content(
+            """
+            <style>
+              input,textarea,select {display:block;width:240px;height:24px;margin:8px;}
+              #autojev-sidepanel {position:fixed;right:12px;top:12px;
+                width:100px;height:100px;background:rgb(20,184,166);}
+            </style>
+            <input id="username" value="fixture-user">
+            <input id="password" type="password" value="fixture-password">
+            <input id="access" aria-label="API key" value="fixture-api-key">
+            <input id="code" autocomplete="one-time-code" value="123456">
+            <textarea id="note" name="session_token">fixture-session</textarea>
+            <select id="choice" aria-label="Secret choice"><option>fixture-private</option></select>
+            <input id="ordinary" placeholder="Product quantity" value="2">
+            <aside id="autojev-sidepanel">J</aside>
+            """
+        )
+        # Record mutations, not just the final style: a transient hide/show
+        # would still flash even if its final computed state were identical.
+        await page.evaluate(
+            """() => {
+              window.fixtureMutations = [];
+              new MutationObserver((changes) => window.fixtureMutations.push(
+                ...changes.map((change) => ({type:change.type,attribute:change.attributeName}))
+              )).observe(document.body, {subtree:true,attributes:true,childList:true});
+            }"""
+        )
+        executor = PlaywrightExecutor(
+            tmp_path, ExplorationOptions(capture_screenshots=True), headless=False
+        )
+        executor._page = page
+        assert executor.secret_values == []  # no credential vault / external key
+        sensitive_ids = await page.locator(
+            executor._SENSITIVE_FIELD_SELECTOR
+        ).evaluate_all("nodes => nodes.map(node => node.id)")
+        assert set(sensitive_ids) == {
+            "username", "password", "access", "code", "note", "choice",
+        }
+
+        first = await executor._capture("manual credentials")
+        second = await executor._capture("manual credentials again")
+
+        assert first and second
+        assert await page.evaluate("window.fixtureMutations") == []
+        assert await page.locator("#username").input_value() == "fixture-user"
+        assert await page.locator("#access").input_value() == "fixture-api-key"
+        assert await page.locator("#ordinary").input_value() == "2"
+        assert await page.locator("#autojev-sidepanel").is_visible()
+
+        coordinates = {}
+        for element_id in [*sensitive_ids, "ordinary", "autojev-sidepanel"]:
+            box = await page.locator(f"#{element_id}").bounding_box()
+            coordinates[element_id] = [
+                int(box["x"] + box["width"] / 2),
+                int(box["y"] + box["height"] / 2),
+            ]
+        # Inspect actual screenshot pixels with an off-DOM canvas. The masking
+        # must protect both repeated captures without painting over the panel.
+        for filename in (first, second):
+            pixels = await page.evaluate(
+                """async ({data,coordinates}) => {
+                  const image = new Image();
+                  image.src = `data:image/png;base64,${data}`;
+                  await image.decode();
+                  const canvas = document.createElement('canvas');
+                  canvas.width=image.width; canvas.height=image.height;
+                  const context=canvas.getContext('2d'); context.drawImage(image,0,0);
+                  return Object.fromEntries(Object.entries(coordinates).map(([id,[x,y]]) =>
+                    [id,Array.from(context.getImageData(x,y,1,1).data)]));
+                }""",
+                {
+                    "data": base64.b64encode((tmp_path / filename).read_bytes()).decode(),
+                    "coordinates": coordinates,
+                },
+            )
+            assert all(
+                pixels[element_id] == [16, 20, 22, 255]
+                for element_id in sensitive_ids
+            )
+            assert pixels["ordinary"] != [16, 20, 22, 255]
+            assert pixels["autojev-sidepanel"] == [20, 184, 166, 255]
+    finally:
+        if browser is not None:
+            await browser.close()
+        await playwright.stop()

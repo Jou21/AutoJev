@@ -173,8 +173,36 @@ type ScenarioCase = {
     timeline?: ScenarioTimelineEntry[];
     technical_signals?: ScenarioTechnicalSignal[];
     assertions?: ScenarioAssertion[];
+    visual_assessment?: { requested?: boolean; status?: string; reason?: string; accepted_count?: number; uncertain_count?: number; limitations?: string[] };
+    documentation_provenance?: { source?: string; reason?: string; evidence_mode?: string; model_input?: string };
     verdict?: { kind?: string; label?: string; explanation?: string; historical?: boolean };
   };
+};
+
+type CoverageRestriction = {
+  id?: string;
+  reason?: string;
+  source_url?: string;
+  target_url?: string;
+  action?: string;
+  name?: string;
+  target?: string;
+  field_name?: string;
+  validation_probe?: { name?: string; blocking_fields?: { name?: string }[] };
+  status?: string;
+  resolution?: { action_step?: number; screenshot?: string; source_url?: string; assertions_passed?: boolean };
+  dependency?: { kind?: string; source?: string; name?: string; item_id?: string; action_step?: number; screenshot?: string };
+};
+
+type VerificationCounts = {
+  business_verified?: number;
+  interaction_only?: number;
+  execution_failures?: number;
+  technical_failures?: number;
+  business_failures?: number;
+  visual_findings?: number;
+  interaction_failures?: number;
+  not_validated?: number;
 };
 
 type Exploration = {
@@ -185,6 +213,12 @@ type Exploration = {
   updated_at?: string;
   started_at?: string;
   finished_at?: string;
+  duration_summary?: { started_at?: string | null; ended_at?: string | null; total_seconds?: number | null; ongoing?: boolean };
+  visual_review_summary?: {
+    total: number; assessed: number; pending: number; unavailable: number;
+    rate_limited: number; incomplete_response: number;
+    unavailable_reasons?: { reason: string; count: number; label: string }[];
+  };
   progress?: number | null;
   overall_progress?: number | null;
   phase?: "preparing" | "exploring" | "waiting_input" | "documenting" | "reporting" | "complete";
@@ -199,6 +233,9 @@ type Exploration = {
     local_evidence?: number;
     stage?: string | null;
     reason?: string | null;
+    pending?: number;
+    deferred?: number;
+    requests?: number;
   };
   completion?: {
     type?: string | null;
@@ -209,7 +246,10 @@ type Exploration = {
     frontier_candidates?: number | null;
     blocked_candidates?: number | null;
     restorations_abandoned?: number | null;
+    restrictions?: CoverageRestriction[];
+    resolved_restrictions?: CoverageRestriction[];
   };
+  verification_summary?: VerificationCounts;
   current_step?: string;
   current_action?: string;
   screenshot_url?: string | null;
@@ -345,6 +385,97 @@ function explorationEvidenceMode(options?: Record<string, unknown>): "text" | "v
   return value === "visual" ? "visual" : "text";
 }
 
+export function visualUnavailabilityLabel(reason: string) {
+  if (reason.startsWith("auxiliary_rate_limit")) return "limitados pelo provedor";
+  return ({
+    documentation_time_limit: "sem revisão antes do limite de espera das revisões auxiliares",
+    TimeoutError: "com tempo de resposta da LLM auxiliar excedido",
+    auxiliary_timeout: "com tempo de resposta da LLM auxiliar excedido",
+    auxiliary_provider_pause_exceeds_budget: "com espera exigida pelo provedor maior que o limite desta execução",
+    auxiliary_request_budget_exhausted: "sem revisão após esgotar o orçamento de chamadas auxiliares",
+    visual_assessment_not_returned: "com resposta visual ausente ou inválida",
+    visual_assessment_schema_invalid: "com resposta visual ausente ou inválida",
+    visual_findings_invalid: "com resposta visual ausente ou inválida",
+    auxiliary_response_invalid: "com resposta auxiliar ausente ou inválida",
+    auxiliary_response_schema_invalid: "com resposta auxiliar ausente ou inválida",
+    screenshot_not_available: "sem captura disponível para a revisão visual",
+    after_screenshot_not_available: "sem captura posterior à ação disponível",
+    vision_rejected_text_fallback: "com entrada de imagem recusada pelo modelo",
+    auxiliary_authentication_rejected: "com autenticação do provedor recusada",
+    auxiliary_provider_error: "com falha na requisição ao provedor",
+    auxiliary_unavailable: "com provedor indisponível",
+    auxiliary_backlog_full: "sem revisão por fila auxiliar cheia",
+    exploration_cancelled: "sem revisão devido ao cancelamento da execução",
+    backend_shutdown: "sem revisão devido ao encerramento do backend",
+    documentation_interrupted: "com revisão auxiliar interrompida",
+    auxiliary_worker_stopped: "com processamento auxiliar interrompido",
+    auxiliary_worker_unavailable: "sem processamento auxiliar disponível",
+    local_evidence_mode: "preservados somente com evidência local",
+  } as Record<string, string>)[reason] || "sem revisão visual válida; motivo não classificado";
+}
+
+export function visualReviewCounts(scenarios: ScenarioCase[]) {
+  const counts = { total: scenarios.length, assessed: 0, pending: 0, unavailable: 0, rateLimited: 0, incompleteResponse: 0, unavailableReasons: [] as { reason: string; count: number; label: string }[] };
+  const unavailableReasons = new Map<string, number>();
+  for (const scenario of scenarios) {
+    const visual = scenario.evidence?.visual_assessment;
+    if (visual?.status === "assessed" && visual.reason !== "visual_findings_invalid") counts.assessed += 1;
+    else if (visual?.status === "pending") counts.pending += 1;
+    else {
+      counts.unavailable += 1;
+      const reason = visual?.reason || "reason_not_recorded";
+      unavailableReasons.set(reason, (unavailableReasons.get(reason) || 0) + 1);
+      if (reason.startsWith("auxiliary_rate_limit")) counts.rateLimited += 1;
+      if (["visual_assessment_not_returned", "visual_assessment_schema_invalid", "visual_findings_invalid"].includes(reason)) counts.incompleteResponse += 1;
+    }
+  }
+  counts.unavailableReasons = [...unavailableReasons].sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0).map(([reason, count]) => ({ reason, count, label: visualUnavailabilityLabel(reason) }));
+  return counts;
+}
+
+export function VisualReviewSummary({ scenarios, active = false, summary }: { scenarios: ScenarioCase[]; active?: boolean; summary?: Exploration["visual_review_summary"] }) {
+  // Prefer the shared API summary; the local equivalent also supports older
+  // backend versions while a live run finishes without a backend restart.
+  const counts = summary?.unavailable_reasons ? { ...summary, unavailableReasons: summary.unavailable_reasons } : visualReviewCounts(scenarios);
+  const title = counts.pending || (active && !counts.total) ? "Análise visual em andamento"
+    : !counts.assessed ? "Análise visual não realizada"
+    : counts.unavailable ? "Análise visual parcial" : "Capturas analisadas";
+  return <section className="visual-review-summary panel" aria-label="Resultado da análise visual">
+    <Eye size={20} />
+    <div><strong>{title}</strong>
+      <p>{counts.assessed} de {counts.total} CTs receberam uma análise visual válida · {counts.pending} em análise · {counts.unavailable} indisponíveis.</p>
+      {counts.unavailableReasons.map((item) => <p key={item.reason}>{item.count} {item.label}. <small>Código: {item.reason}</small></p>)}
+      <small>PASS/FAIL das verificações locais continua válido. Análise visual indisponível não significa aprovação visual; ausência de indícios não garante cobertura visual completa.</small>
+    </div>
+  </section>;
+}
+
+export function screenshotRequestUrl(src: string, revision: string, attempt: number) {
+  if (/^(?:data|blob):/i.test(src)) return src;
+  const url = new URL(src);
+  url.searchParams.set("v", `${revision}${attempt ? `-retry-${attempt}` : ""}`);
+  return url.href;
+}
+
+export function ScreenshotPreview({ src, revision = "latest", alt }: { src?: string | null; revision?: string; alt: string }) {
+  // Reset by source/revision: a late error from an old capture cannot hide a
+  // newer one. Only the user can retry; there is no endless polling loop.
+  return <ScreenshotRequest key={`${src || "empty"}-${revision}`} src={src} revision={revision} alt={alt} />;
+}
+
+function ScreenshotRequest({ src, revision, alt }: { src?: string | null; revision: string; alt: string }) {
+  const [attempt, setAttempt] = useState(0);
+  const [failedAttempt, setFailedAttempt] = useState<number | null>(null);
+  if (!src) return <div className="no-screenshot"><MonitorPlay size={32} /><strong>Aguardando captura do browser</strong><span>O preview aparecerá quando o executor publicar a primeira evidência.</span></div>;
+  if (failedAttempt === attempt) return <div className="no-screenshot screenshot-load-error" role="status">
+    <AlertCircle size={28} /><strong>Não foi possível carregar a captura</strong>
+    <span>Isso não altera o resultado dos testes. Tente carregar a evidência novamente.</span>
+    <button className="button secondary" onClick={() => setAttempt((current) => current + 1)}><RefreshCcw size={16} />Tentar novamente</button>
+    <a className="text-button" href={src} target="_blank" rel="noreferrer">Abrir imagem original</a>
+  </div>;
+  return <img key={attempt} src={screenshotRequestUrl(src, revision, attempt)} alt={alt} onError={() => setFailedAttempt(attempt)} />;
+}
+
 function listFrom<T>(value: unknown, keys: string[]): T[] {
   if (Array.isArray(value)) return value as T[];
   if (value && typeof value === "object") {
@@ -387,6 +518,7 @@ const FREE_MODEL_PREFERENCE = [
 ];
 
 const JEV_MODEL_PREFERENCE = ["typesafe/jev-1.13", "typesafe/jev-latest"];
+const AUXILIARY_MODEL_PREFERENCE = ["google/gemini-2.5-flash-lite"];
 
 function defaultModel(models: Model[], role: "agent" | "auxiliary") {
   if (role === "agent") {
@@ -394,6 +526,12 @@ function defaultModel(models: Model[], role: "agent" | "auxiliary") {
       models.some((model) => modelValue(model) === preferred),
     );
     if (jevModel) return jevModel;
+  } else {
+    // Explicit default requested by the user, not a paid fallback on failure.
+    const preferredModel = AUXILIARY_MODEL_PREFERENCE.find((preferred) =>
+      models.some((model) => modelValue(model) === preferred),
+    );
+    if (preferredModel) return preferredModel;
   }
   const freeModels = models.filter((model) => modelValue(model).endsWith(":free"));
   if (!freeModels.length) return models[0] ? modelValue(models[0]) : "";
@@ -443,16 +581,27 @@ function hostFromUrl(value?: string) {
   }
 }
 
-function durationBetween(start?: string, end?: string) {
-  if (!start) return "—";
-  const first = new Date(start).getTime();
-  const last = end ? new Date(end).getTime() : Date.now();
-  if (Number.isNaN(first) || Number.isNaN(last)) return "—";
-  const totalSeconds = Math.max(0, Math.floor((last - first) / 1000));
+export function explorationDuration(exploration: Exploration, now = Date.now()) {
+  const duration = exploration.duration_summary;
+  const first = Date.parse(duration?.started_at || exploration.started_at || exploration.created_at || "");
+  if (Number.isNaN(first)) return "—";
+  const recordedEnds = [exploration.finished_at, exploration.updated_at, ...(exploration.events || []).map((event) => event.created_at)].map((value) => Date.parse(value || "")).filter(Number.isFinite);
+  const last = isLive(exploration.status) ? now : duration?.ended_at ? Date.parse(duration.ended_at) : recordedEnds.length ? Math.max(...recordedEnds) : NaN;
+  if (Number.isNaN(last)) return "—";
+  const totalSeconds = !isLive(exploration.status) && typeof duration?.total_seconds === "number" ? duration.total_seconds : Math.max(0, Math.floor((last - first) / 1000));
   if (totalSeconds < 60) return `${totalSeconds}s`;
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   return `${minutes}m ${seconds}s`;
+}
+
+export function explorationDetailState(explorationId: string | undefined, selected: Exploration | null, loading: boolean, settledId: string | null) {
+  const exploration = selected?.id === explorationId ? selected : null;
+  return {
+    exploration,
+    loading: loading || (!exploration && settledId !== explorationId),
+    shouldPoll: !exploration || isLive(exploration.status),
+  };
 }
 
 function formatTokens(value?: number) {
@@ -518,7 +667,7 @@ function activityCopy(event: ExplorationEvent) {
     waiting_input: { title: "Aguardando uma ação sua", detail: event.message },
     limit_reached: { title: "Limite de ações atingido", detail: "A execução foi preservada com cobertura parcial." },
     coverage_complete: { title: "Cobertura concluída", detail: "O JEV esgotou as opções alcançáveis." },
-    coverage_complete_with_restrictions: { title: "Cobertura alcançável concluída", detail: "Os controles que não puderam ser executados com segurança foram documentados no resultado." },
+    coverage_complete_with_restrictions: { title: "Cobertura alcançável concluída", detail: "As verificações que não puderam ser concluídas foram documentadas com suas limitações." },
     coverage_stalled: { title: "Exploração bloqueada", detail: event.message },
     scenario_parallel_started: { title: "CTs ativados em paralelo", detail: "Cada evidência válida já começa a virar caso de teste enquanto o navegador continua." },
     scenario_draft_created: { title: `${scenario} preservado ao vivo`, detail: "A evidência local já está segura; a LLM auxiliar pode aprimorá-la em segundo plano." },
@@ -677,6 +826,7 @@ export default function AutoJevApp() {
   const [selectedExploration, setSelectedExploration] = useState<Exploration | null>(null);
   const [loading, setLoading] = useState(true);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [settledExplorationId, setSettledExplorationId] = useState<string | null>(null);
   const [apiState, setApiState] = useState<"checking" | "online" | "offline">("checking");
   const [connectionError, setConnectionError] = useState("");
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -684,6 +834,7 @@ export default function AutoJevApp() {
   const [reportData, setReportData] = useState<unknown | null>(null);
   const [pollInterval, setPollInterval] = useState(3000);
   const modelCatalogRefreshes = useRef(new Set<string>());
+  const activeExplorationId = useRef<string | undefined>(undefined);
 
   const apiBase = normalizeBaseUrl(DEFAULT_API_URL);
 
@@ -774,7 +925,7 @@ export default function AutoJevApp() {
     if (!quiet) setDetailLoading(true);
     try {
       const data = await request<Exploration>(`/explorations/${encodeURIComponent(id)}`);
-      setSelectedExploration(data);
+      if (activeExplorationId.current === id) setSelectedExploration(data);
       setExplorations((current) => current.map((item) => {
         if (item.id !== data.id) return item;
         return {
@@ -792,11 +943,16 @@ export default function AutoJevApp() {
       setConnectionError("");
       return data;
     } catch (error) {
-      setConnectionError(errorMessage(error));
-      if (!quiet) toast(errorMessage(error), "error");
+      if (activeExplorationId.current === id) {
+        setConnectionError(errorMessage(error));
+        if (!quiet) toast(errorMessage(error), "error");
+      }
       return null;
     } finally {
-      setDetailLoading(false);
+      if (activeExplorationId.current === id) {
+        setDetailLoading(false);
+        setSettledExplorationId(id);
+      }
     }
   }, [request, toast]);
 
@@ -804,7 +960,9 @@ export default function AutoJevApp() {
     const saved = window.localStorage.getItem("autojev-poll-interval");
     if (saved && Number(saved) >= 1500) setPollInterval(Number(saved));
     const onHash = () => {
-      setRoute(parseRoute());
+      const nextRoute = parseRoute();
+      activeExplorationId.current = nextRoute.explorationId;
+      setRoute(nextRoute);
       setMobileNavOpen(false);
     };
     if (!window.location.hash) window.location.hash = "#/dashboard";
@@ -826,13 +984,13 @@ export default function AutoJevApp() {
   }, [route, loadExploration]);
 
   useEffect(() => {
-    if (route.view !== "detail" || !route.explorationId || (selectedExploration && !isLive(selectedExploration.status))) return;
+    if (route.view !== "detail" || !route.explorationId || !explorationDetailState(route.explorationId, selectedExploration, detailLoading, settledExplorationId).shouldPoll) return;
     const timer = window.setInterval(async () => {
       const data = await loadExploration(route.explorationId as string, true);
       if (data && !isLive(data.status)) void loadCore(true);
     }, pollInterval);
     return () => window.clearInterval(timer);
-  }, [route, pollInterval, loadExploration, loadCore, selectedExploration]);
+  }, [route, pollInterval, loadExploration, loadCore, selectedExploration, detailLoading, settledExplorationId]);
 
   useEffect(() => {
     if (route.view === "detail" || !explorations.some((item) => isLive(item.status))) return;
@@ -916,8 +1074,9 @@ export default function AutoJevApp() {
       case "detail":
         return (
           <ExplorationDetailView
-            exploration={selectedExploration}
-            loading={detailLoading}
+            key={route.explorationId}
+            exploration={explorationDetailState(route.explorationId, selectedExploration, detailLoading, settledExplorationId).exploration}
+            loading={explorationDetailState(route.explorationId, selectedExploration, detailLoading, settledExplorationId).loading}
             providers={providers}
             request={request}
             toast={toast}
@@ -1328,6 +1487,11 @@ function NewExplorationView({
       toast("Informe a tela, menu ou submenu que deve ser explorado.", "error");
       return;
     }
+    if ((username || password) && (!username.trim() || !password)) {
+      setCredentialsOpen(true);
+      toast("Informe usuário e senha juntos, ou deixe ambos vazios para fazer login manualmente.", "error");
+      return;
+    }
     setUrl(targetUrl);
     setSubmitting(true);
     try {
@@ -1353,7 +1517,9 @@ function NewExplorationView({
         auxiliary_llm: { provider_id: auxProvider, model_id: auxModel },
         options: explorationOptions,
       };
-      if (credentialsOpen && (username || password)) body.credentials = { username, password };
+      // Collapsing the credentials section changes only visibility, not the
+      // login setup. Values remain ephemeral and are never saved in the UI.
+      if (username || password) body.credentials = { username: username.trim(), password };
       const created = await request<Exploration>("/explorations", { method: "POST", body: JSON.stringify(body) });
       onCreated(created);
       toast("Exploração iniciada. O JEV já está preparando o navegador.", "success");
@@ -1493,14 +1659,17 @@ function NewExplorationView({
             <div className="section-number">04</div>
             <div className="form-section-content">
               <button type="button" className="credentials-toggle" onClick={() => setCredentialsOpen((value) => !value)} aria-expanded={credentialsOpen}>
-                <span className="form-section-heading"><span><h2>Credenciais da aplicação <em>opcional</em></h2><p>Use somente quando a jornada exigir autenticação.</p></span><KeyRound size={21} /></span>
+                <span className="form-section-heading"><span><h2>Credenciais da aplicação <em>opcional</em></h2><p>{username && password ? "Credenciais configuradas · login automático, mesmo com esta seção recolhida." : "O Playwright tentará fazer login automaticamente. Sem credenciais, o login será manual."}</p></span><KeyRound size={21} /></span>
                 <ChevronDown size={18} className={credentialsOpen ? "rotated" : ""} />
               </button>
               {credentialsOpen && (
+                <>
                 <div className="field-grid two-columns credential-fields">
                   <label className="field-group"><span>Usuário ou e-mail</span><input type="text" value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" placeholder="qa@empresa.com" /></label>
                   <label className="field-group"><span>Senha</span><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" placeholder="••••••••••••" /></label>
                 </div>
+                <p className="field-hint">Sua senha não é enviada à IA nem salva no banco. Se houver rejeição, CAPTCHA ou autenticação adicional, você continuará manualmente.</p>
+                </>
               )}
             </div>
           </section>
@@ -1979,7 +2148,7 @@ function ExplorationDetailView({
   const [cancelling, setCancelling] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [openingReport, setOpeningReport] = useState(false);
-  const [detailTab, setDetailTab] = useState<"overview" | "scenarios" | "activity" | "evidence" | "config">("overview");
+  const [detailTab, setDetailTab] = useState<"overview" | "scenarios" | "coverage" | "activity" | "evidence" | "config">("overview");
   if (loading && !exploration) return <div className="detail-loading"><Spinner size={24} /><span>Carregando exploração…</span></div>;
   if (!exploration) {
     return <section className="panel"><EmptyState icon={AlertCircle} title="Exploração não encontrada" description="O registro pode ter sido removido ou ainda não está disponível." action={<button className="button secondary" onClick={() => navigate("#/exploracoes")}><ArrowLeft size={16} />Voltar ao histórico</button>} /></section>;
@@ -2008,6 +2177,10 @@ function ExplorationDetailView({
     scenarios: exploration.counters?.scenarios || exploration.counters?.test_scenarios || exploration.scenarios_count || 0,
   };
   const postprocessing = exploration.postprocessing || {};
+  const visualEvidenceMode = explorationEvidenceMode(exploration.options) === "visual";
+  const enrichmentCopy = visualEvidenceMode
+    ? `${exploration.visual_review_summary?.assessed ?? postprocessing.enriched ?? 0} revisões visuais válidas`
+    : `${postprocessing.enriched || 0} documentados pela LLM`;
   const completion = exploration.completion || {};
   const actionLimitReached = completion.type === "limit_reached" || completion.reason === "action_limit";
   const completedWithRestrictions = completion.type === "coverage_complete_with_restrictions";
@@ -2019,7 +2192,7 @@ function ExplorationDetailView({
     { key: "exploring", label: "Explorar", detail: `${exploration.browser_progress?.current ?? counters.actions} ações` },
     {
       key: "documenting",
-      label: scenariosRunningInParallel ? "Criar CTs em paralelo" : "Criar CTs",
+      label: scenariosRunningInParallel ? "CTs + revisão em paralelo" : "CTs e evidências",
       detail: scenariosRunningInParallel
         ? `${counters.scenarios} preservados ao vivo`
         : `${postprocessing.total || counters.scenarios} casos`,
@@ -2042,12 +2215,16 @@ function ExplorationDetailView({
     ? `Limite de ${exploration.browser_progress?.total || configuredStepLimit || counters.actions} ações atingido`
     : terminalOutcomeVisible && completedWithRestrictions
       ? "Exploração concluída com restrições"
-      : exploration.phase_label || status.label;
+      : phase === "documenting"
+        ? visualEvidenceMode ? "Analisando as capturas dos CTs" : "Revisando as evidências dos CTs"
+        : exploration.phase_label || status.label;
   const phaseDescription = terminalOutcomeVisible && actionLimitReached
     ? "A automação não falhou na ação 67: ela concluiu o limite configurado e preservou tudo o que encontrou. A cobertura ficou parcial porque ainda havia opções a explorar."
     : terminalOutcomeVisible && completedWithRestrictions
-      ? "A cobertura alcançável terminou. Os controles que não puderam ser executados com segurança foram preservados como restrições, sem serem contados como testes aprovados."
-      : exploration.phase_description || (isLive(exploration.status) ? `Atualização automática a cada ${pollInterval / 1000}s` : "Resultados preservados e prontos para consulta.");
+      ? "A cobertura alcançável terminou. As verificações que não puderam ser concluídas foram preservadas com suas evidências e restrições, sem serem contadas como testes aprovados."
+      : phase === "documenting" && visualEvidenceMode
+        ? "Os CTs e verificações locais já foram preservados. A LLM auxiliar está analisando as capturas; não reexecuta testes nem controla o navegador."
+        : exploration.phase_description || (isLive(exploration.status) ? `Atualização automática a cada ${pollInterval / 1000}s` : "Resultados preservados e prontos para consulta.");
 
   const cancel = async () => {
     setCancelling(true);
@@ -2137,19 +2314,20 @@ function ExplorationDetailView({
                 {scenariosRunningInParallel ? (
                   <>
                     <strong>Exploração + criação contínua de CTs</strong>
-                    <span>{counters.scenarios} casos já preservados · {postprocessing.enriched || 0} aprimorados pela LLM</span>
+                    <span>{counters.scenarios} casos já preservados · {enrichmentCopy}</span>
                   </>
                 ) : (
                   <>
                     <strong>CT {Math.min(phaseProgress.current || 0, phaseProgress.total || 0)} de {phaseProgress.total || counters.scenarios}</strong>
-                    <span>{counters.scenarios} casos já preservados · {postprocessing.enriched || 0} aprimorados pela LLM</span>
+                    <span>{counters.scenarios} casos já preservados · {enrichmentCopy}</span>
                   </>
                 )}
               </div>
             )}
           </div>
-          <div className="overall-progress">{determinateProgress ? <strong>{Math.round(overallProgressValue)}<small>%</small></strong> : <strong className="progress-running">Em andamento</strong>}<span>{determinateProgress ? "processo total" : "até esgotar a cobertura"}</span></div>
+          <div className="overall-progress">{determinateProgress ? <strong>{Math.round(overallProgressValue)}<small>%</small></strong> : <strong className="progress-running">Em andamento</strong>}<span>{determinateProgress ? "processamento" : "explorando o escopo"}</span></div>
         </div>
+        {(phase === "documenting" || scenariosRunningInParallel) && (postprocessing.pending || 0) > 0 && <p className="ct-queue-copy">{postprocessing.pending} revisões auxiliares pendentes · {postprocessing.requests || 0} chamadas realizadas{(postprocessing.deferred || 0) > 0 ? ` · ${postprocessing.deferred} aguardando nova tentativa` : ""}. Os CTs locais já podem ser consultados.</p>}
         <div className={`large-progress ${determinateProgress ? "" : "indeterminate"}`}><span style={determinateProgress ? { width: `${Math.min(100, Math.max(0, overallProgressValue))}%` } : undefined} /></div>
         <div className="phase-track" aria-label="Fases da execução">
           {phaseSteps.map((step, index) => {
@@ -2162,8 +2340,12 @@ function ExplorationDetailView({
             );
           })}
         </div>
-        <div className="live-counters"><DetailCounter icon={Globe2} value={counters.pages} label="páginas" /><DetailCounter icon={Zap} value={counters.actions} label="ações" /><DetailCounter icon={AlertCircle} value={counters.issues} label="sinais técnicos" /><DetailCounter icon={FileCheck2} value={counters.scenarios} label="CTs" /><DetailCounter icon={Hash} value={formatTokens(exploration.usage?.total_tokens)} label="tokens" /><DetailCounter icon={CircleDollarSign} value={formatCost(exploration.usage)} label="custo" /><DetailCounter icon={Clock3} value={durationBetween(exploration.started_at || exploration.created_at, isLive(exploration.status) ? undefined : exploration.updated_at || exploration.finished_at)} label="duração total" /></div>
+        <div className="live-counters"><DetailCounter icon={Globe2} value={counters.pages} label="páginas" /><DetailCounter icon={Zap} value={counters.actions} label="ações" /><DetailCounter icon={AlertCircle} value={counters.issues} label="sinais técnicos" /><DetailCounter icon={FileCheck2} value={counters.scenarios} label="CTs" /><DetailCounter icon={Hash} value={formatTokens(exploration.usage?.total_tokens)} label="tokens" /><DetailCounter icon={CircleDollarSign} value={formatCost(exploration.usage)} label="custo" /><DetailCounter icon={Clock3} value={explorationDuration(exploration)} label="duração total" /></div>
       </section>
+
+      <VerificationStrengthSummary counts={exploration.verification_summary} />
+
+      {explorationEvidenceMode(exploration.options) === "visual" && <VisualReviewSummary scenarios={exploration.scenarios || []} active={isLive(exploration.status)} summary={exploration.visual_review_summary} />}
 
       {waitingForInput && (
         <section className="panel intervention-card intervention-wide">
@@ -2177,6 +2359,7 @@ function ExplorationDetailView({
         <div className="detail-tabs" role="tablist" aria-label="Detalhes da exploração">
           <button role="tab" aria-selected={detailTab === "overview"} className={detailTab === "overview" ? "active" : ""} onClick={() => setDetailTab("overview")}><Gauge size={16} />Visão geral</button>
           <button role="tab" aria-selected={detailTab === "scenarios"} className={detailTab === "scenarios" ? "active" : ""} onClick={() => setDetailTab("scenarios")}><FileCheck2 size={16} />Casos de teste <span>{exploration.scenarios?.length ?? counters.scenarios}</span></button>
+          <button role="tab" aria-selected={detailTab === "coverage"} className={detailTab === "coverage" ? "active" : ""} onClick={() => setDetailTab("coverage")}><Focus size={16} />Cobertura e restrições <span>{completion.restrictions?.length || completion.blocked_candidates || 0}</span></button>
           <button role="tab" aria-selected={detailTab === "activity"} className={detailTab === "activity" ? "active" : ""} onClick={() => setDetailTab("activity")}><Activity size={16} />Atividade <span>{events.length}</span></button>
           <button role="tab" aria-selected={detailTab === "evidence"} className={detailTab === "evidence" ? "active" : ""} onClick={() => setDetailTab("evidence")}><Eye size={16} />Evidência</button>
           <button role="tab" aria-selected={detailTab === "config"} className={detailTab === "config" ? "active" : ""} onClick={() => setDetailTab("config")}><Settings size={16} />Configuração</button>
@@ -2198,7 +2381,7 @@ function ExplorationDetailView({
                 {completedWithRestrictions && (
                   <div className="coverage-summary warning">
                     <AlertCircle size={18} />
-                    <div><strong>Concluída com restrições</strong><span>{completion.blocked_candidates ?? "Alguns"} controle(s) não puderam ser executados com segurança. Isso não significa a mesma quantidade de telas ou defeitos.</span></div>
+                    <div><strong>Concluída com restrições</strong><span>{completion.blocked_candidates ?? "Algumas"} verificação(ões) não puderam ser concluídas. Isso não significa a mesma quantidade de telas ou defeitos.</span><button className="text-button" onClick={() => setDetailTab("coverage")}>Examinar as restrições <ArrowRight size={14} /></button></div>
                   </div>
                 )}
                 {counters.issues > 0 && (
@@ -2210,7 +2393,7 @@ function ExplorationDetailView({
                 <div className="result-facts">
                   <div><small>Estado da cobertura</small><strong>{actionLimitReached ? "Execução antiga limitada" : completedWithRestrictions ? "Concluída com restrições" : status.label}</strong></div>
                   <div><small>Estados descobertos</small><strong>{completion.known_states ?? counters.pages}</strong></div>
-                  <div><small>CTs aprimorados</small><strong>{postprocessing.enriched ?? 0}</strong></div>
+                  <div><small>{visualEvidenceMode ? "Revisões visuais válidas" : "CTs documentados pela LLM"}</small><strong>{visualEvidenceMode ? exploration.visual_review_summary?.assessed ?? postprocessing.enriched ?? 0 : postprocessing.enriched ?? 0}</strong></div>
                   <div><small>CTs com evidência local</small><strong>{postprocessing.local_evidence || Math.max(0, counters.scenarios - (postprocessing.enriched || 0))}</strong></div>
                 </div>
               </section>
@@ -2219,7 +2402,7 @@ function ExplorationDetailView({
                 <div className="panel-heading row-heading"><div><span className="section-kicker"><Eye size={14} />Última evidência</span><h2>Onde a navegação terminou</h2></div><button className="text-button" onClick={() => setDetailTab("evidence")}>Ver maior <ArrowRight size={14} /></button></div>
                 <div className="browser-frame compact-browser">
                   <div className="browser-chrome"><span className="window-dots"><i /><i /><i /></span><div className="browser-address"><ShieldCheck size={12} />{exploration.app_url}</div><MoreHorizontal size={16} /></div>
-                  <div className="browser-canvas">{screenshot ? <img key={`${screenshot}-${exploration.updated_at || "latest"}`} src={`${screenshot}${screenshot.includes("?") ? "&" : "?"}v=${encodeURIComponent(exploration.updated_at || "latest")}`} alt={`Último screenshot de ${hostFromUrl(exploration.app_url)}`} /> : <div className="no-screenshot"><MonitorPlay size={32} /><strong>Aguardando captura do browser</strong></div>}</div>
+                  <div className="browser-canvas"><ScreenshotPreview src={screenshot} revision={exploration.updated_at || "latest"} alt={`Último screenshot de ${hostFromUrl(exploration.app_url)}`} /></div>
                 </div>
               </section>
 
@@ -2231,8 +2414,10 @@ function ExplorationDetailView({
           )}
 
           {detailTab === "scenarios" && (
-            <ScenarioTimelinePanel scenarios={exploration.scenarios || []} contexts={exploration.scenario_contexts || []} explorationId={exploration.id} apiBase={apiBase} isRunning={isLive(exploration.status)} />
+            <ScenarioTimelinePanel key={exploration.id} scenarios={exploration.scenarios || []} contexts={exploration.scenario_contexts || []} explorationId={exploration.id} apiBase={apiBase} isRunning={isLive(exploration.status)} />
           )}
+
+          {detailTab === "coverage" && <CoverageRestrictionsPanel restrictions={completion.restrictions || []} resolvedRestrictions={completion.resolved_restrictions || []} blockedCount={completion.blocked_candidates || 0} explorationId={exploration.id} apiBase={apiBase} />}
 
           {detailTab === "activity" && (
             <section className="activity-card activity-card-wide">
@@ -2244,7 +2429,7 @@ function ExplorationDetailView({
           {detailTab === "evidence" && (
             <section className="browser-panel evidence-panel">
               <div className="panel-heading row-heading"><div><span className="section-kicker"><Eye size={14} />Última observação</span><h2>Evidência do navegador</h2></div>{screenshot && <a className="text-button" href={screenshot} target="_blank" rel="noreferrer">Abrir imagem <SquareArrowOutUpRight size={14} /></a>}</div>
-              <div className="browser-frame"><div className="browser-chrome"><span className="window-dots"><i /><i /><i /></span><div className="browser-address"><ShieldCheck size={12} />{exploration.app_url}</div><MoreHorizontal size={16} /></div><div className="browser-canvas">{screenshot ? <img src={`${screenshot}${screenshot.includes("?") ? "&" : "?"}v=${encodeURIComponent(exploration.updated_at || "latest")}`} alt={`Último screenshot de ${hostFromUrl(exploration.app_url)}`} /> : <div className="no-screenshot"><MonitorPlay size={32} /><strong>Aguardando captura do browser</strong><span>O preview aparecerá quando o executor publicar a primeira evidência.</span></div>}</div></div>
+              <div className="browser-frame"><div className="browser-chrome"><span className="window-dots"><i /><i /><i /></span><div className="browser-address"><ShieldCheck size={12} />{exploration.app_url}</div><MoreHorizontal size={16} /></div><div className="browser-canvas"><ScreenshotPreview src={screenshot} revision={exploration.updated_at || "latest"} alt={`Último screenshot de ${hostFromUrl(exploration.app_url)}`} /></div></div>
               <div className="evidence-strip"><span><Eye size={15} />Screenshot salvo no relatório</span><span><Code2 size={15} />DOM estruturado</span><span><ShieldCheck size={15} />{explorationEvidenceMode(exploration.options) === "visual" ? "Modo configurado: texto + imagem" : "Modo configurado: somente texto"}</span></div>
             </section>
           )}
@@ -2314,11 +2499,76 @@ export function filterScenarioCases(scenarios: ScenarioCase[], query: string, fi
   });
 }
 
+export function VerificationStrengthSummary({ counts }: { counts?: VerificationCounts }) {
+  if (!counts) return null;
+  const metrics = [
+    ["Negócio verificado", counts.business_verified || 0],
+    ["Só interação técnica", counts.interaction_only || 0],
+    ["Verificação de negócio falhou", counts.business_failures || 0],
+    ["Automação não concluiu a ação", counts.execution_failures || 0],
+    ["Verificação técnica falhou", counts.technical_failures || 0],
+    ["Indício visual a revisar", counts.visual_findings || 0],
+    ["Interação sem resultado esperado", counts.interaction_failures || 0],
+  ] as const;
+  return <section className="panel verification-strength" aria-label="Força das verificações">
+    <span className="section-kicker">O que foi realmente verificado</span>
+    <div className="verification-metrics">{metrics.map(([label, count]) => <div key={label}><strong>{count}</strong><span>{label}</span></div>)}</div>
+    <p>100% significa processamento concluído, não todos os cenários possíveis. PASS sem asserção de negócio confirma somente a interação. A cobertura depende do usuário, dos estados alcançados, do viewport e das restrições.</p>
+  </section>;
+}
+
+const RESTRICTION_REASONS: Record<string, string> = {
+  no_safe_restore_route: "Não foi encontrada uma rota segura para retomar este estado",
+  restore_without_progress: "A retomada repetiu o estado sem progresso",
+  replay_unavailable: "A sequência conhecida não pôde ser reproduzida",
+  replay_without_progress: "A sequência reproduzida não recuperou o estado esperado",
+  action_failed: "A ação não pôde ser executada",
+  candidate_unavailable: "Controle indisponível neste estado",
+  document_navigation_failed: "A navegação direta não carregou um documento válido",
+  restore_step_limit: "A retomada atingiu o limite de segurança sem recuperar o estado",
+  restore_attempt_limit: "As tentativas de retomar este estado foram esgotadas",
+  backtrack_attempt_limit: "As tentativas de voltar a este estado foram esgotadas",
+  policy_blocked: "A política de segurança não permitiu executar esta ação",
+  action_retry_exhausted: "A ação continuou indisponível após as tentativas permitidas",
+  form_validation_precondition_failed: "Não foi possível preparar os demais campos para isolar esta validação",
+  required_field_validation_masked: "A tentativa foi executada, mas a resposta de outro campo impediu validar este campo obrigatório",
+  form_probe_target_not_empty: "Não foi possível esvaziar o campo após as tentativas de preparação; sua validação não foi presumida",
+};
+
+export function CoverageRestrictionsPanel({ restrictions, resolvedRestrictions = [], blockedCount = 0, explorationId, apiBase }: { restrictions: CoverageRestriction[]; resolvedRestrictions?: CoverageRestriction[]; blockedCount?: number; explorationId?: string; apiBase?: string }) {
+  return <section className="coverage-restrictions" aria-label="Cobertura e restrições">
+    <div className="panel-heading"><span className="section-kicker">Limites da execução</span><h2>O que ficou sem testar</h2><p>Restrições são lacunas de cobertura, não testes aprovados nem bugs confirmados. Cada registro identifica o controle e o motivo observado.</p></div>
+    {restrictions.length === 0 ? <p className="scenario-context-note">{blockedCount ? `Esta execução histórica registrou ${blockedCount} controles bloqueados sem detalhes individuais. Não é possível reconstruir seus motivos com segurança; as novas execuções registram cada restrição.` : "Nenhuma restrição individual registrada. Isso não garante todos os cenários possíveis: valores de entrada, perfis de acesso e combinações de estados exigem escopos específicos."}</p> : <div className="restriction-list">{restrictions.map((restriction, index) => <article className="restriction-card" key={restriction.id || index}>
+      <strong>{restriction.field_name || restriction.validation_probe?.name ? `${restriction.field_name || restriction.validation_probe?.name} · ${restriction.name || "Validação obrigatória"}` : restriction.name || restriction.target || "Controle sem nome"}</strong>
+      <p>{RESTRICTION_REASONS[restriction.reason || ""] || restriction.reason || "Motivo não informado"}</p>
+      {restriction.dependency?.kind === "failed_inverse_cart_toggle" && restriction.dependency.source === "actual_business_assertion" && <p>Pré-condição impedida por uma falha já observada: {restriction.dependency.name || "Remoção do item"}{restriction.dependency.item_id ? ` (produto ${restriction.dependency.item_id})` : ""}, etapa {restriction.dependency.action_step ?? "não registrada"}. O item permaneceu no carrinho, impedindo preparar novamente o teste de inclusão.</p>}
+      {restriction.dependency?.screenshot && apiBase && explorationId && scenarioScreenshotUrl(apiBase, explorationId, restriction.dependency.screenshot) && <a href={scenarioScreenshotUrl(apiBase, explorationId, restriction.dependency.screenshot)!} target="_blank" rel="noopener noreferrer">Ver captura da pré-condição</a>}
+      {!!restriction.validation_probe?.blocking_fields?.length && <p>Campos que impediram a preparação: {restriction.validation_probe.blocking_fields.map(field => field.name || "Campo sem nome").join(", ")}</p>}
+      <small>{restriction.action || "ação"} · {restriction.source_url || restriction.target_url || "URL não registrada"}</small>
+      {restriction.target_url && restriction.target_url !== restriction.source_url && <small>Estado a retomar: {restriction.target_url}</small>}
+    </article>)}</div>}
+    {resolvedRestrictions.length > 0 && <details className="panel">
+      <summary>Restrições de retomada resolvidas · {resolvedRestrictions.length}</summary>
+      <p>Estes controles foram executados posteriormente. A retomada deixou de ser uma lacuna de cobertura; o resultado PASS/FAIL de cada CT continua independente.</p>
+      <div className="restriction-list">{resolvedRestrictions.map((restriction, index) => {
+        const resolution = restriction.resolution || {};
+        const screenshot = apiBase && explorationId ? scenarioScreenshotUrl(apiBase, explorationId, resolution.screenshot) : null;
+        return <article className="restriction-card" key={restriction.id || index}>
+          <strong>{restriction.name || restriction.target || "Controle sem nome"}</strong>
+          <p>Executado na etapa {resolution.action_step ?? "não registrada"}. {resolution.assertions_passed === false ? "A ação foi executada, mas houve verificação reprovada; consulte o CT." : "Consulte as verificações e o resultado do CT correspondente."}</p>
+          <small>{restriction.target_url || resolution.source_url || "URL não registrada"}</small>
+          {screenshot && <a href={screenshot} target="_blank" rel="noopener noreferrer">Ver captura da execução</a>}
+        </article>;
+      })}</div>
+    </details>}
+  </section>;
+}
+
 function scenarioVerdict(scenario: ScenarioCase, context: boolean) {
   if (context) return { label: "Contexto · não é um teste", tone: "info" };
   const status = scenario.status.toUpperCase();
   const verdict = scenario.evidence?.verdict;
-  const tone = verdict?.kind === "technical_failure" ? "warning" : status === "FAIL" ? "error" : status === "PASS" ? "success" : "info";
+  const tone = verdict?.kind === "interaction_only" ? "info" : ["technical_failure", "visual_failure", "execution_failure"].includes(verdict?.kind || "") ? "warning" : status === "FAIL" ? "error" : status === "PASS" ? "success" : "info";
   const fallback: Record<string, string> = { PASS: "Verificações aprovadas", FAIL: "Verificação falhou", BLOCKED: "Execução bloqueada", SKIPPED: "Não validado" };
   return { label: `${status} · ${verdict?.label || fallback[status] || "Evidência preservada"}`, tone };
 }
@@ -2337,6 +2587,11 @@ function ScenarioTimelineCard({ scenario, explorationId, apiBase, context = fals
   const verdict = scenarioVerdict(scenario, context);
   const signals = scenarioSignals(scenario);
   const entries = scenarioTimeline(scenario);
+  const visual = scenario.evidence?.visual_assessment;
+  const visualLabel = visual?.status === "pending" ? "Análise visual em andamento"
+    : visual?.status !== "assessed" ? "Análise visual indisponível · CT baseado nas verificações locais"
+    : visual.accepted_count ? `${visual.accepted_count} indício(s) visual(is) · revisão necessária`
+    : "Capturas analisadas · nenhum indício visual aceito, sem garantia de aprovação visual completa";
   const uniqueScreenshots = new Set<string>();
   const timeline = entries.map((entry) => {
     const screenshot = scenarioScreenshotUrl(apiBase, explorationId, entry.screenshot);
@@ -2348,12 +2603,13 @@ function ScenarioTimelineCard({ scenario, explorationId, apiBase, context = fals
     <details className={`scenario-case-card verdict-${verdict.tone}`}>
       <summary className="scenario-case-summary">
         <ChevronRight className="scenario-expand-icon" size={17} />
-        <div className="scenario-case-heading"><span>{context ? "Contexto / navegação de apoio" : scenario.id}</span><h3>{scenario.title}</h3><div className="scenario-case-meta"><span>{timeline.length} registros na linha do tempo</span>{uniqueScreenshots.size > 0 && <span><Eye size={12} />{uniqueScreenshots.size} capturas</span>}{signals.length > 0 && <span className="scenario-signal-count"><Network size={12} />{signals.length} sinais técnicos</span>}</div></div>
+        <div className="scenario-case-heading"><span>{context ? "Contexto / navegação de apoio" : scenario.id}</span><h3>{scenario.title}</h3><div className="scenario-case-meta"><span>{timeline.length} registros na linha do tempo</span>{uniqueScreenshots.size > 0 && <span><Eye size={12} />{uniqueScreenshots.size} capturas</span>}{signals.length > 0 && <span className="scenario-signal-count"><Network size={12} />{signals.length} sinais técnicos</span>}{!context && visual?.requested && <span>Visual: {visual.status === "pending" ? "em análise" : visual.status !== "assessed" ? "indisponível" : visual.accepted_count ? "indício a revisar" : "analisado"}</span>}</div></div>
         <span className={`scenario-verdict verdict-${verdict.tone}`}>{verdict.label}</span>
       </summary>
       <div className="scenario-case-body">
         {scenario.evidence?.verdict?.explanation && <p className={`scenario-verdict-explanation verdict-${verdict.tone}`}>{scenario.evidence.verdict.explanation}{scenario.evidence.verdict.historical && <small>O resultado histórico foi preservado; a classificação técnica explica a evidência, sem afirmar um defeito funcional.</small>}</p>}
         {context && <p className="scenario-context-note">Esta evidência ocorreu fora de um CT executado. É contexto de preparação ou recuperação, não um teste aprovado ou falho.</p>}
+        {!context && visual?.requested && <div className="scenario-context-note"><strong>{visualLabel}</strong>{visual.reason && visual.status === "unavailable" && <small>Motivo: {visual.reason.startsWith("auxiliary_rate_limit") ? "O provedor limitou as chamadas. As verificações locais foram preservadas." : visual.reason === "auxiliary_request_budget_exhausted" ? "O orçamento de chamadas auxiliares desta execução foi esgotado." : visual.reason === "screenshot_not_available" ? "Não havia captura disponível para enviar ao modelo." : ["visual_assessment_not_returned", "visual_assessment_schema_invalid"].includes(visual.reason) ? "O modelo não devolveu uma análise visual no formato obrigatório. A documentação recebida não é uma validação visual." : `${visualUnavailabilityLabel(visual.reason)}. As verificações locais foram preservadas.`} Código: {visual.reason}</small>}{visual.status === "assessed" && <small>A confiança é declarada pelo modelo; um indício visual não confirma sozinho um bug funcional.</small>}</div>}
         {!context && (scenario.expected_result || scenario.actual_result) && <div className="scenario-outcome-grid">{scenario.expected_result && <div><small>Resultado esperado</small><p>{scenario.expected_result}</p></div>}{scenario.actual_result && <div><small>Resultado observado</small><p>{scenario.actual_result}</p></div>}</div>}
         <h4 className="scenario-timeline-title"><History size={15} />Linha do tempo do {context ? "contexto" : "CT"}</h4>
         {timeline.length === 0 ? <p className="scenario-context-note">Nenhum evento detalhado foi preservado para este caso.</p> : <ol className="scenario-timeline">{timeline.map(({ entry, image }, index) => {
@@ -2362,6 +2618,7 @@ function ScenarioTimelineCard({ scenario, explorationId, apiBase, context = fals
           const kind = entry.kind;
           const failedAssertion = kind === "assertion" && assertion?.passed === false;
           const technicalAssertion = ["no_new_browser_errors", "no_new_application_errors"].includes(assertion?.kind || "");
+          const visualAssertion = assertion?.kind === "visual_model";
           const link = safeScenarioPageUrl(entry.url || signal?.url);
           const entryTone = signal ? "technical" : failedAssertion ? (technicalAssertion ? "technical" : "error") : kind === "assertion" && assertion?.passed ? "success" : "info";
           const Icon = kind === "signal" ? Network : kind === "observation" ? Eye : kind === "assertion" ? (failedAssertion ? AlertCircle : ShieldCheck) : Play;
@@ -2372,7 +2629,7 @@ function ScenarioTimelineCard({ scenario, explorationId, apiBase, context = fals
               <div className="scenario-timeline-event-head"><strong>{signal?.label || entry.title || ({ observation: "Observação", action: "Ação executada", assertion: "Verificação", signal: "Sinal técnico" })[kind]}</strong>{entry.occurred_at && <time dateTime={entry.occurred_at}>{formatDate(entry.occurred_at)}</time>}</div>
               {(entry.message || signal?.message || assertion?.message) && <p>{entry.message || signal?.message || assertion?.message}</p>}
               {kind === "action" && (entry.step_number !== undefined || entry.target) && <div className="scenario-case-meta">{entry.step_number !== undefined && <span>Etapa {entry.step_number}</span>}{entry.target && <span>Alvo observado: {entry.target}</span>}</div>}
-              {assertion && <div className={`scenario-assertion-result ${assertion.passed === false ? "not-passed" : ""}`}><span>{assertion.passed === true ? "Aprovada" : assertion.passed === false ? "Falhou" : "Sem resultado"}{technicalAssertion ? " · verificação técnica" : ""}</span>{assertion.expected !== undefined && <small>Esperado: {JSON.stringify(assertion.expected)}</small>}{assertion.actual !== undefined && <small>Observado: {JSON.stringify(assertion.actual)}</small>}</div>}
+              {assertion && <div className={`scenario-assertion-result ${assertion.passed === false ? "not-passed" : ""}`}><span>{assertion.passed === true ? "Aprovada" : assertion.passed === false ? "Falhou" : "Sem resultado"}{technicalAssertion ? " · verificação técnica" : visualAssertion ? " · indício visual da LLM" : ""}</span>{visualAssertion && <small>Reprovação baseada na análise da imagem; confira a captura e a região antes de confirmar o defeito.</small>}{assertion.expected !== undefined && <small>Esperado: {JSON.stringify(assertion.expected)}</small>}{assertion.actual !== undefined && <small>Observado: {JSON.stringify(assertion.actual)}</small>}</div>}
               {signal && <div className="scenario-signal-detail">{signal.status_code && <span className="scenario-http-code">HTTP {signal.status_code}</span>}<p>{technicalSignalImpact(signal)}</p>{signal.classification_reason && <small>{signal.classification_reason}</small>}<small>{association === "before_action" ? "Observado antes da ação; contexto anterior, sem atribuição causal." : association === "after_action" ? "Observado após a ação; associação temporal, não causalidade comprovada." : association === "during_action" ? "Registrado durante a ação; associação temporal, não causalidade comprovada." : "Registrado nesta observação de contexto."}</small>{signal.affects_verdict === false && <small>Não reprova automaticamente o CT.</small>}</div>}
               {(entry.url || signal?.url) && <div className="scenario-event-url">{link ? <a href={link} target="_blank" rel="noreferrer">{entry.url || signal?.url}<SquareArrowOutUpRight size={12} /></a> : <span>{entry.url || signal?.url}</span>}</div>}
               {image && <figure className="scenario-timeline-screenshot"><a href={image} target="_blank" rel="noreferrer"><img src={image} loading="lazy" alt={`${scenario.id} · ${entry.title || "evidência"}`} /></a><figcaption><span>{entry.screenshot?.replace(/\\/g, "/").split("/").pop()}</span><a href={image} target="_blank" rel="noreferrer">Ampliar <SquareArrowOutUpRight size={12} /></a></figcaption></figure>}
@@ -2391,7 +2648,7 @@ export function ScenarioTimelinePanel({ scenarios, contexts, explorationId, apiB
   const filteredContexts = filter === "all" || filter === "signals" ? filterScenarioCases(contexts, query, filter) : [];
   return <section className="scenario-cases-panel">
     <div className="scenario-cases-heading"><div><span className="section-kicker">Evidência por caso</span><h2>Casos de teste e suas linhas do tempo</h2><p>Ações, verificações, capturas e sinais técnicos juntos, na ordem em que foram observados.</p></div>{isRunning && <span className="live-mini"><span />ao vivo</span>}</div>
-    <div className="scenario-evidence-note"><ShieldCheck size={17} /><p>Sinal técnico não é sinônimo de bug. Integrações externas e requisições canceladas são distinguidas das verificações do CT; nenhuma ocorrência confirma sozinha um defeito funcional.</p></div>
+    <div className="scenario-evidence-note"><ShieldCheck size={17} /><p>PASS vale para as verificações executadas, não para todas as regras de negócio. Sinais técnicos e indícios visuais não confirmam sozinhos um bug; consulte a origem da reprovação na linha do tempo.</p></div>
     <div className="scenario-case-tools"><label className="scenario-case-search"><Search size={16} /><input aria-label="Buscar casos de teste ou sinais técnicos" placeholder="Buscar CT, título, URL ou sinal técnico…" value={query} onChange={(event) => setQuery(event.target.value)} /></label><label className="scenario-case-filter"><span>Exibir</span><select aria-label="Filtrar casos de teste" value={filter} onChange={(event) => setFilter(event.target.value)}><option value="all">Todos os CTs</option><option value="PASS">Verificações aprovadas</option><option value="FAIL">Verificações falhas</option><option value="BLOCKED">Bloqueados</option><option value="SKIPPED">Não validados</option><option value="signals">Com sinais técnicos</option></select></label></div>
     <div className="scenario-case-results"><span>{filtered.length} de {scenarios.length} CTs</span><small>Abra um caso para acompanhar as evidências.</small></div>
     <div className="scenario-case-list">{filtered.map((scenario) => <ScenarioTimelineCard key={scenario.id} scenario={scenario} explorationId={explorationId} apiBase={apiBase} />)}</div>

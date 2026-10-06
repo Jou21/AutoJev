@@ -24,6 +24,10 @@ from autojev.domain.models import (
     ProviderModel,
 )
 from autojev.services.scenario_timeline import prepare_scenario_timelines
+from autojev.services.coverage_ledger import coverage_restriction_ledger
+from autojev.services.execution_summary import execution_duration_summary, report_snapshot_key
+from autojev.services.visual_checks import visual_review_counts
+from autojev.services.verification_summary import verification_summary
 
 from .schemas import (
     ConnectionTestInput,
@@ -104,10 +108,14 @@ def _phase_payload(result: dict[str, Any], events: list[dict[str, Any]]) -> dict
             current, total, percentage = (1, 1, 100) if report_ready else (0, 1, 50)
         else:
             phase = "documenting"
-            label = "Criando os casos de teste"
+            visual_mode = result.get("options", {}).get("auxiliary_evidence_mode") == "visual"
+            label = "Analisando as capturas dos CTs" if visual_mode else "Revisando as evidências dos CTs"
             description = (
-                "O navegador já terminou. A LLM auxiliar está organizando as "
-                "evidências sem controlar o browser."
+                "Os CTs e verificações locais já foram preservados. A LLM auxiliar "
+                "está analisando as capturas; não reexecuta testes nem controla o navegador."
+                if visual_mode else
+                "Os CTs locais já foram preservados. A LLM auxiliar está revisando "
+                "a documentação das evidências sem controlar o navegador."
             )
             progress_event = next(
                 (
@@ -118,6 +126,8 @@ def _phase_payload(result: dict[str, Any], events: list[dict[str, Any]]) -> dict
                         "scenario_enriched",
                         "scenario_enrichment_skipped",
                         "scenario_enrichment_started",
+                        "scenario_enrichment_deferred",
+                        "scenario_enrichment_waiting_provider",
                         "scenario_preparation_started",
                         "scenario_documentation_fallback",
                         "scenario_created",
@@ -155,6 +165,9 @@ def _phase_payload(result: dict[str, Any], events: list[dict[str, Any]]) -> dict
                 "scenario_enrichment_skipped",
                 "scenario_enrichment_backlog_full",
                 "scenario_enrichment_worker_unavailable",
+                "scenario_enrichment_deferred",
+                "scenario_enrichment_retrying",
+                "scenario_enrichment_waiting_provider",
                 "scenario_draft_created",
                 "scenario_draft_updated",
                 "scenario_draft_removed",
@@ -164,6 +177,17 @@ def _phase_payload(result: dict[str, Any], events: list[dict[str, Any]]) -> dict
         None,
     )
     enrichment = (enrichment_event or {}).get("payload") or {}
+    # Draft/backlog events from older runs do not carry every queue counter.
+    # Preserve the latest measured value instead of showing zero between
+    # provider updates. Explicit zero values still mean an empty queue.
+    counter_keys = ("pending", "deferred", "provider_requests", "requests")
+    for key in counter_keys:
+        if key not in enrichment:
+            for event in reversed(events):
+                event_payload = event.get("payload") or {}
+                if key in event_payload and str(event.get("type", "")).startswith("scenario_"):
+                    enrichment = {**enrichment, key: event_payload[key]}
+                    break
     legacy_enriched = sum(1 for event in events if event.get("type") == "scenario_created")
     legacy_local = sum(
         1 for event in events if event.get("type") == "scenario_documentation_fallback"
@@ -180,6 +204,9 @@ def _phase_payload(result: dict[str, Any], events: list[dict[str, Any]]) -> dict
         "local_evidence": local_count,
         "stage": enrichment.get("stage"),
         "reason": enrichment.get("reason"),
+        "pending": enrichment.get("pending", 0),
+        "deferred": enrichment.get("deferred", 0),
+        "requests": enrichment.get("provider_requests", enrichment.get("requests", 0)),
     }
 
     completion_event = next(
@@ -230,7 +257,18 @@ def _phase_payload(result: dict[str, Any], events: list[dict[str, Any]]) -> dict
         "restorations_abandoned": completion_payload.get(
             "restorations_abandoned"
         ),
+        "restrictions": completion_payload.get("restrictions") or [],
+        "unreachable_restorations": completion_payload.get("unreachable_restorations") or [],
     }
+    # Resolve the same explicit evidence ledger used by the standalone report.
+    # Historical aggregate-only runs retain their original counts and status.
+    ledger = coverage_restriction_ledger(completion_payload, events)
+    completion["restrictions"] = ledger["restrictions"]
+    if ledger["has_individual_records"]:
+        completion["blocked_candidates"] = ledger["restriction_count"]
+    if ledger["resolved_restrictions"]:
+        completion["resolved_restrictions"] = ledger["resolved_restrictions"]
+        completion["resolved_restriction_count"] = ledger["resolved_restriction_count"]
     if (
         status_value == "completed"
         and completion["type"] == "coverage_complete_with_restrictions"
@@ -352,6 +390,16 @@ def _exploration_payload(item: dict[str, Any]) -> dict[str, Any]:
                 ) or last_action_event.get("message")
     events = result.get("events", [])
     result.update(_phase_payload(result, events))
+    result["duration_summary"] = execution_duration_summary(result)
+    if "scenarios" in result:
+        result["verification_summary"] = verification_summary(result["scenarios"])
+        visual_requested = (result.get("options") or {}).get("auxiliary_evidence_mode") == "visual"
+        result["visual_review_summary"] = (
+            {"requested": True, **visual_review_counts(result["scenarios"])}
+            if visual_requested else
+            {**visual_review_counts([]), "requested": False,
+             "total": len(result["scenarios"]), "not_requested": len(result["scenarios"])}
+        )
     if "screenshots" in result:
         result["screenshots"] = [
             {
@@ -801,13 +849,17 @@ async def get_report(exploration_id: str, request: Request) -> FileResponse:
     # Existing reports are immutable evidence. Render their updated presentation
     # to a separate artifact, retaining original verdicts and the original HTML.
     # No browser/model calls or historical data changes are needed.
-    marker = b'data-report-schema="ct-timeline-v1"'
+    snapshot = _repository(request).get_exploration(exploration_id)
+    marker = b'data-report-summary="execution-v2"'
+    coverage_marker = b'data-coverage-ledger="execution-evidence-v1"'
+    snapshot_marker = f'data-report-snapshot="{report_snapshot_key(snapshot)}"'.encode("ascii")
 
     def valid_presentation(candidate: Path) -> bool:
         if not candidate.is_file() or allowed not in candidate.resolve().parents:
             return False
         with candidate.open("rb") as artifact:
-            if marker not in artifact.read(8192):
+            header = artifact.read(8192)
+            if marker not in header or coverage_marker not in header or snapshot_marker not in header:
                 return False
             artifact.seek(max(candidate.stat().st_size - 1024, 0))
             return artifact.read().rstrip().endswith(b"</html>")
@@ -822,11 +874,13 @@ async def get_report(exploration_id: str, request: Request) -> FileResponse:
             path.stat().st_mtime,
             Path(getfile(StandaloneHtmlReport)).stat().st_mtime,
             Path(getfile(prepare_scenario_timelines)).stat().st_mtime,
+            Path(getfile(coverage_restriction_ledger)).stat().st_mtime,
+            Path(getfile(execution_duration_summary)).stat().st_mtime,
+            Path(getfile(visual_review_counts)).stat().st_mtime,
         )
         if valid_presentation(updated) and updated.stat().st_mtime >= presentation_modified:
             return updated
 
-        snapshot = _repository(request).get_exploration(exploration_id)
         # A separate temporary artifact and atomic rename avoid serving a
         # partially written HTML when two report requests arrive together.
         with NamedTemporaryFile(dir=allowed, suffix=".html", delete=False) as temporary:

@@ -3,12 +3,15 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import re
 import time
 from collections.abc import Awaitable
 from contextlib import suppress
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from autojev.adapters.openai_compatible import (
@@ -36,7 +39,10 @@ from autojev.domain.models import (
     TestScenario,
     utc_now,
 )
+from autojev.services.business_checks import check_business_outcomes
+from autojev.services.action_dispatch import is_stale_undispatched_action
 from autojev.services.coverage import CoveragePlanner, canonical_url
+from autojev.services.scenario_documentation import local_scenario_documentation
 from autojev.services.technical_signals import (
     build_scenario_evidence,
     classify_signal,
@@ -44,6 +50,11 @@ from autojev.services.technical_signals import (
     scenario_screenshots,
     signal_occurrence_id,
 )
+from autojev.services.visual_checks import (
+    assess_visual_findings,
+    unavailable_visual_assessment,
+)
+from autojev.services.verification_summary import NON_BUSINESS_CHECKS, evidence_verification_summary
 
 
 @dataclass(slots=True)
@@ -54,6 +65,8 @@ class _ScenarioEnrichmentJob:
     decision: AgentDecision
     result: ActionResult
     sequence: int
+    retries: int = 0
+    queue_order: int = 0
 
 
 class _LiveScenarioPipeline:
@@ -91,10 +104,220 @@ class _LiveScenarioPipeline:
         self.sequences: dict[str, int] = {}
         self.enriched: set[str] = set()
         self.skipped: set[str] = set()
+        self.drafts: dict[str, TestScenario] = {}
         self.worker: asyncio.Task[None] | None = None
         self.started = False
         self.closed = False
         self._usage_is_drained = True
+        self._next_request_at = 0.0
+        self._provider_pause_count = 0
+        self._stop_reason: str | None = None
+        self._queue_sequence = 0
+        self._visually_reviewed_pages: set[str] = set()
+        self._visually_reviewed_families: set[str] = set()
+        if isinstance(auxiliary_client, OpenAICompatibleClient):
+            # The transport enforces the same bound even for its one explicit
+            # format-compatibility retry, so 120 means at most 120 HTTP POSTs.
+            auxiliary_client.chat_request_budget = self._setting("auxiliary_max_requests", 120)
+
+    def _setting(self, name: str, default: Any) -> Any:
+        return getattr(getattr(self.manager, "settings", None), name, default)
+
+    def _uses_compact_visual_contract(self, scenario: TestScenario) -> bool:
+        return (
+            (scenario.evidence.get("visual_review_provenance") or {}).get("response_contract") == "visual_findings_v1"
+            or getattr(self.auxiliary, "response_contract", None) == "visual_findings_v1"
+        )
+
+    def _progress_payload(self) -> dict[str, Any]:
+        return {
+            "current": len(self.enriched) + len(self.skipped), "total": self.total,
+            "enriched": len(self.enriched), "local_evidence": self.total - len(self.enriched),
+            "pending": self.total - len(self.enriched) - len(self.skipped),
+            "deferred": sum((s.evidence.get("visual_review_provenance") or s.evidence.get("documentation_provenance") or {}).get("reason") == "awaiting_provider_retry" for s in self.drafts.values()),
+            "provider_requests": int(getattr(self.auxiliary, "request_count", 0)),
+            "stage": "parallel_enrichment",
+        }
+
+    def _compact_queue(self) -> int:
+        """Drop obsolete revisions without dropping any current CT review.
+
+        Browser retries can update one CT dozens of times during a provider
+        pause. Those obsolete jobs must not consume the bounded backlog and
+        crowd out the latest evidence. Rotation preserves FIFO ordering and
+        unfinished-task accounting, including an already waiting join().
+        """
+        discarded = 0
+        for _ in range(self.queue.qsize()):
+            job = self.queue.get_nowait()
+            try:
+                if job is None or self.revisions.get(job.fingerprint) == job.revision:
+                    self.queue.put_nowait(job)
+                else:
+                    discarded += 1
+            finally:
+                self.queue.task_done()
+        return discarded
+
+    @staticmethod
+    def _review_family(job: _ScenarioEnrichmentJob) -> str:
+        # A scheduling hint only: this is NOT an evidence-cache key and never
+        # marks another CT assessed. Group repeated checks on the same route
+        # solely to distribute scarce provider requests more usefully.
+        return json.dumps([
+            canonical_url(job.observation.url),
+            sorted(assertion.kind for assertion in job.result.assertions),
+            str((job.observation.page_state.get("checkout") or {}).get("stage") or ""),
+        ], sort_keys=True)
+
+    def _review_priority(self, job: _ScenarioEnrichmentJob) -> int:
+        if getattr(self.auxiliary, "evidence_mode", "text") != "visual":
+            return 0
+        business = [assertion for assertion in job.result.assertions if assertion.kind not in NON_BUSINESS_CHECKS]
+        state = job.observation.page_state
+        checkout = state.get("checkout") or {}
+        if any(not assertion.passed for assertion in business):
+            priority = 600
+        elif not job.result.success:
+            priority = 550
+        elif any(not assertion.passed for assertion in job.result.assertions):
+            priority = 520
+        elif checkout.get("stage") in {"review", "complete"}:
+            priority = 420
+        elif state.get("product_detail"):
+            priority = 400
+        elif business:
+            priority = 260
+        else:
+            priority = 100
+        if canonical_url(job.observation.url) not in self._visually_reviewed_pages:
+            priority += 120
+        if self._review_family(job) in self._visually_reviewed_families:
+            priority -= 180
+        # An unsuccessful retry should not monopolize the next scarce slot.
+        return priority - job.retries * 80
+
+    def _reprioritize_job(self, selected: _ScenarioEnrichmentJob) -> _ScenarioEnrichmentJob:
+        """Choose useful current evidence, preserving FIFO ties and all jobs.
+
+        Called once on dequeue and again AFTER a provider pause, when cart,
+        detail, checkout or a business failure may have arrived meanwhile.
+        Rotation keeps Queue.join accounting correct; no CT is discarded for
+        having a low priority. Once the finite backlog stops growing, every
+        retained job is eligible until an explicit provider budget ends work.
+        """
+        if getattr(self.auxiliary, "evidence_mode", "text") != "visual":
+            return selected
+        for _ in range(self.queue.qsize()):
+            candidate = self.queue.get_nowait()
+            if candidate is None:
+                self.queue.put_nowait(candidate)
+                self.queue.task_done()
+                continue
+            if self.revisions.get(candidate.fingerprint) != candidate.revision:
+                self.queue.task_done()
+                continue
+            selected_key = (self._review_priority(selected), -selected.queue_order)
+            candidate_key = (self._review_priority(candidate), -candidate.queue_order)
+            if candidate_key > selected_key:
+                self.queue.put_nowait(selected)
+                self.queue.task_done()
+                selected = candidate
+            else:
+                self.queue.put_nowait(candidate)
+                self.queue.task_done()
+        return selected
+
+    async def _provider_gate(self, job: _ScenarioEnrichmentJob) -> str | None:
+        """Await quota recovery while keeping browser work independent.
+
+        Waiting creates no HTTP request and consumes no attempt. The global
+        budgets stop persistent quota errors; Retry-After is never shortened.
+        """
+        if int(getattr(self.auxiliary, "request_count", 0)) >= self._setting("auxiliary_max_requests", 120):
+            return "auxiliary_request_budget_exhausted"
+        if int(getattr(self.auxiliary, "rate_limit_count", 0)) >= self._setting("auxiliary_max_rate_limits", 6):
+            return "auxiliary_rate_limit_budget_exhausted"
+        if getattr(self.auxiliary, "non_retryable_reason", None):
+            return str(self.auxiliary.non_retryable_reason)
+        cooldown = float(getattr(self.auxiliary, "cooldown_remaining_seconds", 0))
+        if not math.isfinite(cooldown):
+            return "auxiliary_authentication_rejected"
+        delay = max(cooldown, self._next_request_at - time.monotonic(), 0.0)
+        if delay <= 0:
+            return None
+        # A daily Retry-After cannot finish inside this bounded run. Preserve
+        # the CT as unavailable, rather than occupying a task until tomorrow.
+        if delay > self._setting("auxiliary_tail_timeout_seconds", 600.0):
+            return "auxiliary_provider_pause_exceeds_budget"
+        if cooldown > 0:
+            self._provider_pause_count += 1
+            self.repository.add_event(
+                self.exploration_id, "warning", "scenario_enrichment_waiting_provider",
+                "LLM auxiliar aguardando o limite do provedor; CTs locais continuam disponíveis",
+                {**self._progress_payload(), "scenario_id": f"CT{job.sequence:03d}", "retry_after_seconds": round(delay, 2)},
+            )
+        pause = asyncio.create_task(asyncio.sleep(delay))
+        cancellation = asyncio.create_task(self.manager._wait_for_cancellation(self.exploration_id))
+        try:
+            done, _ = await asyncio.wait({pause, cancellation}, return_when=asyncio.FIRST_COMPLETED)
+            if cancellation in done:
+                cancellation.result()
+                return "exploration_cancelled"
+            return None
+        finally:
+            for task in (pause, cancellation):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(pause, cancellation, return_exceptions=True)
+
+    def _defer_rate_limited(self, job: _ScenarioEnrichmentJob) -> bool:
+        if job.retries >= 2:
+            self._mark_skipped(job, "auxiliary_rate_limit_retry_exhausted")
+            return False
+        job.retries += 1
+        scenario = self.drafts.get(job.fingerprint)
+        if scenario is not None:
+            if scenario.evidence.get("visual_assessment", {}).get("requested"):
+                scenario.evidence["visual_assessment"] = {
+                    **(scenario.evidence.get("visual_assessment") or {}),
+                    "requested": True, "status": "pending", "reason": "awaiting_provider_retry",
+                    "retry_count": job.retries,
+                    "limitations": ["Revisão aguardando o provedor; não é uma aprovação visual."],
+                }
+            if self._uses_compact_visual_contract(scenario):
+                scenario.evidence["visual_review_provenance"] = {
+                    "provider_requests": 0,
+                    **(scenario.evidence.get("visual_review_provenance") or {}),
+                    "source": "local_draft", "status": "pending",
+                    "reason": "awaiting_provider_retry", "model_input": "none",
+                    "response_contract": "visual_findings_v1",
+                }
+                # The provider deferred a review, not the local document.
+                # Do not mislabel deterministic CT text as an LLM fallback.
+                scenario.evidence["documentation_provenance"] = {
+                    "source": "local_evidence", "reason": "deterministic_browser_evidence",
+                    "model_input": "none", "evidence_mode": "visual",
+                    "provider_requests": 0, "cache_key": None,
+                }
+            else:
+                scenario.evidence["documentation_provenance"] = {
+                    "source": "local_draft", "reason": "awaiting_provider_retry", "model_input": "none",
+                    "evidence_mode": "visual" if scenario.evidence.get("visual_assessment", {}).get("requested") else "text",
+                }
+            scenario.evidence["verification_summary"] = evidence_verification_summary(scenario.evidence)
+            self.repository.add_scenario(self.exploration_id, job.sequence, scenario)
+        try:
+            self.queue.put_nowait(job)
+        except asyncio.QueueFull:
+            self._mark_skipped(job, "auxiliary_backlog_full")
+            return False
+        self.repository.add_event(
+            self.exploration_id, "warning", "scenario_enrichment_deferred",
+            f"CT{job.sequence:03d} aguardará uma nova tentativa após a pausa do provedor",
+            {**self._progress_payload(), "scenario_id": f"CT{job.sequence:03d}", "retry_count": job.retries},
+        )
+        return True
 
     @property
     def total(self) -> int:
@@ -121,11 +344,7 @@ class _LiveScenarioPipeline:
                 "exploração do navegador"
             ),
             {
-                "current": 0,
-                "total": 0,
-                "enriched": 0,
-                "local_evidence": 0,
-                "stage": "parallel_enrichment",
+                **self._progress_payload(),
             },
         )
         if not self.use_local_evidence:
@@ -141,7 +360,7 @@ class _LiveScenarioPipeline:
     ) -> None:
         """Make the local CT durable before returning to browser planning."""
 
-        if self.closed:
+        if self.closed or is_stale_undispatched_action(result):
             return
         revision = self.revisions.get(fingerprint, 0) + 1
         existed = fingerprint in self.sequences
@@ -153,6 +372,19 @@ class _LiveScenarioPipeline:
         scenario = self.manager._scenario_from_evidence(
             observation, decision, result, sequence
         )
+        if scenario.evidence.get("visual_assessment", {}).get("requested") and (
+            self.use_local_evidence or self.worker is None or self.worker.done()
+        ):
+            scenario.evidence["visual_assessment"] = unavailable_visual_assessment(
+                requested=True, model=self.auxiliary.model,
+                reason="local_evidence_mode" if self.use_local_evidence else "auxiliary_worker_unavailable",
+            )
+        self._preserve_visual_history(
+            scenario, self.drafts.get(fingerprint), archive_current=True
+        )
+        self.drafts[fingerprint] = scenario
+        if self.use_local_evidence or self.worker is None or self.worker.done():
+            self.skipped.add(fingerprint)
         self.repository.add_scenario(self.exploration_id, sequence, scenario)
         self.repository.add_event(
             self.exploration_id,
@@ -164,12 +396,8 @@ class _LiveScenarioPipeline:
                 else f"{scenario.id} preservado enquanto a exploração continua"
             ),
             {
+                **self._progress_payload(),
                 "scenario_id": scenario.id,
-                "current": self.total,
-                "total": self.total,
-                "enriched": len(self.enriched),
-                "local_evidence": self.total - len(self.enriched),
-                "stage": "parallel_enrichment",
                 "revision": revision,
             },
         )
@@ -191,12 +419,8 @@ class _LiveScenarioPipeline:
                     "da LLM auxiliar não estava disponível"
                 ),
                 {
+                    **self._progress_payload(),
                     "scenario_id": scenario.id,
-                    "current": len(self.enriched) + len(self.skipped),
-                    "total": self.total,
-                    "enriched": len(self.enriched),
-                    "local_evidence": self.total - len(self.enriched),
-                    "stage": "parallel_enrichment",
                 },
             )
             return
@@ -208,6 +432,9 @@ class _LiveScenarioPipeline:
             result=result,
             sequence=sequence,
         )
+        self._queue_sequence += 1
+        job.queue_order = self._queue_sequence
+        self._compact_queue()
         try:
             self.queue.put_nowait(job)
         except asyncio.QueueFull:
@@ -223,14 +450,54 @@ class _LiveScenarioPipeline:
                     "auxiliar atingiu o limite de segurança"
                 ),
                 {
+                    **self._progress_payload(),
                     "scenario_id": scenario.id,
-                    "current": len(self.enriched) + len(self.skipped),
-                    "total": self.total,
-                    "enriched": len(self.enriched),
-                    "local_evidence": self.total - len(self.enriched),
-                    "stage": "parallel_enrichment",
                 },
             )
+            self._mark_skipped(job, "auxiliary_backlog_full")
+
+    @staticmethod
+    def _preserve_visual_history(
+        scenario: TestScenario, previous: TestScenario | None, *, archive_current: bool,
+    ) -> None:
+        """Keep prior image reviews in the CT, not in its current verdict.
+
+        Auxiliary evidence deliberately never mutates browser ActionResults.
+        Therefore action-retry merging alone cannot preserve an already
+        completed visual review. Carry it through draft/worker replacement
+        while leaving only the latest attempt's assertions authoritative.
+        """
+        if previous is None:
+            return
+        history = deepcopy(previous.evidence.get("visual_assessment_history") or [])
+        assessment = previous.evidence.get("visual_assessment") or {}
+        if archive_current and assessment.get("status") == "assessed":
+            history.append({
+                "action_step": previous.evidence.get("action_step"),
+                "assessment": deepcopy(assessment),
+            })
+        if history:
+            scenario.evidence["visual_assessment_history"] = list({
+                json.dumps(item, sort_keys=True): item for item in history
+            }.values())
+        entries = list(scenario.evidence.get("timeline") or [])
+        shots = list(scenario.screenshots)
+        for entry in previous.evidence.get("timeline") or []:
+            if (entry.get("assertion") or {}).get("kind") != "visual_model":
+                continue
+            if not archive_current and not entry.get("previous_attempt"):
+                continue
+            archived = deepcopy(entry)
+            archived["previous_attempt"] = True
+            archived["title"] = "Tentativa anterior · indício visual a revisar"
+            entries.append(archived)
+            if archived.get("screenshot"):
+                shots.append(str(archived["screenshot"]))
+        scenario.evidence["timeline"] = sorted(
+            {entry["id"]: entry for entry in entries}.values(),
+            key=lambda entry: str(entry.get("occurred_at") or ""),
+        )
+        scenario.screenshots = list(dict.fromkeys(shots))
 
     async def remove(self, fingerprint: str, sequence: int) -> None:
         """Invalidate an unverified draft recovered by a later no-op retry."""
@@ -241,6 +508,7 @@ class _LiveScenarioPipeline:
         stored_sequence = self.sequences.pop(fingerprint, sequence)
         self.enriched.discard(fingerprint)
         self.skipped.discard(fingerprint)
+        self.drafts.pop(fingerprint, None)
         scenario_id = f"CT{stored_sequence:03d}"
         self.repository.delete_scenario(self.exploration_id, scenario_id)
         self.repository.add_event(
@@ -252,12 +520,8 @@ class _LiveScenarioPipeline:
                 "bem-sucedida sem falha verificável"
             ),
             {
+                **self._progress_payload(),
                 "scenario_id": scenario_id,
-                "current": self.total,
-                "total": self.total,
-                "enriched": len(self.enriched),
-                "local_evidence": self.total - len(self.enriched),
-                "stage": "parallel_enrichment",
             },
         )
 
@@ -271,8 +535,21 @@ class _LiveScenarioPipeline:
                     if self.revisions.get(job.fingerprint) != job.revision:
                         continue
                     if self.repository.is_cancel_requested(self.exploration_id):
+                        self._mark_skipped(job, "exploration_cancelled")
                         return
 
+                    job = self._reprioritize_job(job)
+
+                    gate_reason = await self._provider_gate(job)
+                    if gate_reason:
+                        self._mark_skipped(job, gate_reason)
+                        continue
+                    if self.revisions.get(job.fingerprint) != job.revision:
+                        continue
+                    job = self._reprioritize_job(job)
+
+                    review_started_at = time.monotonic()
+                    requests_before = int(getattr(self.auxiliary, "request_count", 0))
                     scenario_task = asyncio.create_task(
                         self.auxiliary.create_scenario(
                             job.observation,
@@ -293,6 +570,7 @@ class _LiveScenarioPipeline:
                         )
                         if cancellation_task in done:
                             cancellation_task.result()
+                            self._mark_skipped(job, "exploration_cancelled")
                             return
                         if scenario_task not in done:
                             raise TimeoutError
@@ -301,26 +579,29 @@ class _LiveScenarioPipeline:
                             continue
                         if job.fingerprint not in self.sequences:
                             continue
-                        # The model owns wording only. Preserve all local
-                        # attempts, screenshots, assertions and signal IDs even
-                        # if an adapter returns a sparse documentation payload.
-                        local_evidence = build_scenario_evidence(
-                            job.observation, job.decision, job.result
+                        # Local checks stay authoritative. A grounded visual
+                        # assessment may add negative evidence, never erase a
+                        # business failure or replace browser observations.
+                        self.manager._merge_scenario_enrichment(
+                            scenario, job.observation, job.decision, job.result
                         )
-                        provenance = scenario.evidence.get("documentation_provenance")
-                        scenario.evidence.update(local_evidence)
-                        if provenance is not None:
-                            scenario.evidence["documentation_provenance"] = provenance
-                        scenario.screenshots = scenario_screenshots(
-                            local_evidence, job.result
+                        scenario.evidence["auxiliary_review_metrics"] = {
+                            "elapsed_seconds": round(time.monotonic() - review_started_at, 3),
+                            "provider_requests": max(0, int(getattr(self.auxiliary, "request_count", 0)) - requests_before),
+                        }
+                        self._preserve_visual_history(
+                            scenario, self.drafts.get(job.fingerprint), archive_current=False
                         )
                         self.repository.add_scenario(
                             self.exploration_id, job.sequence, scenario
                         )
-                        provenance = scenario.evidence.get(
-                            "documentation_provenance", {}
-                        )
-                        if provenance.get("source", "auxiliary_llm") != "auxiliary_llm":
+                        self.drafts[job.fingerprint] = scenario
+                        provenance = (scenario.evidence.get("visual_review_provenance")
+                                      or scenario.evidence.get("documentation_provenance", {}))
+                        if provenance.get("reason") == "auxiliary_rate_limited":
+                            self._defer_rate_limited(job)
+                            continue
+                        if provenance.get("source", "auxiliary_llm") not in {"auxiliary_llm", "auxiliary_cache"}:
                             self._mark_skipped(
                                 job,
                                 str(
@@ -329,25 +610,51 @@ class _LiveScenarioPipeline:
                                 ),
                             )
                             continue
+                        visual = scenario.evidence.get("visual_assessment") or {}
+                        if self._uses_compact_visual_contract(scenario) and visual.get("status") != "assessed":
+                            # A compact response supplied no documentation to
+                            # enrich. Missing/invalid visual JSON is an
+                            # unavailable review, never completed enrichment.
+                            self._mark_skipped(job, str(visual.get("reason") or "auxiliary_visual_evidence_unavailable"))
+                            continue
                         self.enriched.add(job.fingerprint)
                         self.skipped.discard(job.fingerprint)
+                        if visual.get("status") == "assessed":
+                            self._visually_reviewed_pages.add(canonical_url(job.observation.url))
+                            self._visually_reviewed_families.add(self._review_family(job))
+                        if visual.get("requested") and visual.get("status") == "unavailable":
+                            self.repository.add_event(
+                                self.exploration_id, "warning", "scenario_visual_unavailable",
+                                f"{scenario.id}: documentação recebida, mas análise visual indisponível; verificações locais preservadas",
+                                {**self._progress_payload(), "scenario_id": scenario.id, "reason": visual.get("reason")},
+                            )
                         self.repository.add_event(
                             self.exploration_id,
                             "info",
                             "scenario_enriched",
-                            f"{scenario.id} aprimorado pela LLM auxiliar em paralelo",
+                            (
+                                f"{scenario.id}: revisão reutilizada para evidência idêntica, sem nova chamada"
+                                if provenance.get("source") == "auxiliary_cache"
+                                else f"{scenario.id} aprimorado pela LLM auxiliar em paralelo"
+                            ),
                             {
+                                **self._progress_payload(),
                                 "scenario_id": scenario.id,
-                                "current": len(self.enriched) + len(self.skipped),
-                                "total": self.total,
-                                "enriched": len(self.enriched),
-                                "local_evidence": self.total - len(self.enriched),
-                                "stage": "parallel_enrichment",
+                                "reused_identical_evidence": provenance.get("source") == "auxiliary_cache",
+                                "review_elapsed_seconds": scenario.evidence["auxiliary_review_metrics"]["elapsed_seconds"],
+                                "review_provider_requests": scenario.evidence["auxiliary_review_metrics"]["provider_requests"],
                             },
                         )
                     except Exception as exc:
                         self._mark_skipped(job, exc.__class__.__name__)
                     finally:
+                        # Free-model pacing is per-run and includes rejected
+                        # calls. Paid models are not delayed unnecessarily.
+                        if str(getattr(self.auxiliary, "model", "")).endswith(":free") and (
+                            not hasattr(self.auxiliary, "request_count")
+                            or int(self.auxiliary.request_count) > requests_before
+                        ):
+                            self._next_request_at = time.monotonic() + self._setting("auxiliary_request_interval_seconds", 3.1)
                         for task in (scenario_task, cancellation_task):
                             if not task.done():
                                 task.cancel()
@@ -364,6 +671,8 @@ class _LiveScenarioPipeline:
                             )
                             self._usage_is_drained = True
                 except asyncio.CancelledError:
+                    if job is not None:
+                        self._mark_skipped(job, self._stop_reason or ("exploration_cancelled" if self.repository.is_cancel_requested(self.exploration_id) else "documentation_interrupted"))
                     raise
                 except Exception as exc:
                     # Repository/cancellation checks can fail outside the
@@ -375,10 +684,48 @@ class _LiveScenarioPipeline:
                 self.queue.task_done()
 
     def _mark_skipped(self, job: _ScenarioEnrichmentJob, reason: str) -> None:
-        if self.revisions.get(job.fingerprint) != job.revision:
+        if self.revisions.get(job.fingerprint) != job.revision or job.fingerprint in self.enriched:
             return
         self.skipped.add(job.fingerprint)
         with suppress(Exception):
+            scenario = self.drafts.get(job.fingerprint)
+            if scenario and scenario.evidence.get("visual_assessment", {}).get("requested") and scenario.evidence.get("visual_assessment", {}).get("status") != "assessed":
+                review = scenario.evidence.get("visual_review_provenance") or scenario.evidence.get("documentation_provenance") or {}
+                allowed = {
+                    "before": (job.result.evidence.get("before_screenshot"), job.result.before_url),
+                    "after": (job.observation.screenshot, job.observation.url),
+                }
+                images = [
+                    image for image in (scenario.evidence.get("visual_assessment") or {}).get("images", [])
+                    if isinstance(image, dict) and image.get("ref") in allowed
+                    and allowed[image["ref"]][0]
+                    and image.get("screenshot") == Path(str(allowed[image["ref"]][0])).name
+                    and image.get("url") == allowed[image["ref"]][1]
+                ] if review.get("model_input") == "text_and_image" else []
+                scenario.evidence["visual_assessment"] = unavailable_visual_assessment(
+                    requested=True, model=str(getattr(self.auxiliary, "model", "")), reason=reason,
+                    images=images,
+                )
+            if scenario:
+                if self._uses_compact_visual_contract(scenario):
+                    scenario.evidence["visual_review_provenance"] = {
+                        "model_input": "none", "provider_requests": 0,
+                        **(scenario.evidence.get("visual_review_provenance") or {}),
+                        "source": "local_fallback", "status": "unavailable", "reason": reason,
+                        "response_contract": "visual_findings_v1",
+                    }
+                    scenario.evidence["documentation_provenance"] = {
+                        "source": "local_evidence", "reason": "deterministic_browser_evidence",
+                        "model_input": "none", "evidence_mode": "visual",
+                        "provider_requests": 0, "cache_key": None,
+                    }
+                else:
+                    scenario.evidence["documentation_provenance"] = {
+                        **(scenario.evidence.get("documentation_provenance") or {}),
+                        "source": "local_fallback", "reason": reason,
+                    }
+                scenario.evidence["verification_summary"] = evidence_verification_summary(scenario.evidence)
+                self.repository.add_scenario(self.exploration_id, job.sequence, scenario)
             self.repository.add_event(
                 self.exploration_id,
                 "warning",
@@ -388,12 +735,8 @@ class _LiveScenarioPipeline:
                     "a LLM auxiliar não concluiu o aprimoramento"
                 ),
                 {
+                    **self._progress_payload(),
                     "scenario_id": f"CT{job.sequence:03d}",
-                    "current": len(self.enriched) + len(self.skipped),
-                    "total": self.total,
-                    "enriched": len(self.enriched),
-                    "local_evidence": self.total - len(self.enriched),
-                    "stage": "parallel_enrichment",
                     "reason": reason,
                 },
             )
@@ -421,13 +764,13 @@ class _LiveScenarioPipeline:
             if self.worker is not None:
                 if cancelled:
                     completion_reason = "exploration_cancelled"
+                    self._stop_reason = completion_reason
                     self.worker.cancel()
                 elif self.worker.done():
                     completion_reason = "auxiliary_worker_stopped"
                 else:
                     completion_reason = "documentation_complete"
-                    remaining = self.queue.qsize() + 1
-                    timeout = min(max(remaining * 8, 15), 180)
+                    timeout = self._setting("auxiliary_tail_timeout_seconds", 600.0)
                     queue_drained = asyncio.create_task(self.queue.join())
                     try:
                         done, _ = await asyncio.wait(
@@ -452,6 +795,7 @@ class _LiveScenarioPipeline:
             completion_reason = "backend_shutdown"
             interrupted = exc
         finally:
+            self._stop_reason = completion_reason
             if self.worker is not None:
                 if not self.worker.done():
                     self.worker.cancel()
@@ -484,12 +828,17 @@ class _LiveScenarioPipeline:
                 "do navegador"
             ),
             {
+                **self._progress_payload(),
                 "current": self.total,
                 "total": self.total,
                 "enriched": len(self.enriched),
                 "local_evidence": self.total - len(self.enriched),
                 "reason": completion_reason,
                 "stage": "scenarios_complete",
+                "provider_requests": int(getattr(self.auxiliary, "request_count", 0)),
+                "provider_rate_limits": int(getattr(self.auxiliary, "rate_limit_count", 0)),
+                "provider_pauses": self._provider_pause_count,
+                "request_budget": self._setting("auxiliary_max_requests", 120),
             },
         )
 
@@ -536,6 +885,8 @@ class ExplorationManager:
 
     @staticmethod
     def _needs_login(observation: Observation) -> bool:
+        if observation.page_state.get("authentication_challenge") is True:
+            return True
         element_text = " ".join(
             str(element.get("name") or "")
             for element in observation.interactive_elements
@@ -565,6 +916,27 @@ class ExplorationManager:
         "2) Clique no botão Login do próprio site e aguarde entrar. "
         "3) Só então clique em Continuar exploração abaixo."
     )
+
+    @classmethod
+    def _automatic_login_message(cls, reason: str) -> str:
+        if reason == "authentication_challenge":
+            return (
+                "O site exige CAPTCHA ou uma etapa adicional de autenticação. "
+                "Conclua essa etapa no site. A exploração retomará quando a entrada for confirmada. "
+                "Não reenviamos suas credenciais automaticamente."
+            )
+        explanation = {
+            "incomplete_credentials": "As credenciais informadas estão incompletas.",
+            "login_rejected": "O site rejeitou a tentativa de login automático. Não vamos reenviar suas credenciais.",
+            "authentication_challenge": "O site exige CAPTCHA ou uma etapa adicional de autenticação.",
+            "unsafe_origin": "A tela de login não está na origem autorizada.",
+            "unsafe_form_action": "O formulário envia o login para outra origem ou usa um envio não seguro.",
+            "unsafe_authentication_request": "Uma requisição de autenticação não segura foi bloqueada.",
+            "controls_changed": "Os campos de login mudaram durante o preenchimento automático.",
+            "already_attempted": "A tentativa automática já foi realizada nesta exploração.",
+            "login_not_confirmed": "Não foi possível confirmar o login automático. A tentativa não será repetida.",
+        }.get(reason, "Não foi possível identificar um formulário de login único e seguro.")
+        return f"{explanation} Continue manualmente. {cls.LOGIN_PANEL_MESSAGE}"
 
     async def _poll_login_gone(
         self, executor: PlaywrightExecutor, deadline: float | None
@@ -1244,8 +1616,19 @@ class ExplorationManager:
     ) -> tuple[bool, str | None]:
         """Decide whether an executed action is meaningful test-case evidence."""
 
+        if is_stale_undispatched_action(result):
+            return False, "stale_control_not_dispatched"
         if decision_source == "coverage" or is_restoration_action:
-            return False, "mechanical_coverage_action"
+            # Graph traversal is usually supporting navigation. But a real
+            # business check or attributable negative evidence observed while
+            # replaying a path is still a test result, not disposable plumbing.
+            if not any(
+                not assertion.passed or assertion.kind not in {"observable_state_change", "no_new_browser_errors"}
+                for assertion in result.assertions
+            ):
+                return False, "mechanical_coverage_action"
+        if (result.evidence.get("business_settle") or {}).get("status") == "api_wait_timed_out":
+            return True, None
         if result.success and not result.assertions:
             return False, "successful_action_without_verifiable_evidence"
         return True, None
@@ -1359,43 +1742,146 @@ class ExplorationManager:
         scenario_number: int,
     ) -> TestScenario:
         status = ScenarioStatus.SKIPPED
-        if not result.success:
+        if is_stale_undispatched_action(result):
+            # Defensive classification for direct callers. The live manager
+            # keeps these attempts as automation context, not new CTs.
+            status = ScenarioStatus.BLOCKED
+        elif not result.success:
             status = (
                 ScenarioStatus.BLOCKED
                 if "PolicyBlocked" in result.message
                 or "unavailable" in result.message.lower()
                 else ScenarioStatus.FAIL
             )
+        elif (result.evidence.get("business_settle") or {}).get("status") == "api_wait_timed_out" and not any(
+            not assertion.passed for assertion in result.assertions
+        ):
+            status = ScenarioStatus.BLOCKED
         elif result.assertions:
+            failed = [assertion for assertion in result.assertions if not assertion.passed]
             status = (
-                ScenarioStatus.PASS
-                if all(assertion.passed for assertion in result.assertions)
-                else ScenarioStatus.FAIL
+                ScenarioStatus.BLOCKED
+                if failed and all(assertion.kind == "form_validation_probe_precondition" for assertion in failed)
+                else ScenarioStatus.FAIL if failed else ScenarioStatus.PASS
             )
-        hint = decision.scenario_hint or {}
         evidence = build_scenario_evidence(observation, decision, result)
+        evidence["verification_summary"] = ExplorationManager._verification_summary(evidence)
         return TestScenario(
             id=f"CT{scenario_number:03d}",
-            title=str(
-                hint.get("title")
-                or f"Explore {decision.action} on {observation.title or observation.url}"
-            )[:300],
-            description=str(hint.get("description") or decision.rationale)[:3000],
-            preconditions=[
-                str(item)[:500] for item in hint.get("preconditions", []) if item
-            ][:20],
-            steps=[f"Execute {decision.action} on the observed page"],
-            expected_result=str(
-                hint.get("expected_result")
-                or "The declared assertion should be observed."
-            )[:3000],
-            actual_result=result.message or f"Browser ended at {result.after_url}",
+            **local_scenario_documentation(observation, decision, result),
             status=status,
             url=result.after_url,
             created_at=utc_now(),
             screenshots=scenario_screenshots(evidence, result),
             evidence=evidence,
         )
+
+    @staticmethod
+    def _merge_scenario_enrichment(
+        scenario: TestScenario, observation: Observation,
+        decision: AgentDecision, result: ActionResult,
+    ) -> None:
+        """Keep browser checks authoritative; admit only grounded visual negatives."""
+        generated = scenario.evidence or {}
+        native = build_scenario_evidence(observation, decision, result)
+        provenance = generated.get("documentation_provenance")
+        if isinstance(provenance, dict):
+            native["documentation_provenance"] = dict(provenance)
+        review_provenance = generated.get("visual_review_provenance")
+        if isinstance(review_provenance, dict):
+            native["visual_review_provenance"] = dict(review_provenance)
+        else:
+            review_provenance = provenance  # Immutable legacy response contract.
+        probe = (decision.scenario_hint or {}).get("validation_probe") or {}
+        # The attempted rule is fixed before execution. A provider may see
+        # another field's earlier error, but must not relabel a blocked Postal
+        # Code probe as a successful Last Name test.
+        if probe.get("kind") == "required_field" or (
+            isinstance(provenance, dict) and provenance.get("source") == "local_evidence"
+        ):
+            for key, value in local_scenario_documentation(observation, decision, result).items():
+                setattr(scenario, key, value)
+        status = ExplorationManager._scenario_from_evidence(observation, decision, result, 1).status
+        if native.get("visual_assessment", {}).get("requested"):
+            assessment = generated.get("visual_assessment") or {}
+            allowed = {
+                "before": (result.evidence.get("before_screenshot"), result.before_url),
+                "after": (observation.screenshot, observation.url),
+            }
+            images = [
+                image for image in assessment.get("images", [])
+                if isinstance(image, dict) and image.get("ref") in allowed
+                and allowed[image["ref"]][0]
+                and image.get("screenshot") == Path(str(allowed[image["ref"]][0])).name
+                and image.get("url") == allowed[image["ref"]][1]
+            ]
+            if (
+                isinstance(review_provenance, dict)
+                and review_provenance.get("source") in {"auxiliary_llm", "auxiliary_cache"}
+                and review_provenance.get("model_input") == "text_and_image"
+                and assessment.get("status") == "assessed" and images
+            ):
+                assessment, extra = assess_visual_findings(
+                    {"findings": assessment.get("findings", [])}, images=images,
+                    model=str(assessment.get("model") or ""), reference_text=observation.text,
+                    before_text=str(result.evidence.get("before_text") or ""), action_succeeded=result.success,
+                    interactive_elements=observation.interactive_elements,
+                )
+                if generated.get("visual_assessment", {}).get("reused_identical_evidence"):
+                    assessment["reused_identical_evidence"] = True
+                    assessment["cache_key"] = review_provenance.get("cache_key")
+                native["assertions"].extend(extra)
+                for assertion in extra:
+                    native["timeline"].append({
+                        "id": assertion["actual"]["finding_id"], "kind": "assertion", "occurred_at": utc_now(),
+                        "title": "Revisão visual · indício a revisar", "message": assertion["message"],
+                        "url": observation.url, "screenshot": assertion["actual"]["screenshot"],
+                        "step_number": native.get("action_step"), "assertion": assertion,
+                    })
+                if extra and status != ScenarioStatus.BLOCKED:
+                    status = ScenarioStatus.FAIL
+            else:
+                assessment = unavailable_visual_assessment(
+                    requested=True, model=str(assessment.get("model") or ""),
+                    reason=str(assessment.get("reason") or "auxiliary_visual_evidence_unavailable"),
+                    # Keep only locally verified references, never arbitrary
+                    # provider paths. Sent images are context, not validation.
+                    images=images if isinstance(review_provenance, dict) and review_provenance.get("model_input") == "text_and_image" else [],
+                )
+            native["visual_assessment"] = assessment
+        native["verification_summary"] = ExplorationManager._verification_summary(native)
+        scenario.evidence = native
+        scenario.screenshots = scenario_screenshots(native, result)
+        scenario.status = status
+        scenario.url = result.after_url
+
+    @staticmethod
+    def _verification_summary(evidence: dict[str, Any]) -> dict[str, Any]:
+        return evidence_verification_summary(evidence)
+
+    def _record_coverage_restrictions(self, exploration_id: str, coverage: CoveragePlanner, observation: Observation | None) -> None:
+        drain = getattr(coverage, "drain_restrictions", None)
+        for restriction in drain() if callable(drain) else []:
+            self.repository.add_event(
+                exploration_id, "warning", "coverage_restriction_recorded",
+                "Restrição de cobertura registrada individualmente; não é um teste aprovado",
+                {**restriction, "screenshot": observation.screenshot if observation else None,
+                 "observed_at": observation.captured_at if observation else utc_now()},
+            )
+        drain_resolutions = getattr(coverage, "drain_restriction_resolutions", None)
+        for restriction in drain_resolutions() if callable(drain_resolutions) else []:
+            self.repository.add_event(
+                exploration_id, "info", "coverage_restriction_resolved",
+                "Controle testado posteriormente; restrição de retomada resolvida com evidência, sem alterar o resultado do CT",
+                restriction,
+            )
+        drain_updates = getattr(coverage, "drain_restriction_updates", None)
+        for restriction in drain_updates() if callable(drain_updates) else []:
+            self.repository.add_event(
+                exploration_id, "warning", "coverage_restriction_updated",
+                "Restrição vinculada a uma pré-condição que falhou; evidência preservada, sem aprovação presumida",
+                restriction,
+            )
 
     @staticmethod
     def _append_observable_state_evidence(
@@ -1417,9 +1903,13 @@ class ExplorationManager:
         is preserved in the CT timeline without fabricating a functional FAIL.
         """
 
-        if not result.success or decision.action in {"wait", "screenshot"}:
+        if decision.action in {"wait", "screenshot"}:
             return
-        if state_changed and not any(
+        has_result_check = any(
+            assertion.kind not in {"observable_state_change", "no_new_browser_errors"}
+            for assertion in result.assertions
+        )
+        if result.success and state_changed and not has_result_check and not any(
             item.kind == "observable_state_change" for item in result.assertions
         ):
             result.assertions.append(
@@ -1459,10 +1949,12 @@ class ExplorationManager:
             else 0
         )
         error_count = console_count + network_count
+        if not result.success and error_count == 0:
+            return
         # A request that newly fails is concrete negative evidence even when
         # the visible page does not change. Conversely, a successful no-op
         # with no new error stays assertion-free and is omitted as a CT.
-        if not state_changed and error_count == 0:
+        if not state_changed and error_count == 0 and not has_result_check:
             return
         result.assertions.append(
             AssertionResult(
@@ -1597,12 +2089,7 @@ class ExplorationManager:
                 if scenario_task not in done:
                     raise TimeoutError
                 scenario = scenario_task.result()
-                provenance = scenario.evidence.get("documentation_provenance")
-                local_evidence = build_scenario_evidence(observation, decision, result)
-                scenario.evidence.update(local_evidence)
-                if provenance is not None:
-                    scenario.evidence["documentation_provenance"] = provenance
-                scenario.screenshots = scenario_screenshots(local_evidence, result)
+                self._merge_scenario_enrichment(scenario, observation, decision, result)
                 self.repository.add_scenario(exploration_id, scenario_number, scenario)
                 enriched += 1
                 event_type = "scenario_enriched"
@@ -1779,6 +2266,7 @@ class ExplorationManager:
             scenario_number = 0
             consecutive_model_errors = 0
             login_retried = False
+            automatic_login_attempted = False
             authentication_boundary_crossed = False
             actions_executed = 0
             consecutive_loop_rejections = 0
@@ -1858,6 +2346,42 @@ class ExplorationManager:
                     break
                 if self._needs_login(observation):
                     panel_message = None
+                    if credentials and not automatic_login_attempted:
+                        # Claim the attempt before awaiting: rejection, timeout
+                        # and later returns to login must never cause resubmits.
+                        automatic_login_attempted = True
+                        self.repository.add_event(
+                            exploration_id, "info", "automatic_login_started",
+                            "Tentando login automaticamente pelo Playwright, sem enviar credenciais à IA",
+                        )
+                        await executor.update_live_panel("Autenticando", "Tentativa local de login · sem chamadas à IA")
+                        try:
+                            login = await asyncio.wait_for(
+                                executor.attempt_login(credentials, observation),
+                                timeout=min(25, self._operation_timeout(deadline)),
+                            )
+                        except asyncio.TimeoutError:
+                            login = None
+                        if login and login.status == "success" and login.observation:
+                            observation = login.observation
+                            self._record_screenshot(exploration_id, observation, "After automatic login")
+                            self.repository.update_exploration(exploration_id, current_url=observation.url)
+                            self.repository.add_event(
+                                exploration_id, "info", "automatic_login_succeeded",
+                                "Login automático confirmado; iniciando a exploração autenticada",
+                            )
+                        else:
+                            reason = login.reason if login else "login_not_confirmed"
+                            panel_message = self._automatic_login_message(reason)
+                            self.repository.add_event(
+                                exploration_id, "warning", "automatic_login_manual_required",
+                                panel_message, {"reason": reason},
+                            )
+                    elif credentials:
+                        panel_message = self._automatic_login_message("already_attempted")
+                    if self.repository.is_cancel_requested(exploration_id):
+                        terminal = ExplorationStatus.CANCELLED
+                        break
                     if login_retried:
                         panel_message = (
                             "Login ainda não detectado! Você preencheu mas "
@@ -1865,63 +2389,61 @@ class ExplorationManager:
                             "da página e aguarde entrar — ao entrar, a exploração "
                             "retoma sozinha."
                         )
-                    outcome = await self._wait_for_user_input(
-                        exploration_id,
-                        observation,
-                        executor,
-                        panel_message,
-                        deadline,
-                    )
-                    if outcome == "cancelled" or self.repository.is_cancel_requested(
-                        exploration_id
-                    ):
-                        terminal = ExplorationStatus.CANCELLED
-                        break
-                    if outcome == "browser_closed":
-                        raise BrowserUnavailableError(
-                            "Browser window was closed by the user"
-                        )
-                    if outcome == "timeout":
-                        terminal = ExplorationStatus.PARTIAL
-                        self.repository.add_event(
-                            exploration_id,
-                            "warning",
-                            "coverage_partial",
-                            "Maximum exploration duration reached while waiting for login; coverage is partial",
-                            {
-                                "reason": "duration_limit",
-                                **coverage.context(observation),
-                            },
-                        )
-                        break
-                    observation = await asyncio.wait_for(
-                        executor.observe("after-user-input"),
-                        timeout=self._operation_timeout(deadline),
-                    )
-                    self._record_screenshot(exploration_id, observation, "After login")
-                    self.repository.update_exploration(
-                        exploration_id, current_url=observation.url
-                    )
                     if self._needs_login(observation):
-                        # Usuário clicou "continuar" sem concluir o login:
-                        # volta a aguardar em vez de deixar o JEV dar
-                        # "finish" com 0 ações e relatório vazio.
-                        # O painel mostra aviso explícito para não parecer
-                        # que "nada acontece".
-                        login_retried = True
-                        self.repository.add_event(
+                        outcome = await self._wait_for_user_input(
                             exploration_id,
-                            "warning",
-                            "login_not_completed",
-                            "Login page still detected after user confirmation. Waiting for login again.",
-                            {"url": observation.url},
+                            observation,
+                            executor,
+                            panel_message,
+                            deadline,
                         )
-                        await executor.show_intervention_panel(
-                            "Login ainda não detectado! Clique no botão Login "
-                            "do próprio site, aguarde a próxima página carregar "
-                            "e só então clique em Continuar exploração."
+                        if outcome == "cancelled" or self.repository.is_cancel_requested(
+                            exploration_id
+                        ):
+                            terminal = ExplorationStatus.CANCELLED
+                            break
+                        if outcome == "browser_closed":
+                            raise BrowserUnavailableError(
+                                "Browser window was closed by the user"
+                            )
+                        if outcome == "timeout":
+                            terminal = ExplorationStatus.PARTIAL
+                            self.repository.add_event(
+                                exploration_id,
+                                "warning",
+                                "coverage_partial",
+                                "Maximum exploration duration reached while waiting for login; coverage is partial",
+                                {
+                                    "reason": "duration_limit",
+                                    **coverage.context(observation),
+                                },
+                            )
+                            break
+                        observation = await asyncio.wait_for(
+                            executor.observe("after-user-input"),
+                            timeout=self._operation_timeout(deadline),
                         )
-                        continue
+                        self._record_screenshot(exploration_id, observation, "After login")
+                        self.repository.update_exploration(
+                            exploration_id, current_url=observation.url
+                        )
+                        if self._needs_login(observation):
+                            # User resumed before actually signing in: keep the
+                            # manual gate, without another automatic attempt.
+                            login_retried = True
+                            self.repository.add_event(
+                                exploration_id,
+                                "warning",
+                                "login_not_completed",
+                                "Login page still detected after user confirmation. Waiting for login again.",
+                                {"url": observation.url},
+                            )
+                            await executor.show_intervention_panel(
+                                "Login ainda não detectado! Clique no botão Login "
+                                "do próprio site, aguarde a próxima página carregar "
+                                "e só então clique em Continuar exploração."
+                            )
+                            continue
                     login_retried = False
                     executor.protect_authenticated_history()
                     if not authentication_boundary_crossed:
@@ -1929,7 +2451,10 @@ class ExplorationManager:
                         # of every authenticated screen. Start coverage at the
                         # first authenticated observation so logical
                         # backtracking can never target the sign-in page.
-                        coverage = CoveragePlanner(observation.url, options.focus_area)
+                        # Retain the supplied document entry URL. Login may
+                        # reach a SPA route via pushState; moving the logical
+                        # root there must not silently certify a GET deep link.
+                        coverage = CoveragePlanner(item["app_url"], options.focus_area)
                         coverage.observe(observation)
                         authentication_boundary_crossed = True
                         self.repository.add_event(
@@ -1947,6 +2472,7 @@ class ExplorationManager:
                 # used to let it request go_back from the authenticated root
                 # forever, even though the frontier was already exhausted.
                 if coverage.can_finish():
+                    self._record_coverage_restrictions(exploration_id, coverage, observation)
                     terminal = ExplorationStatus.COMPLETED
                     if coverage.coverage_complete():
                         self.repository.add_event(
@@ -1973,6 +2499,7 @@ class ExplorationManager:
                 # cannot spend one full JEV prompt (or grow its history) for
                 # every mechanical browser step.
                 mechanical_restore = coverage.next_restoration_action(observation)
+                self._record_coverage_restrictions(exploration_id, coverage, observation)
                 decision_source = "coverage" if mechanical_restore else "jev"
                 if mechanical_restore is not None:
                     decision, coverage_override = mechanical_restore
@@ -2124,6 +2651,7 @@ class ExplorationManager:
                     decision_source == "coverage" or is_restoration_action
                 )
                 if decision.action == "finish":
+                    self._record_coverage_restrictions(exploration_id, coverage, observation)
                     if not coverage.can_finish():
                         state = coverage.context(observation)
                         history.append(
@@ -2192,6 +2720,16 @@ class ExplorationManager:
                     coverage_state_key,
                 )
                 semantic_decision_key = coverage.decision_key(observation, decision)
+                validation_probe = (decision.scenario_hint or {}).get("validation_probe") or {}
+                if validation_probe:
+                    # All three submit probes can target the same button and
+                    # route. Preserve distinct required-field expectations.
+                    semantic_decision_key = json.dumps({
+                        "move": semantic_decision_key,
+                        "probe_kind": validation_probe.get("kind"),
+                        "probe_field": validation_probe.get("field_identity"),
+                        "probe_expected": validation_probe.get("expected"),
+                    }, sort_keys=True)
                 scenario_fingerprint = (
                     hashlib.sha256(
                         f"{coverage_state_key}:{semantic_decision_key}".encode()
@@ -2199,8 +2737,12 @@ class ExplorationManager:
                     if semantic_decision_key
                     else fingerprint
                 )
-                action_counts[fingerprint] = action_counts.get(fingerprint, 0) + 1
-                if action_counts[fingerprint] > 2 and not is_mechanical_action:
+                # Bounded planner probes/replays have their own retry budget.
+                # Three different required-field probes may submit the same
+                # button; they must not consume a later JEV happy-path retry.
+                if not is_mechanical_action:
+                    action_counts[fingerprint] = action_counts.get(fingerprint, 0) + 1
+                if not is_mechanical_action and action_counts[fingerprint] > 2:
                     consecutive_loop_rejections += 1
                     # Direciona o modelo para elementos ainda não tentados,
                     # em vez de só dizer "não" e desistir em seguida.
@@ -2283,6 +2825,19 @@ class ExplorationManager:
                 before_state_key = coverage.effect_key(observation)
                 after_state_key = coverage.effect_key(next_observation)
                 state_changed = before_state_key != after_state_key
+                result.evidence["action_effect"] = {"state_changed": state_changed}
+                result.assertions.extend(
+                    check_business_outcomes(observation, decision, result, next_observation)
+                )
+                if options.auxiliary_evidence_mode == "visual":
+                    result.evidence["visual_assessment"] = {
+                        "requested": True,
+                        "status": "pending",
+                        "reason": "awaiting_auxiliary_assessment",
+                        "limitations": [
+                            "A análise visual ainda não foi concluída; não é uma aprovação visual."
+                        ],
+                    }
                 if (
                     decision.action == "go_back"
                     and result.success
@@ -2370,6 +2925,7 @@ class ExplorationManager:
                     action_step=next_action,
                     before_screenshot=observation.screenshot,
                     before_observed_at=observation.captured_at,
+                    before_text=observation.text[:3500] if options.auxiliary_evidence_mode == "visual" else "",
                     technical_signals=local_signals,
                 )
                 result.evidence = build_scenario_evidence(
@@ -2392,7 +2948,12 @@ class ExplorationManager:
                 )
                 actions_executed += 1
                 coverage.record_action(observation, decision, result, next_observation)
-                if result.success and state_changed:
+                self._record_coverage_restrictions(exploration_id, coverage, next_observation)
+                verified_outcome = any(
+                    assertion.kind not in {"observable_state_change", "no_new_browser_errors"}
+                    for assertion in result.assertions
+                )
+                if result.success and (state_changed or verified_outcome):
                     consecutive_no_progress = 0
                 elif not is_mechanical_action:
                     consecutive_no_progress += 1
@@ -2414,11 +2975,16 @@ class ExplorationManager:
                 )
                 self.repository.add_event(
                     exploration_id,
-                    "info" if result.success else "error",
+                    "warning" if is_stale_undispatched_action(result)
+                    else "info" if result.success and all(a.passed for a in result.assertions) else "error",
                     "action_completed",
                     (
-                        result.message
-                        if result.success
+                        "Referência alterada antes da ação: nenhum comando foi executado. "
+                        "A página foi observada novamente; a retomada tem tentativa limitada."
+                        if is_stale_undispatched_action(result) else
+                        "Verificação de resultado falhou; o CT será reprovado e a exploração continuará. " + result.message
+                        if result.success and any(not a.passed for a in result.assertions)
+                        else result.message if result.success
                         else (
                             "Falha registrada nesta opção; a exploração seguirá "
                             f"pelas demais. Detalhe: {result.message}"
@@ -2430,12 +2996,14 @@ class ExplorationManager:
                         "success": result.success,
                         "url": result.after_url,
                         "state_changed": state_changed,
+                        "assertions_passed": all(a.passed for a in result.assertions),
                         "exploration_continues": not result.success,
                         "failure_policy": (
                             "retry_then_continue_frontier"
                             if not result.success
                             else None
                         ),
+                        "action_dispatch": result.evidence.get("action_dispatch"),
                         "coverage": {
                             "known_states": coverage_after["known_states"],
                             "frontier_states": coverage_after["frontier_states"],
@@ -2450,7 +3018,7 @@ class ExplorationManager:
                 )
                 await executor.update_live_panel(
                     self._step_label(actions_executed, options.max_steps),
-                    f"{'OK' if result.success else 'FALHA REGISTRADA — CONTINUANDO'} · {decision.action}"
+                    f"{'REFERÊNCIA ATUALIZADA — RETOMANDO' if is_stale_undispatched_action(result) else 'OK' if result.success and all(a.passed for a in result.assertions) else 'FALHA REGISTRADA — CONTINUANDO'} · {decision.action}"
                     f"{' ' + str(decision.target) if decision.target else ''} · "
                     f"{(result.after_url or '')[:80]}",
                 )
@@ -2551,6 +3119,7 @@ class ExplorationManager:
                     settlement = coverage.abandon_stalled_restoration(
                         reason="consecutive_restore_without_progress"
                     )
+                    self._record_coverage_restrictions(exploration_id, coverage, observation)
                     if settlement is not None:
                         self.repository.add_event(
                             exploration_id,
@@ -2664,6 +3233,9 @@ class ExplorationManager:
                 error_message,
             )
         finally:
+            if coverage is not None:
+                with suppress(Exception):
+                    self._record_coverage_restrictions(exploration_id, coverage, locals().get("observation"))
             if executor:
                 with suppress(Exception):
                     await executor.update_live_panel(
