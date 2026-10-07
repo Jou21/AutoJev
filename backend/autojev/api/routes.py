@@ -28,12 +28,14 @@ from autojev.services.coverage_ledger import coverage_restriction_ledger
 from autojev.services.execution_summary import execution_duration_summary, report_snapshot_key
 from autojev.services.visual_checks import visual_review_counts
 from autojev.services.verification_summary import verification_summary
+from autojev.services.visual_review_resume import visual_review_resume_summary
 
 from .schemas import (
     ConnectionTestInput,
     ExplorationCreate,
     ProviderCreate,
     ProviderUpdate,
+    VisualReviewResumeInput,
 )
 
 router = APIRouter(prefix="/api")
@@ -400,6 +402,7 @@ def _exploration_payload(item: dict[str, Any]) -> dict[str, Any]:
             {**visual_review_counts([]), "requested": False,
              "total": len(result["scenarios"]), "not_requested": len(result["scenarios"])}
         )
+        result["visual_review_resume"] = visual_review_resume_summary(result)
     if "screenshots" in result:
         result["screenshots"] = [
             {
@@ -800,9 +803,10 @@ async def get_exploration(
     exploration_id: str, request: Request
 ) -> dict[str, Any]:
     try:
-        return _exploration_payload(
-            _repository(request).get_exploration(exploration_id)
-        )
+        item = _repository(request).get_exploration(exploration_id)
+        result = _exploration_payload(item)
+        result["visual_review_resume"] = request.app.state.visual_review_resume_service.state_for(exploration_id, item)
+        return result
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -834,6 +838,27 @@ async def resume_exploration(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.post("/explorations/{exploration_id}/visual-reviews/resume", status_code=status.HTTP_202_ACCEPTED)
+async def resume_visual_reviews(
+    exploration_id: str, body: VisualReviewResumeInput, request: Request,
+) -> dict[str, Any]:
+    try:
+        return request.app.state.visual_review_resume_service.resume(
+            exploration_id, body.max_requests, body.max_attempts)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/explorations/{exploration_id}/visual-reviews/cancel", status_code=status.HTTP_202_ACCEPTED)
+async def cancel_visual_reviews(exploration_id: str, request: Request) -> dict[str, Any]:
+    try:
+        return await request.app.state.visual_review_resume_service.cancel(exploration_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.get("/explorations/{exploration_id}/report", response_class=HTMLResponse)
 async def get_report(exploration_id: str, request: Request) -> FileResponse:
     try:
@@ -850,8 +875,11 @@ async def get_report(exploration_id: str, request: Request) -> FileResponse:
     # to a separate artifact, retaining original verdicts and the original HTML.
     # No browser/model calls or historical data changes are needed.
     snapshot = _repository(request).get_exploration(exploration_id)
+    snapshot["visual_review_resume"] = visual_review_resume_summary(snapshot)
     marker = b'data-report-summary="execution-v2"'
     coverage_marker = b'data-coverage-ledger="execution-evidence-v1"'
+    cost_marker = b'data-cost-breakdown="roles-v1"'
+    visual_policy_marker = b'data-visual-review-policy="bounded-v1"'
     snapshot_marker = f'data-report-snapshot="{report_snapshot_key(snapshot)}"'.encode("ascii")
 
     def valid_presentation(candidate: Path) -> bool:
@@ -859,7 +887,9 @@ async def get_report(exploration_id: str, request: Request) -> FileResponse:
             return False
         with candidate.open("rb") as artifact:
             header = artifact.read(8192)
-            if marker not in header or coverage_marker not in header or snapshot_marker not in header:
+            if any(required not in header for required in (
+                marker, coverage_marker, cost_marker, visual_policy_marker, snapshot_marker,
+            )):
                 return False
             artifact.seek(max(candidate.stat().st_size - 1024, 0))
             return artifact.read().rstrip().endswith(b"</html>")

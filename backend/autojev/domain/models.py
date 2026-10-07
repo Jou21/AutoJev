@@ -101,6 +101,10 @@ class ExplorationOptions:
     # enabled.  This option controls only what is sent to the auxiliary model:
     # text is the economical default; visual also attaches the screenshot.
     auxiliary_evidence_mode: str = "text"
+    # None inherits the backend's finite default. These are HTTP request caps,
+    # including retries, not a promise of full visual coverage.
+    auxiliary_max_requests: int | None = None
+    auxiliary_review_max_attempts: int = 3
     capture_console_errors: bool = True
     capture_network_errors: bool = True
     generate_test_cases: bool = True

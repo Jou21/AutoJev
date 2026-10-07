@@ -261,6 +261,104 @@ async def test_invalid_visual_response_is_never_cached(tmp_path):
     assert client.calls == 2
 
 
+async def test_cache_only_miss_never_claims_requests_or_changes_cooldown(tmp_path):
+    _png(tmp_path / "image.png")
+
+    class Client:
+        chat_request_count = 4
+        chat_request_budget = 4
+
+        async def chat_json(self, *_args, **_kwargs):
+            pytest.fail("A cache-only lookup must never call the provider")
+
+    client = Client()
+    generator = OpenAIAuxiliaryScenarioGenerator(client, "fixture", tmp_path, "visual")
+    generator.request_count = 4
+    generator.rate_limit_count = 2
+    generator._cooldown_until = float("inf")
+    generator._cooldown_reason = "HTTP 401 unauthorized"
+    generator.non_retryable_reason = "auxiliary_authentication_rejected"
+    before = (generator.request_count, generator.rate_limit_count, generator._cooldown_until, generator._cooldown_reason, generator.non_retryable_reason)
+    assert await generator.cached_scenario(*_scenario_inputs(screenshot="image.png"), 1) is None
+    assert before == (generator.request_count, generator.rate_limit_count, generator._cooldown_until, generator._cooldown_reason, generator.non_retryable_reason)
+    assert client.chat_request_count == 4
+
+
+async def test_cache_only_hit_reuses_exact_review_after_transport_budget_exhaustion(monkeypatch, tmp_path):
+    for name in ("first.png", "same.png"):
+        _png(tmp_path / name)
+    _png(tmp_path / "different.png", color="blue")
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(200, json={"choices": [{"message": {
+            "content": '{"visual_assessment":{"findings":[]}}',
+        }}]})
+
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original_client(transport=httpx.MockTransport(respond), **kwargs))
+    client = OpenAICompatibleClient("http://fixture.test/v1", None)
+    client.chat_request_budget = 1
+    generator = OpenAIAuxiliaryScenarioGenerator(client, "fixture", tmp_path, "visual")
+    first = await generator.create_scenario(*_scenario_inputs(screenshot="first.png"), 1)
+    assert first.evidence["visual_assessment"]["status"] == "assessed"
+    assert client.chat_request_count == generator.request_count == 1
+    generator._vision_rejected = True  # A later rejection must not invalidate saved exact evidence.
+    generator._cooldown_until = float("inf")
+    generator.non_retryable_reason = "auxiliary_authentication_rejected"
+    cached = await generator.cached_scenario(*_scenario_inputs(screenshot="same.png"), 9)
+    assert cached is not None and cached.id == "CT009"
+    assert cached.evidence["visual_review_provenance"]["source"] == "auxiliary_cache"
+    assert cached.evidence["visual_assessment"]["status"] == "assessed"
+    assert cached.evidence["visual_assessment"]["images"][0]["screenshot"] == "same.png"
+    assert await generator.cached_scenario(*_scenario_inputs(screenshot="different.png"), 10) is None
+    observation, decision, result = _scenario_inputs(screenshot="same.png")
+    observation.text = "Different product identity"
+    assert await generator.cached_scenario(observation, decision, result, 11) is None
+    assert len(requests) == client.chat_request_count == generator.request_count == 1
+    assert generator._cooldown_until == float("inf")
+    assert generator.non_retryable_reason == "auxiliary_authentication_rejected"
+
+
+@pytest.mark.parametrize("malformed", [{}, {"visual_assessment": {"findings": [{}]}}])
+async def test_cache_only_does_not_accept_malformed_saved_review(tmp_path, malformed):
+    _png(tmp_path / "image.png")
+
+    class Client:
+        calls = 0
+
+        async def chat_json(self, *_args, **_kwargs):
+            self.calls += 1
+            return {"visual_assessment": {"findings": []}}
+
+    client = Client()
+    generator = OpenAIAuxiliaryScenarioGenerator(client, "fixture", tmp_path, "visual")
+    await generator.create_scenario(*_scenario_inputs(screenshot="image.png"), 1)
+    key = next(iter(generator._response_cache))
+    generator._response_cache[key] = malformed
+    assert await generator.cached_scenario(*_scenario_inputs(screenshot="image.png"), 2) is None
+    assert client.calls == generator.request_count == 1
+
+
+@pytest.mark.parametrize("provider_error,reason", [
+    ("Provider returned HTTP 503: temporarily unavailable", "auxiliary_provider_temporary_error"),
+    ("Provider returned HTTP 504: gateway timeout", "auxiliary_timeout"),
+    ("Provider returned HTTP 408: request expired", "auxiliary_provider_temporary_error"),
+    ("Provider returned HTTP 400: invalid input", "auxiliary_provider_error"),
+])
+async def test_temporary_provider_failures_have_explicit_retry_reason(tmp_path, provider_error, reason):
+    _png(tmp_path / "image.png")
+
+    class Client:
+        async def chat_json(self, *_args, **_kwargs):
+            raise ProviderConnectionError(provider_error)
+
+    generator = OpenAIAuxiliaryScenarioGenerator(Client(), "fixture", tmp_path, "visual")
+    scenario = await generator.create_scenario(*_scenario_inputs(screenshot="image.png"), 1)
+    assert scenario.evidence["visual_assessment"]["reason"] == reason
+
+
 @pytest.mark.asyncio
 async def test_list_models_uses_openrouter_model_name(monkeypatch):
     class FakeResponse:
@@ -417,6 +515,9 @@ async def test_chat_json_captures_and_drains_provider_usage(monkeypatch):
         "total_tokens": 40,
         "cost": 0.00042,
         "cost_known": True,
+        "cost_complete": True,
+        "usage_records": 1,
+        "cost_reported_records": 1,
     }
     assert client.drain_usage()["total_tokens"] == 0
 
@@ -481,6 +582,9 @@ async def test_openrouter_jev_uses_native_decisions_endpoint_and_usage(monkeypat
         "total_tokens": 136,
         "cost": 0.00001,
         "cost_known": True,
+        "cost_complete": True,
+        "usage_records": 1,
+        "cost_reported_records": 1,
     }
 
 

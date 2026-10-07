@@ -131,8 +131,10 @@ type ScenarioAssertion = {
 
 type ScenarioTechnicalSignal = {
   kind?: string;
+  type?: string;
   message?: string;
   url?: string;
+  method?: string;
   occurred_at?: string;
   status_code?: number | null;
   classification?: string;
@@ -150,6 +152,16 @@ type ScenarioTimelineEntry = {
   title?: string;
   message?: string;
   url?: string;
+  page_url?: string | null;
+  observation?: {
+    page_url?: string | null;
+    page_url_source?: "event" | "observation" | null;
+    phase?: string | null;
+    summary?: string;
+    request_url?: string | null;
+    method?: string | null;
+    status_code?: number | null;
+  };
   screenshot?: string | null;
   signal?: ScenarioTechnicalSignal;
   assertion?: ScenarioAssertion;
@@ -173,7 +185,7 @@ type ScenarioCase = {
     timeline?: ScenarioTimelineEntry[];
     technical_signals?: ScenarioTechnicalSignal[];
     assertions?: ScenarioAssertion[];
-    visual_assessment?: { requested?: boolean; status?: string; reason?: string; accepted_count?: number; uncertain_count?: number; limitations?: string[] };
+    visual_assessment?: { requested?: boolean; status?: string; reason?: string; accepted_count?: number; uncertain_count?: number; limitations?: string[]; context_limited?: boolean; review_scope?: string };
     documentation_provenance?: { source?: string; reason?: string; evidence_mode?: string; model_input?: string };
     verdict?: { kind?: string; label?: string; explanation?: string; historical?: boolean };
   };
@@ -205,6 +217,16 @@ type VerificationCounts = {
   not_validated?: number;
 };
 
+type UsageBucket = {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+  tokens?: number;
+  cost?: number | null;
+  cost_known?: boolean;
+  cost_complete?: boolean;
+};
+
 type Exploration = {
   id: string;
   app_url: string;
@@ -217,7 +239,13 @@ type Exploration = {
   visual_review_summary?: {
     total: number; assessed: number; pending: number; unavailable: number;
     rate_limited: number; incomplete_response: number;
+    context_limited?: number;
     unavailable_reasons?: { reason: string; count: number; label: string }[];
+  };
+  visual_review_resume?: {
+    running?: boolean; total?: number; completed?: number; failed?: number; pending?: number;
+    requests_used?: number; request_budget?: number; max_attempts?: number;
+    context_limited_count?: number; reason?: string | null;
   };
   progress?: number | null;
   overall_progress?: number | null;
@@ -289,12 +317,8 @@ type Exploration = {
   scenarios?: ScenarioCase[];
   scenario_contexts?: ScenarioCase[];
   error?: string | null;
-  usage?: {
-    prompt_tokens?: number;
-    completion_tokens?: number;
-    total_tokens?: number;
-    cost?: number | null;
-    cost_known?: boolean;
+  usage?: UsageBucket & {
+    by_role?: { jev?: UsageBucket; auxiliary?: UsageBucket };
   };
 };
 
@@ -403,6 +427,7 @@ export function visualUnavailabilityLabel(reason: string) {
     vision_rejected_text_fallback: "com entrada de imagem recusada pelo modelo",
     auxiliary_authentication_rejected: "com autenticação do provedor recusada",
     auxiliary_provider_error: "com falha na requisição ao provedor",
+    auxiliary_provider_temporary_error: "com falha temporária na requisição ao provedor",
     auxiliary_unavailable: "com provedor indisponível",
     auxiliary_backlog_full: "sem revisão por fila auxiliar cheia",
     exploration_cancelled: "sem revisão devido ao cancelamento da execução",
@@ -410,43 +435,113 @@ export function visualUnavailabilityLabel(reason: string) {
     documentation_interrupted: "com revisão auxiliar interrompida",
     auxiliary_worker_stopped: "com processamento auxiliar interrompido",
     auxiliary_worker_unavailable: "sem processamento auxiliar disponível",
+    visual_review_cancelled: "com retomada visual interrompida a pedido do usuário",
+    visual_review_context_unavailable: "sem contexto preservado suficiente para retomar a análise visual",
+    visual_review_retry_exhausted: "sem revisão válida após o limite de tentativas",
+    auxiliary_review_retry_exhausted: "sem revisão válida após o limite de tentativas",
+    auxiliary_review_attempts_exhausted: "sem revisão válida após o limite de tentativas",
     local_evidence_mode: "preservados somente com evidência local",
   } as Record<string, string>)[reason] || "sem revisão visual válida; motivo não classificado";
 }
 
 export function visualReviewCounts(scenarios: ScenarioCase[]) {
-  const counts = { total: scenarios.length, assessed: 0, pending: 0, unavailable: 0, rateLimited: 0, incompleteResponse: 0, unavailableReasons: [] as { reason: string; count: number; label: string }[] };
+  const counts = { total: scenarios.length, assessed: 0, pending: 0, unavailable: 0, rateLimited: 0, incompleteResponse: 0, contextLimited: 0, unavailableReasons: [] as { reason: string; count: number; label: string }[] };
   const unavailableReasons = new Map<string, number>();
   for (const scenario of scenarios) {
     const visual = scenario.evidence?.visual_assessment;
-    if (visual?.status === "assessed" && visual.reason !== "visual_findings_invalid") counts.assessed += 1;
+    if (visual?.status === "assessed" && visual.reason !== "visual_findings_invalid") {
+      counts.assessed += 1;
+      if (visual.context_limited === true || visual.review_scope === "saved_capture_only_legacy") counts.contextLimited += 1;
+    }
     else if (visual?.status === "pending") counts.pending += 1;
     else {
       counts.unavailable += 1;
       const reason = visual?.reason || "reason_not_recorded";
       unavailableReasons.set(reason, (unavailableReasons.get(reason) || 0) + 1);
       if (reason.startsWith("auxiliary_rate_limit")) counts.rateLimited += 1;
-      if (["visual_assessment_not_returned", "visual_assessment_schema_invalid", "visual_findings_invalid"].includes(reason)) counts.incompleteResponse += 1;
+      if (["visual_assessment_not_returned", "visual_assessment_schema_invalid", "visual_findings_invalid", "auxiliary_response_invalid", "auxiliary_response_schema_invalid"].includes(reason)) counts.incompleteResponse += 1;
     }
   }
   counts.unavailableReasons = [...unavailableReasons].sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0).map(([reason, count]) => ({ reason, count, label: visualUnavailabilityLabel(reason) }));
   return counts;
 }
 
-export function VisualReviewSummary({ scenarios, active = false, summary }: { scenarios: ScenarioCase[]; active?: boolean; summary?: Exploration["visual_review_summary"] }) {
+export function VisualReviewSummary({ scenarios, active = false, summary, requestBudget, requests }: { scenarios: ScenarioCase[]; active?: boolean; summary?: Exploration["visual_review_summary"]; requestBudget?: number; requests?: number }) {
   // Prefer the shared API summary; the local equivalent also supports older
   // backend versions while a live run finishes without a backend restart.
-  const counts = summary?.unavailable_reasons ? { ...summary, unavailableReasons: summary.unavailable_reasons } : visualReviewCounts(scenarios);
+  const counts = summary?.unavailable_reasons ? { ...summary, unavailableReasons: summary.unavailable_reasons, contextLimited: summary.context_limited ?? visualReviewCounts(scenarios).contextLimited } : visualReviewCounts(scenarios);
   const title = counts.pending || (active && !counts.total) ? "Análise visual em andamento"
     : !counts.assessed ? "Análise visual não realizada"
-    : counts.unavailable ? "Análise visual parcial" : "Capturas analisadas";
+    : counts.unavailable ? "Análise visual parcial" : counts.contextLimited ? "Capturas analisadas · contexto parcial" : "Capturas analisadas";
   return <section className="visual-review-summary panel" aria-label="Resultado da análise visual">
     <Eye size={20} />
     <div><strong>{title}</strong>
       <p>{counts.assessed} de {counts.total} CTs receberam uma análise visual válida · {counts.pending} em análise · {counts.unavailable} indisponíveis.</p>
+      {counts.contextLimited > 0 && <p><strong>{counts.contextLimited} revisões com contexto textual limitado.</strong> As imagens salvas foram analisadas, mas o DOM e o texto visível originais não foram preservados. Essas revisões não equivalem a uma análise com o contexto semântico completo da tela.</p>}
+      {typeof requestBudget === "number" && <p className="field-hint">Limite local registrado: {requestBudget} chamadas auxiliares{typeof requests === "number" ? ` · ${requests} realizadas` : ""}. É um limite de requisições HTTP, não de CTs.</p>}
       {counts.unavailableReasons.map((item) => <p key={item.reason}>{item.count} {item.label}. <small>Código: {item.reason}</small></p>)}
+      {(counts.unavailable > 0 || counts.pending > 0) && <p>O que está pendente aqui é a revisão visual adicional das capturas pela LLM. Ações e verificações locais já registradas continuam válidas. O limite local de chamadas não é um limite de testes nem indica falta de crédito no provedor.</p>}
       <small>PASS/FAIL das verificações locais continua válido. Análise visual indisponível não significa aprovação visual; ausência de indícios não garante cobertura visual completa.</small>
     </div>
+  </section>;
+}
+
+export function VisualReviewResumeControls({ state, pending, initialBudget = 120, initiallyExpanded = false, onResume, onCancel }: {
+  state?: Exploration["visual_review_resume"];
+  pending: number;
+  initialBudget?: number;
+  initiallyExpanded?: boolean;
+  onResume: (options: { max_requests: number; max_attempts: number }) => Promise<void | boolean>;
+  onCancel: () => Promise<void>;
+}) {
+  const [expanded, setExpanded] = useState(initiallyExpanded);
+  const [budget, setBudget] = useState(String(initialBudget));
+  const [consent, setConsent] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const amount = Number(budget);
+  const validBudget = Number.isInteger(amount) && amount >= 1 && amount <= 2000;
+  const running = !!state?.running;
+  const lastBatchMessage = ({
+    auxiliary_request_budget_exhausted: "O último lote atingiu o limite de chamadas. As revisões restantes continuam pendentes; nenhum novo lote será iniciado automaticamente.",
+    auxiliary_authentication_rejected: "O provedor recusou a autenticação na retomada. Verifique a chave nas configurações do provedor antes de tentar novamente.",
+    vision_rejected_text_fallback: "O modelo recusou imagens na retomada. Verifique a compatibilidade visual do modelo.",
+    backend_restart_interrupted: "A retomada foi interrompida pelo reinício do backend. As revisões já salvas foram preservadas.",
+    cancelled: "A retomada foi interrompida. As revisões já salvas e a exploração original foram preservadas.",
+    auxiliary_review_batch_timeout: "O tempo de espera deste lote terminou. As revisões já salvas foram preservadas; as restantes continuam pendentes.",
+    auxiliary_review_batch_failed: "Não foi possível concluir este lote de revisões. As evidências e a exploração original foram preservadas; confira a atividade antes de tentar novamente.",
+    completed_with_unavailable_reviews: "O lote terminou, mas algumas revisões continuam indisponíveis. Consulte o motivo de cada CT antes de autorizar outro lote.",
+  } as Record<string, string>)[state?.reason || ""];
+  const start = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!consent || !validBudget || busy || running) return;
+    setBusy(true);
+    try {
+      const accepted = await onResume({ max_requests: amount, max_attempts: 3 });
+      if (accepted === false) return;
+      setConsent(false);
+      setExpanded(false);
+    } finally { setBusy(false); }
+  };
+  const cancel = async () => {
+    setBusy(true);
+    try { await onCancel(); } finally { setBusy(false); }
+  };
+  if (!running && pending < 1) return null;
+  return <section className="panel visual-review-resume" aria-label="Retomar análise visual">
+    <div className="visual-review-resume-head"><div><strong>{running ? "Revisões visuais retomadas" : "Complete as revisões visuais pendentes"}</strong><p>Reutiliza as capturas salvas, sem abrir o navegador nem repetir a exploração. Os resultados locais dos CTs são preservados.</p></div>
+      {running ? <button type="button" className="button secondary" disabled={busy} onClick={() => void cancel()}>{busy ? <Spinner /> : <CircleStop size={16} />}Parar revisões visuais</button>
+        : <button type="button" className="button secondary" aria-expanded={expanded} disabled={busy} onClick={() => setExpanded((value) => !value)}><RefreshCcw size={16} />Retomar revisões visuais pendentes</button>}
+    </div>
+    {running && <p role="status">{state?.completed || 0} de {state?.total || pending} revisões concluídas · {state?.failed || 0} ainda indisponíveis · {state?.requests_used || 0} de {state?.request_budget || 0} chamadas utilizadas. Até {state?.max_attempts || 3} tentativas por revisão, contando a primeira.</p>}
+    {!running && lastBatchMessage && <p role="status">{lastBatchMessage}</p>}
+    {!!state?.context_limited_count && <p className="field-hint">{state.context_limited_count} CT(s) de execuções anteriores têm contexto textual limitado. A revisão usa as evidências preservadas, sem reconstruir dados que não foram salvos.</p>}
+    {!running && expanded && <form onSubmit={(event) => void start(event)} className="visual-review-resume-form">
+      <div className="callout warning-callout" role="note"><AlertCircle size={18} /><div><strong>Novas chamadas podem gerar custo na LLM.</strong><span>Este lote tem um limite independente e finito. São até 3 tentativas por revisão, contando a primeira; falhas de autenticação ou limite de chamadas não serão repetidas automaticamente. Abrir esta tela não inicia chamadas.</span></div></div>
+      <p className="field-hint">Capturas de execuções antigas podem não ter o DOM e o texto visível originais salvos. Nesse caso, a revisão terá contexto textual limitado e não será equivalente à análise com o contexto semântico completo.</p>
+      <label className="field-group"><span>Limite de chamadas deste lote</span><input type="number" min="1" max="2000" step="1" required value={budget} onChange={(event) => setBudget(event.target.value)} /><small>1 a 2.000 requisições HTTP. Retentativas também consomem o limite; o cache não consome chamadas. Não é uma promessa de revisar todos os CTs neste lote.</small></label>
+      <label className="review-cost-consent"><input type="checkbox" checked={consent} onChange={(event) => setConsent(event.target.checked)} />Entendo que esta retomada pode gerar custo adicional na LLM.</label>
+      <div className="modal-actions"><button type="button" className="button ghost" onClick={() => setExpanded(false)}>Voltar</button><button type="submit" className="button primary" disabled={!consent || !validBudget || busy}>{busy ? <Spinner /> : <Play size={16} />}Iniciar revisões com este limite</button></div>
+    </form>}
   </section>;
 }
 
@@ -600,7 +695,7 @@ export function explorationDetailState(explorationId: string | undefined, select
   return {
     exploration,
     loading: loading || (!exploration && settledId !== explorationId),
-    shouldPoll: !exploration || isLive(exploration.status),
+    shouldPoll: !exploration || isLive(exploration.status) || !!exploration.visual_review_resume?.running,
   };
 }
 
@@ -608,9 +703,33 @@ function formatTokens(value?: number) {
   return new Intl.NumberFormat("pt-BR").format(value || 0);
 }
 
-function formatCost(usage?: Exploration["usage"]) {
-  if (!usage?.cost_known) return "—";
-  return `$${(usage.cost || 0).toFixed(6)}`;
+function formatCost(usage?: UsageBucket) {
+  if (!usage?.cost_known || typeof usage.cost !== "number" || !Number.isFinite(usage.cost) || usage.cost < 0) return "—";
+  return `$${usage.cost.toFixed(6)}${usage.cost_complete === false ? " (parcial)" : ""}`;
+}
+
+export function CostBreakdown({ usage }: { usage?: Exploration["usage"] }) {
+  const costs = [
+    { key: "jev", label: "Custo JEV", icon: BrainCircuit, bucket: usage?.by_role?.jev },
+    { key: "auxiliary", label: "Custo LLM", icon: Sparkles, bucket: usage?.by_role?.auxiliary },
+    { key: "total", label: "Custo total", icon: CircleDollarSign, bucket: usage },
+  ];
+  return <div className="cost-breakdown" role="group" aria-label="Custos da execução em dólares americanos">
+    {costs.map(({ key, label, icon: Icon, bucket }) => {
+      const value = formatCost(bucket);
+      const note = !bucket && key !== "total"
+        ? "Divisão por modelo não registrada nesta execução."
+        : value === "—"
+          ? "Custo não informado pelo provedor."
+          : bucket?.cost_complete === false
+            ? "Valor parcial: há chamadas sem custo informado."
+            : "";
+      return <div className="cost-breakdown-item" key={key}>
+        <Icon size={17} aria-hidden="true" /><span>{label}</span><strong>{value}</strong>
+        {note && <small>{note}</small>}
+      </div>;
+    })}
+  </div>;
 }
 
 function errorMessage(error: unknown) {
@@ -1021,8 +1140,9 @@ export default function AutoJevApp() {
         total_tokens: total.total_tokens + (item.usage?.total_tokens || 0),
         cost: total.cost + (item.usage?.cost || 0),
         cost_known: total.cost_known || Boolean(item.usage?.cost_known),
+        cost_complete: total.cost_complete && Boolean(item.usage?.cost_known) && item.usage?.cost_complete !== false,
       }),
-      { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost: 0, cost_known: false },
+      { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost: 0, cost_known: false, cost_complete: true },
     );
   const hasActiveUsage = explorations.some((item) => isLive(item.status));
   const totalModels = useMemo(
@@ -1153,7 +1273,7 @@ export default function AutoJevApp() {
               <div className="usage-indicator-heading"><Activity size={14} /><strong>Uso ao vivo</strong><span className="live-mini"><span />ao vivo</span></div>
               <div className="usage-indicator-values">
                 <span><Hash size={13} /><strong>{formatTokens(activeUsage.total_tokens)}</strong><small>tokens</small></span>
-                <span><CircleDollarSign size={13} /><strong>{activeUsage.cost_known ? `$${activeUsage.cost.toFixed(6)}` : "—"}</strong><small>custo informado</small></span>
+                <span><CircleDollarSign size={13} /><strong>{formatCost(activeUsage)}</strong><small>custo total</small></span>
               </div>
             </div>
           )}
@@ -1393,6 +1513,7 @@ function NewExplorationView({
   const [auxModel, setAuxModel] = useState("");
   const [viewport, setViewport] = useState("1440x900");
   const [auxiliaryEvidenceMode, setAuxiliaryEvidenceMode] = useState<"text" | "visual">("text");
+  const [auxiliaryMaxRequests, setAuxiliaryMaxRequests] = useState("120");
   const [captureConsoleErrors, setCaptureConsoleErrors] = useState(true);
   const [captureNetworkErrors, setCaptureNetworkErrors] = useState(true);
   const [credentialsOpen, setCredentialsOpen] = useState(false);
@@ -1492,6 +1613,11 @@ function NewExplorationView({
       toast("Informe usuário e senha juntos, ou deixe ambos vazios para fazer login manualmente.", "error");
       return;
     }
+    const requestBudget = Number(auxiliaryMaxRequests);
+    if (!Number.isInteger(requestBudget) || requestBudget < 1 || requestBudget > 2000) {
+      toast("Defina um limite de 1 a 2.000 chamadas auxiliares.", "error");
+      return;
+    }
     setUrl(targetUrl);
     setSubmitting(true);
     try {
@@ -1503,6 +1629,8 @@ function NewExplorationView({
         max_duration_seconds: null,
         capture_screenshots: true,
         auxiliary_evidence_mode: auxiliaryEvidenceMode,
+        auxiliary_max_requests: requestBudget,
+        auxiliary_review_max_attempts: 3,
         capture_console_errors: captureConsoleErrors,
         capture_network_errors: captureNetworkErrors,
         generate_test_cases: true,
@@ -1648,6 +1776,10 @@ function NewExplorationView({
                 <label className="field-group"><span>Viewport</span><select value={viewport} onChange={(event) => setViewport(event.target.value)}><option value="1440x900">Desktop · 1440 × 900</option><option value="1280x720">Notebook · 1280 × 720</option><option value="390x844">Mobile · 390 × 844</option></select></label>
                 <div className="field-group"><span>Evidências</span><div className="static-field"><Eye size={16} />Screenshot + DOM</div></div>
               </div>
+              <div className="auxiliary-budget-settings">
+                <label className="field-group"><span>Limite de chamadas da LLM auxiliar</span><input type="number" min="1" max="2000" step="1" required value={auxiliaryMaxRequests} onChange={(event) => setAuxiliaryMaxRequests(event.target.value)} /><small>Limite local de requisições HTTP, não de CTs. Retentativas e atualizações consomem chamadas; evidências idênticas podem usar cache sem custo de nova chamada.</small></label>
+                <p className="field-hint">Até 3 tentativas por revisão, contando a primeira. A exploração e os testes locais continuam se o limite auxiliar for atingido. No modo visual, as revisões pendentes podem ser retomadas depois com sua confirmação.</p>
+              </div>
               <div className="toggle-list">
                 <label className="toggle-row"><span><strong>Capturar erros de console</strong><small>Registra exceções e mensagens relevantes emitidas pela aplicação.</small></span><input aria-label="Capturar erros de console" type="checkbox" checked={captureConsoleErrors} onChange={(event) => setCaptureConsoleErrors(event.target.checked)} /><i /></label>
                 <label className="toggle-row"><span><strong>Capturar falhas de rede</strong><small>Inclui requisições malsucedidas nas evidências da exploração.</small></span><input aria-label="Capturar falhas de rede" type="checkbox" checked={captureNetworkErrors} onChange={(event) => setCaptureNetworkErrors(event.target.checked)} /><i /></label>
@@ -1683,6 +1815,7 @@ function NewExplorationView({
             <SummaryRow label="Agente JEV" value={agentModel || "Selecione um modelo"} />
             <SummaryRow label="LLM auxiliar" value={auxModel || "Selecione um modelo"} />
             <SummaryRow label="Evidência da LLM" value={auxiliaryEvidenceMode === "visual" ? "Visual · texto + imagem" : "Econômico · somente texto"} />
+            <SummaryRow label="Chamadas auxiliares" value={`Até ${auxiliaryMaxRequests || "—"} · 3 tentativas/revisão`} />
             <SummaryRow label="Escopo" value={focusMode === "focused" ? focusArea.trim() || "Defina uma área" : "Aplicação inteira"} />
             <SummaryRow label="Conclusão" value="Ao esgotar a cobertura" />
             <SummaryRow label="Limite" value="Sem teto fixo" />
@@ -1840,7 +1973,7 @@ function ExplorationsView({ explorations, loading, navigate }: { explorations: E
         ) : (
           <div className="exploration-table-wrap">
             <table className="data-table">
-              <thead><tr><th>Aplicação</th><th>Status</th><th>Progresso</th><th>Cenários</th><th>Tokens</th><th>Custo</th><th>Iniciada</th><th><span className="sr-only">Ações</span></th></tr></thead>
+              <thead><tr><th>Aplicação</th><th>Status</th><th>Progresso</th><th>Cenários</th><th>Tokens</th><th>Custo total</th><th>Iniciada</th><th><span className="sr-only">Ações</span></th></tr></thead>
               <tbody>{filtered.map((item) => {
                 const progress = item.overall_progress ?? item.progress ?? (["completed", "success"].includes(item.status?.toLowerCase()) ? 100 : undefined);
                 const determinate = typeof progress === "number";
@@ -2252,6 +2385,23 @@ function ExplorationDetailView({
     }
   };
 
+  const resumeVisualReviews = async (options: { max_requests: number; max_attempts: number }) => {
+    try {
+      await request(`/explorations/${encodeURIComponent(exploration.id)}/visual-reviews/resume`, { method: "POST", body: JSON.stringify(options) });
+      toast("Revisões visuais pendentes iniciadas. A exploração não será repetida.", "success");
+      onRefresh();
+      return true;
+    } catch (error) { toast(errorMessage(error), "error"); return false; }
+  };
+
+  const cancelVisualReviews = async () => {
+    try {
+      await request(`/explorations/${encodeURIComponent(exploration.id)}/visual-reviews/cancel`, { method: "POST" });
+      toast("Parada das revisões solicitada. Os CTs e a exploração foram preservados.", "success");
+      onRefresh();
+    } catch (error) { toast(errorMessage(error), "error"); }
+  };
+
   const openReport = async () => {
     setOpeningReport(true);
     try {
@@ -2340,12 +2490,20 @@ function ExplorationDetailView({
             );
           })}
         </div>
-        <div className="live-counters"><DetailCounter icon={Globe2} value={counters.pages} label="páginas" /><DetailCounter icon={Zap} value={counters.actions} label="ações" /><DetailCounter icon={AlertCircle} value={counters.issues} label="sinais técnicos" /><DetailCounter icon={FileCheck2} value={counters.scenarios} label="CTs" /><DetailCounter icon={Hash} value={formatTokens(exploration.usage?.total_tokens)} label="tokens" /><DetailCounter icon={CircleDollarSign} value={formatCost(exploration.usage)} label="custo" /><DetailCounter icon={Clock3} value={explorationDuration(exploration)} label="duração total" /></div>
+        <div className="live-counters"><DetailCounter icon={Globe2} value={counters.pages} label="páginas" /><DetailCounter icon={Zap} value={counters.actions} label="ações" /><DetailCounter icon={AlertCircle} value={counters.issues} label="sinais técnicos" /><DetailCounter icon={FileCheck2} value={counters.scenarios} label="CTs" /><DetailCounter icon={Hash} value={formatTokens(exploration.usage?.total_tokens)} label="tokens" /><DetailCounter icon={Clock3} value={explorationDuration(exploration)} label="duração total" /></div>
+        <CostBreakdown usage={exploration.usage} />
       </section>
 
       <VerificationStrengthSummary counts={exploration.verification_summary} />
 
-      {explorationEvidenceMode(exploration.options) === "visual" && <VisualReviewSummary scenarios={exploration.scenarios || []} active={isLive(exploration.status)} summary={exploration.visual_review_summary} />}
+      {explorationEvidenceMode(exploration.options) === "visual" && <VisualReviewSummary scenarios={exploration.scenarios || []} active={isLive(exploration.status)} summary={exploration.visual_review_summary} requestBudget={typeof exploration.options?.auxiliary_max_requests === "number" ? exploration.options.auxiliary_max_requests : undefined} requests={postprocessing.requests} />}
+      {visualEvidenceMode && !isLive(exploration.status) && <VisualReviewResumeControls
+        state={exploration.visual_review_resume}
+        pending={exploration.visual_review_resume?.pending ?? ((exploration.visual_review_summary?.pending ?? visualReviewCounts(exploration.scenarios || []).pending) + (exploration.visual_review_summary?.unavailable ?? visualReviewCounts(exploration.scenarios || []).unavailable))}
+        initialBudget={typeof exploration.options?.auxiliary_max_requests === "number" ? exploration.options.auxiliary_max_requests : 120}
+        onResume={resumeVisualReviews}
+        onCancel={cancelVisualReviews}
+      />}
 
       {waitingForInput && (
         <section className="panel intervention-card intervention-wide">
@@ -2387,7 +2545,7 @@ function ExplorationDetailView({
                 {counters.issues > 0 && (
                   <div className="coverage-summary">
                     <ShieldCheck size={18} />
-                    <div><strong>Sinais técnicos dentro da evidência</strong><span>Cada ocorrência aparece na linha do tempo do CT ou no contexto de navegação correspondente. Um sinal de console ou rede não confirma sozinho um defeito funcional.</span><button className="text-button" onClick={() => setDetailTab("scenarios")}>Examinar os casos de teste <ArrowRight size={14} /></button></div>
+                    <div><strong>Sinais técnicos dentro da evidência</strong><span>Cada ocorrência aparece na linha do tempo do CT correspondente. Registros sem vínculo com um CT ficam nas observações da execução, com a página e o momento registrados. Um sinal de console ou rede não confirma sozinho um defeito funcional.</span><button className="text-button" onClick={() => setDetailTab("scenarios")}>Examinar os casos de teste <ArrowRight size={14} /></button></div>
                   </div>
                 )}
                 <div className="result-facts">
@@ -2564,8 +2722,7 @@ export function CoverageRestrictionsPanel({ restrictions, resolvedRestrictions =
   </section>;
 }
 
-function scenarioVerdict(scenario: ScenarioCase, context: boolean) {
-  if (context) return { label: "Contexto · não é um teste", tone: "info" };
+function scenarioVerdict(scenario: ScenarioCase) {
   const status = scenario.status.toUpperCase();
   const verdict = scenario.evidence?.verdict;
   const tone = verdict?.kind === "interaction_only" ? "info" : ["technical_failure", "visual_failure", "execution_failure"].includes(verdict?.kind || "") ? "warning" : status === "FAIL" ? "error" : status === "PASS" ? "success" : "info";
@@ -2583,11 +2740,12 @@ function technicalSignalImpact(signal: ScenarioTechnicalSignal) {
   return labels[signal.impact || ""] || signal.impact || "Este registro precisa de contexto: sozinho não confirma um defeito funcional nem reprova o CT.";
 }
 
-function ScenarioTimelineCard({ scenario, explorationId, apiBase, context = false }: { scenario: ScenarioCase; explorationId: string; apiBase: string; context?: boolean }) {
-  const verdict = scenarioVerdict(scenario, context);
+function ScenarioTimelineCard({ scenario, explorationId, apiBase }: { scenario: ScenarioCase; explorationId: string; apiBase: string }) {
+  const verdict = scenarioVerdict(scenario);
   const signals = scenarioSignals(scenario);
   const entries = scenarioTimeline(scenario);
   const visual = scenario.evidence?.visual_assessment;
+  const contextLimited = visual?.context_limited === true || visual?.review_scope === "saved_capture_only_legacy";
   const visualLabel = visual?.status === "pending" ? "Análise visual em andamento"
     : visual?.status !== "assessed" ? "Análise visual indisponível · CT baseado nas verificações locais"
     : visual.accepted_count ? `${visual.accepted_count} indício(s) visual(is) · revisão necessária`
@@ -2603,15 +2761,14 @@ function ScenarioTimelineCard({ scenario, explorationId, apiBase, context = fals
     <details className={`scenario-case-card verdict-${verdict.tone}`}>
       <summary className="scenario-case-summary">
         <ChevronRight className="scenario-expand-icon" size={17} />
-        <div className="scenario-case-heading"><span>{context ? "Contexto / navegação de apoio" : scenario.id}</span><h3>{scenario.title}</h3><div className="scenario-case-meta"><span>{timeline.length} registros na linha do tempo</span>{uniqueScreenshots.size > 0 && <span><Eye size={12} />{uniqueScreenshots.size} capturas</span>}{signals.length > 0 && <span className="scenario-signal-count"><Network size={12} />{signals.length} sinais técnicos</span>}{!context && visual?.requested && <span>Visual: {visual.status === "pending" ? "em análise" : visual.status !== "assessed" ? "indisponível" : visual.accepted_count ? "indício a revisar" : "analisado"}</span>}</div></div>
+        <div className="scenario-case-heading"><span>{scenario.id}</span><h3>{scenario.title}</h3><div className="scenario-case-meta"><span>{timeline.length} registros na linha do tempo</span>{uniqueScreenshots.size > 0 && <span><Eye size={12} />{uniqueScreenshots.size} capturas</span>}{signals.length > 0 && <span className="scenario-signal-count"><Network size={12} />{signals.length} sinais técnicos</span>}{visual?.requested && <span>Visual: {visual.status === "pending" ? "em análise" : visual.status !== "assessed" ? "indisponível" : visual.accepted_count ? "indício a revisar" : "analisado"}</span>}</div></div>
         <span className={`scenario-verdict verdict-${verdict.tone}`}>{verdict.label}</span>
       </summary>
       <div className="scenario-case-body">
         {scenario.evidence?.verdict?.explanation && <p className={`scenario-verdict-explanation verdict-${verdict.tone}`}>{scenario.evidence.verdict.explanation}{scenario.evidence.verdict.historical && <small>O resultado histórico foi preservado; a classificação técnica explica a evidência, sem afirmar um defeito funcional.</small>}</p>}
-        {context && <p className="scenario-context-note">Esta evidência ocorreu fora de um CT executado. É contexto de preparação ou recuperação, não um teste aprovado ou falho.</p>}
-        {!context && visual?.requested && <div className="scenario-context-note"><strong>{visualLabel}</strong>{visual.reason && visual.status === "unavailable" && <small>Motivo: {visual.reason.startsWith("auxiliary_rate_limit") ? "O provedor limitou as chamadas. As verificações locais foram preservadas." : visual.reason === "auxiliary_request_budget_exhausted" ? "O orçamento de chamadas auxiliares desta execução foi esgotado." : visual.reason === "screenshot_not_available" ? "Não havia captura disponível para enviar ao modelo." : ["visual_assessment_not_returned", "visual_assessment_schema_invalid"].includes(visual.reason) ? "O modelo não devolveu uma análise visual no formato obrigatório. A documentação recebida não é uma validação visual." : `${visualUnavailabilityLabel(visual.reason)}. As verificações locais foram preservadas.`} Código: {visual.reason}</small>}{visual.status === "assessed" && <small>A confiança é declarada pelo modelo; um indício visual não confirma sozinho um bug funcional.</small>}</div>}
-        {!context && (scenario.expected_result || scenario.actual_result) && <div className="scenario-outcome-grid">{scenario.expected_result && <div><small>Resultado esperado</small><p>{scenario.expected_result}</p></div>}{scenario.actual_result && <div><small>Resultado observado</small><p>{scenario.actual_result}</p></div>}</div>}
-        <h4 className="scenario-timeline-title"><History size={15} />Linha do tempo do {context ? "contexto" : "CT"}</h4>
+        {visual?.requested && <div className="scenario-context-note"><strong>{visualLabel}</strong>{visual.reason && visual.status === "unavailable" && <small>Motivo: {visual.reason.startsWith("auxiliary_rate_limit") ? "O provedor limitou as chamadas. As verificações locais foram preservadas." : visual.reason === "auxiliary_request_budget_exhausted" ? "O orçamento de chamadas auxiliares desta execução foi esgotado." : visual.reason === "screenshot_not_available" ? "Não havia captura disponível para enviar ao modelo." : ["visual_assessment_not_returned", "visual_assessment_schema_invalid"].includes(visual.reason) ? "O modelo não devolveu uma análise visual no formato obrigatório. A documentação recebida não é uma validação visual." : `${visualUnavailabilityLabel(visual.reason)}. As verificações locais foram preservadas.`} Código: {visual.reason}</small>}{visual.status === "assessed" && <small>A confiança é declarada pelo modelo; um indício visual não confirma sozinho um bug funcional.</small>}{contextLimited && <small>Contexto textual limitado: esta revisão usa as capturas salvas. O DOM e o texto visível originais não foram preservados; não equivale a uma análise com contexto semântico completo.</small>}</div>}
+        {(scenario.expected_result || scenario.actual_result) && <div className="scenario-outcome-grid">{scenario.expected_result && <div><small>Resultado esperado</small><p>{scenario.expected_result}</p></div>}{scenario.actual_result && <div><small>Resultado observado</small><p>{scenario.actual_result}</p></div>}</div>}
+        <h4 className="scenario-timeline-title"><History size={15} />Linha do tempo do CT</h4>
         {timeline.length === 0 ? <p className="scenario-context-note">Nenhum evento detalhado foi preservado para este caso.</p> : <ol className="scenario-timeline">{timeline.map(({ entry, image }, index) => {
           const signal = entry.signal;
           const assertion = entry.assertion;
@@ -2630,7 +2787,7 @@ function ScenarioTimelineCard({ scenario, explorationId, apiBase, context = fals
               {(entry.message || signal?.message || assertion?.message) && <p>{entry.message || signal?.message || assertion?.message}</p>}
               {kind === "action" && (entry.step_number !== undefined || entry.target) && <div className="scenario-case-meta">{entry.step_number !== undefined && <span>Etapa {entry.step_number}</span>}{entry.target && <span>Alvo observado: {entry.target}</span>}</div>}
               {assertion && <div className={`scenario-assertion-result ${assertion.passed === false ? "not-passed" : ""}`}><span>{assertion.passed === true ? "Aprovada" : assertion.passed === false ? "Falhou" : "Sem resultado"}{technicalAssertion ? " · verificação técnica" : visualAssertion ? " · indício visual da LLM" : ""}</span>{visualAssertion && <small>Reprovação baseada na análise da imagem; confira a captura e a região antes de confirmar o defeito.</small>}{assertion.expected !== undefined && <small>Esperado: {JSON.stringify(assertion.expected)}</small>}{assertion.actual !== undefined && <small>Observado: {JSON.stringify(assertion.actual)}</small>}</div>}
-              {signal && <div className="scenario-signal-detail">{signal.status_code && <span className="scenario-http-code">HTTP {signal.status_code}</span>}<p>{technicalSignalImpact(signal)}</p>{signal.classification_reason && <small>{signal.classification_reason}</small>}<small>{association === "before_action" ? "Observado antes da ação; contexto anterior, sem atribuição causal." : association === "after_action" ? "Observado após a ação; associação temporal, não causalidade comprovada." : association === "during_action" ? "Registrado durante a ação; associação temporal, não causalidade comprovada." : "Registrado nesta observação de contexto."}</small>{signal.affects_verdict === false && <small>Não reprova automaticamente o CT.</small>}</div>}
+              {signal && <div className="scenario-signal-detail">{signal.status_code && <span className="scenario-http-code">HTTP {signal.status_code}</span>}<p>{technicalSignalImpact(signal)}</p>{signal.classification_reason && <small>{signal.classification_reason}</small>}<small>{association === "before_action" ? "Observado antes da ação; sem atribuição causal." : association === "after_action" ? "Observado após a ação; associação temporal, não causalidade comprovada." : association === "during_action" ? "Registrado durante a ação; associação temporal, não causalidade comprovada." : "Registrado durante a execução; relação causal não comprovada."}</small>{signal.affects_verdict === false && <small>Não reprova automaticamente o CT.</small>}</div>}
               {(entry.url || signal?.url) && <div className="scenario-event-url">{link ? <a href={link} target="_blank" rel="noreferrer">{entry.url || signal?.url}<SquareArrowOutUpRight size={12} /></a> : <span>{entry.url || signal?.url}</span>}</div>}
               {image && <figure className="scenario-timeline-screenshot"><a href={image} target="_blank" rel="noreferrer"><img src={image} loading="lazy" alt={`${scenario.id} · ${entry.title || "evidência"}`} /></a><figcaption><span>{entry.screenshot?.replace(/\\/g, "/").split("/").pop()}</span><a href={image} target="_blank" rel="noreferrer">Ampliar <SquareArrowOutUpRight size={12} /></a></figcaption></figure>}
             </div>
@@ -2641,19 +2798,55 @@ function ScenarioTimelineCard({ scenario, explorationId, apiBase, context = fals
   );
 }
 
+export function ExecutionObservations({ contexts, explorationId, apiBase }: { contexts: ScenarioCase[]; explorationId: string; apiBase: string }) {
+  const entries = contexts.flatMap(scenarioTimeline);
+  if (entries.length === 0) return null;
+  return <details className="execution-observations">
+    <summary><History size={17} /><strong>Observações da execução</strong><span>{entries.length} registros</span><ChevronRight className="scenario-expand-icon" size={17} /></summary>
+    <p>Ocorrências de preparação, carregamento ou retomada sem vínculo comprovado com um CT. São observações do que aconteceu, sem alterar o resultado ou a contagem dos testes.</p>
+    <ol className="execution-observation-list">{entries.map((entry, index) => {
+      const observation = entry.observation;
+      const signal = entry.signal;
+      const pageUrl = observation?.page_url || entry.page_url;
+      const pageLink = safeScenarioPageUrl(pageUrl || undefined);
+      const networkSignal = ["http", "network"].includes(signal?.type || signal?.kind || "");
+      const requestUrl = observation?.request_url !== undefined ? observation.request_url : networkSignal ? signal?.url || entry.url : null;
+      const requestLink = safeScenarioPageUrl(requestUrl || undefined);
+      const method = observation?.method || (networkSignal ? signal?.method : null);
+      const statusCode = observation?.status_code ?? signal?.status_code;
+      const occurredAt = entry.occurred_at || signal?.occurred_at;
+      const screenshot = scenarioScreenshotUrl(apiBase, explorationId, entry.screenshot);
+      const originalMessage = entry.message || signal?.message;
+      return <li key={entry.id || `${entry.kind}-${occurredAt || "record"}-${index}`}>
+        <div className="execution-observation-heading"><strong>{observation?.summary || entry.message || signal?.message || entry.title || "Observação registrada"}</strong>{occurredAt ? <time dateTime={occurredAt}>{formatDate(occurredAt)}</time> : <small>Momento não registrado</small>}</div>
+        {observation?.summary && originalMessage && originalMessage !== observation.summary && <p className="execution-observation-message">Mensagem registrada: {originalMessage}</p>}
+        <dl className="execution-observation-facts">
+          <div><dt>Página</dt><dd>{pageLink ? <a href={pageLink} target="_blank" rel="noreferrer">{pageUrl}<SquareArrowOutUpRight size={12} /></a> : pageUrl || "Página não registrada"}</dd></div>
+          {observation?.phase && <div><dt>Etapa</dt><dd>{observation.phase}</dd></div>}
+          {(requestUrl || method || statusCode != null) && <div><dt>{networkSignal || requestUrl ? "Requisição" : "Registro técnico"}</dt><dd>{method && <span>{method} · </span>}{statusCode != null && <span>HTTP {statusCode}</span>}{requestUrl && <div>{requestLink ? <a href={requestLink} target="_blank" rel="noreferrer">{requestUrl}<SquareArrowOutUpRight size={12} /></a> : requestUrl}</div>}</dd></div>}
+        </dl>
+        {signal && <p className="execution-observation-impact">{technicalSignalImpact(signal)}{signal.classification_reason && <small>{signal.classification_reason}</small>}</p>}
+        {screenshot && <a className="execution-observation-capture" href={screenshot} target="_blank" rel="noreferrer">Ver captura preservada <SquareArrowOutUpRight size={12} /></a>}
+      </li>;
+    })}</ol>
+  </details>;
+}
+
 export function ScenarioTimelinePanel({ scenarios, contexts, explorationId, apiBase, isRunning = false }: { scenarios: ScenarioCase[]; contexts: ScenarioCase[]; explorationId: string; apiBase: string; isRunning?: boolean }) {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("all");
-  const filtered = filterScenarioCases(scenarios, query, filter);
-  const filteredContexts = filter === "all" || filter === "signals" ? filterScenarioCases(contexts, query, filter) : [];
+  const cases = scenarios.filter((scenario) => !["INFO", "CONTEXT"].includes(scenario.status.toUpperCase()));
+  const legacyObservations = scenarios.filter((scenario) => ["INFO", "CONTEXT"].includes(scenario.status.toUpperCase()));
+  const observations = [...contexts, ...legacyObservations.filter((scenario) => !contexts.some((entry) => entry.id === scenario.id))];
+  const filtered = filterScenarioCases(cases, query, filter);
   return <section className="scenario-cases-panel">
     <div className="scenario-cases-heading"><div><span className="section-kicker">Evidência por caso</span><h2>Casos de teste e suas linhas do tempo</h2><p>Ações, verificações, capturas e sinais técnicos juntos, na ordem em que foram observados.</p></div>{isRunning && <span className="live-mini"><span />ao vivo</span>}</div>
     <div className="scenario-evidence-note"><ShieldCheck size={17} /><p>PASS vale para as verificações executadas, não para todas as regras de negócio. Sinais técnicos e indícios visuais não confirmam sozinhos um bug; consulte a origem da reprovação na linha do tempo.</p></div>
     <div className="scenario-case-tools"><label className="scenario-case-search"><Search size={16} /><input aria-label="Buscar casos de teste ou sinais técnicos" placeholder="Buscar CT, título, URL ou sinal técnico…" value={query} onChange={(event) => setQuery(event.target.value)} /></label><label className="scenario-case-filter"><span>Exibir</span><select aria-label="Filtrar casos de teste" value={filter} onChange={(event) => setFilter(event.target.value)}><option value="all">Todos os CTs</option><option value="PASS">Verificações aprovadas</option><option value="FAIL">Verificações falhas</option><option value="BLOCKED">Bloqueados</option><option value="SKIPPED">Não validados</option><option value="signals">Com sinais técnicos</option></select></label></div>
-    <div className="scenario-case-results"><span>{filtered.length} de {scenarios.length} CTs</span><small>Abra um caso para acompanhar as evidências.</small></div>
+    <div className="scenario-case-results"><span>{filtered.length} de {cases.length} CTs</span><small>Abra um caso para acompanhar as evidências.</small></div>
     <div className="scenario-case-list">{filtered.map((scenario) => <ScenarioTimelineCard key={scenario.id} scenario={scenario} explorationId={explorationId} apiBase={apiBase} />)}</div>
-    {filtered.length === 0 && <div className="activity-empty"><FileCheck2 size={22} /><span>{scenarios.length === 0 ? "Os CTs aparecerão aqui conforme as evidências forem preservadas." : "Nenhum CT corresponde à busca e ao filtro."}</span></div>}
-    {filteredContexts.length > 0 && <section className="scenario-context-section"><h3>Contexto / navegação de apoio <span>{filteredContexts.length}</span></h3><p>Evidências fora de um teste executado, preservadas sem entrar na contagem de CTs ou de aprovações.</p>{filteredContexts.map((scenario) => <ScenarioTimelineCard key={scenario.id} scenario={scenario} explorationId={explorationId} apiBase={apiBase} context />)}</section>}
+    {filtered.length === 0 && <div className="activity-empty"><FileCheck2 size={22} /><span>{cases.length === 0 ? "Os CTs aparecerão aqui conforme as evidências forem preservadas." : "Nenhum CT corresponde à busca e ao filtro."}</span></div>}
+    <ExecutionObservations contexts={observations} explorationId={explorationId} apiBase={apiBase} />
   </section>;
 }
 

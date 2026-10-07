@@ -264,13 +264,13 @@ class PlaywrightExecutor:
         except Exception:
             # The binding may already exist after a same-document transition.
             pass
-        page.on("console", self._on_console)
-        page.on("pageerror", self._on_page_error)
-        page.on("response", self._on_response)
+        page.on("console", lambda message: self._on_console(message, page=page))
+        page.on("pageerror", lambda error: self._on_page_error(error, page=page))
+        page.on("response", lambda response: self._on_response(response, page=page))
         page.on("request", self._on_request_started)
         page.on("requestfinished", self._on_request_settled)
         page.on("requestfailed", self._on_request_settled)
-        page.on("requestfailed", self._on_request_failed)
+        page.on("requestfailed", lambda request: self._on_request_failed(request, page=page))
         page.on("close", lambda: self._on_page_close(page))
 
     def _on_context_page(self, page: Any) -> None:
@@ -1440,29 +1440,49 @@ class PlaywrightExecutor:
         except (TypeError, ValueError):
             return self._redact_text(value.split("#", 1)[0])
 
-    def _on_console(self, message: Any) -> None:
+    def _event_page_context(self, page: Any = None) -> dict[str, str]:
+        """Capture the current page at callback time, not request initiation.
+
+        Buffers can be collected after a subsequent navigation. Keep this
+        factual page context separate from the later observation's URL.
+        """
+
+        source_page = page if page is not None else self._page
+        page_url = source_page.url if source_page else ""
+        if not page_url:
+            return {}
+        return {
+            "page_url": self._public_url(page_url)[:2000],
+            "page_url_source": "event",
+        }
+
+    def _on_console(self, message: Any, *, page: Any = None) -> None:
         if self.options.capture_console_errors and message.type == "error":
+            page_context = self._event_page_context(page)
             self._console_buffer.append(
                 {
                     "type": "console",
                     "message": self._redact_text(message.text)[:2000],
-                    "url": self._public_url(self._page.url) if self._page else "",
+                    "url": page_context.get("page_url", ""),
                     "occurred_at": utc_now(),
+                    **page_context,
                 }
             )
 
-    def _on_page_error(self, error: Exception) -> None:
+    def _on_page_error(self, error: Exception, *, page: Any = None) -> None:
         if self.options.capture_console_errors:
+            page_context = self._event_page_context(page)
             self._console_buffer.append(
                 {
                     "type": "pageerror",
                     "message": self._redact_text(str(error))[:2000],
-                    "url": self._public_url(self._page.url) if self._page else "",
+                    "url": page_context.get("page_url", ""),
                     "occurred_at": utc_now(),
+                    **page_context,
                 }
             )
 
-    def _on_response(self, response: Any) -> None:
+    def _on_response(self, response: Any, *, page: Any = None) -> None:
         # Remember the main document independently from error capture. A SPA
         # may hydrate after a 404 response; the planner still needs to know
         # that replaying the URL with GET is not equivalent to its UI route.
@@ -1480,10 +1500,11 @@ class PlaywrightExecutor:
                     "status_code": response.status,
                     "message": f"{response.request.method} returned HTTP {response.status}",
                     "occurred_at": utc_now(),
+                    **self._event_page_context(page),
                 }
             )
 
-    def _on_request_failed(self, request: Any) -> None:
+    def _on_request_failed(self, request: Any, *, page: Any = None) -> None:
         if self.options.capture_network_errors:
             failure = request.failure or "Request failed"
             self._network_buffer.append(
@@ -1494,6 +1515,7 @@ class PlaywrightExecutor:
                     "status_code": None,
                     "message": self._redact_text(str(failure))[:2000],
                     "occurred_at": utc_now(),
+                    **self._event_page_context(page),
                 }
             )
 

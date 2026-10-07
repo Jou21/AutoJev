@@ -628,6 +628,204 @@ def test_new_route_does_not_inherit_classified_control_from_preceding_page():
     assert not planner.restrictions
 
 
+def wrong_product_route(*, card_tag="button", target_url="https://app.test/detail?id=2"):
+    card = (anchor("card", "View Shirt", "https://app.test/detail?id=1")
+            if card_tag == "a" else button("card", "View Shirt"))
+    catalog = page("https://app.test/catalog", [card])
+    catalog.page_state["products"] = [{"id": "shirt", "name": "Shirt", "price": "15.99",
+                                       "link_refs": ["card"]}]
+    actual = page(target_url, [button("open", "Open Menu"),
+                               button("back", "Back to products")])
+    actual.page_state["product_detail"] = {"id": "onesie", "name": "Onesie", "price": "7.99"}
+    decision = AgentDecision("click", "Actually observed product card", target="card")
+    result = outcome(catalog, actual)
+    result.assertions = [
+        AssertionResult("product_detail_identity", "Shirt", "Onesie", False, "Wrong actual product"),
+        AssertionResult("product_detail_price", 15.99, 7.99, False, "Wrong actual price"),
+    ]
+    if card_tag == "a":
+        result.assertions.append(AssertionResult("navigation_destination", card["href"], target_url,
+                                                False, "Wrong actual anchor destination"))
+    return catalog, actual, decision, result
+
+
+@pytest.mark.parametrize("card_tag", ["button", "a"])
+def test_failed_product_card_retains_only_its_actual_native_route_and_fail_verdict(card_tag):
+    catalog, actual, decision, result = wrong_product_route(card_tag=card_tag)
+    planner = CoveragePlanner(catalog.url)
+    planner.record_action(catalog, decision, result, actual)
+    root_key, target_key = planner.state_key(catalog), planner.state_key(actual)
+    recipe = planner.transitions[root_key][0]
+    assert recipe.child_key == target_key
+    assert recipe.observed_wrong_product_destination is True
+    assert not recipe.checkout_submit_verified and not recipe.setup
+    assert all(check.passed is False for check in result.assertions)
+    assert not planner.states[target_key].attempted
+    assert {move["name"] for _, move in planner._remaining(planner.states[target_key])} == {
+        "Open Menu", "Back to products",
+    }
+
+    # Fresh refs on the already-observed source route are used, never a GET of
+    # either the intended or erroneous detail URL or a guessed corrected card.
+    fresh = page(catalog.url, [{**catalog.interactive_elements[0], "ref": "card-fresh"},
+                               button("help", "Help")])
+    fresh.page_state["products"] = [{**catalog.page_state["products"][0], "link_refs": ["card-fresh"]}]
+    current_key = planner.observe(fresh)
+    planner.path = [current_key]
+    planner.restoration_target = target_key
+    if card_tag == "a":
+        hop = planner._route_restoration_hop(current_key, target_key)
+        assert hop and hop[0].target == "card-fresh"
+        assert hop[0].url is None and hop[0].credential_key is None
+        planner._issued_restore_step = None  # inspect, then exercise native replay
+    resumed, reason = planner._continue_restoration(current_key)
+    assert (resumed.action, resumed.target, resumed.url, reason) == (
+        "click", "card-fresh", None, "frontier_restore_replay",
+    )
+    second = outcome(fresh, actual)
+    second.assertions = list(result.assertions)
+    planner.record_action(fresh, resumed, second, actual)
+    assert not planner.restrictions
+    assert planner.restoration_target is None
+    assert all(check.passed is False for check in second.assertions)
+    assert {move["name"] for _, move in planner._remaining(planner.states[target_key])} == {
+        "Open Menu", "Back to products",
+    }
+    opener, _ = planner.next_restoration_action(actual)
+    assert opener.target == "open"  # mounted work remains native/executable
+    opened = page(actual.url, [button("close", "Close Menu"), button("back", "Back to products")])
+    opened.page_state["product_detail"] = dict(actual.page_state["product_detail"])
+    planner.record_action(actual, opener, outcome(actual, opened), opened)
+    close, _ = planner.reconcile(opened, AgentDecision("click", "Actual menu close", target="close"))
+    assert close.target == "close"
+    planner.record_action(opened, close, outcome(opened, actual), actual)
+    back, _ = planner.reconcile(actual, AgentDecision("click", "Actual detail's back control", target="back"))
+    assert back.target == "back" and back.url is None
+    planner.record_action(actual, back, outcome(actual, catalog), catalog)
+    assert not planner._remaining(planner.states[target_key])
+    assert all(check.passed is False for check in result.assertions)
+
+
+@pytest.mark.parametrize("duplicate_identity", ["alias", "different_id", "different_provenance"])
+def test_wrong_product_cart_card_collapses_only_exact_physical_row_aliases(duplicate_identity):
+    catalog, actual, decision, result = wrong_product_route()
+    catalog.url = "https://app.test/cart"
+    result.before_url = catalog.url
+    row = {**catalog.page_state["products"][0], "identity_source": "declared_product_id"}
+    catalog.page_state["products"] = [dict(row)]
+    alias = dict(row)
+    if duplicate_identity == "different_id":
+        alias["id"] = "another-homonymous-shirt"
+    elif duplicate_identity == "different_provenance":
+        alias["identity_source"] = "observed_name_id"
+    catalog.page_state["cart"] = {"items": [alias], "items_known": True}
+    planner = CoveragePlanner(catalog.url)
+    planner.record_action(catalog, decision, result, actual)
+    recipes = planner.transitions.get(planner.state_key(catalog), [])
+    assert bool(recipes) is (duplicate_identity == "alias")
+    assert all(not assertion.passed for assertion in result.assertions)
+
+
+def test_wrong_anchor_without_product_failure_never_teaches_declared_href_another_destination():
+    catalog, actual, decision, result = wrong_product_route(card_tag="a")
+    result.assertions = [result.assertions[-1]]
+    planner = CoveragePlanner(catalog.url)
+    planner.record_action(catalog, decision, result, actual)
+    root_key, target_key = planner.state_key(catalog), planner.state_key(actual)
+    assert not planner.transitions.get(root_key)
+    # Even an unflagged, otherwise safe learned click cannot grant the special
+    # declared-href mismatch shortcut.
+    planner._register_transition(root_key, target_key, planner.decision_key(catalog, decision), decision)
+    assert planner._route_restoration_hop(planner.observe(catalog), target_key) is None
+
+
+@pytest.mark.parametrize("kind", ["url_equals", "url_contains", "form_progress"])
+def test_failed_product_recovery_does_not_relax_other_failed_transition_contracts(kind):
+    catalog, actual, decision, result = wrong_product_route()
+    result.assertions.append(AssertionResult(kind, "Expected", "Actual", False, "Independent failed contract"))
+    planner = CoveragePlanner(catalog.url)
+    planner.record_action(catalog, decision, result, actual)
+    assert not planner.transitions.get(planner.state_key(catalog))
+    assert not result.assertions[-1].passed
+
+
+@pytest.mark.parametrize("unsafe", ["native_failure", "cross_origin", "credential", "source_form",
+                                  "unexpected_form", "password", "password_field", "sensitive_field",
+                                  "missing_product", "unobserved_card", "auth_entry"])
+def test_wrong_product_edge_rejects_native_failure_forms_credentials_and_foreign_routes(unsafe):
+    catalog, actual, decision, result = wrong_product_route()
+    start = catalog.url
+    if unsafe == "native_failure":
+        result.success = False
+    elif unsafe == "cross_origin":
+        actual.url = "https://foreign.test/detail?id=2"
+        result.after_url = actual.url
+    elif unsafe == "credential":
+        decision.credential_key = "username"
+    elif unsafe == "source_form":
+        catalog.interactive_elements[0]["form"] = "checkout"
+    elif unsafe == "unexpected_form":
+        actual.page_state["forms"] = [{"id": "checkout", "submit_refs": ["submit"]}]
+    elif unsafe == "password":
+        actual.interactive_elements.append({"ref": "secret", "tag": "input", "type": "password", "sensitive": True})
+    elif unsafe == "password_field":
+        actual.page_state["fields"] = [{"ref": "secret", "type": "password"}]
+    elif unsafe == "sensitive_field":
+        actual.page_state["fields"] = [{"ref": "secret", "type": "text", "sensitive": True}]
+    elif unsafe == "missing_product":
+        actual.page_state.pop("product_detail")
+    elif unsafe == "unobserved_card":
+        catalog.page_state.pop("products")
+    elif unsafe == "auth_entry":
+        start = "https://app.test/login"
+        actual.url = start
+        result.after_url = start
+    planner = CoveragePlanner(start)
+    planner.record_action(catalog, decision, result, actual)
+    assert not planner.transitions.get(planner.state_key(catalog))
+    assert not result.assertions[0].passed
+
+
+@pytest.mark.parametrize("same_origin", [True, False])
+def test_price_only_failure_keeps_actual_native_route_only_within_origin(same_origin):
+    catalog, actual, decision, result = wrong_product_route()
+    result.assertions = [result.assertions[1]]
+    if not same_origin:
+        actual.url = "https://foreign.test/detail?id=2"
+        result.after_url = actual.url
+    planner = CoveragePlanner(catalog.url)
+    planner.record_action(catalog, decision, result, actual)
+    recipes = planner.transitions.get(planner.state_key(catalog), [])
+    assert bool(recipes) is same_origin
+    if recipes:
+        assert not recipes[0].observed_wrong_product_destination
+    assert not result.assertions[0].passed
+
+
+def test_wrong_product_native_replay_still_stops_after_two_wrong_actual_destinations():
+    catalog, actual, decision, result = wrong_product_route()
+    planner = CoveragePlanner(catalog.url)
+    planner.record_action(catalog, decision, result, actual)
+    target_key = planner.state_key(actual)
+    unexpected = page("https://app.test/another-detail", [button("back", "Back to products")])
+    unexpected.page_state["product_detail"] = {"name": "A different wrong item"}
+    planner.restoration_target = target_key
+    for _ in range(_MAX_REPLAY_FAILURES):
+        planner.observe(catalog)
+        resumed, reason = planner._continue_restoration(planner.state_key(catalog))
+        assert resumed.target == "card" and reason == "frontier_restore_replay"
+        failed = outcome(catalog, unexpected)
+        failed.assertions = list(result.assertions)
+        planner.record_action(catalog, resumed, failed, unexpected)
+        assert all(not check.passed for check in failed.assertions)
+    planner.observe(catalog)
+    assert planner._continue_restoration(planner.state_key(catalog)) is None
+    assert planner.restoration_target is None
+    assert planner.restrictions
+    assert all(record["reason"] == "no_safe_restore_route" for record in planner.restrictions)
+    assert all(not check.passed for check in result.assertions)
+
+
 def temporarily_blocked_exit() -> tuple[CoveragePlanner, Observation, str]:
     historical = page("https://app.test/cart", [button("e1", "Continue Shopping")])
     planner = CoveragePlanner(historical.url)

@@ -261,6 +261,11 @@ async def test_full_exploration_finishes_and_preserves_business_failures(
         True,
         "chromium",
         1,
+        # The expanded three-catalog fixture produces over 120 incremental
+        # reviews of 108 CTs. Keep its fake-client oracle finite while checking
+        # every final visual revision; the product's default 120-call cost
+        # safeguard remains unchanged, and these isolated calls cost no credits.
+        auxiliary_max_requests=200,
     )
     observed_routes, snapshots, planners = set(), [], []
     dispatched_controls, spa_transitions = [], []
@@ -498,7 +503,8 @@ async def test_full_exploration_finishes_and_preserves_business_failures(
             assert any(
                 cancellation_step < cart_ct["evidence"]["action_step"] < next_finish
                 and "/cart.html" in cart_ct["evidence"].get("after_url", "")
-                and any(a["kind"] == "cart_persistence" and bool(a["expected"]) == populated and a["passed"]
+                and any(a["kind"] in {"cart_persistence", "cart_contents_match"}
+                        and bool(a["expected"]) == populated and a["passed"]
                         for a in cart_ct["evidence"]["assertions"])
                 for cart_ct in run["scenarios"]
             ), (ct, summary)
@@ -506,6 +512,8 @@ async def test_full_exploration_finishes_and_preserves_business_failures(
             ct for ct in run["scenarios"]
             if "/checkout-step-one.html" in ct["evidence"].get("before_url", "")
             and "/cart.html" in ct["evidence"].get("after_url", "")
+            and any(a["kind"] == "checkout_form_cancel_progress" and a["passed"]
+                    for a in ct["evidence"]["assertions"])
         ]
         for populated in (False, True):
             assert any(

@@ -117,6 +117,11 @@ def test_unlinked_startup_and_restoration_get_context_not_nearest_ct():
         context["status"] == "INFO" for context in projected["scenario_contexts"]
     )
     assert "etapa 2" in projected["scenario_contexts"][1]["title"]
+    support_action = next(
+        entry for entry in projected["scenario_contexts"][1]["evidence"]["timeline"]
+        if entry["kind"] == "action"
+    )
+    assert support_action["page_url"] == "https://example.test/items"
     assert projected["summary"]["total_scenarios"] == 1
     assert projected["technical_signal_summary"]["context_occurrences"] == 2
 
@@ -137,6 +142,81 @@ def test_ambiguous_screenshot_does_not_guess_ct_owner():
     projected = prepare_scenario_timelines(original)
     assert all(not s["evidence"]["technical_signals"] for s in projected["scenarios"])
     assert len(projected["scenario_contexts"]) == 1
+
+
+def test_execution_observation_distinguishes_event_page_from_request_destination():
+    original = run()
+    original["issues"] = [{
+        "type": "http", "method": "POST", "status_code": 401,
+        "url": "https://events.backtrace.io/api/submit",
+        "page_url": "https://example.test/login", "page_url_source": "event",
+        "observation_url": "https://example.test/items",
+        "occurred_at": "2026-10-02T12:00:00+00:00",
+        "observation_phase": "page_load",
+    }]
+    projected = prepare_scenario_timelines(original)
+    entry = projected["scenario_contexts"][0]["evidence"]["timeline"][0]
+    observation = entry["observation"]
+    assert observation["page_url"] == "https://example.test/login"
+    assert observation["page_url_source"] == "event"
+    assert observation["request_url"] == "https://events.backtrace.io/api/submit"
+    assert observation["phase"] == "Carregamento da página"
+    assert observation["status_code"] == 401
+    assert "Na página https://example.test/login" in observation["summary"]
+    assert "HTTP 401" in observation["summary"]
+    assert projected["summary"] == original["summary"]
+    assert projected["scenarios"][0]["evidence"]["technical_signals"] == []
+
+
+def test_legacy_observation_does_not_invent_loading_phase_or_event_page():
+    original = run()
+    original["issues"] = [{
+        "type": "http", "method": "POST", "status_code": 401,
+        "url": "https://events.backtrace.io/api/submit",
+        "page_url": "https://example.test/items",
+    }]
+    projected = prepare_scenario_timelines(original)
+    observation = projected["scenario_contexts"][0]["evidence"]["timeline"][0]["observation"]
+    assert observation["page_url_source"] == "observation"
+    assert observation["phase"] is None
+    assert observation["summary"].startswith("Na observação da página https://example.test/items")
+    assert "carregamento" not in observation["summary"].lower()
+
+
+def test_unknown_page_stays_unknown_and_console_url_is_not_a_request_endpoint():
+    original = run()
+    original["issues"] = [
+        {"type": "http", "status_code": 401, "url": "https://events.backtrace.io/api/submit",
+         "occurred_at": "2026-10-02T11:00:00+00:00"},
+        {"type": "console", "url": "https://example.test/login",
+         "page_url": "https://example.test/items",
+         "occurred_at": "2026-10-02T12:00:00+00:00",
+         "message": "Failed to load resource: the server responded with a status of 401 (Unauthorized)"},
+    ]
+    entries = prepare_scenario_timelines(original)["scenario_contexts"][0]["evidence"]["timeline"]
+    observations = [entry["observation"] for entry in entries]
+    unknown = next(item for item in observations if item["request_url"])
+    console = next(item for item in observations if item["request_url"] is None)
+    assert unknown["page_url"] is None  # Neither app_url nor endpoint is a recorded page.
+    assert unknown["page_url_source"] is None
+    assert console["page_url"] == "https://example.test/login"
+    assert console["page_url_source"] == "event"
+    assert console["status_code"] == 401
+    assert "o console registrou HTTP 401" in console["summary"]
+
+
+def test_observation_preserves_timing_context_without_assigning_a_test():
+    original = run()
+    original["issues"] = [{
+        "type": "network", "method": "GET", "url": "https://example.test/api",
+        "page_url": "https://example.test/items",
+        "association": {"kind": "before_action"},
+    }]
+    projected = prepare_scenario_timelines(original)
+    entry = projected["scenario_contexts"][0]["evidence"]["timeline"][0]
+    assert entry["observation"]["phase"] == "Antes da ação"
+    assert entry["signal"]["association"]["kind"] == "observation_context"
+    assert projected["technical_signal_summary"]["associated_with_cts"] == 0
 
 
 def test_old_guard_only_fail_is_explained_not_rewritten_as_pass():

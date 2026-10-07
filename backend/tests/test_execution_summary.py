@@ -59,3 +59,60 @@ def test_negative_duration_is_clamped_without_inventing_end_time():
         "finished_at": "2026-10-04T03:22:53Z",
     }) == "00:00:00"
     assert formatted_execution_duration({"status": "completed", "started_at": "2026-10-04T03:22:54Z"}) == "—"
+
+
+def test_report_snapshot_changes_for_role_costs_even_when_timestamps_and_total_are_unchanged():
+    run = {
+        "status": "completed", "started_at": "2026-10-04T03:22:54Z",
+        "finished_at": "2026-10-04T03:22:57Z",
+        "usage": {"total_tokens": 100, "cost": 0.3, "cost_known": True},
+    }
+    legacy_key = report_snapshot_key(run)
+    run["usage"]["by_role"] = {
+        "jev": {"cost": 0.1, "cost_known": True, "cost_complete": True},
+        "auxiliary": {"cost": 0.2, "cost_known": True, "cost_complete": True},
+    }
+    attributed_key = report_snapshot_key(run)
+    assert attributed_key != legacy_key
+    run["usage"]["by_role"]["jev"]["cost"] = 0.2
+    run["usage"]["by_role"]["auxiliary"]["cost"] = 0.1
+    assert report_snapshot_key(run) != attributed_key
+
+
+def test_report_snapshot_is_canonical_and_includes_cost_availability():
+    usage = {
+        "cost": 0, "cost_known": True, "cost_complete": True,
+        "by_role": {"jev": {"cost": 0, "cost_known": True, "cost_complete": True}},
+    }
+    run = {"status": "completed", "usage": usage}
+    first = report_snapshot_key(run)
+    assert first == report_snapshot_key({"usage": dict(reversed(list(usage.items()))), "status": "completed"})
+    run["usage"]["by_role"]["jev"]["cost_complete"] = False
+    assert first != report_snapshot_key(run)
+    run["usage"]["by_role"]["jev"]["cost_complete"] = True
+    run["usage"]["cost_known"] = False
+    assert first != report_snapshot_key(run)
+
+
+def test_later_visual_resume_does_not_make_original_execution_last_days():
+    run = {
+        "status": "completed", "started_at": "2026-10-04T03:22:54Z",
+        "finished_at": "2026-10-04T03:28:54Z", "updated_at": "2026-10-07T04:00:00Z",
+        "events": [
+            {"created_at": "2026-10-04T03:29:00Z", "type": "report_generated"},
+            {"created_at": "2026-10-07T03:22:54Z", "type": "visual_review_resume_started"},
+            {"created_at": "2026-10-07T03:29:54Z", "type": "visual_review_resume_finished"},
+        ],
+    }
+    assert formatted_execution_duration(run) == "00:06:06"
+    assert execution_duration_summary(run)["ended_at"] == "2026-10-04T03:29:00+00:00"
+
+
+def test_report_snapshot_changes_after_free_cached_visual_replay_without_cost_change():
+    run = {"status": "completed", "scenarios": [{
+        "id": "CT001", "status": "pass",
+        "evidence": {"visual_assessment": {"status": "unavailable"}},
+    }]}
+    original = report_snapshot_key(run)
+    run["scenarios"][0]["evidence"]["visual_assessment"]["status"] = "assessed"
+    assert report_snapshot_key(run) != original

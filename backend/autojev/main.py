@@ -14,6 +14,7 @@ from autojev.api.routes import router
 from autojev.config import Settings
 from autojev.config import settings as default_settings
 from autojev.services.exploration import ExplorationManager
+from autojev.services.visual_review_resume import VisualReviewResumeService
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -38,7 +39,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.repository = repository
         app.state.credential_vault = credential_vault
         app.state.exploration_manager = manager
+        review_resume = VisualReviewResumeService(manager, runtime_settings)
+        app.state.visual_review_resume_service = review_resume
         yield
+        await review_resume.shutdown()
         await manager.shutdown()
 
     app = FastAPI(

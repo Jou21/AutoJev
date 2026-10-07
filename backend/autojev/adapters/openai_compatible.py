@@ -401,6 +401,8 @@ def _safe_documentation_fallback_reason(exc: Exception) -> str:
         return "auxiliary_rate_limited"
     if "timed out" in detail or "timeout" in detail:
         return "auxiliary_timeout"
+    if re.search(r"\bhttp\s+(408|425|5\d\d)\b", detail):
+        return "auxiliary_provider_temporary_error"
     if "could not be reached" in detail:
         return "auxiliary_unavailable"
     return "auxiliary_provider_error"
@@ -443,6 +445,9 @@ class OpenAICompatibleClient:
             "total_tokens": 0,
             "cost": 0.0,
             "cost_known": False,
+            "cost_complete": True,
+            "usage_records": 0,
+            "cost_reported_records": 0,
         }
         self._structured_models: set[str] | None = None
         self._model_parameters: dict[str, set[str]] | None = None
@@ -497,22 +502,37 @@ class OpenAICompatibleClient:
             ) from exc
 
     def _record_usage(self, body: dict[str, Any]) -> None:
-        usage = body.get("usage") if isinstance(body, dict) else None
+        body = body if isinstance(body, dict) else {}
+        usage = body.get("usage")
         if not isinstance(usage, dict):
-            return
-        prompt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
-        completion = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
-        total = int(usage.get("total_tokens") or prompt + completion)
+            usage = {}
+
+        def token_count(value: Any) -> int:
+            try:
+                return max(0, int(value or 0))
+            except (TypeError, ValueError, OverflowError):
+                return 0
+
+        prompt = token_count(usage.get("prompt_tokens") or usage.get("input_tokens"))
+        completion = token_count(usage.get("completion_tokens") or usage.get("output_tokens"))
+        total = token_count(usage.get("total_tokens") or prompt + completion)
         raw_cost = usage.get("cost", body.get("cost"))
         try:
             cost = float(raw_cost) if raw_cost is not None else 0.0
-        except (TypeError, ValueError):
+            cost_known = raw_cost is not None and not isinstance(raw_cost, bool) and math.isfinite(cost) and cost >= 0
+        except (TypeError, ValueError, OverflowError):
+            cost = 0.0
+            cost_known = False
+        if not cost_known:
             cost = 0.0
         self._pending_usage["prompt_tokens"] += prompt
         self._pending_usage["completion_tokens"] += completion
         self._pending_usage["total_tokens"] += total
         self._pending_usage["cost"] += cost
-        self._pending_usage["cost_known"] = self._pending_usage["cost_known"] or raw_cost is not None
+        self._pending_usage["cost_known"] = self._pending_usage["cost_known"] or cost_known
+        self._pending_usage["cost_complete"] = self._pending_usage["cost_complete"] and cost_known
+        self._pending_usage["usage_records"] += 1
+        self._pending_usage["cost_reported_records"] += int(cost_known)
 
     def drain_usage(self) -> dict[str, int | float | bool]:
         usage = dict(self._pending_usage)
@@ -522,6 +542,9 @@ class OpenAICompatibleClient:
             "total_tokens": 0,
             "cost": 0.0,
             "cost_known": False,
+            "cost_complete": True,
+            "usage_records": 0,
+            "cost_reported_records": 0,
         }
         return usage
 
@@ -681,9 +704,12 @@ class OpenAICompatibleClient:
                 "name": "autojev_visual_case", "strict": True, "schema": response_schema,
             }}
             payload["provider"] = {"require_parameters": True}
+        request_started = False
+        usage_recorded = False
         try:
             async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
                 self._claim_chat_request()
+                request_started = True
                 response = await client.post(
                     _api_url(self.base_url, "chat/completions"),
                     headers=_headers(self.api_key),
@@ -707,12 +733,19 @@ class OpenAICompatibleClient:
                 response.raise_for_status()
                 body = response.json()
                 self._record_usage(body)
+                usage_recorded = True
                 content = body["choices"][0]["message"]["content"]
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
             raise ProviderConnectionError(
                 _safe_error(exc, [self.api_key or ""]),
                 retry_after_seconds=_retry_after_seconds(getattr(exc, "response", None)),
             ) from exc
+        finally:
+            if request_started and not usage_recorded:
+                # A timeout/cancellation/transport failure is not proof of a
+                # free request. Preserve billing uncertainty even if no usage
+                # metadata arrived, instead of displaying a fabricated $0.
+                self._record_usage({})
         if isinstance(content, list):
             content = "".join(
                 str(part.get("text", "")) for part in content if isinstance(part, dict)
@@ -726,8 +759,11 @@ class OpenAICompatibleClient:
         questions: dict[str, dict[str, Any]],
     ) -> dict[str, Any]:
         payload = {"model": model, "state": state, "questions": questions}
+        request_started = False
+        usage_recorded = False
         try:
             async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+                request_started = True
                 response = await client.post(
                     f"{self.base_url.split('/api/')[0]}/api/alpha/decisions",
                     headers=_headers(self.api_key),
@@ -736,8 +772,12 @@ class OpenAICompatibleClient:
                 response.raise_for_status()
                 body = response.json()
                 self._record_usage(body)
+                usage_recorded = True
         except (httpx.HTTPError, ValueError, TypeError) as exc:
             raise ProviderConnectionError(_safe_error(exc, [self.api_key or ""])) from exc
+        finally:
+            if request_started and not usage_recorded:
+                self._record_usage({})
         answers = body.get("answers") if isinstance(body, dict) else None
         if not isinstance(answers, dict):
             # The transport succeeded, but the model payload was malformed.
@@ -1272,6 +1312,47 @@ class OpenAIAuxiliaryScenarioGenerator:
         result: ActionResult,
         scenario_number: int,
     ) -> TestScenario:
+        scenario = await self._create_scenario(
+            observation, decision, result, scenario_number, cache_only=False
+        )
+        assert scenario is not None  # Only cache-only lookups can miss.
+        return scenario
+
+    async def cached_scenario(
+        self,
+        observation: Observation,
+        decision: AgentDecision,
+        result: ActionResult,
+        scenario_number: int,
+    ) -> TestScenario | None:
+        """Reuse exact reviewed evidence without claiming a provider request.
+
+        This is safe before budget/authentication/cooldown gates: cache misses
+        return None, never perform HTTP, and never alter those gates. Both
+        paths share the exact request preparation and grounded postprocessing,
+        so changing pixels or semantic evidence cannot reuse an old verdict.
+        """
+        scenario = await self._create_scenario(
+            observation, decision, result, scenario_number, cache_only=True
+        )
+        if scenario is None:
+            return None
+        provenance = scenario.evidence.get("visual_review_provenance") or scenario.evidence.get("documentation_provenance") or {}
+        if provenance.get("source") != "auxiliary_cache":
+            return None
+        if self.evidence_mode == "visual" and scenario.evidence.get("visual_assessment", {}).get("status") != "assessed":
+            return None
+        return scenario
+
+    async def _create_scenario(
+        self,
+        observation: Observation,
+        decision: AgentDecision,
+        result: ActionResult,
+        scenario_number: int,
+        *,
+        cache_only: bool,
+    ) -> TestScenario | None:
         status = self.evidence_status(result)
         evidence = build_scenario_evidence(observation, decision, result)
         system = """You are an auxiliary QA documentation model. You cannot control the browser and must not propose browser commands.
@@ -1362,7 +1443,7 @@ Never return a status or browser command."""
         try:
             text_content = json.dumps(user, ensure_ascii=False)
             content: str | list[dict[str, Any]] = text_content
-            if visual_requested and not self._vision_rejected:
+            if visual_requested and (cache_only or not self._vision_rejected):
                 content, images = self._visual_content(observation, evidence, text_content)
                 user["supplied_images"] = images
                 user["before_visible_text"] = str(evidence.get("before_text") or "")[:3500]
@@ -1374,6 +1455,11 @@ Never return a status or browser command."""
             if isinstance(content, list):
                 model_input = "text_and_image"
             cache_key = self._evidence_cache_key(self.model, system, content)
+            if cache_only and (
+                cache_key not in self._response_cache
+                or (visual_requested and not images)
+            ):
+                return None
             try:
                 schema_options = {"response_schema": _visual_document_schema()} if isinstance(content, list) else {}
                 if visual_requested and not images:

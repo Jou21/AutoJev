@@ -155,6 +155,56 @@ def test_current_timeline_report_refreshes_total_duration_without_changing_origi
         assert details["scenarios"][0]["status"] == "PASS"
 
 
+def test_report_cache_refreshes_role_costs_without_rewriting_original_or_history(tmp_path):
+    from autojev.adapters.report import StandaloneHtmlReport
+
+    app = create_app(settings(tmp_path))
+    with TestClient(app) as client:
+        repository = app.state.repository
+        exploration_id = repository.create_exploration(ExplorationRequest(
+            app_url="https://example.test", agent=ModelSelection("local", "same-model"),
+            auxiliary_llm=ModelSelection("local", "same-model"), options=ExplorationOptions(),
+        ))
+
+        def roles(jev, auxiliary):
+            return {
+                "jev": {"cost": jev, "cost_known": True, "cost_complete": True},
+                "auxiliary": {"cost": auxiliary, "cost_known": True, "cost_complete": True},
+            }
+
+        repository.update_exploration(
+            exploration_id, status="completed", started_at="2026-10-07T12:00:00Z",
+            finished_at="2026-10-07T12:01:00Z", cost=0.03, cost_known=True,
+            cost_complete=True, usage_by_role=roles(0.01, 0.02),
+        )
+        directory = tmp_path / "artifacts" / exploration_id
+        original = directory / "report.html"
+        StandaloneHtmlReport(tmp_path / "artifacts").generate(repository.get_exploration(exploration_id), str(original))
+        original_document = original.read_text()
+        repository.update_exploration(exploration_id, report_path=str(original))
+        assert client.get(f"/api/explorations/{exploration_id}/report").text == original_document
+
+        # The total and all timestamps remain identical; only attribution changes.
+        repository.update_exploration(exploration_id, usage_by_role=roles(0.02, 0.01))
+        snapshot_before = repository.get_exploration(exploration_id)
+        response = client.get(f"/api/explorations/{exploration_id}/report")
+        assert response.status_code == 200
+        assert 'data-cost-role="jev"><strong>$0.020000</strong>' in response.text
+        assert 'data-cost-role="auxiliary"><strong>$0.010000</strong>' in response.text
+        assert 'data-cost-role="total"><strong>$0.030000</strong>' in response.text
+        assert original.read_text() == original_document
+        assert repository.get_exploration(exploration_id) == snapshot_before
+        assert client.get(f"/api/explorations/{exploration_id}/report").text == response.text
+
+        # A report without the new layout marker is never considered current,
+        # even if its snapshot happens to match and the original is intact.
+        cached = directory / "report-ct-timeline-v1.html"
+        cached.write_text(response.text.replace(' data-cost-breakdown="roles-v1"', ''))
+        repaired = client.get(f"/api/explorations/{exploration_id}/report")
+        assert 'data-cost-breakdown="roles-v1"' in repaired.text
+        assert original.read_text() == original_document
+
+
 def test_health_and_provider_crud_never_return_api_key(tmp_path):
     app = create_app(settings(tmp_path))
     with TestClient(app) as client:

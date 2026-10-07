@@ -1,7 +1,101 @@
 import base64
 from copy import deepcopy
 
+import pytest
+
 from autojev.adapters.report import StandaloneHtmlReport
+from autojev.services.scenario_timeline import TIMELINE_VERSION
+
+
+def test_report_separates_recorded_jev_auxiliary_and_total_cost_without_changing_usage(tmp_path):
+    run = {
+        "id": "cost-split", "status": "completed", "app_url": "https://shop.test",
+        "usage": {
+            "total_tokens": 397386, "cost": 0.038586, "cost_known": True, "cost_complete": True,
+            "by_role": {
+                "jev": {"cost": 0.001, "cost_known": True, "cost_complete": True},
+                "auxiliary": {"cost": 0.037586, "cost_known": True, "cost_complete": True},
+            },
+        },
+    }
+    before = deepcopy(run)
+    path = tmp_path / "report.html"
+    StandaloneHtmlReport(tmp_path).generate(run, str(path))
+    document = path.read_text()
+    assert 'data-cost-breakdown="roles-v1"' in document[:8192]
+    assert 'data-cost-role="jev"><strong>$0.001000</strong>Custo JEV' in document
+    assert 'data-cost-role="auxiliary"><strong>$0.037586</strong>Custo LLM' in document
+    assert 'data-cost-role="total"><strong>$0.038586</strong>Custo total' in document
+    assert ">397.386</strong>Tokens" in document
+    assert "Divisão por modelo não registrada" not in document
+    assert '<span class="cost-state">Parcial</span>' not in document
+    assert run == before
+
+
+def test_report_preserves_historical_total_without_inventing_a_model_split(tmp_path):
+    run = {"id": "old-cost", "usage": {"cost": 0.0042, "cost_known": True}}
+    path = tmp_path / "report.html"
+    StandaloneHtmlReport(tmp_path).generate(run, str(path))
+    document = path.read_text()
+    assert 'data-cost-role="jev"><strong>—</strong>Custo JEV' in document
+    assert 'data-cost-role="auxiliary"><strong>—</strong>Custo LLM' in document
+    assert 'data-cost-role="total"><strong>$0.004200</strong>Custo total' in document
+    assert "Divisão por modelo não registrada nesta execução" in document
+    assert "$0.000000" not in document
+
+
+def test_report_shows_reported_zero_cost_but_not_unknown_cost_as_zero(tmp_path):
+    run = {"id": "free-cost", "usage": {
+        "cost": 0, "cost_known": True,
+        "by_role": {
+            "jev": {"cost": 0, "cost_known": True},
+            "auxiliary": {"cost": 0, "cost_known": False},
+        },
+    }}
+    path = tmp_path / "report.html"
+    StandaloneHtmlReport(tmp_path).generate(run, str(path))
+    document = path.read_text()
+    assert 'data-cost-role="jev"><strong>$0.000000</strong>Custo JEV' in document
+    assert 'data-cost-role="auxiliary"><strong>—</strong>Custo LLM' in document
+    assert 'data-cost-role="total"><strong>$0.000000</strong>Custo total' in document
+    assert "Custo não informado pelo provedor" in document
+
+
+def test_report_labels_partial_known_sums_and_keeps_fully_unknown_total_unreported(tmp_path):
+    run = {"id": "partial-cost", "usage": {
+        "cost": 0.0042, "cost_known": True, "cost_complete": False,
+        "by_role": {
+            "jev": {"cost": 0.0042, "cost_known": True, "cost_complete": False},
+            "auxiliary": {"cost": 0, "cost_known": False, "cost_complete": False},
+        },
+    }}
+    path = tmp_path / "report.html"
+    report = StandaloneHtmlReport(tmp_path)
+    report.generate(run, str(path))
+    document = path.read_text()
+    assert document.count('<span class="cost-state">Parcial</span>') == 2
+    assert document.count("Valor parcial · soma dos custos informados.") == 2
+    assert 'data-cost-role="total"><strong>$0.004200</strong>Custo total' in document
+    run["usage"]["cost_known"] = False
+    report.generate(run, str(path))
+    document = path.read_text()
+    assert 'data-cost-role="total"><strong>—</strong>Custo total' in document
+    assert document.count('<span class="cost-state">Parcial</span>') == 1
+
+
+@pytest.mark.parametrize("invalid", [None, True, float("nan"), float("inf"), -1, '<script>alert("price")</script>'])
+def test_report_never_renders_invalid_or_unsafe_prices_as_reported_cost(tmp_path, invalid):
+    run = {"id": "invalid-cost", "usage": {
+        "cost": invalid, "cost_known": True,
+        "by_role": {"jev": {"cost": invalid, "cost_known": True}},
+    }}
+    path = tmp_path / "report.html"
+    StandaloneHtmlReport(tmp_path).generate(run, str(path))
+    document = path.read_text()
+    assert 'data-cost-role="jev"><strong>—</strong>Custo JEV' in document
+    assert 'data-cost-role="total"><strong>—</strong>Custo total' in document
+    assert "alert(" not in document
+    assert "$0.000000" not in document
 
 
 def test_report_names_masked_field_and_escapes_blocking_field(tmp_path):
@@ -188,6 +282,48 @@ def test_visual_report_prominently_explains_unavailable_reviews_without_changing
     assert run == before
 
 
+def test_visual_report_distinguishes_local_request_budget_from_unexecuted_tests(tmp_path):
+    run = {
+        "id": "fixture", "status": "completed", "app_url": "https://shop.test",
+        "options": {"auxiliary_evidence_mode": "visual", "auxiliary_max_requests": 120},
+        "scenarios": [{"id": "CT001", "title": "Cart updated", "status": "PASS", "evidence": {
+            "assertions": [{"kind": "cart_count", "passed": True}],
+            "visual_assessment": {"requested": True, "status": "unavailable", "reason": "auxiliary_request_budget_exhausted"},
+        }}],
+    }
+    before = deepcopy(run)
+    output = tmp_path / "report.html"
+    StandaloneHtmlReport(tmp_path).generate(run, str(output))
+    html = output.read_text()
+    assert 'data-visual-review-policy="bounded-v1"' in html
+    assert "Limite local registrado: 120 requisições HTTP auxiliares" in html
+    assert "não representa uma quantidade de CTs nem falta de crédito" in html
+    assert "após confirmação de custo, sem repetir a exploração" in html
+    assert "até 3 tentativas por revisão, contando a primeira" in html
+    assert 'data-status="PASS"' in html
+    assert run == before
+
+
+def test_visual_report_marks_assessed_legacy_reviews_as_partial_context(tmp_path):
+    run = {
+        "id": "fixture", "status": "completed", "app_url": "https://shop.test",
+        "options": {"auxiliary_evidence_mode": "visual"},
+        "scenarios": [{"id": "CT001", "title": "Saved images", "status": "PASS", "evidence": {
+            "visual_assessment": {"requested": True, "status": "assessed", "context_limited": True,
+                                  "limitations": ["current_dom_and_visible_text_not_preserved"]},
+        }}],
+    }
+    output = tmp_path / "report.html"
+    StandaloneHtmlReport(tmp_path).generate(run, str(output))
+    html = output.read_text()
+    assert "Capturas analisadas · contexto parcial" in html
+    assert "1 revisões com contexto textual limitado" in html
+    assert "DOM e o texto visível originais não foram preservados" in html
+    assert "não equivalem a uma análise com o contexto semântico completo" in html
+    assert "Contexto textual limitado: esta revisão usa as capturas salvas" in html
+    assert "current_dom_and_visible_text_not_preserved" not in html
+
+
 def test_report_total_duration_and_unavailable_reasons_include_postprocessing_tail(tmp_path):
     run = {
         "id": "fixture", "status": "completed", "app_url": "https://shop.test",
@@ -282,7 +418,7 @@ def test_report_is_standalone_and_escapes_model_content(tmp_path):
     assert "Linha do tempo · ações e evidências" in document
     assert "Sinais técnicos observados" not in document
     assert ">150</strong>Tokens" in document
-    assert ">$0.004200</strong>Custo" in document
+    assert ">$0.004200</strong>Custo total" in document
     assert "Administração &gt; Usuários" in document
     assert "Visual · texto + imagem" in document
     assert "Cobertura parcial" in document
@@ -357,14 +493,204 @@ def test_report_explains_restricted_completion_and_correlates_browser_signals(
     assert "SEM VALIDAÇÃO" in document
     assert "Sinais técnicos observados" not in document
     assert "2 registros correlacionados · mesma ocorrência" in document
-    assert "Evidência de contexto · não é um CT" in document
-    assert 'data-status="INFO"' in document
-    assert "Não são testes aprovados e não entram na contagem de CTs." in document
+    assert "Evidência de contexto" not in document
+    assert 'data-status="INFO"' not in document
+    assert 'id="execution-observations"' in document
+    assert "Observações da execução" in document
+    assert "Não alteram os resultados nem a contagem de testes." in document
     assert "Falha HTTP da aplicação" in document
     assert "secret-one" not in document
     assert "secret-two" not in document
     assert "item=1" in document
     assert "%5BREDACTED%5D" in document
+
+
+def test_report_keeps_observations_outside_ct_cards_counts_and_filters(tmp_path):
+    run = {
+        "id": "observed", "timeline_version": TIMELINE_VERSION, "app_url": "https://shop.test",
+        "summary": {"total_scenarios": 1, "pass": 1, "fail": 0},
+        "scenarios": [{"id": "CT001", "title": "Business check", "status": "PASS"}],
+        "scenario_contexts": [{
+            "id": "CTX-private", "title": "Legacy context card", "status": "INFO",
+            "url": "https://shop.test/fallback-that-must-not-be-inferred",
+            "evidence": {"timeline": [{
+                "id": "unowned-401", "kind": "signal",
+                "occurred_at": "2026-10-06T21:59:22+00:00",
+                "url": "https://telemetry.test/event?token=secret-endpoint",
+                "signal": {"type": "http", "method": "POST", "status_code": 401,
+                           "message": "POST returned HTTP 401", "url": "https://telemetry.test/event?token=secret-endpoint"},
+                "observation": {
+                    "summary": "Na página https://shop.test/inventory?token=secret-page, ocorreu HTTP 401.",
+                    "page_url": "https://shop.test/inventory?token=secret-page",
+                    "phase": "Carregamento da página",
+                    "request_url": "https://telemetry.test/event?token=secret-endpoint",
+                    "method": "POST", "status_code": 401,
+                },
+            }]},
+        }],
+    }
+    before = deepcopy(run)
+    path = tmp_path / "report.html"
+    StandaloneHtmlReport(tmp_path).generate(run, str(path))
+    document = path.read_text()
+    ct_section, observations = document.split('<section id="execution-observations"', 1)
+    assert ct_section.count('<details class="scenario"') == 1
+    assert ct_section.count('data-status="PASS"') == 1
+    assert '<strong>1</strong>Total' in ct_section
+    assert '<strong>0</strong>FAIL' in ct_section
+    assert '<details class="execution-observations">' in observations
+    assert '<details class="execution-observations" open' not in document
+    assert 'data-status=' not in observations
+    assert '<span class="badge' not in observations
+    assert "CTX-private" not in document and "Legacy context card" not in document
+    assert "Evidência de contexto" not in document and "CONTEXTO" not in document
+    assert 'const statuses=["ALL", "PASS", "FAIL", "BLOCKED", "SKIPPED"]' in document
+    assert "querySelectorAll('#scenarios .scenario')" in document
+    assert "Na página https://shop.test/inventory?token=%5BREDACTED%5D, ocorreu HTTP 401." in observations
+    assert "Página: https://shop.test/inventory?token=%5BREDACTED%5D" in observations
+    assert "Fase registrada: Carregamento da página" in observations
+    assert "Requisição: POST · HTTP 401" in observations
+    assert "Destino da requisição: https://telemetry.test/event?token=%5BREDACTED%5D" in observations
+    assert "06/10/2026 21:59:22" in observations
+    assert "secret-endpoint" not in document and "secret-page" not in document
+    assert "fallback-that-must-not-be-inferred" not in document
+    assert run == before
+
+
+def test_report_observation_does_not_invent_page_phase_request_or_failure(tmp_path):
+    payload = '<svg/onload=alert(1)>'
+    run = {
+        "id": "observed", "timeline_version": TIMELINE_VERSION, "app_url": "https://shop.test",
+        "scenarios": [], "scenario_contexts": [{
+            "id": "CTX-unlinked", "url": "https://shop.test/unsupported-fallback",
+            "evidence": {"timeline": [{
+                "kind": "signal", "occurred_at": None,
+                "url": "https://shop.test/console-origin",
+                "signal": {"type": "console", "status_code": 401, "message": payload},
+                "observation": {"summary": payload, "page_url": None, "phase": None,
+                                "request_url": None},
+            }]},
+        }],
+    }
+    path = tmp_path / "report.html"
+    StandaloneHtmlReport(tmp_path).generate(run, str(path))
+    document = path.read_text()
+    observations = document.split('<section id="execution-observations"', 1)[1]
+    assert "Página:" not in observations and "Fase registrada:" not in observations
+    assert "Requisição:" not in observations and "Destino da requisição:" not in observations
+    assert "unsupported-fallback" not in document
+    assert payload not in document and "&lt;svg/onload=alert(1)&gt;" in observations
+    assert '<details class="scenario"' not in document
+    assert 'data-status="FAIL"' not in document
+
+
+def test_report_omits_empty_observations_section(tmp_path):
+    run = {"id": "empty", "scenarios": [], "issues": []}
+    path = tmp_path / "report.html"
+    StandaloneHtmlReport(tmp_path).generate(run, str(path))
+    assert 'id="execution-observations"' not in path.read_text()
+
+
+def test_report_partitions_legacy_observations_and_corrects_only_visible_ct_counts(tmp_path):
+    scenarios = [{
+        "id": f"CT{index:03d}", "title": f"Real {status} case", "status": status,
+        "evidence": {"visual_assessment": {"requested": True, "status": "assessed"}},
+    } for index, status in enumerate(("PASS", "FAIL", "BLOCKED", "SKIPPED"), 1)]
+    scenarios[0]["evidence"]["assertions"] = [{"kind": "cart_count", "passed": True}]
+    scenarios[1]["evidence"]["verdict"] = {
+        "kind": "technical_failure", "label": "Falha histórica preservada",
+        "explanation": "Mensagem histórica preservada", "historical": True,
+    }
+    legacy_observations = [{
+        "id": f"legacy-{status.lower()}", "title": "Old pseudo test", "status": status,
+        "evidence": {
+            "visual_assessment": {"requested": True, "status": "pending"},
+            "timeline": [{"kind": "signal", "message": f"Legacy {status} HTTP 401"}],
+        },
+    } for status in ("INFO", "CONTEXT")]
+    canonical_observation = deepcopy(legacy_observations[0])
+    canonical_observation["evidence"]["timeline"][0]["message"] = "Canonical telemetry HTTP 401"
+    run = {
+        "id": "legacy", "timeline_version": TIMELINE_VERSION,
+        "options": {"auxiliary_evidence_mode": "visual"},
+        "summary": {"total_scenarios": 6, "pass": 1, "fail": 1, "blocked": 1, "skipped": 3},
+        "scenarios": [*scenarios, *legacy_observations],
+        "scenario_contexts": [canonical_observation],
+    }
+    before = deepcopy(run)
+    path = tmp_path / "report.html"
+    StandaloneHtmlReport(tmp_path).generate(run, str(path))
+    document = path.read_text()
+    ct_section, observations = document.split('<section id="execution-observations"', 1)
+
+    assert ct_section.count('<details class="scenario"') == 4
+    for status in ("PASS", "FAIL", "BLOCKED", "SKIPPED"):
+        assert ct_section.count(f'data-status="{status}"') == 1
+    for label in ("PASS", "FAIL", "BLOCKED", "Sem validação"):
+        assert f'<strong>1</strong>{label}' in ct_section
+    assert '<strong>4</strong>Total' in ct_section
+    assert "4 de 4 CTs receberam uma análise visual válida" in ct_section
+    assert "0 em análise" in ct_section
+    assert "1 PASS com asserção de negócio" in ct_section
+    assert "1 falha(s) técnica(s)" in ct_section
+    assert "Mensagem histórica preservada" in ct_section
+    assert "Old pseudo test" not in document
+    assert "Canonical telemetry HTTP 401" in observations
+    assert "Legacy INFO HTTP 401" not in document
+    assert observations.count("Legacy CONTEXT HTTP 401") == 1
+    assert " · 2 registro(s)" in observations
+    assert 'data-status=' not in observations
+    assert run == before
+
+
+def test_report_preserves_stored_summary_without_legacy_observations(tmp_path):
+    run = {
+        "id": "historical", "summary": {"total_scenarios": 18, "pass": 17, "fail": 1},
+        "scenarios": [{"id": "CT001", "title": "Preserved failure", "status": "FAIL"}],
+    }
+    before = deepcopy(run)
+    path = tmp_path / "report.html"
+    StandaloneHtmlReport(tmp_path).generate(run, str(path))
+    document = path.read_text()
+
+    assert '<strong>18</strong>Total' in document
+    assert '<strong>17</strong>PASS' in document
+    assert '<strong>1</strong>FAIL' in document
+    assert run == before
+
+
+def test_report_observation_deduplicates_recorded_message_and_endpoint_only(tmp_path):
+    message = "POST returned HTTP 401"
+    endpoint = "https://telemetry.test/event"
+    scenario = {"id": "context", "evidence": {"timeline": [{
+        "kind": "signal", "message": message, "url": endpoint,
+        "observation": {
+            "summary": "Na página https://shop.test, foi observado HTTP 401.",
+            "page_url": "https://shop.test", "request_url": endpoint,
+            "method": "POST", "status_code": 401,
+        },
+        "signal": {
+            "type": "http", "message": message, "url": endpoint, "status_code": 401,
+            "label": "Telemetria externa", "impact_message": "Sem impacto funcional confirmado",
+            "evidence_channels": ["network", "console"],
+            "related_console_errors": [{"message": "Correlated console detail"}],
+        },
+    }]}}
+    before = deepcopy(scenario)
+    report = StandaloneHtmlReport(tmp_path)
+    observation = report._timeline("fixture", scenario, observation=True)
+    ct_timeline = report._timeline("fixture", scenario)
+
+    assert observation.count(message) == 1
+    assert observation.count(endpoint) == 1
+    assert observation.count("https://shop.test") == 2  # Factual summary and page metadata.
+    assert "Telemetria externa" in observation
+    assert "Sem impacto funcional confirmado" in observation
+    assert "network + console" in observation
+    assert "Correlated console detail" in observation
+    assert ct_timeline.count(message) == 2
+    assert ct_timeline.count(endpoint) == 2
+    assert scenario == before
 
 
 def test_report_places_legacy_signals_inside_ct_with_before_after_captures(tmp_path):

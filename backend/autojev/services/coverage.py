@@ -250,6 +250,9 @@ class _TransitionRecipe:
     # field contents or credentials. Restore prerequisites before submitting.
     setup: tuple[tuple[str, str, str], ...] = ()
     checkout_submit_verified: bool = False
+    # A card may really open the wrong product. Remember that observed native
+    # destination for bounded recovery only; this is never a passing contract.
+    observed_wrong_product_destination: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1818,6 +1821,7 @@ class CoveragePlanner:
         *,
         is_focus_entry: bool = False,
         result: ActionResult | None = None,
+        observed_wrong_product_destination: bool = False,
     ) -> None:
         """Remember how a safe semantic interaction produced a new state.
 
@@ -1829,6 +1833,8 @@ class CoveragePlanner:
         if decision.action not in _REPLAYABLE_ACTIONS or decision.credential_key:
             return
         if parent_key == child_key:
+            return
+        if urlsplit(self.states[child_key].url)[:2] != self.origin:
             return
         element = self.states[parent_key].candidates.get(fingerprint)
         if element is None or not self._safe_candidate(element, self.origin):
@@ -1876,6 +1882,7 @@ class CoveragePlanner:
                 and any(assertion.kind == "form_progress" and assertion.passed
                         for assertion in result.assertions)
             ),
+            observed_wrong_product_destination=observed_wrong_product_destination,
         )
         outgoing = self.transitions.setdefault(parent_key, [])
         if recipe not in outgoing:
@@ -1886,6 +1893,60 @@ class CoveragePlanner:
             # recreated without making unrelated base controls eligible.
             self.focus_entry_anchor = parent_key
             self.focus_entry_child = child_key
+
+    def _actual_wrong_product_edge(
+        self, before: Observation, decision: AgentDecision,
+        result: ActionResult, after: Observation,
+    ) -> bool:
+        """Separate a failed product contract from its observed reachability.
+
+        Only an actually clicked, observed product card can teach this edge.
+        No guessed URLs, form submission, authentication, external destination
+        or failed browser operation is made replayable by a business failure.
+        """
+        if (not result.success or decision.action != "click"
+                or decision.credential_key or decision.url
+                or canonical_url(before.url) == canonical_url(after.url)
+                or urlsplit(canonical_url(after.url))[:2] != self.origin):
+            return False
+        detail = after.page_state.get("product_detail")
+        if not isinstance(detail, dict) or not (detail.get("name") or detail.get("id")):
+            return False
+        if (after.page_state.get("forms")
+                or any(field.get("form") or field.get("sensitive")
+                       or field.get("type") == "password"
+                       for field in after.page_state.get("fields", []) if isinstance(field, dict))
+                or any(move.get("sensitive") or move.get("type") == "password"
+                       for move in after.interactive_elements if isinstance(move, dict))):
+            return False
+        root = self.states.get(self.coverage_root_key or "")
+        if (root is not None and root.url != self.start_url
+                and canonical_url(after.url) == self.start_url):
+            return False
+        products: list[dict[str, Any]] = []
+        for items in (before.page_state.get("products"),
+                      (before.page_state.get("cart") or {}).get("items")):
+            if isinstance(items, list):
+                products.extend(item for item in items if isinstance(item, dict))
+        source_detail = before.page_state.get("product_detail")
+        if isinstance(source_detail, dict):
+            products.append(source_detail)
+        # A cart's same physical row can appear in both page-state collections.
+        # Collapse only aliases of this exact clicked ref with identical item
+        # identity/provenance/name. Homonymous distinct IDs stay ambiguous.
+        source_cards = {
+            (str(item.get("id") or ""), str(item.get("identity_source") or ""),
+             _normalise_text(str(item.get("name") or ""))): item
+            for item in products if decision.target in (item.get("link_refs") or [])
+            and (item.get("name") or item.get("id"))
+        }
+        element = next((move for move in before.interactive_elements
+                        if isinstance(move, dict) and move.get("ref") == decision.target), None)
+        return bool(len(source_cards) == 1 and element is not None
+                    and not element.get("form") and not self._is_form_submit(element)
+                    and self._safe_candidate(element, self.origin)
+                    and any(assertion.kind == "product_detail_identity" and not assertion.passed
+                            for assertion in result.assertions))
 
     def _is_focus_entry_recipe(self, recipe: _TransitionRecipe) -> bool:
         return (
@@ -2223,9 +2284,16 @@ class CoveragePlanner:
                     # where this exact semantic control went. Only that learned
                     # edge can be replayed; never infer a route from its label.
                     return learned and self._clickable(element)
-                # A bad card destination is a defect, not a useful recovery
-                # recipe. Do not repeatedly replay it to restore other work.
-                return canonical_url(href) == destination
+                if canonical_url(href) == destination:
+                    return True
+                # A failing product card can still be the only native entry
+                # to the page that really opened. The explicit learned edge
+                # owns that actual destination; the declared href alone never
+                # teaches a different route or turns the card's FAIL into PASS.
+                return bool(learned and recipe is not None
+                            and recipe.observed_wrong_product_destination
+                            and self.states[recipe.child_key].url == destination
+                            and self._clickable(element))
             return self._clickable(element)
 
         def resolve_move(parent: _CoverageState, fingerprint: str) -> tuple[str, dict[str, Any]] | None:
@@ -3017,15 +3085,24 @@ class CoveragePlanner:
             and (not focus_was_reached or entered_focus_by_target)
         )
 
+        failed_transition_contracts = {
+            assertion.kind for assertion in result.assertions
+            if not assertion.passed and assertion.kind in {
+                "product_detail_identity", "url_equals", "url_contains", "navigation_destination",
+                "form_progress",
+            }
+        }
+        actual_wrong_product_edge = (
+            failed_transition_contracts
+            and failed_transition_contracts <= {"product_detail_identity", "navigation_destination"}
+            and self._actual_wrong_product_edge(before, decision, result, after)
+        )
         if (
             result.success
             and after_key != before_key
             and transition_fingerprint is not None
             and not (decision.scenario_hint or {}).get("validation_probe")
-            and not any(not assertion.passed and assertion.kind in {
-                "product_detail_identity", "url_equals", "url_contains", "navigation_destination",
-                "form_progress",
-            } for assertion in result.assertions)
+            and (not failed_transition_contracts or actual_wrong_product_edge)
         ):
             self._register_transition(
                 before_key,
@@ -3034,6 +3111,7 @@ class CoveragePlanner:
                 decision,
                 is_focus_entry=is_focus_entry,
                 result=result,
+                observed_wrong_product_destination=bool(actual_wrong_product_edge),
             )
 
         if issued_restore is not None:

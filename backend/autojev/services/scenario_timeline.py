@@ -1,14 +1,15 @@
 """Project stored browser evidence into CT timelines without rewriting history.
 
 Old runs did not store a request-to-CT link. Only explicit links, unique capture
-matches or unique action time windows are used. Unmatched evidence belongs to a
-context card, never to an arbitrarily nearby test or to an invented PASS.
+matches or unique action time windows are used. Unmatched evidence belongs to
+execution observations, never to an arbitrarily nearby test or an invented PASS.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -22,7 +23,7 @@ from autojev.services.technical_signals import (
 )
 from autojev.services.verification_summary import NON_BUSINESS_CHECKS
 
-TIMELINE_VERSION = 1
+TIMELINE_VERSION = 2
 
 
 def _time(value: Any) -> float | None:
@@ -34,6 +35,68 @@ def _time(value: Any) -> float | None:
 
 def _shot(value: Any) -> str:
     return Path(str(value)).name if value else ""
+
+
+def _execution_observation(signal: dict[str, Any]) -> dict[str, Any]:
+    """Describe the recorded event, keeping the page distinct from its endpoint.
+
+    Older page_url values name the page at capture time, potentially after a
+    navigation. They must not claim to identify the page at response time or a
+    loading phase. Console URLs, unlike HTTP URLs, were recorded from the page
+    at the event; they do not identify the failed request's destination.
+    """
+
+    kind = signal.get("type")
+    source = signal.get("page_url_source")
+    page_url = signal.get("page_url")
+    if kind in {"console", "pageerror"} and signal.get("url") and source != "event":
+        page_url, source = signal["url"], "event"
+    elif page_url:
+        source = "event" if source == "event" else "observation"
+    else:
+        source = None
+    association = signal.get("association") or {}
+    if not isinstance(association, dict):
+        association = {}
+    phase = {
+        "page_load": "Carregamento da página",
+        "restoration": "Retomada da navegação",
+        "before_action": "Antes da ação",
+        "during_action": "Durante a ação",
+        "after_action": "Após a ação",
+    }.get(signal.get("observation_phase") or association.get("kind"))
+    status = signal.get("status_code")
+    if status is None and kind == "console":
+        match = re.search(r"(?:status of|HTTP)\s+(\d{3})\b", str(signal.get("message") or ""), re.I)
+        status = int(match.group(1)) if match else None
+    method = signal.get("method")
+    request_url = signal.get("url") if kind in {"http", "network"} else None
+    location = (
+        f"Na página {page_url}"
+        if source == "event"
+        else f"Na observação da página {page_url}"
+        if page_url
+        else "Em uma página não registrada"
+    )
+    if kind == "http" and status is not None:
+        description = f"foi observado HTTP {status} em uma requisição{f' {method}' if method else ''}."
+    elif kind == "network":
+        description = f"foi registrada uma falha de rede{f' em uma requisição {method}' if method else ''}."
+    elif kind == "console":
+        description = f"o console registrou HTTP {status}." if status is not None else "o console registrou uma ocorrência."
+    elif kind == "pageerror":
+        description = "foi registrada uma exceção JavaScript."
+    else:
+        description = "foi registrada uma ocorrência técnica."
+    return {
+        "page_url": page_url or None,
+        "page_url_source": source,
+        "phase": phase,
+        "summary": f"{location}, {description}",
+        "request_url": request_url,
+        "method": method,
+        "status_code": status,
+    }
 
 
 def _merge_signal(
@@ -505,18 +568,27 @@ def prepare_scenario_timelines(exploration: dict[str, Any]) -> dict[str, Any]:
                     },
                 }
             context = contexts[key]
+            # Preserve the original timing attribution before assigning this
+            # event to the execution observations (not a test verdict).
+            entry = _signal_entry(signal)
             signal["association"] = {
                 "kind": "observation_context",
                 "step_number": step,
                 "reason": "Sem associação segura a um CT funcional.",
             }
             context["evidence"]["technical_signals"].append(signal)
-            context["evidence"]["timeline"].append(_signal_entry(signal))
+            context["evidence"]["timeline"].append(entry)
             signal_owners.setdefault(identity, []).append(context)
         included_signals.add(identity)
 
     for item in [*scenarios, *contexts.values()]:
         evidence = item["evidence"]
+        # These entries describe observed page states/actions, unlike signal
+        # URLs which can identify a request endpoint. Preserve their known
+        # page without inferring a loading phase or a test association.
+        for entry in evidence["timeline"]:
+            if entry.get("kind") in {"action", "observation", "assertion"} and entry.get("url"):
+                entry.setdefault("page_url", entry["url"])
         if (
             evidence.get("verdict", {}).get("kind") == "technical_failure"
             and evidence.get("verdict", {}).get("historical")
@@ -525,7 +597,7 @@ def prepare_scenario_timelines(exploration: dict[str, Any]) -> dict[str, Any]:
             evidence["verdict"]["explanation"] += (
                 " Esta execução antiga registrou a contagem de erros, mas não "
                 "armazenou a requisição exata vinculada a esta ação. Os registros "
-                "sem vínculo seguro estão nos cartões de contexto."
+                "sem vínculo seguro estão nas observações da execução."
             )
         evidence["timeline"] = _unique_timeline(evidence["timeline"])
         item["screenshots"] = list(
@@ -557,6 +629,7 @@ def prepare_scenario_timelines(exploration: dict[str, Any]) -> dict[str, Any]:
 
 
 def _signal_entry(signal: dict[str, Any]) -> dict[str, Any]:
+    observation = _execution_observation(signal)
     return {
         "id": f"signal-{signal['occurrence_id']}",
         "kind": "signal",
@@ -564,6 +637,8 @@ def _signal_entry(signal: dict[str, Any]) -> dict[str, Any]:
         "title": signal.get("label") or "Sinal técnico · impacto a investigar",
         "message": signal.get("message") or "",
         "url": signal.get("url"),
+        "page_url": observation["page_url"],
+        "observation": observation,
         "screenshot": _shot(signal.get("screenshot")) or None,
         "signal": signal,
     }

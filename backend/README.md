@@ -11,7 +11,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 playwright install chromium
 cp .env.example .env
-uvicorn autojev.main:app --reload --host 127.0.0.1 --port 8000
+AUTOJEV_HEADLESS=false uvicorn autojev.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
 If Google Chrome or Microsoft Edge is already installed, set
@@ -19,6 +19,12 @@ If Google Chrome or Microsoft Edge is already installed, set
 corresponding Playwright channel instead of a downloaded browser.
 
 Environment variables are read directly by the process. If you use a `.env` file, launch Uvicorn with `--env-file .env`.
+
+Interactive local runs need `AUTOJEV_HEADLESS=false`, especially when login
+requires user intervention. The explicit launch setting prevents a headless
+value inherited from diagnostics from hiding the window. Run headless
+diagnostics in a separate temporary backend process/port and stop that process
+after validation; do not leave the interactive localhost backend headless.
 
 OpenAPI is available at `http://127.0.0.1:8000/docs`; the frontend normally uses `http://127.0.0.1:8000/api`.
 
@@ -186,6 +192,24 @@ HTTP 429 honors `Retry-After` (60-second fallback); local CTs continue without
 provider calls during it. Authentication rejection stops auxiliary calls for
 the run; explicit vision incompatibility is remembered after its first rejected
 request, with no text retry and no repeated unusable vision calls.
+The local auxiliary HTTP-request allowance is finite and independent of CT count.
+`options.auxiliary_max_requests` overrides the configured default for a new run;
+`auxiliary_review_max_attempts` defaults to 3 total attempts, including the first.
+Exact evidence cache hits remain available after the request allowance is spent.
+Retryable visual failures use bounded retries; authentication rejection and
+budget exhaustion never trigger retry loops. Rapid revisions of one CT are
+coalesced before review, while its verified actions and prior findings remain
+preserved in the timeline.
+
+For a terminal visual run, `POST /api/explorations/{id}/visual-reviews/resume`
+accepts a finite `{ "max_requests": 120, "max_attempts": 3 }` allowance for the
+pending saved-evidence reviews only. It does not reopen a browser, rerun local
+assertions or ask JEV to explore again. `POST .../visual-reviews/cancel` stops
+only that review batch. Detail payloads expose `visual_review_resume` for progress
+and independent cancellation; GET detail/report never starts paid requests.
+The frontend requires cost consent before submitting a new batch. Legacy CTs
+without the original semantic review context retain an explicit limitation;
+missing captures or insufficient evidence are not fabricated or marked reviewed.
 Only an explicit JSON-format rejection permits one format compatibility retry;
 strict schema, generic request, auth, timeout and rate-limit errors do not
 trigger silent format downgrades or a request burst.
@@ -245,8 +269,9 @@ explicit recovered history; a business FAIL still stays FAIL. Failed inverse
 cart toggles can explain missing setup without resetting application data or
 bypassing the site. This finite observed frontier is not proof of every possible
 input, user profile, or combination of application states.
-Route shortcuts never skip a known same-route business prerequisite (for
-example, adding the expected item before entering its cart). Replay selects a
+Route shortcuts never skip a known business prerequisite anywhere in the
+chosen replay path (for example, adding the expected item before entering its
+cart, even if another route comes first). Replay selects a
 shorter learned safe path only if its first semantic move exists in the current
 DOM; reaching a URL still does not approve a scenario. Unique observed DOM
 markers stabilize existing controls across sibling text changes, while entity
@@ -263,6 +288,19 @@ selection/count are checked there, and contents/prices are checked when the
 actual cart is subsequently opened. A drawer already open on a newly reached
 route can be closed as bounded local setup for its still-untested opener; the
 setup itself never approves that opener or its remaining work.
+The information form's actual Cart link is also exercised before its pending
+positive submit departs that empty/populated lane. Cancel is a separate handler
+and never serves as proof that the Cart link worked. Completed form setup is
+not resurrected in an old state after that route's submit was actually tried;
+genuinely untried submits and blocked fields remain distinguishable.
+
+A product card opening the wrong detail remains a business FAIL. Its actually
+observed same-origin destination may nevertheless provide a bounded native
+recovery edge for testing the controls on the page that opened. A divergent
+anchor needs an explicit learned wrong-product edge; its label or declared href
+cannot invent another destination. Browser-operation failure, authentication,
+external destinations and failed form/explicit URL contracts remain excluded.
+This recovery does not approve the intended product or modify earlier verdicts.
 
 Offline regressions in `tests/test_business_checks.py` reproduce the observable
 mutations in the official [Sauce Labs sample app](https://github.com/saucelabs/sample-app-web):
@@ -342,7 +380,13 @@ Token usage is accumulated for both JEV and auxiliary calls as prompt,
 completion and total tokens. Monetary cost is persisted only when the provider
 returns it; unknown cost remains `—` rather than being estimated. The live
 browser panel and React sidebar show the running total, and exploration history,
-detail payloads and the standalone report retain the final values.
+detail payloads and the standalone report retain the final values. New runs
+persist `usage.by_role.jev` and `usage.by_role.auxiliary`, with the same token
+fields plus `cost`, `cost_known` and `cost_complete`. Attribution uses the call's
+role, not its model ID. Exploration detail and the report show **Custo JEV**,
+**Custo LLM** and **Custo total** in USD. Known zero-cost calls show zero;
+incomplete known sums are marked partial. Migrated historical rows keep their
+combined total with an empty role breakdown, never an estimated split.
 
 ## Security notes
 

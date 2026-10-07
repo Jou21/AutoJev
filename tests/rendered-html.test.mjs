@@ -133,6 +133,47 @@ test("offers economical text and optional visual auxiliary evidence modes", asyn
   assert.match(source, /explorationEvidenceMode\(exploration\.options\)/);
 });
 
+test("requires explicit cost consent and a finite budget before resuming visual reviews", async () => {
+  const { VisualReviewResumeControls } = await timelineComponents();
+  let calls = 0;
+  const html = renderToStaticMarkup(createElement(VisualReviewResumeControls, {
+    pending: 57, initiallyExpanded: true, initialBudget: 120,
+    onResume: async () => { calls += 1; }, onCancel: async () => {},
+  }));
+  assert.match(html, /Retomar revisões visuais pendentes/);
+  assert.match(html, /Novas chamadas podem gerar custo na LLM/);
+  assert.match(html, /até 3 tentativas por revisão, contando a primeira/i);
+  assert.match(html, /min="1" max="2000"/);
+  assert.match(html, /Entendo que esta retomada pode gerar custo adicional/);
+  assert.match(html, /type="submit"[^>]*disabled=""/);
+  assert.match(html, /sem abrir o navegador nem repetir a exploração/);
+  assert.equal(calls, 0);
+  assert.equal(renderToStaticMarkup(createElement(VisualReviewResumeControls, {
+    pending: 0, onResume: async () => {}, onCancel: async () => {},
+  })), "");
+});
+
+test("shows independent visual review progress and cancellation without cancelling the exploration", async () => {
+  const { VisualReviewResumeControls, explorationDetailState } = await timelineComponents();
+  const state = { running: true, total: 58, completed: 4, failed: 1, pending: 53,
+    requests_used: 7, request_budget: 120, max_attempts: 3, context_limited_count: 2 };
+  const html = renderToStaticMarkup(createElement(VisualReviewResumeControls, {
+    state, pending: 53, onResume: async () => {}, onCancel: async () => {},
+  }));
+  assert.match(html, /4 de 58 revisões concluídas/);
+  assert.match(html, /7 de 120 chamadas utilizadas/);
+  assert.match(html, /Parar revisões visuais/);
+  assert.match(html, /contexto textual limitado/);
+  assert.doesNotMatch(html, /Iniciar revisões com este limite/);
+  assert.equal(explorationDetailState("run", { id: "run", status: "completed", visual_review_resume: state }, false, "run").shouldPoll, true);
+  assert.equal(explorationDetailState("run", { id: "run", status: "completed", visual_review_resume: { running: false } }, false, "run").shouldPoll, false);
+  const source = await readFile(new URL("../app/AutoJevApp.tsx", import.meta.url), "utf8");
+  assert.match(source, /visual-reviews\/resume/);
+  assert.match(source, /visual-reviews\/cancel/);
+  assert.match(source, /auxiliary_max_requests: requestBudget/);
+  assert.match(source, /auxiliary_review_max_attempts: 3/);
+});
+
 async function timelineComponents() {
   const { transpileModule, ModuleKind, JsxEmit, ScriptTarget } = await import("typescript");
   const source = await readFile(new URL("../app/AutoJevApp.tsx", import.meta.url), "utf8");
@@ -146,6 +187,84 @@ async function timelineComponents() {
   );
   return componentModule.exports;
 }
+
+test("renders separate JEV, auxiliary LLM and total costs without losing precision", async () => {
+  const { CostBreakdown } = await timelineComponents();
+  const html = renderToStaticMarkup(createElement(CostBreakdown, {
+    usage: { cost: 0.038586, cost_known: true, cost_complete: true, by_role: {
+      jev: { cost: 0.000101, cost_known: true, cost_complete: true },
+      auxiliary: { cost: 0.038485, cost_known: true, cost_complete: true },
+    } },
+  }));
+  assert.match(html, /Custos da execução em dólares americanos/);
+  assert.match(html, /Custo JEV<\/span><strong>\$0\.000101/);
+  assert.match(html, /Custo LLM<\/span><strong>\$0\.038485/);
+  assert.match(html, /Custo total<\/span><strong>\$0\.038586/);
+  assert.equal((html.match(/class="cost-breakdown-item"/g) || []).length, 3);
+  assert.doesNotMatch(html, /parcial|não informado|não registrada/);
+});
+
+test("distinguishes reported zero cost from unavailable costs", async () => {
+  const { CostBreakdown } = await timelineComponents();
+  const free = { cost: 0, cost_known: true, cost_complete: true };
+  const html = renderToStaticMarkup(createElement(CostBreakdown, {
+    usage: { ...free, by_role: { jev: free, auxiliary: free } },
+  }));
+  assert.equal((html.match(/\$0\.000000/g) || []).length, 3);
+  assert.doesNotMatch(html, /—|parcial|não informado|não registrada/);
+});
+
+test("does not substitute zero for costs missing from the provider", async () => {
+  const { CostBreakdown } = await timelineComponents();
+  const html = renderToStaticMarkup(createElement(CostBreakdown, {
+    usage: { cost: null, cost_known: false, by_role: {
+      jev: { cost: null, cost_known: false },
+      auxiliary: { cost: null, cost_known: true },
+    } },
+  }));
+  assert.equal((html.match(/<strong>—<\/strong>/g) || []).length, 3);
+  assert.equal((html.match(/Custo não informado pelo provedor/g) || []).length, 3);
+  assert.doesNotMatch(html, /\$0\.000000|não registrada/);
+});
+
+test("rejects negative and non-finite costs instead of displaying invalid charges", async () => {
+  const { CostBreakdown } = await timelineComponents();
+  const html = renderToStaticMarkup(createElement(CostBreakdown, {
+    usage: { cost: Infinity, cost_known: true, by_role: {
+      jev: { cost: -0.01, cost_known: true },
+      auxiliary: { cost: NaN, cost_known: true },
+    } },
+  }));
+  assert.equal((html.match(/<strong>—<\/strong>/g) || []).length, 3);
+  assert.equal((html.match(/Custo não informado pelo provedor/g) || []).length, 3);
+  assert.doesNotMatch(html, /\$|NaN|Infinity/);
+});
+
+test("preserves historical total costs when role attribution was not recorded", async () => {
+  const { CostBreakdown } = await timelineComponents();
+  const html = renderToStaticMarkup(createElement(CostBreakdown, {
+    usage: { cost: 0.038586, cost_known: true },
+  }));
+  assert.match(html, /Custo JEV<\/span><strong>—/);
+  assert.match(html, /Custo LLM<\/span><strong>—/);
+  assert.match(html, /Custo total<\/span><strong>\$0\.038586/);
+  assert.equal((html.match(/Divisão por modelo não registrada nesta execução/g) || []).length, 2);
+  assert.doesNotMatch(html, /\$0\.000000/);
+});
+
+test("labels known partial costs instead of presenting them as complete totals", async () => {
+  const { CostBreakdown } = await timelineComponents();
+  const html = renderToStaticMarkup(createElement(CostBreakdown, {
+    usage: { cost: 0.01, cost_known: true, cost_complete: false, by_role: {
+      jev: { cost: 0.01, cost_known: true, cost_complete: false },
+      auxiliary: { cost: null, cost_known: false, cost_complete: false },
+    } },
+  }));
+  assert.match(html, /Custo JEV<\/span><strong>\$0\.010000 \(parcial\)/);
+  assert.match(html, /Custo total<\/span><strong>\$0\.010000 \(parcial\)/);
+  assert.match(html, /Custo LLM<\/span><strong>—/);
+  assert.equal((html.match(/Valor parcial: há chamadas sem custo informado/g) || []).length, 2);
+});
 
 test("renders each CT timeline with its captures, assertions and technical signals", async () => {
   const { ScenarioTimelinePanel } = await timelineComponents();
@@ -172,7 +291,7 @@ test("renders each CT timeline with its captures, assertions and technical signa
       },
     }], contexts: [{
       id: "context-startup", title: "Preparação do navegador", status: "INFO",
-      evidence: { timeline: [{ kind: "signal", signal }], technical_signals: [signal] },
+      evidence: { timeline: [{ kind: "signal", signal: { kind: "http", message: "Startup request returned HTTP 503", status_code: 503 } }] },
     }],
   }));
   assert.match(html, /<details class="scenario-case-card verdict-warning"/);
@@ -186,9 +305,86 @@ test("renders each CT timeline with its captures, assertions and technical signa
   assert.ok(html.indexOf("POST returned HTTP 401") < html.indexOf("Depois da ação"));
   assert.match(html, /Não reprova automaticamente o CT/);
   assert.match(html, /Esperado: true/);
-  assert.match(html, /Contexto · não é um teste/);
-  assert.match(html, /fora de um teste executado/);
+  assert.match(html, /<details class="execution-observations"><summary>/);
+  assert.match(html, /Observações da execução/);
+  assert.match(html, /Startup request returned HTTP 503/);
+  assert.equal((html.match(/class="scenario-case-card /g) || []).length, 1);
+  assert.ok(html.indexOf('class="execution-observations"') > html.indexOf('class="scenario-case-list"'));
+  assert.doesNotMatch(html, /Contexto · não é um teste|Contexto \/ navegação de apoio|Evidência de contexto|context-startup/);
   assert.doesNotMatch(html, /Sinais técnicos observados \(/);
+});
+
+test("shows orphan occurrences as execution observations with page provenance and request facts", async () => {
+  const { ExecutionObservations } = await timelineComponents();
+  const html = renderToStaticMarkup(createElement(ExecutionObservations, {
+    explorationId: "run", apiBase: "http://localhost:8000/api", contexts: [{
+      id: "context-page", title: "Old context card title", status: "INFO", evidence: { timeline: [{
+        id: "request-401", kind: "signal", occurred_at: "2026-10-06T21:59:22Z", screenshot: "startup.png",
+        url: "https://events.example.test/submit",
+        observation: {
+          page_url: "https://shop.test/inventory.html", page_url_source: "event", phase: "Carregamento da página",
+          summary: "Ocorreu HTTP 401 durante o carregamento da página de produtos.",
+          method: "POST", status_code: 401, request_url: "https://events.example.test/submit",
+        },
+        signal: { kind: "http", message: "POST returned HTTP 401", status_code: 401, url: "https://events.example.test/submit", impact: "external_integration", affects_verdict: false },
+      }, {
+        kind: "signal", url: "https://shop.test/cart.html",
+        observation: { page_url: "https://shop.test/cart.html", page_url_source: "observation", request_url: null, summary: "Na observação da página do carrinho, foi registrada uma mensagem de console." },
+        signal: { kind: "console", message: "Console error", url: "https://shop.test/cart.html" },
+      }] },
+    }],
+  }));
+  assert.match(html, /Observações da execução/);
+  assert.match(html, /2 registros/);
+  assert.match(html, /Ocorreu HTTP 401 durante o carregamento da página de produtos/);
+  assert.match(html, /Mensagem registrada: POST returned HTTP 401/);
+  assert.match(html, /Mensagem registrada: Console error/);
+  assert.match(html, /<dt>Página<\/dt><dd><a href="https:\/\/shop.test\/inventory.html"/);
+  assert.match(html, /<dt>Etapa<\/dt><dd>Carregamento da página/);
+  assert.match(html, /dateTime="2026-10-06T21:59:22Z"/i);
+  assert.match(html, /<dt>Requisição<\/dt><dd><span>POST · <\/span><span>HTTP 401/);
+  assert.match(html, /href="https:\/\/events.example.test\/submit"/);
+  assert.equal((html.match(/<dt>Requisição<\/dt>/g) || []).length, 1);
+  assert.match(html, /\/run\/screenshots\/startup.png/);
+  assert.match(html, /Ocorrência em uma integração externa; sem defeito funcional confirmado/);
+  assert.doesNotMatch(html, /Old context card title|scenario-case-card|scenario-verdict|CONTEXTO|INFO|<details[^>]* open/);
+});
+
+test("retains original exception details and recognizes legacy backend network types in observations", async () => {
+  const { ExecutionObservations } = await timelineComponents();
+  const html = renderToStaticMarkup(createElement(ExecutionObservations, {
+    explorationId: "run", apiBase: "http://localhost:8000/api", contexts: [{
+      id: "unowned", status: "INFO", evidence: { timeline: [
+        { kind: "signal", observation: { summary: "Foi registrada uma exceção JavaScript.", request_url: null },
+          signal: { type: "pageerror", message: "TypeError: Cannot read properties of undefined" } },
+        { kind: "signal", signal: { type: "network", method: "GET", url: "https://example.test/api", message: "net::ERR_CONNECTION_RESET" } },
+      ] },
+    }],
+  }));
+  assert.match(html, /Mensagem registrada: TypeError: Cannot read properties of undefined/);
+  assert.match(html, /net::ERR_CONNECTION_RESET/);
+  assert.match(html, /<dt>Requisição<\/dt><dd><span>GET · <\/span>/);
+  assert.match(html, /href="https:\/\/example.test\/api"/);
+  assert.doesNotMatch(html, /scenario-case-card|scenario-verdict/);
+});
+
+test("does not invent an observation page or phase from a legacy request endpoint or count it as a CT", async () => {
+  const { ScenarioTimelinePanel } = await timelineComponents();
+  const html = renderToStaticMarkup(createElement(ScenarioTimelinePanel, {
+    explorationId: "run", apiBase: "http://localhost:8000/api", contexts: [], scenarios: [{
+      id: "context-legacy", status: "INFO", title: "Evidência de contexto", url: "https://unknown.test/",
+      evidence: { technical_signals: [{ kind: "http", message: "<script>bad</script> HTTP 401", status_code: 401, url: "javascript:alert(1)" }] },
+    }],
+  }));
+  assert.match(html, /0 de 0 CTs/);
+  assert.match(html, /Observações da execução/);
+  assert.match(html, /Página não registrada/);
+  assert.match(html, /Momento não registrado/);
+  assert.match(html, /&lt;script&gt;bad&lt;\/script&gt; HTTP 401/);
+  assert.doesNotMatch(html, /<dt>Etapa<\/dt>|Carregamento da página|href="javascript:|href="https:\/\/unknown.test|class="scenario-case-card|<script>bad<\/script>|Evidência de contexto/);
+  const source = await readFile(new URL("../app/AutoJevApp.tsx", import.meta.url), "utf8");
+  assert.match(source, /<ExecutionObservations contexts=\{observations\}/);
+  assert.doesNotMatch(source, /filteredContexts/);
 });
 
 test("distinguishes business validation from technical interaction and lists coverage restrictions", async () => {
@@ -264,7 +460,7 @@ test("makes missing visual reviews visible without converting local PASS to visu
     { id: "CT002", status: "PASS", evidence: { visual_assessment: { status: "unavailable", reason: "visual_assessment_not_returned" } } },
   ];
   assert.deepEqual(visualReviewCounts(scenarios), {
-    total: 2, assessed: 0, pending: 0, unavailable: 2, rateLimited: 1, incompleteResponse: 1,
+    total: 2, assessed: 0, pending: 0, unavailable: 2, rateLimited: 1, incompleteResponse: 1, contextLimited: 0,
     unavailableReasons: [
       { reason: "auxiliary_rate_limited", count: 1, label: "limitados pelo provedor" },
       { reason: "visual_assessment_not_returned", count: 1, label: "com resposta visual ausente ou inválida" },
@@ -279,6 +475,29 @@ test("makes missing visual reviews visible without converting local PASS to visu
   assert.match(renderToStaticMarkup(createElement(VisualReviewSummary, { scenarios: [], active: true })), /Análise visual em andamento/);
   const source = await readFile(new URL("../app/AutoJevApp.tsx", import.meta.url), "utf8");
   assert.match(source, /explorationEvidenceMode\(exploration.options\) === "visual" && <VisualReviewSummary/);
+});
+
+test("keeps completed legacy image reviews visibly distinct from full-semantic visual analysis", async () => {
+  const { VisualReviewSummary, visualReviewCounts, ScenarioTimelinePanel } = await timelineComponents();
+  const scenarios = [
+    { id: "CT001", title: "Legacy", status: "PASS", evidence: { visual_assessment: { requested: true, status: "assessed", context_limited: true } } },
+    { id: "CT002", title: "Legacy scoped", status: "PASS", evidence: { visual_assessment: { requested: true, status: "assessed", review_scope: "saved_capture_only_legacy" } } },
+    { id: "CT003", title: "Full semantics", status: "PASS", evidence: { visual_assessment: { requested: true, status: "assessed", context_limited: false } } },
+  ];
+  assert.equal(visualReviewCounts(scenarios).contextLimited, 2);
+  const html = renderToStaticMarkup(createElement(VisualReviewSummary, { scenarios }));
+  assert.match(html, /Capturas analisadas · contexto parcial/);
+  assert.match(html, /2 revisões com contexto textual limitado/);
+  assert.match(html, /DOM e o texto visível originais não foram preservados/);
+  assert.match(html, /não equivalem a uma análise com o contexto semântico completo/);
+  const apiHtml = renderToStaticMarkup(createElement(VisualReviewSummary, { scenarios: [], summary: {
+    total: 3, assessed: 3, pending: 0, unavailable: 0, context_limited: 2, unavailable_reasons: [],
+  } }));
+  assert.match(apiHtml, /2 revisões com contexto textual limitado/);
+  const caseHtml = renderToStaticMarkup(createElement(ScenarioTimelinePanel, {
+    scenarios, contexts: [], explorationId: "run", apiBase: "http://localhost:8000/api",
+  }));
+  assert.match(caseHtml, /Contexto textual limitado: esta revisão usa as capturas salvas/);
 });
 
 test("accounts for every unavailable visual review including timeout and local tail limit", async () => {

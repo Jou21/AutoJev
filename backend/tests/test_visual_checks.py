@@ -298,12 +298,29 @@ def test_visual_summary_separates_local_pass_from_visual_unavailability():
     assert visual_review_counts(scenarios) == {
         "total": 5, "assessed": 1, "pending": 1, "unavailable": 3,
         "rate_limited": 1, "incomplete_response": 1,
+        "context_limited": 0,
         "unavailable_reasons": [
             {"reason": "auxiliary_rate_limited", "count": 1, "label": "limitados pelo provedor"},
             {"reason": "reason_not_recorded", "count": 1, "label": "sem revisão visual válida; motivo não classificado"},
             {"reason": "visual_assessment_not_returned", "count": 1, "label": "com resposta visual ausente ou inválida"},
         ],
     }
+
+
+def test_visual_summary_exposes_only_assessed_reviews_with_missing_legacy_semantics():
+    scenarios = [{"evidence": {"visual_assessment": visual}} for visual in [
+        {"status": "assessed", "context_limited": True},
+        {"status": "assessed", "review_scope": "saved_capture_only_legacy"},
+        {"status": "assessed", "context_limited": False},
+        {"status": "unavailable", "context_limited": True},
+        {"status": "pending", "context_limited": True},
+        {"status": "assessed", "reason": "visual_findings_invalid", "context_limited": True},
+    ]]
+    counts = visual_review_counts(scenarios)
+    assert counts["assessed"] == 3
+    assert counts["context_limited"] == 2
+    assert counts["pending"] == 1
+    assert counts["unavailable"] == 2
 
 
 def test_every_unavailable_visual_review_has_one_reason_including_tail_and_timeout():

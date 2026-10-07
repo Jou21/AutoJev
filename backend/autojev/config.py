@@ -26,6 +26,7 @@ class Settings:
     auxiliary_max_rate_limits: int = 6
     auxiliary_tail_timeout_seconds: float = 600.0
     auxiliary_request_interval_seconds: float = 3.1
+    auxiliary_review_max_attempts: int = 3
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -55,6 +56,7 @@ class Settings:
             auxiliary_max_rate_limits=max(1, int(os.getenv("AUTOJEV_AUXILIARY_MAX_RATE_LIMITS", "6"))),
             auxiliary_tail_timeout_seconds=max(1.0, float(os.getenv("AUTOJEV_AUXILIARY_TAIL_TIMEOUT_SECONDS", "600"))),
             auxiliary_request_interval_seconds=max(0.0, float(os.getenv("AUTOJEV_AUXILIARY_REQUEST_INTERVAL_SECONDS", "3.1"))),
+            auxiliary_review_max_attempts=min(5, max(1, int(os.getenv("AUTOJEV_AUXILIARY_REVIEW_MAX_ATTEMPTS", "3")))),
         )
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import html
 import json
+import math
 import re
 from collections import OrderedDict
 from datetime import datetime
@@ -185,9 +186,55 @@ class StandaloneHtmlReport:
     def _usage(exploration: dict[str, Any]) -> tuple[str, str]:
         usage = exploration.get("usage") or {}
         tokens = f"{int(usage.get('total_tokens') or 0):,}".replace(",", ".")
-        if not usage.get("cost_known"):
-            return tokens, "—"
-        return tokens, f"${float(usage.get('cost') or 0):.6f}"
+        return tokens, StandaloneHtmlReport._formatted_cost(usage)
+
+    @staticmethod
+    def _formatted_cost(usage: dict[str, Any] | None) -> str:
+        """An unreported price is not zero, including in historical runs."""
+        if not isinstance(usage, dict) or not usage.get("cost_known"):
+            return "—"
+        value = usage.get("cost")
+        if value is None or isinstance(value, bool):
+            return "—"
+        try:
+            amount = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return "—"
+        return f"${amount:.6f}" if math.isfinite(amount) and amount >= 0 else "—"
+
+    def _cost_summary(self, exploration: dict[str, Any]) -> str:
+        usage = exploration.get("usage") or {}
+        by_role = usage.get("by_role")
+        roles = by_role if isinstance(by_role, dict) else {}
+        metrics: list[str] = []
+        for role, label, bucket in (
+            ("jev", "Custo JEV", roles.get("jev")),
+            ("auxiliary", "Custo LLM", roles.get("auxiliary")),
+            ("total", "Custo total", usage),
+        ):
+            value = self._formatted_cost(bucket)
+            partial = isinstance(bucket, dict) and bucket.get("cost_complete") is False
+            note = (
+                "Valor parcial · soma dos custos informados."
+                if partial and value != "—" else
+                "Não registrado nesta execução."
+                if role != "total" and not isinstance(bucket, dict) else
+                "Custo não informado pelo provedor."
+                if value == "—" else ""
+            )
+            metrics.append(
+                f'<div class="metric cost-metric" data-cost-role="{role}">'
+                f'<strong>{_h(value)}</strong>{label}'
+                + ('<span class="cost-state">Parcial</span>' if partial and value != "—" else '')
+                + (f'<small>{_h(note)}</small>' if note else '') + '</div>'
+            )
+        missing_split = any(not isinstance(roles.get(role), dict) for role in ("jev", "auxiliary"))
+        return (
+            '<section class="cost-summary" aria-label="Custos por modelo" data-cost-breakdown="roles-v1">'
+            + "".join(metrics) + '</section>'
+            + ('<p class="cost-note muted">Divisão por modelo não registrada nesta execução. '
+               'O total disponível foi preservado; não foi estimada uma divisão.</p>' if missing_split else '')
+        )
 
     @staticmethod
     def _completion(exploration: dict[str, Any]) -> tuple[str, str]:
@@ -446,7 +493,13 @@ class StandaloneHtmlReport:
             f'{_h(assertion.get("message"))}</p>{assertion_values}<p class="muted">{note}</p></div>'
         )
 
-    def _signal_detail(self, signal: dict[str, Any]) -> str:
+    def _signal_detail(
+        self,
+        signal: dict[str, Any],
+        *,
+        rendered_messages: set[str] | None = None,
+        rendered_urls: set[str] | None = None,
+    ) -> str:
         classification = signal.get("classification")
         if isinstance(classification, dict):
             classification_label = classification.get("label") or classification.get("category")
@@ -495,9 +548,13 @@ class StandaloneHtmlReport:
             '<div class="signal-detail"><div class="signal-head">'
             f'<span class="event-chip signal-chip">{_h(classification_label)}</span>'
             f'<span class="muted">{_h(channel_label)}{f" · HTTP {_h(status)}" if status else ""}</span></div>'
-            + "".join(f'<p>{_h(message)}</p>' for message in messages)
+            + "".join(
+                f'<p>{_h(message)}</p>' for message in messages
+                if str(message) not in (rendered_messages or set())
+            )
             + "".join(
                 f'<div class="url">{_h(self._public_issue_url(url))}</div>' for url in urls
+                if str(url) not in (rendered_urls or set())
             )
             + (f'<p class="muted">{_h(explanation)}</p>' if explanation else "")
             + f'<p class="impact-note">{_h(impact)}</p>'
@@ -506,7 +563,9 @@ class StandaloneHtmlReport:
             + '</div>'
         )
 
-    def _timeline(self, exploration_id: str, scenario: dict[str, Any]) -> str:
+    def _timeline(
+        self, exploration_id: str, scenario: dict[str, Any], *, observation: bool = False,
+    ) -> str:
         evidence = scenario.get("evidence") or {}
         entries = list(evidence.get("timeline") or [])
         used_shots = {
@@ -535,12 +594,63 @@ class StandaloneHtmlReport:
             if kind not in labels:
                 kind = "observation"
             screenshot = str(entry.get("screenshot") or "")
+            provenance = entry.get("observation") or {}
+            if not isinstance(provenance, dict):
+                provenance = {}
+            page_url = provenance.get("page_url") or entry.get("page_url")
+            entry_url = entry.get("url")
+            if observation and (
+                entry_url == page_url or entry_url == provenance.get("request_url")
+            ):
+                entry_url = None
             detail = ""
             if isinstance(entry.get("signal"), dict):
-                detail = self._signal_detail(entry["signal"])
+                detail = self._signal_detail(
+                    entry["signal"],
+                    rendered_messages={str(entry["message"])}
+                    if observation and entry.get("message") else None,
+                    rendered_urls={
+                        str(url) for url in (
+                            page_url, provenance.get("request_url"), entry_url,
+                        ) if url
+                    } if observation else None,
+                )
             if isinstance(entry.get("assertion"), dict):
                 detail += self._assertion_detail(entry["assertion"])
             timestamp = entry.get("occurred_at")
+            title = (
+                provenance.get("summary") if observation else None
+            ) or entry.get("title") or labels[kind]
+            phase = provenance.get("phase")
+            if observation:
+                # Projected summaries can contain recorded page URLs. Apply
+                # the same query redaction as the separate diagnostic fields.
+                title = str(title)
+                for url in (page_url, provenance.get("request_url"), entry.get("url")):
+                    if url:
+                        title = title.replace(str(url), self._public_issue_url(url))
+            observation_meta = (
+                (f'<div class="url">Página: {_h(self._public_issue_url(page_url))}</div>' if page_url else '')
+                + (f'<p class="muted">Fase registrada: {_h(phase)}</p>' if phase else '')
+            ) if observation else ''
+            signal = entry.get("signal") or {}
+            if observation and isinstance(signal, dict) and kind == "signal":
+                channels = signal.get("evidence_channels") or signal.get("types") or [signal.get("type")]
+                if not isinstance(channels, list):
+                    channels = [channels]
+                request_url = provenance.get("request_url")
+                request_recorded = bool(request_url) or bool({"http", "network"}.intersection(channels))
+                request_meta = " · ".join(
+                    str(value) for value in [
+                        provenance.get("method") or signal.get("method"),
+                        f'HTTP {provenance.get("status_code") or signal.get("status_code")}'
+                        if provenance.get("status_code") or signal.get("status_code") else None,
+                    ] if value
+                )
+                if request_meta and request_recorded:
+                    observation_meta += f'<p class="muted">Requisição: {_h(request_meta)}</p>'
+                if request_url:
+                    observation_meta += f'<div class="url">Destino da requisição: {_h(self._public_issue_url(request_url))}</div>'
             step = entry.get("step_number", entry.get("action_step"))
             action_meta = (
                 f'<p class="muted">{f"Etapa {_h(step)}" if step is not None else ""}'
@@ -551,10 +661,11 @@ class StandaloneHtmlReport:
                 '<div class="timeline-content"><div class="event-meta">'
                 f'<span class="event-kind">{labels[kind]}</span>'
                 f'<time datetime="{_h(timestamp)}">{_h(self._timeline_time(timestamp))}</time></div>'
-                f'<h3>{_h(entry.get("title") or labels[kind])}</h3>'
+                f'<h3>{_h(title)}</h3>'
                 + action_meta
+                + observation_meta
                 + (f'<p>{_h(entry.get("message"))}</p>' if entry.get("message") else "")
-                + (f'<div class="url">{_h(self._public_issue_url(entry.get("url")))}</div>' if entry.get("url") else "")
+                + (f'<div class="url">{_h(self._public_issue_url(entry_url))}</div>' if entry_url else "")
                 + detail
                 + (f'<div class="shots">{self._screenshots(exploration_id, [screenshot])}</div>' if screenshot else "")
                 + '</div></li>'
@@ -563,15 +674,38 @@ class StandaloneHtmlReport:
             '<p class="muted">Não há evidência temporal registrada para este caso.</p>'
         )
 
-    def _scenario_card(self, exploration_id: str, scenario: dict[str, Any], *, context: bool = False) -> str:
-        status = "INFO" if context else str(scenario.get("status", "SKIPPED"))
-        if status not in {"PASS", "FAIL", "BLOCKED", "SKIPPED", "INFO"}:
+    def _execution_observations(self, exploration_id: str, contexts: list[dict[str, Any]]) -> str:
+        """Keep unowned evidence outside test cases, results and CT filters."""
+        timelines = []
+        entry_count = 0
+        for context in contexts:
+            evidence = context.get("evidence") or {}
+            entries = evidence.get("timeline") or []
+            if not entries and not context.get("screenshots"):
+                continue
+            entry_count += len(entries) or len(context.get("screenshots") or [])
+            timelines.append(self._timeline(exploration_id, context, observation=True))
+        if not timelines:
+            return ""
+        return (
+            '<section id="execution-observations" aria-label="Observações da execução">'
+            '<details class="execution-observations"><summary><strong>Observações da execução</strong>'
+            f' · {entry_count} registro(s)</summary>'
+            '<p class="muted">Ocorrências registradas fora de um CT identificado, como carregamento '
+            'da página e navegação de apoio. Não alteram os resultados nem a contagem de testes. '
+            'Página e fase são mostradas somente quando foram registradas; não há atribuição de falha a um CT.</p>'
+            + "".join(timelines) + '</details></section>'
+        )
+
+    def _scenario_card(self, exploration_id: str, scenario: dict[str, Any]) -> str:
+        status = str(scenario.get("status", "SKIPPED"))
+        if status not in {"PASS", "FAIL", "BLOCKED", "SKIPPED"}:
             status = "SKIPPED"
         steps = "".join(f"<li>{_h(step)}</li>" for step in scenario.get("steps", []))
         preconditions = "".join(
             f"<li>{_h(item)}</li>" for item in scenario.get("preconditions", [])
         ) or "<li>Nenhuma pré-condição documentada.</li>"
-        visible_status = "CONTEXTO" if context else "SEM VALIDAÇÃO" if status == "SKIPPED" else status
+        visible_status = "SEM VALIDAÇÃO" if status == "SKIPPED" else status
         evidence = scenario.get("evidence") or {}
         verdict = evidence.get("verdict") or {}
         technical_failure = isinstance(verdict, dict) and verdict.get("kind") == "technical_failure"
@@ -585,27 +719,24 @@ class StandaloneHtmlReport:
             f'<p>{_h(verdict.get("explanation"))}</p>'
             + ('<p class="muted">Resultado histórico preservado; esta apresentação não reexecuta o teste.</p>' if verdict.get("historical") else '')
             + '</div>'
-        ) if isinstance(verdict, dict) and verdict.get("label") and not context else ''
+        ) if isinstance(verdict, dict) and verdict.get("label") else ''
         signal_count = len(evidence.get("technical_signals") or [])
-        case_label = "Evidência de contexto · não é um CT" if context else str(scenario.get("id") or "CT")
-        description = (
-            '<p class="context-note">Registros de início, restauração ou sem vínculo confiável '
-            'com um CT. Não são testes aprovados e não entram na contagem de CTs.</p>'
-            if context else ''
-        )
-        details = '' if context else f"""
+        case_label = str(scenario.get("id") or "CT")
+        details = f"""
             <details class="case-documentation"><summary>Descrição e passos do caso</summary>
             <div class="columns"><section><h3>Pré-condições</h3><ul>{preconditions}</ul></section><section><h3>Passos</h3><ol>{steps}</ol></section></div>
             <div class="result"><section><h3>Esperado</h3><p>{_h(scenario.get("expected_result"))}</p></section><section><h3>Obtido</h3><p>{_h(scenario.get("actual_result"))}</p></section></div></details>"""
         visual_detail = ""
         visual_meta = ""
         visual = evidence.get("visual_assessment") or {}
-        if not context and visual.get("requested"):
+        if visual.get("requested"):
             visual_meta = " · visual: " + ("analisado" if visual.get("status") == "assessed" else "em análise" if visual.get("status") == "pending" else "indisponível")
             if visual.get("status") == "assessed":
                 text = (f"{visual.get('accepted_count', 0)} indício(s) visual(is) · revisão necessária"
                         if visual.get("accepted_count") else "Capturas analisadas · nenhum indício visual aceito")
                 note = "A confiança é declarada pelo modelo. Não há aprovação visual completa nem bug funcional confirmado apenas pela imagem."
+                if visual.get("context_limited") is True or visual.get("review_scope") == "saved_capture_only_legacy":
+                    note += " Contexto textual limitado: esta revisão usa as capturas salvas; o DOM e o texto visível originais não foram preservados. Não equivale a uma análise com contexto semântico completo."
             elif visual.get("status") == "pending":
                 text, note = "Análise visual em andamento", "O resultado visual ainda não foi concluído."
             else:
@@ -621,9 +752,9 @@ class StandaloneHtmlReport:
                     visual_unavailability_label(reason).capitalize() + ". As verificações locais foram preservadas."
                 )
             visual_detail = f'<div class="context-note"><strong>{_h(text)}</strong><p>{_h(note)}</p></div>'
-        return f"""<details class="scenario{' scenario-context' if context else ''}" data-status="{status}">
+        return f"""<details class="scenario" data-status="{status}">
           <summary><div><span class="case-id">{_h(case_label)}</span><h2>{_h(scenario.get("title"))}</h2><span class="case-meta">{signal_count} sinal(is) técnico(s){visual_meta} · clique para ver a linha do tempo</span></div><span class="badge {badge_class}">{visible_status}</span></summary>
-          <div class="scenario-body">{description}<p>{_h(scenario.get("description"))}</p>
+          <div class="scenario-body"><p>{_h(scenario.get("description"))}</p>
           <div class="url">{_h(self._public_issue_url(scenario.get("url")))}</div>
           {verdict_detail}{visual_detail}{details}<h3 class="timeline-heading">Linha do tempo · ações e evidências</h3>
           {self._timeline(exploration_id, scenario)}</div></details>"""
@@ -631,7 +762,21 @@ class StandaloneHtmlReport:
     def generate(self, exploration: dict[str, Any], output_path: str) -> str:
         exploration = prepare_scenario_timelines(exploration)
         exploration_id = str(exploration["id"])
-        scenarios = exploration.get("scenarios", [])
+        recorded_scenarios = exploration.get("scenarios", [])
+        legacy_observations = [
+            scenario for scenario in recorded_scenarios
+            if str(scenario.get("status") or "").upper() in {"INFO", "CONTEXT"}
+        ]
+        scenarios = [
+            scenario for scenario in recorded_scenarios
+            if str(scenario.get("status") or "").upper() not in {"INFO", "CONTEXT"}
+        ]
+        contexts = list(exploration.get("scenario_contexts") or [])
+        context_ids = {context.get("id") for context in contexts}
+        for observation in legacy_observations:
+            if observation.get("id") not in context_ids:
+                contexts.append(observation)
+                context_ids.add(observation.get("id"))
         strength = verification_summary(scenarios)
         strength_summary = (
             '<section class="completion" aria-label="Força das verificações"><strong>O que foi realmente verificado</strong>'
@@ -682,6 +827,19 @@ class StandaloneHtmlReport:
                           for item in ledger["resolved_restrictions"]) + '</details>'
             )
         summary = exploration.get("summary", {})
+        if legacy_observations:
+            # Historical context records were sometimes stored alongside CTs.
+            # Correct only the displayed counts; preserve every real verdict
+            # and leave summaries of runs without that legacy shape unchanged.
+            counts = dict.fromkeys(("PASS", "FAIL", "BLOCKED", "SKIPPED"), 0)
+            for scenario in scenarios:
+                status = str(scenario.get("status") or "SKIPPED").upper()
+                counts[status if status in counts else "SKIPPED"] += 1
+            summary = {
+                **summary,
+                "total_scenarios": len(scenarios),
+                **{status.lower(): count for status, count in counts.items()},
+            }
         focus_area = str(
             (exploration.get("options") or {}).get("focus_area") or ""
         ).strip()
@@ -698,56 +856,86 @@ class StandaloneHtmlReport:
         visual_summary = ""
         if evidence_mode == "visual":
             visual_counts = visual_review_counts(scenarios)
+            options = exploration.get("options") or {}
+            review_budget = options.get("auxiliary_max_requests")
+            if not isinstance(review_budget, int):
+                review_budget = next((
+                    (event.get("payload") or {}).get("request_budget")
+                    for event in reversed(exploration.get("events") or [])
+                    if isinstance((event.get("payload") or {}).get("request_budget"), int)
+                ), None)
+            budget_copy = (
+                f'Limite local registrado: {_h(review_budget)} requisições HTTP auxiliares.'
+                if review_budget is not None else 'O limite local de chamadas desta execução não foi registrado.'
+            )
+            review_attempts = (exploration.get("visual_review_resume") or {}).get("max_attempts") or options.get("auxiliary_review_max_attempts") or 3
+            if not isinstance(review_attempts, int) or not 1 <= review_attempts <= 5:
+                review_attempts = 3
             title = ("Análise visual em andamento" if visual_counts["pending"]
                      else "Análise visual não realizada" if not visual_counts["assessed"]
-                     else "Análise visual parcial" if visual_counts["unavailable"] else "Capturas analisadas")
+                     else "Análise visual parcial" if visual_counts["unavailable"]
+                     else "Capturas analisadas · contexto parcial" if visual_counts["context_limited"] else "Capturas analisadas")
+            limited_context_copy = (
+                f'<p><strong>{visual_counts["context_limited"]} revisões com contexto textual limitado.</strong> '
+                'As imagens salvas foram analisadas, mas o DOM e o texto visível originais não foram preservados. '
+                'Essas revisões não equivalem a uma análise com o contexto semântico completo da tela.</p>'
+                if visual_counts["context_limited"] else ""
+            )
             visual_summary = (
                 f'<section class="completion visual-review-summary" aria-label="Resultado da análise visual"><strong>{title}</strong>'
                 f'<p>{visual_counts["assessed"]} de {visual_counts["total"]} CTs receberam uma análise visual válida · '
                 f'{visual_counts["pending"]} em análise · {visual_counts["unavailable"]} indisponíveis.</p>'
+                + limited_context_copy
                 + "".join(
                     f'<p>{item["count"]} {_h(item["label"])}. <small>Código: {_h(item["reason"])}</small></p>'
                     for item in visual_counts["unavailable_reasons"]
                 ) +
+                f'<p class="muted">{budget_copy} Retentativas e atualizações de evidência consomem chamadas; reutilização de cache não consome novas chamadas. '
+                'O limite não representa uma quantidade de CTs nem falta de crédito no provedor.</p>'
+                '<p>Uma revisão visual pendente significa que falta a análise adicional das capturas pela LLM; '
+                'ações e verificações locais já registradas continuam válidas. Na aplicação, revisões pendentes podem ser retomadas com um novo limite finito, '
+                f'após confirmação de custo, sem repetir a exploração. A retomada usa até {review_attempts} tentativas por revisão, contando a primeira.</p>'
                 '<p class="muted">PASS/FAIL das verificações locais continua válido. Análise visual indisponível não significa aprovação visual; '
                 'ausência de indícios não garante cobertura visual completa.</p></section>'
             )
-        tokens, cost = self._usage(exploration)
+        tokens, _ = self._usage(exploration)
+        cost_summary = self._cost_summary(exploration)
         completion_status, completion_reason = self._completion(exploration)
         cards = [self._scenario_card(exploration_id, scenario) for scenario in scenarios]
-        cards.extend(
-            self._scenario_card(exploration_id, context, context=True)
-            for context in exploration.get("scenario_contexts") or []
+        execution_observations = self._execution_observations(
+            exploration_id, contexts,
         )
         generated = datetime.now().astimezone().strftime("%d/%m/%Y %H:%M:%S %Z")
-        safe_filter_data = json.dumps(["ALL", "PASS", "FAIL", "BLOCKED", "SKIPPED", "INFO"])
+        safe_filter_data = json.dumps(["ALL", "PASS", "FAIL", "BLOCKED", "SKIPPED"])
         document = f"""<!doctype html>
-<html lang="pt-BR" data-report-schema="ct-timeline-v1" data-report-summary="execution-v2" data-coverage-ledger="execution-evidence-v1" data-report-snapshot="{report_snapshot_key(exploration)}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="pt-BR" data-report-schema="ct-timeline-v1" data-report-summary="execution-v2" data-coverage-ledger="execution-evidence-v1" data-cost-breakdown="roles-v1" data-visual-review-policy="bounded-v1" data-report-snapshot="{report_snapshot_key(exploration)}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AutoJev — Exploratory Test Report</title>
 <style>
 :root{{--bg:#0b0e14;--panel:#141923;--line:#293142;--text:#edf1f7;--muted:#9ca8ba;--accent:#f0b44d;--pass:#3ddc97;--fail:#ff647c;--blocked:#ffa657;--skipped:#8b98aa;--info:#83bffc}}
 *{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 Inter,system-ui,sans-serif}}main{{max-width:1120px;margin:auto;padding:48px 24px}}
 .eyebrow,.case-id{{color:var(--accent);font-weight:800;letter-spacing:.12em;text-transform:uppercase;font-size:12px}}h1{{font-size:40px;margin:.15em 0}}h2{{margin:.2em 0;font-size:22px;overflow-wrap:anywhere}}h3{{font-size:13px;text-transform:uppercase;color:var(--muted)}}p{{overflow-wrap:anywhere}}.muted,small{{color:var(--muted)}}
-.meta,.summary,.columns,.result{{display:grid;gap:12px}}.meta{{grid-template-columns:repeat(auto-fit,minmax(180px,1fr));margin:24px 0}}.summary{{grid-template-columns:repeat(auto-fit,minmax(120px,1fr));margin:20px 0 28px}}
+.meta,.summary,.cost-summary,.columns,.result{{display:grid;gap:12px}}.meta{{grid-template-columns:repeat(auto-fit,minmax(180px,1fr));margin:24px 0}}.summary{{grid-template-columns:repeat(auto-fit,minmax(120px,1fr));margin:20px 0 12px}}.cost-summary{{grid-template-columns:repeat(3,minmax(0,1fr));margin:0 0 28px}}.cost-metric{{min-width:0}}.cost-metric strong{{overflow-wrap:anywhere;font-variant-numeric:tabular-nums}}.cost-metric small{{display:block;margin-top:6px;font-size:12px}}.cost-state{{display:inline-block;margin-left:8px;padding:1px 6px;border:1px solid var(--accent);border-radius:5px;color:var(--accent);font-size:11px}}.cost-note{{margin:-16px 0 24px;font-size:12px}}
 .completion,.reading-guide{{padding:14px 16px;border:1px solid var(--line);border-radius:10px;background:var(--panel);margin:0 0 20px}}.completion{{border-left:3px solid var(--accent)}}.completion strong{{margin-right:8px}}.reading-guide{{color:var(--muted)}}.reading-guide strong{{color:var(--text)}}
 .metric,.scenario{{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px}}.metric strong{{display:block;font-size:28px}}.report-tools{{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:24px 0}}.search{{flex:1;min-width:240px;background:#10151e;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:10px 13px}}.filters{{display:flex;gap:8px;flex-wrap:wrap}}button{{background:#1c2330;color:var(--text);border:1px solid var(--line);border-radius:999px;padding:8px 14px;cursor:pointer}}button.active{{border-color:var(--accent);color:var(--accent)}}button:focus-visible,summary:focus-visible{{outline:2px solid var(--accent);outline-offset:5px}}
 .scenario{{margin:16px 0}}.scenario>summary{{display:flex;justify-content:space-between;gap:20px;cursor:pointer;list-style:none;align-items:flex-start}}.scenario>summary::-webkit-details-marker{{display:none}}.scenario>summary>div{{min-width:0}}.case-meta{{font-size:12px;color:var(--muted)}}.scenario-body{{padding-top:12px;margin-top:16px;border-top:1px solid var(--line)}}.badge{{height:max-content;border-radius:999px;padding:5px 10px;font-weight:800;font-size:12px;white-space:nowrap}}.pass{{color:var(--pass);background:#143328}}.fail{{color:var(--fail);background:#3a1720}}.blocked{{color:var(--blocked);background:#3c2814}}.skipped{{color:var(--skipped);background:#252c36}}.info{{color:var(--info);background:#162a40}}
-.url{{color:var(--muted);font:12px/1.6 ui-monospace,monospace;overflow-wrap:anywhere}}.columns,.result{{grid-template-columns:1fr 1fr;margin:15px 0}}.case-documentation{{border-top:1px solid var(--line);padding:14px 0;margin-top:16px}}.case-documentation>summary{{cursor:pointer;color:var(--muted)}}.verdict-note,.context-note{{border:1px solid var(--line);border-radius:10px;background:#10151e;padding:12px 14px;margin:16px 0}}.verdict-note p{{margin:6px 0}}.context-note{{border-color:#29465d;color:#b2cce1}}.scenario-context .case-id{{color:var(--info)}}
+.url{{color:var(--muted);font:12px/1.6 ui-monospace,monospace;overflow-wrap:anywhere}}.columns,.result{{grid-template-columns:1fr 1fr;margin:15px 0}}.case-documentation{{border-top:1px solid var(--line);padding:14px 0;margin-top:16px}}.case-documentation>summary{{cursor:pointer;color:var(--muted)}}.verdict-note,.context-note{{border:1px solid var(--line);border-radius:10px;background:#10151e;padding:12px 14px;margin:16px 0}}.verdict-note p{{margin:6px 0}}.context-note{{border-color:#29465d;color:#b2cce1}}.execution-observations{{margin-top:28px;padding-top:18px;border-top:1px solid var(--line)}}.execution-observations>summary{{cursor:pointer;color:var(--muted)}}.execution-observations>summary strong{{color:var(--text)}}.execution-observations .evidence-timeline{{margin-top:16px}}
 .timeline-heading{{margin:22px 0 14px}}.evidence-timeline{{list-style:none;padding:0;margin:0}}.timeline-entry{{position:relative;display:grid;grid-template-columns:14px minmax(0,1fr);gap:14px;padding-bottom:18px}}.timeline-entry:not(:last-child)::before{{content:"";position:absolute;left:6px;top:14px;bottom:0;width:1px;background:var(--line)}}.timeline-marker{{position:relative;width:13px;height:13px;border:3px solid var(--panel);border-radius:50%;background:#728397;margin-top:6px;box-shadow:0 0 0 1px var(--line)}}.action .timeline-marker{{background:var(--accent)}}.signal .timeline-marker{{background:var(--blocked)}}.assertion .timeline-marker{{background:var(--info)}}.timeline-content{{min-width:0;border:1px solid var(--line);border-radius:10px;background:#10151e;padding:14px 16px}}.event-meta{{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:11px;color:var(--muted)}}.event-kind{{letter-spacing:.09em;text-transform:uppercase;font-weight:750}}.timeline-content h3{{font-size:16px;text-transform:none;color:var(--text);margin:7px 0}}.timeline-content p{{margin:8px 0}}.event-chip{{display:inline-block;font-size:11px;border:1px solid var(--line);padding:3px 8px;border-radius:6px;color:var(--info)}}.signal-chip{{color:var(--blocked);border-color:#6a4b24}}.signal-head{{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}}.signal-detail,.assertion-detail{{padding-top:10px;margin-top:10px;border-top:1px solid var(--line)}}.impact-note{{color:#c5bca9;font-size:13px}}.shots{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr));gap:12px;margin-top:16px}}figure{{margin:0;min-width:0}}img{{display:block;width:100%;border-radius:9px;border:1px solid var(--line)}}figcaption{{color:var(--muted);font-size:12px;margin-top:5px;overflow-wrap:anywhere}}
-@media(max-width:720px){{main{{padding:28px 14px}}h1{{font-size:30px}}.summary{{grid-template-columns:1fr 1fr}}.meta,.columns,.result{{grid-template-columns:1fr}}.scenario{{padding:14px}}.scenario h2{{font-size:18px}}.scenario>summary{{gap:10px}}.timeline-entry{{gap:10px}}.timeline-content{{padding:12px}}.search{{min-width:0;width:100%;flex-basis:100%}}}}@media(prefers-reduced-motion:reduce){{*{{scroll-behavior:auto}}}}
+@media(max-width:720px){{main{{padding:28px 14px}}h1{{font-size:30px}}.summary{{grid-template-columns:1fr 1fr}}.cost-summary,.meta,.columns,.result{{grid-template-columns:1fr}}.scenario{{padding:14px}}.scenario h2{{font-size:18px}}.scenario>summary{{gap:10px}}.timeline-entry{{gap:10px}}.timeline-content{{padding:12px}}.search{{min-width:0;width:100%;flex-basis:100%}}}}@media(prefers-reduced-motion:reduce){{*{{scroll-behavior:auto}}}}
 </style></head><body data-report-schema="ct-timeline-v1"><main>
 <div class="eyebrow">AutoJev</div><h1>Exploratory Test Report</h1><p class="muted">Relatório autônomo com evidências observadas pelo Playwright.</p>
 <div class="meta"><div><strong>Aplicação</strong><div class="url">{_h(exploration.get("app_url"))}</div></div><div><strong>Escopo</strong><div>{_h(scope)}</div></div><div><strong>Evidência da LLM</strong><div>{_h(evidence_mode_label)}</div></div><div><strong>Status</strong><div>{_h(completion_status)}</div></div><div><strong>Duração total</strong><div>{_h(self._duration(exploration))}</div><small>Inclui revisões auxiliares e geração do relatório.</small></div><div><strong>Gerado em</strong><div>{_h(generated)}</div></div></div>
 {f'<div class="completion"><strong>Motivo do encerramento:</strong>{_h(completion_reason)}</div>' if completion_reason else ''}
-<section class="summary"><div class="metric"><strong>{int(summary.get("total_scenarios", 0))}</strong>Total</div><div class="metric"><strong>{int(summary.get("pass", 0))}</strong>PASS</div><div class="metric"><strong>{int(summary.get("fail", 0))}</strong>FAIL</div><div class="metric"><strong>{int(summary.get("blocked", 0))}</strong>BLOCKED</div><div class="metric"><strong>{int(summary.get("skipped", 0))}</strong>Sem validação</div><div class="metric"><strong>{_h(tokens)}</strong>Tokens</div><div class="metric"><strong>{_h(cost)}</strong>Custo</div></section>
+<section class="summary"><div class="metric"><strong>{int(summary.get("total_scenarios", 0))}</strong>Total</div><div class="metric"><strong>{int(summary.get("pass", 0))}</strong>PASS</div><div class="metric"><strong>{int(summary.get("fail", 0))}</strong>FAIL</div><div class="metric"><strong>{int(summary.get("blocked", 0))}</strong>BLOCKED</div><div class="metric"><strong>{int(summary.get("skipped", 0))}</strong>Sem validação</div><div class="metric"><strong>{_h(tokens)}</strong>Tokens</div></section>
+{cost_summary}
 {visual_summary}
 {strength_summary}{coverage_summary}
-<div class="reading-guide"><strong>Cada caso conta sua história.</strong> Abra um CT para ver ações, capturas, verificações e sinais técnicos no momento em que foram registrados. Um sinal de console/rede não é automaticamente um defeito funcional. Registros sem vínculo confiável ficam em cartões de contexto, sem contar como CTs.</div>
+<div class="reading-guide"><strong>Cada caso conta sua história.</strong> Abra um CT para ver ações, capturas, verificações e sinais técnicos no momento em que foram registrados. Um sinal de console/rede não é automaticamente um defeito funcional. Registros sem vínculo confiável ficam nas Observações da execução, separadas dos CTs e de seus resultados.</div>
 <div class="report-tools"><input class="search" id="search" type="search" placeholder="Buscar por CT, URL, sinal ou evidência" aria-label="Buscar cenários"><div class="filters" id="filters"></div></div><section id="scenarios">{"".join(cards) or '<p class="muted">Nenhum cenário gerado.</p>'}</section>
+{execution_observations}
 </main><script>
 const statuses={safe_filter_data};const root=document.getElementById('filters');const search=document.getElementById('search');let active='ALL';
-function apply(){{const term=search.value.trim().toLowerCase();document.querySelectorAll('.scenario').forEach(x=>{{x.hidden=(active!=='ALL'&&x.dataset.status!==active)||(term&&!x.textContent.toLowerCase().includes(term))}})}}
-for(const status of statuses){{const b=document.createElement('button');b.textContent=status==='SKIPPED'?'SEM VALIDAÇÃO':status==='INFO'?'CONTEXTO':status==='ALL'?'TODOS':status;b.className=status==='ALL'?'active':'';b.onclick=()=>{{active=status;document.querySelectorAll('#filters button').forEach(x=>x.classList.remove('active'));b.classList.add('active');apply()}};root.appendChild(b)}}search.addEventListener('input',apply);
+function apply(){{const term=search.value.trim().toLowerCase();document.querySelectorAll('#scenarios .scenario').forEach(x=>{{x.hidden=(active!=='ALL'&&x.dataset.status!==active)||(term&&!x.textContent.toLowerCase().includes(term))}})}}
+for(const status of statuses){{const b=document.createElement('button');b.textContent=status==='SKIPPED'?'SEM VALIDAÇÃO':status==='ALL'?'TODOS':status;b.className=status==='ALL'?'active':'';b.onclick=()=>{{active=status;document.querySelectorAll('#filters button').forEach(x=>x.classList.remove('active'));b.classList.add('active');apply()}};root.appendChild(b)}}search.addEventListener('input',apply);
 document.querySelectorAll('.coverage-resolution a[href^="#"],.coverage-dependency a[href^="#"]').forEach(link=>link.addEventListener('click',()=>{{const target=document.getElementById(link.hash.slice(1));if(!target)return;let parent=target.parentElement;while(parent){{if(parent.tagName==='DETAILS')parent.open=true;parent=parent.parentElement}}}}));
 </script></body></html>"""
         output = Path(output_path)

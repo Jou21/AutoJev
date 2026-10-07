@@ -1,5 +1,6 @@
 import base64
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from autojev.adapters.playwright_executor import (
@@ -22,6 +23,99 @@ def test_public_browser_urls_redact_secrets_and_preserve_spa_routes(tmp_path: Pa
     assert "known-secret" not in public
     assert "q=ok" in public
     assert public.endswith("#/dashboard")
+
+
+@pytest.mark.parametrize("event_kind", ["http", "network", "console", "pageerror"])
+def test_browser_signals_preserve_redacted_event_page_before_later_navigation(
+    tmp_path: Path, event_kind: str
+):
+    executor = PlaywrightExecutor(
+        tmp_path, ExplorationOptions(), secret_values=["known-secret"]
+    )
+    executor._page = SimpleNamespace(
+        url="https://login-user:login-pass@app.test/login?token=private-token&name=known-secret"
+    )
+    if event_kind == "http":
+        executor._on_response(SimpleNamespace(
+            status=401,
+            url="https://telemetry.test/events?token=endpoint-secret",
+            request=SimpleNamespace(method="POST", resource_type="fetch"),
+        ))
+    elif event_kind == "network":
+        executor._on_request_failed(SimpleNamespace(
+            method="POST",
+            url="https://telemetry.test/events?token=endpoint-secret",
+            failure="net::ERR_CONNECTION_RESET",
+        ))
+    elif event_kind == "console":
+        executor._on_console(SimpleNamespace(type="error", text="Resource failed"))
+    else:
+        executor._on_page_error(ValueError("Runtime failure"))
+
+    # A later capture must not rewrite where the buffered event was observed.
+    executor._page.url = "https://app.test/inventory"
+    signals = list(executor._network_buffer) + list(executor._console_buffer)
+    assert len(signals) == 1
+    signal = signals[0]
+    assert signal["page_url"].startswith("https://app.test/login?")
+    assert signal["page_url_source"] == "event"
+    assert "inventory" not in signal["page_url"]
+    assert not any(secret in str(signal) for secret in (
+        "login-user", "login-pass", "private-token", "known-secret", "endpoint-secret"
+    ))
+    if event_kind in {"http", "network"}:
+        assert signal["url"].startswith("https://telemetry.test/events?")
+
+
+def test_browser_signal_without_page_does_not_claim_event_page_context(tmp_path: Path):
+    executor = PlaywrightExecutor(tmp_path, ExplorationOptions())
+    executor._on_request_failed(SimpleNamespace(
+        method="GET", url="https://app.test/asset.js", failure="Request failed"
+    ))
+
+    signal = executor._network_buffer[0]
+    assert "page_url" not in signal
+    assert "page_url_source" not in signal
+
+
+async def test_browser_hooks_attribute_background_events_to_the_emitting_page(
+    tmp_path: Path,
+):
+    class Page:
+        url = "https://app.test/login"
+
+        def __init__(self):
+            self.callbacks = {}
+
+        async def expose_binding(self, *args):
+            pass
+
+        def on(self, event, callback):
+            self.callbacks.setdefault(event, []).append(callback)
+
+    executor = PlaywrightExecutor(tmp_path, ExplorationOptions())
+    original_page = Page()
+    executor._page = original_page
+    await executor._prepare_page(original_page)
+    executor._page = SimpleNamespace(url="https://app.test/popup")
+
+    original_page.callbacks["console"][0](
+        SimpleNamespace(type="error", text="Resource failed")
+    )
+    original_page.callbacks["pageerror"][0](ValueError("Runtime failure"))
+    original_page.callbacks["response"][0](SimpleNamespace(
+        status=401,
+        url="https://telemetry.test/events",
+        request=SimpleNamespace(method="POST", resource_type="fetch"),
+    ))
+    original_page.callbacks["requestfailed"][-1](SimpleNamespace(
+        method="GET", url="https://app.test/asset.js", failure="Request failed"
+    ))
+
+    signals = list(executor._network_buffer) + list(executor._console_buffer)
+    assert len(signals) == 4
+    assert all(signal["page_url"] == original_page.url for signal in signals)
+    assert all(signal["page_url_source"] == "event" for signal in signals)
 
 
 async def test_navigation_guard_allows_same_origin_popup_without_frame_access(

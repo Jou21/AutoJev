@@ -40,6 +40,12 @@ from autojev.domain.models import (
     utc_now,
 )
 from autojev.services.business_checks import check_business_outcomes
+from autojev.services.auxiliary_review_policy import (
+    clamp_review_max_attempts,
+    is_retryable_review_reason,
+    review_retry_reason,
+)
+from autojev.services.visual_review_input import build_visual_review_input
 from autojev.services.action_dispatch import is_stale_undispatched_action
 from autojev.services.coverage import CoveragePlanner, canonical_url
 from autojev.services.scenario_documentation import local_scenario_documentation
@@ -67,6 +73,9 @@ class _ScenarioEnrichmentJob:
     sequence: int
     retries: int = 0
     queue_order: int = 0
+    ready_at: float = 0.0
+    attempts: int = 0
+    provider_requests: int = 0
 
 
 class _LiveScenarioPipeline:
@@ -89,6 +98,8 @@ class _LiveScenarioPipeline:
         *,
         use_local_evidence: bool,
         executor: PlaywrightExecutor | None = None,
+        options: ExplorationOptions | None = None,
+        secret_values: list[str] | None = None,
     ) -> None:
         self.manager = manager
         self.repository = manager.repository
@@ -97,6 +108,13 @@ class _LiveScenarioPipeline:
         self.auxiliary_client = auxiliary_client
         self.use_local_evidence = use_local_evidence
         self.executor = executor
+        self.secret_values = secret_values or []
+        configured_budget = getattr(options, "auxiliary_max_requests", None)
+        self.request_budget = int(configured_budget if configured_budget is not None else self._setting("auxiliary_max_requests", 120))
+        self.max_attempts = clamp_review_max_attempts(
+            getattr(options, "auxiliary_review_max_attempts", None)
+            or self._setting("auxiliary_review_max_attempts", 3)
+        )
         self.queue: asyncio.Queue[_ScenarioEnrichmentJob | None] = asyncio.Queue(
             maxsize=self._QUEUE_LIMIT
         )
@@ -118,7 +136,7 @@ class _LiveScenarioPipeline:
         if isinstance(auxiliary_client, OpenAICompatibleClient):
             # The transport enforces the same bound even for its one explicit
             # format-compatibility retry, so 120 means at most 120 HTTP POSTs.
-            auxiliary_client.chat_request_budget = self._setting("auxiliary_max_requests", 120)
+            auxiliary_client.chat_request_budget = self.request_budget
 
     def _setting(self, name: str, default: Any) -> Any:
         return getattr(getattr(self.manager, "settings", None), name, default)
@@ -136,6 +154,8 @@ class _LiveScenarioPipeline:
             "pending": self.total - len(self.enriched) - len(self.skipped),
             "deferred": sum((s.evidence.get("visual_review_provenance") or s.evidence.get("documentation_provenance") or {}).get("reason") == "awaiting_provider_retry" for s in self.drafts.values()),
             "provider_requests": int(getattr(self.auxiliary, "request_count", 0)),
+            "request_budget": self.request_budget,
+            "max_attempts": self.max_attempts,
             "stage": "parallel_enrichment",
         }
 
@@ -234,7 +254,7 @@ class _LiveScenarioPipeline:
         Waiting creates no HTTP request and consumes no attempt. The global
         budgets stop persistent quota errors; Retry-After is never shortened.
         """
-        if int(getattr(self.auxiliary, "request_count", 0)) >= self._setting("auxiliary_max_requests", 120):
+        if int(getattr(self.auxiliary, "request_count", 0)) >= self.request_budget:
             return "auxiliary_request_budget_exhausted"
         if int(getattr(self.auxiliary, "rate_limit_count", 0)) >= self._setting("auxiliary_max_rate_limits", 6):
             return "auxiliary_rate_limit_budget_exhausted"
@@ -272,10 +292,18 @@ class _LiveScenarioPipeline:
             await asyncio.gather(pause, cancellation, return_exceptions=True)
 
     def _defer_rate_limited(self, job: _ScenarioEnrichmentJob) -> bool:
-        if job.retries >= 2:
-            self._mark_skipped(job, "auxiliary_rate_limit_retry_exhausted")
+        return self._defer_review(job, "auxiliary_rate_limited")
+
+    def _defer_review(self, job: _ScenarioEnrichmentJob, reason: str) -> bool:
+        if job.retries >= self.max_attempts - 1 or job.provider_requests >= self.max_attempts:
+            self._mark_skipped(job, "auxiliary_rate_limit_retry_exhausted" if reason == "auxiliary_rate_limited" else reason)
             return False
         job.retries += 1
+        retry_delay = self._setting(
+            "auxiliary_review_retry_delay_seconds",
+            0.5 if isinstance(self.auxiliary_client, OpenAICompatibleClient) else 0.0,
+        )
+        job.ready_at = time.monotonic() + max(0.0, float(retry_delay)) * job.retries
         scenario = self.drafts.get(job.fingerprint)
         if scenario is not None:
             if scenario.evidence.get("visual_assessment", {}).get("requested"):
@@ -283,7 +311,8 @@ class _LiveScenarioPipeline:
                     **(scenario.evidence.get("visual_assessment") or {}),
                     "requested": True, "status": "pending", "reason": "awaiting_provider_retry",
                     "retry_count": job.retries,
-                    "limitations": ["Revisão aguardando o provedor; não é uma aprovação visual."],
+                    "max_attempts": self.max_attempts,
+                    "limitations": ["Revisão aguardando uma nova tentativa limitada; não é uma aprovação visual."],
                 }
             if self._uses_compact_visual_contract(scenario):
                 scenario.evidence["visual_review_provenance"] = {
@@ -314,8 +343,8 @@ class _LiveScenarioPipeline:
             return False
         self.repository.add_event(
             self.exploration_id, "warning", "scenario_enrichment_deferred",
-            f"CT{job.sequence:03d} aguardará uma nova tentativa após a pausa do provedor",
-            {**self._progress_payload(), "scenario_id": f"CT{job.sequence:03d}", "retry_count": job.retries},
+            f"CT{job.sequence:03d}: nova tentativa de revisão ({job.retries + 1} de {self.max_attempts})",
+            {**self._progress_payload(), "scenario_id": f"CT{job.sequence:03d}", "retry_count": job.retries, "reason": reason},
         )
         return True
 
@@ -372,6 +401,10 @@ class _LiveScenarioPipeline:
         scenario = self.manager._scenario_from_evidence(
             observation, decision, result, sequence
         )
+        if getattr(self.auxiliary, "evidence_mode", "text") == "visual":
+            scenario.evidence["visual_review_input"] = build_visual_review_input(
+                observation, decision, result, sequence, secret_values=self.secret_values
+            )
         if scenario.evidence.get("visual_assessment", {}).get("requested") and (
             self.use_local_evidence or self.worker is None or self.worker.done()
         ):
@@ -434,6 +467,14 @@ class _LiveScenarioPipeline:
         )
         self._queue_sequence += 1
         job.queue_order = self._queue_sequence
+        # Wait only until this evidence settles, not once per queued CT. Old
+        # queued jobs are ready immediately; rapid retries replace their job
+        # before any paid request is made. Browser execution never awaits it.
+        debounce = self._setting(
+            "auxiliary_review_debounce_seconds",
+            0.35 if isinstance(self.auxiliary_client, OpenAICompatibleClient) else 0.0,
+        )
+        job.ready_at = time.monotonic() + max(0.0, float(debounce))
         self._compact_queue()
         try:
             self.queue.put_nowait(job)
@@ -469,7 +510,10 @@ class _LiveScenarioPipeline:
         """
         if previous is None:
             return
-        history = deepcopy(previous.evidence.get("visual_assessment_history") or [])
+        history = [
+            *deepcopy(scenario.evidence.get("visual_assessment_history") or []),
+            *deepcopy(previous.evidence.get("visual_assessment_history") or []),
+        ]
         assessment = previous.evidence.get("visual_assessment") or {}
         if archive_current and assessment.get("status") == "assessed":
             history.append({
@@ -525,6 +569,27 @@ class _LiveScenarioPipeline:
             },
         )
 
+    async def _cached_review(self, job: _ScenarioEnrichmentJob) -> TestScenario | None:
+        lookup = getattr(self.auxiliary, "cached_scenario", None)
+        if lookup is None:
+            return None
+        return await lookup(job.observation, job.decision, job.result, job.sequence)
+
+    async def _settle_review(self, job: _ScenarioEnrichmentJob) -> None:
+        delay = job.ready_at - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    async def _review_scenario(
+        self, job: _ScenarioEnrichmentJob, cached: TestScenario | None,
+    ) -> TestScenario:
+        if cached is not None:
+            return cached
+        job.attempts += 1
+        return await self.auxiliary.create_scenario(
+            job.observation, job.decision, job.result, job.sequence
+        )
+
     async def _worker(self) -> None:
         while True:
             job = await self.queue.get()
@@ -539,24 +604,42 @@ class _LiveScenarioPipeline:
                         return
 
                     job = self._reprioritize_job(job)
-
-                    gate_reason = await self._provider_gate(job)
-                    if gate_reason:
-                        self._mark_skipped(job, gate_reason)
-                        continue
+                    await self._settle_review(job)
                     if self.revisions.get(job.fingerprint) != job.revision:
                         continue
-                    job = self._reprioritize_job(job)
+                    # Cache hits cost nothing and remain usable after the
+                    # paid-request cap, a provider pause or an auth rejection.
+                    cached = await self._cached_review(job)
+                    if cached is None:
+                        gate_reason = await self._provider_gate(job)
+                        if gate_reason:
+                            self._mark_skipped(job, gate_reason)
+                            continue
+                        if self.revisions.get(job.fingerprint) != job.revision:
+                            continue
+                        job = self._reprioritize_job(job)
+                        await self._settle_review(job)
+                        if self.revisions.get(job.fingerprint) != job.revision:
+                            continue
+                        cached = await self._cached_review(job)
+
+                    if self.repository.is_cancel_requested(self.exploration_id):
+                        self._mark_skipped(job, "exploration_cancelled")
+                        return
 
                     review_started_at = time.monotonic()
                     requests_before = int(getattr(self.auxiliary, "request_count", 0))
-                    scenario_task = asyncio.create_task(
-                        self.auxiliary.create_scenario(
-                            job.observation,
-                            job.decision,
-                            job.result,
-                            job.sequence,
+                    transport_budget = getattr(self.auxiliary_client, "chat_request_budget", None)
+                    if isinstance(self.auxiliary_client, OpenAICompatibleClient) and cached is None:
+                        # The format compatibility fallback also consumes an
+                        # HTTP request. It must not silently multiply the
+                        # per-review three-attempt allowance.
+                        self.auxiliary_client.chat_request_budget = min(
+                            self.request_budget,
+                            self.auxiliary_client.chat_request_count + max(0, self.max_attempts - job.provider_requests),
                         )
+                    scenario_task = asyncio.create_task(
+                        self._review_scenario(job, cached)
                     )
                     self._usage_is_drained = False
                     cancellation_task = asyncio.create_task(
@@ -575,19 +658,39 @@ class _LiveScenarioPipeline:
                         if scenario_task not in done:
                             raise TimeoutError
                         scenario = scenario_task.result()
+                        # Ground the response even if the browser advanced.
+                        # It belongs to that earlier attempt, not the latest
+                        # verdict, but its paid evidence must not disappear.
+                        self.manager._merge_scenario_enrichment(
+                            scenario, job.observation, job.decision, job.result
+                        )
                         if self.revisions.get(job.fingerprint) != job.revision:
+                            current = self.drafts.get(job.fingerprint)
+                            if current and (scenario.evidence.get("visual_assessment") or {}).get("status") == "assessed":
+                                self._preserve_visual_history(current, scenario, archive_current=True)
+                                self.repository.add_scenario(self.exploration_id, self.sequences[job.fingerprint], current)
+                            self.repository.add_event(
+                                self.exploration_id, "info", "scenario_review_obsolete",
+                                f"CT{job.sequence:03d}: revisão de uma tentativa anterior; resultado atual preservado",
+                                {**self._progress_payload(), "scenario_id": f"CT{job.sequence:03d}",
+                                 "revision": job.revision, "archived": bool(current),
+                                 "review_provider_requests": max(0, int(getattr(self.auxiliary, "request_count", 0)) - requests_before)},
+                            )
                             continue
                         if job.fingerprint not in self.sequences:
                             continue
                         # Local checks stay authoritative. A grounded visual
                         # assessment may add negative evidence, never erase a
                         # business failure or replace browser observations.
-                        self.manager._merge_scenario_enrichment(
-                            scenario, job.observation, job.decision, job.result
-                        )
+                        original = self.drafts.get(job.fingerprint)
+                        if original and original.evidence.get("visual_review_input"):
+                            scenario.evidence["visual_review_input"] = deepcopy(original.evidence["visual_review_input"])
                         scenario.evidence["auxiliary_review_metrics"] = {
                             "elapsed_seconds": round(time.monotonic() - review_started_at, 3),
                             "provider_requests": max(0, int(getattr(self.auxiliary, "request_count", 0)) - requests_before),
+                            "attempts": job.attempts,
+                            "max_attempts": self.max_attempts,
+                            "total_provider_requests": job.provider_requests + max(0, int(getattr(self.auxiliary, "request_count", 0)) - requests_before),
                         }
                         self._preserve_visual_history(
                             scenario, self.drafts.get(job.fingerprint), archive_current=False
@@ -598,8 +701,29 @@ class _LiveScenarioPipeline:
                         self.drafts[job.fingerprint] = scenario
                         provenance = (scenario.evidence.get("visual_review_provenance")
                                       or scenario.evidence.get("documentation_provenance", {}))
-                        if provenance.get("reason") == "auxiliary_rate_limited":
-                            self._defer_rate_limited(job)
+                        retry_reason = review_retry_reason(scenario)
+                        if (not self._uses_compact_visual_contract(scenario)
+                            and provenance.get("source") in {"auxiliary_llm", "auxiliary_cache"}):
+                            # Legacy full-document responses can successfully
+                            # document the CT without supplying a visual review.
+                            # Do not discard that received documentation.
+                            retry_reason = None
+                        spent = max(0, int(getattr(self.auxiliary, "request_count", 0)) - requests_before)
+                        if (retry_reason == "auxiliary_request_budget_exhausted"
+                            and int(getattr(self.auxiliary, "request_count", 0)) < self.request_budget
+                            and job.provider_requests + spent >= self.max_attempts):
+                            retry_reason = "auxiliary_review_attempts_exhausted"
+                            self._mark_skipped(job, retry_reason)
+                            continue
+                        if retry_reason and is_retryable_review_reason(retry_reason):
+                            # Account this attempt before deciding whether to
+                            # queue another one; finally accounts all paths.
+                            job.provider_requests += spent
+                            if job.provider_requests >= self.max_attempts:
+                                self._mark_skipped(job, retry_reason)
+                            else:
+                                self._defer_review(job, retry_reason)
+                            job.provider_requests -= spent
                             continue
                         if provenance.get("source", "auxiliary_llm") not in {"auxiliary_llm", "auxiliary_cache"}:
                             self._mark_skipped(
@@ -646,7 +770,14 @@ class _LiveScenarioPipeline:
                             },
                         )
                     except Exception as exc:
-                        self._mark_skipped(job, exc.__class__.__name__)
+                        reason = exc.__class__.__name__
+                        if is_retryable_review_reason(reason):
+                            spent = max(0, int(getattr(self.auxiliary, "request_count", 0)) - requests_before)
+                            job.provider_requests += spent
+                            self._defer_review(job, reason)
+                            job.provider_requests -= spent
+                        else:
+                            self._mark_skipped(job, reason)
                     finally:
                         # Free-model pacing is per-run and includes rejected
                         # calls. Paid models are not delayed unnecessarily.
@@ -661,6 +792,9 @@ class _LiveScenarioPipeline:
                         await asyncio.gather(
                             scenario_task, cancellation_task, return_exceptions=True
                         )
+                        job.provider_requests += max(0, int(getattr(self.auxiliary, "request_count", 0)) - requests_before)
+                        if isinstance(self.auxiliary_client, OpenAICompatibleClient):
+                            self.auxiliary_client.chat_request_budget = transport_budget
                         # Accounting failures must not kill the sole worker.
                         # finish() performs one final idempotent drain as well.
                         with suppress(Exception):
@@ -668,6 +802,7 @@ class _LiveScenarioPipeline:
                                 self.exploration_id,
                                 [self.auxiliary_client],
                                 self.executor,
+                                "auxiliary",
                             )
                             self._usage_is_drained = True
                 except asyncio.CancelledError:
@@ -810,6 +945,7 @@ class _LiveScenarioPipeline:
                         self.exploration_id,
                         [self.auxiliary_client],
                         None,
+                        "auxiliary",
                     )
                     self._usage_is_drained = True
 
@@ -838,7 +974,7 @@ class _LiveScenarioPipeline:
                 "provider_requests": int(getattr(self.auxiliary, "request_count", 0)),
                 "provider_rate_limits": int(getattr(self.auxiliary, "rate_limit_count", 0)),
                 "provider_pauses": self._provider_pause_count,
-                "request_budget": self._setting("auxiliary_max_requests", 120),
+                "request_budget": self.request_budget,
             },
         )
 
@@ -864,6 +1000,7 @@ class ExplorationManager:
         self.tasks: dict[str, asyncio.Task[None]] = {}
         self.input_events: dict[str, asyncio.Event] = {}
         self.usage_locks: dict[str, asyncio.Lock] = {}
+        self.pending_model_usage: dict[str, dict[str, dict[str, Any]]] = {}
         self.semaphore = asyncio.Semaphore(max_concurrent)
 
     def submit(self, exploration_id: str) -> None:
@@ -1131,20 +1268,32 @@ class ExplorationManager:
         exploration_id: str,
         clients: list[OpenAICompatibleClient],
         executor: PlaywrightExecutor | None = None,
+        role: str | None = None,
     ) -> None:
+        if role not in {"jev", "auxiliary"}:
+            raise ValueError("Model usage must have an explicit JEV or auxiliary role")
         # JEV and the auxiliary documentation worker intentionally run in
         # parallel. Serialize only their tiny accounting section so concurrent
         # read-modify-write updates cannot lose tokens or cost.
         lock = self.usage_locks.setdefault(exploration_id, asyncio.Lock())
-        panel_snapshot: tuple[int, float, bool] | None = None
+        panel_snapshot: tuple[int, float | None, bool] | None = None
         async with lock:
-            usage = {
+            if not hasattr(self, "pending_model_usage"):
+                self.pending_model_usage = {}
+            pending = self.pending_model_usage.setdefault(exploration_id, {})
+            # drain_usage() transfers ownership to this buffer. Do not drop
+            # it until the repository write succeeds: a transient DB read or
+            # write error must be retryable even when the next drain is empty.
+            usage = pending.setdefault(role, {
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "total_tokens": 0,
                 "cost": 0.0,
                 "cost_known": False,
-            }
+                "cost_complete": True,
+                "usage_records": 0,
+                "cost_reported_records": 0,
+            })
             for client in clients:
                 current = client.drain_usage()
                 for key in (
@@ -1153,10 +1302,24 @@ class ExplorationManager:
                     "total_tokens",
                     "cost",
                 ):
-                    usage[key] += current[key]
+                    usage[key] += current.get(key) or 0
                 usage["cost_known"] = (
                     usage["cost_known"] or current["cost_known"]
                 )
+                records = int(current.get("usage_records", int(bool(
+                    current.get("total_tokens")
+                    or current.get("prompt_tokens")
+                    or current.get("completion_tokens")
+                    or current.get("cost_known")
+                ))))
+                usage["usage_records"] += records
+                usage["cost_reported_records"] += int(current.get(
+                    "cost_reported_records", records if current["cost_known"] else 0
+                ))
+                if records:
+                    usage["cost_complete"] = usage["cost_complete"] and bool(
+                        current.get("cost_complete", current["cost_known"])
+                    )
             if (
                 not any(
                     usage[key]
@@ -1167,29 +1330,57 @@ class ExplorationManager:
                     )
                 )
                 and not usage["cost_known"]
+                and not usage["usage_records"]
             ):
+                pending.pop(role, None)
+                if not pending:
+                    self.pending_model_usage.pop(exploration_id, None)
                 return
             item = self.repository.get_exploration(
                 exploration_id, include_details=False
             )
             previous = item.get("usage", {})
-            total_tokens = int(previous.get("total_tokens") or 0) + int(
-                usage["total_tokens"]
-            )
-            cost_known = bool(previous.get("cost_known")) or bool(
-                usage["cost_known"]
-            )
-            cost = float(previous.get("cost") or 0.0) + float(usage["cost"])
+            by_role = dict(previous.get("by_role") or {})
+            aggregate_previous = dict(previous)
+            if by_role:
+                aggregate_previous["usage_records"] = sum(
+                    int(bucket.get("usage_records") or 0)
+                    for bucket in by_role.values()
+                )
+                aggregate_previous["cost_reported_records"] = sum(
+                    int(bucket.get("cost_reported_records") or 0)
+                    for bucket in by_role.values()
+                )
+                # A legacy aggregate may contain priced calls that predate
+                # the per-role ledger. Retain that reported subtotal even
+                # after later increments create a partial role breakdown.
+                if previous.get("cost_known") and not (
+                    previous.get("cost_complete") is True
+                    and aggregate_previous["usage_records"] == 0
+                    and not previous.get("total_tokens")
+                    and not previous.get("cost")
+                ):
+                    aggregate_previous["cost_reported_records"] = max(
+                        1, aggregate_previous["cost_reported_records"]
+                    )
+            aggregate = self._merge_usage_bucket(aggregate_previous, usage)
+            by_role[role] = self._merge_usage_bucket(by_role.get(role) or {}, usage)
+            total_tokens = aggregate["total_tokens"]
+            cost_known = aggregate["cost_known"]
+            cost = aggregate["cost"]
             self.repository.update_exploration(
                 exploration_id,
-                prompt_tokens=int(previous.get("prompt_tokens") or 0)
-                + int(usage["prompt_tokens"]),
-                completion_tokens=int(previous.get("completion_tokens") or 0)
-                + int(usage["completion_tokens"]),
+                prompt_tokens=aggregate["prompt_tokens"],
+                completion_tokens=aggregate["completion_tokens"],
                 total_tokens=total_tokens,
                 cost=cost if cost_known else None,
                 cost_known=cost_known,
+                cost_complete=aggregate["cost_complete"],
+                usage_by_role=by_role,
             )
+            pending.pop(role, None)
+            if not pending:
+                self.pending_model_usage.pop(exploration_id, None)
             panel_snapshot = (total_tokens, cost, cost_known)
 
         # Browser DOM I/O may be slow while a navigation is in flight. Keep it
@@ -1201,6 +1392,43 @@ class ExplorationManager:
                 await executor.update_usage_panel(
                     total_tokens, cost if cost_known else None, cost_known
                 )
+
+    @staticmethod
+    def _merge_usage_bucket(
+        previous: dict[str, Any], current: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Keep reported subtotals separate from missing provider billing.
+
+        A newly initialized zero-call bucket is a proven zero, but that zero
+        must not make the first response with missing cost look priced. Legacy
+        aggregate prices remain valid; their missing role split is never
+        reconstructed from model IDs or estimated from token counts.
+        """
+        previous_records = int(previous.get("usage_records", int(bool(
+            previous.get("total_tokens") or previous.get("cost_known")
+        ))))
+        current_records = int(current.get("usage_records") or 0)
+        records = previous_records + current_records
+        reported = int(previous.get(
+            "cost_reported_records", previous_records if previous.get("cost_known") else 0
+        )) + int(current.get("cost_reported_records") or 0)
+        cost_known = reported > 0 or (
+            records == 0 and bool(previous.get("cost_known"))
+        )
+        return {
+            **{
+                key: int(previous.get(key) or 0) + int(current.get(key) or 0)
+                for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+            },
+            "cost": (
+                float(previous.get("cost") or 0.0) + float(current.get("cost") or 0.0)
+            ) if cost_known else None,
+            "cost_known": cost_known,
+            "cost_complete": bool(previous.get("cost_complete", False))
+            and bool(current.get("cost_complete", current.get("cost_known"))),
+            "usage_records": records,
+            "cost_reported_records": reported,
+        }
 
     @staticmethod
     def _fingerprint(
@@ -1437,6 +1665,24 @@ class ExplorationManager:
             json.dumps(stable_issue, sort_keys=True).encode()
         ).hexdigest()
 
+    @staticmethod
+    def _issue_page_context(
+        issue: dict[str, Any], observation: Observation
+    ) -> dict[str, str]:
+        """Keep event-time attribution distinct from a later buffer capture."""
+
+        recorded_page_url = issue.get("page_url")
+        page_url = str(recorded_page_url or observation.url)
+        page_url_source = (
+            str(issue.get("page_url_source") or "observation")
+            if recorded_page_url else "observation"
+        )
+        return {
+            "page_url": page_url,
+            "page_url_source": page_url_source,
+            "observation_url": observation.url,
+        }
+
     def _record_observation_issues(
         self,
         exploration_id: str,
@@ -1474,7 +1720,7 @@ class ExplorationManager:
                 )
             record.update(
                 screenshot=observation.screenshot,
-                page_url=observation.url,
+                **self._issue_page_context(issue, observation),
                 step_number=action_step,
                 scenario_id=scenario_id,
                 association=association,
@@ -2111,7 +2357,7 @@ class ExplorationManager:
                     scenario_task, cancellation_task, return_exceptions=True
                 )
             processed += 1
-            await self._record_model_usage(exploration_id, [auxiliary_client], None)
+            await self._record_model_usage(exploration_id, [auxiliary_client], None, "auxiliary")
             self.repository.add_event(
                 exploration_id,
                 event_level,
@@ -2160,6 +2406,7 @@ class ExplorationManager:
         coverage: CoveragePlanner | None = None
         auxiliary: OpenAIAuxiliaryScenarioGenerator | None = None
         auxiliary_client: OpenAICompatibleClient | None = None
+        agent_client: OpenAICompatibleClient | None = None
         scenario_pipeline: _LiveScenarioPipeline | None = None
         agent_model_id = ""
         auxiliary_model_id = ""
@@ -2257,6 +2504,8 @@ class ExplorationManager:
                     auxiliary_client,
                     use_local_evidence=self._is_jev_model(auxiliary_model_id),
                     executor=executor,
+                    options=options,
+                    secret_values=secret_values,
                 )
                 await scenario_pipeline.start()
             history: list[dict[str, Any]] = []
@@ -2593,7 +2842,7 @@ class ExplorationManager:
                             consecutive_model_errors = 0
                         except ModelResponseError as exc:
                             await self._record_model_usage(
-                                exploration_id, [agent_client], executor
+                                exploration_id, [agent_client], executor, "jev"
                             )
                             consecutive_model_errors += 1
                             self.repository.add_event(
@@ -2608,7 +2857,7 @@ class ExplorationManager:
                                 ) from exc
                             continue
                         await self._record_model_usage(
-                            exploration_id, [agent_client], executor
+                            exploration_id, [agent_client], executor, "jev"
                         )
                         decision, coverage_override = coverage.reconcile(
                             observation, decision
@@ -2905,7 +3154,7 @@ class ExplorationManager:
                     )
                     signal.update(
                         screenshot=next_observation.screenshot,
-                        page_url=next_observation.url,
+                        **self._issue_page_context(issue, next_observation),
                         step_number=next_action,
                         scenario_id=candidate_scenario_id,
                         association=self._signal_action_association(
@@ -3233,6 +3482,14 @@ class ExplorationManager:
                 error_message,
             )
         finally:
+            # Persist responses that arrived just before cancellation, or
+            # uncertain billing left by a failed JEV transport. Draining is
+            # idempotent and shares the same lock as the auxiliary worker.
+            if agent_client is not None:
+                with suppress(Exception):
+                    await self._record_model_usage(
+                        exploration_id, [agent_client], None, "jev"
+                    )
             if coverage is not None:
                 with suppress(Exception):
                     self._record_coverage_restrictions(exploration_id, coverage, locals().get("observation"))

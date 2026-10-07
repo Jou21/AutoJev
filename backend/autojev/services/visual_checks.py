@@ -347,6 +347,7 @@ def visual_unavailability_label(reason: str) -> str:
         "vision_rejected_text_fallback": "com entrada de imagem recusada pelo modelo",
         "auxiliary_authentication_rejected": "com autenticação do provedor recusada",
         "auxiliary_provider_error": "com falha na requisição ao provedor",
+        "auxiliary_provider_temporary_error": "com falha temporária na requisição ao provedor",
         "auxiliary_unavailable": "com provedor indisponível",
         "auxiliary_backlog_full": "sem revisão por fila auxiliar cheia",
         "exploration_cancelled": "sem revisão devido ao cancelamento da execução",
@@ -354,18 +355,25 @@ def visual_unavailability_label(reason: str) -> str:
         "documentation_interrupted": "com revisão auxiliar interrompida",
         "auxiliary_worker_stopped": "com processamento auxiliar interrompido",
         "auxiliary_worker_unavailable": "sem processamento auxiliar disponível",
+        "visual_review_cancelled": "com retomada visual interrompida a pedido do usuário",
+        "visual_review_context_unavailable": "sem contexto preservado suficiente para retomar a análise visual",
+        "visual_review_retry_exhausted": "sem revisão válida após o limite de tentativas",
+        "auxiliary_review_retry_exhausted": "sem revisão válida após o limite de tentativas",
+        "auxiliary_review_attempts_exhausted": "sem revisão válida após o limite de tentativas",
         "local_evidence_mode": "preservados somente com evidência local",
     }.get(reason, "sem revisão visual válida; motivo não classificado")
 
 
 def visual_review_counts(scenarios: list[dict[str, Any]]) -> dict[str, Any]:
-    counts: dict[str, Any] = {"total": len(scenarios), "assessed": 0, "pending": 0, "unavailable": 0, "rate_limited": 0, "incomplete_response": 0}
+    counts: dict[str, Any] = {"total": len(scenarios), "assessed": 0, "pending": 0, "unavailable": 0, "rate_limited": 0, "incomplete_response": 0, "context_limited": 0}
     unavailable_reasons: dict[str, int] = {}
     for scenario in scenarios:
         visual = (scenario.get("evidence") or {}).get("visual_assessment") or {}
         reason = str(visual.get("reason") or "")
         if visual.get("status") == "assessed" and reason != "visual_findings_invalid":
             counts["assessed"] += 1
+            if visual.get("context_limited") is True or visual.get("review_scope") == "saved_capture_only_legacy":
+                counts["context_limited"] += 1
         elif visual.get("status") == "pending":
             counts["pending"] += 1
         else:
@@ -374,7 +382,7 @@ def visual_review_counts(scenarios: list[dict[str, Any]]) -> dict[str, Any]:
             unavailable_reasons[reason] = unavailable_reasons.get(reason, 0) + 1
             if reason.startswith("auxiliary_rate_limit"):
                 counts["rate_limited"] += 1
-            if reason in {"visual_assessment_not_returned", "visual_assessment_schema_invalid", "visual_findings_invalid"}:
+            if reason in {"visual_assessment_not_returned", "visual_assessment_schema_invalid", "visual_findings_invalid", "auxiliary_response_invalid", "auxiliary_response_schema_invalid"}:
                 counts["incomplete_response"] += 1
     # Every unavailable CT has exactly one recorded reason. Do not attribute
     # timeouts/local tail limits to provider throttling or silently omit them.

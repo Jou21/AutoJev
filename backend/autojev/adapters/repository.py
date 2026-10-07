@@ -81,7 +81,9 @@ class SQLiteRepository:
             completion_tokens INTEGER NOT NULL DEFAULT 0,
             total_tokens INTEGER NOT NULL DEFAULT 0,
             cost REAL,
-            cost_known INTEGER NOT NULL DEFAULT 0
+            cost_known INTEGER NOT NULL DEFAULT 0,
+            cost_complete INTEGER,
+            usage_by_role_json TEXT NOT NULL DEFAULT '{}'
         );
         CREATE TABLE IF NOT EXISTS exploration_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -134,6 +136,8 @@ class SQLiteRepository:
                 ("total_tokens", "INTEGER NOT NULL DEFAULT 0"),
                 ("cost", "REAL"),
                 ("cost_known", "INTEGER NOT NULL DEFAULT 0"),
+                ("cost_complete", "INTEGER"),
+                ("usage_by_role_json", "TEXT NOT NULL DEFAULT '{}'"),
             ):
                 try:
                     connection.execute(f"ALTER TABLE explorations ADD COLUMN {column} {definition}")
@@ -346,13 +350,27 @@ class SQLiteRepository:
             key: getattr(request.options, key)
             for key in request.options.__dataclass_fields__
         }
+        # Only newly created runs can prove that neither role has made a
+        # request yet. Migrated rows deliberately keep an empty breakdown:
+        # their historical aggregate cannot safely be assigned by model ID.
+        empty_usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cost": 0.0,
+            "cost_known": True,
+            "cost_complete": True,
+            "usage_records": 0,
+            "cost_reported_records": 0,
+        }
         with self._lock, self._connect() as connection:
             connection.execute(
                 """INSERT INTO explorations (
                     id, app_url, agent_provider_id, agent_model_id,
                     auxiliary_provider_id, auxiliary_model_id, options_json,
-                    status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    status, created_at, cost, cost_known, cost_complete,
+                    usage_by_role_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     exploration_id,
                     request.app_url,
@@ -363,6 +381,10 @@ class SQLiteRepository:
                     json.dumps(options),
                     ExplorationStatus.QUEUED,
                     utc_now(),
+                    0.0,
+                    True,
+                    True,
+                    json.dumps({role: empty_usage for role in ("jev", "auxiliary")}),
                 ),
             )
         return exploration_id
@@ -381,6 +403,8 @@ class SQLiteRepository:
         "total_tokens",
         "cost",
         "cost_known",
+        "cost_complete",
+        "usage_by_role",
     }
 
     def update_exploration(self, exploration_id: str, **values: Any) -> None:
@@ -389,6 +413,8 @@ class SQLiteRepository:
             raise ValueError(f"Invalid exploration fields: {', '.join(sorted(invalid))}")
         if not values:
             return
+        if "usage_by_role" in values:
+            values["usage_by_role_json"] = json.dumps(values.pop("usage_by_role"))
         assignments = ", ".join(f"{key} = ?" for key in values)
         params = [int(value) if isinstance(value, bool) else value for value in values.values()]
         with self._lock, self._connect() as connection:
@@ -453,6 +479,20 @@ class SQLiteRepository:
                     utc_now(),
                 ),
             )
+
+    def running_visual_review_resume_ids(self) -> list[str]:
+        """Recover only durable unfinished review batches after a restart."""
+        with self._lock, self._connect() as connection:
+            return [row["exploration_id"] for row in connection.execute(
+                """SELECT event.exploration_id FROM exploration_events event
+                   WHERE event.type = 'visual_review_resume_state'
+                     AND json_extract(event.payload_json, '$.running') = 1
+                     AND event.id = (
+                       SELECT MAX(newer.id) FROM exploration_events newer
+                       WHERE newer.exploration_id = event.exploration_id
+                         AND newer.type = 'visual_review_resume_state'
+                     )"""
+            ).fetchall()]
 
     def add_action(
         self,
@@ -558,6 +598,12 @@ class SQLiteRepository:
                 "total_tokens": row["total_tokens"],
                 "cost": row["cost"],
                 "cost_known": bool(row["cost_known"]),
+                "by_role": json.loads(row["usage_by_role_json"]),
+                **(
+                    {"cost_complete": bool(row["cost_complete"])}
+                    if row["cost_complete"] is not None
+                    else {}
+                ),
             },
         }
 

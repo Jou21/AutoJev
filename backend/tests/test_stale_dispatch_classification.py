@@ -173,7 +173,8 @@ def test_undispatched_action_is_automation_context_in_report_without_fake_ct(tmp
     path = tmp_path / "stale-context.html"
     StandaloneHtmlReport(tmp_path).generate(run, str(path))
     html = path.read_text()
-    assert "Contexto de automação" in html and "Nenhum comando foi executado" in html
+    assert "Observações da execução" in html and "Nenhum comando foi executado" in html
+    assert "Evidência de contexto" not in html and 'data-status="INFO"' not in html
     assert 'data-status="FAIL"' not in html and 'data-status="PASS"' not in html
 
 

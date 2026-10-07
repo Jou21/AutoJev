@@ -355,6 +355,55 @@ def test_new_browser_error_without_visual_delta_is_still_fail_evidence():
     )
 
 
+@pytest.mark.parametrize("has_event_page", [True, False])
+def test_recorded_signal_keeps_original_page_separate_from_later_observation(
+    has_event_page: bool,
+):
+    class RecordingRepository:
+        def __init__(self):
+            self.issues = []
+
+        def add_issue(self, exploration_id, issue):
+            self.issues.append(issue)
+
+        def add_event(self, *args, **kwargs):
+            pass
+
+    issue = {
+        "type": "http",
+        "method": "POST",
+        "message": "POST returned HTTP 401",
+        "url": "https://events.backtrace.io/submit",
+        "status_code": 401,
+        "occurred_at": "2026-01-01T12:00:00+00:00",
+    }
+    if has_event_page:
+        issue.update(page_url="https://app.test/login", page_url_source="event")
+    observation = Observation(
+        url="https://app.test/inventory",
+        title="Inventory",
+        text="Products",
+        interactive_elements=[],
+        network_errors=[issue],
+        screenshot="after-login.png",
+    )
+    manager = object.__new__(ExplorationManager)
+    manager.repository = RecordingRepository()
+
+    returned = manager._record_observation_issues("run", observation, set())
+
+    assert len(returned) == len(manager.repository.issues) == 1
+    record = manager.repository.issues[0]
+    assert record["page_url"] == (
+        "https://app.test/login" if has_event_page else observation.url
+    )
+    assert record["page_url_source"] == ("event" if has_event_page else "observation")
+    assert record["observation_url"] == observation.url
+    assert record["url"] == issue["url"]
+    assert record["classification"] == "external_telemetry"
+    assert record["affects_verdict"] is False
+
+
 def test_issue_emitted_while_jev_plans_does_not_fail_the_following_action():
     class RecordingRepository:
         def __init__(self):
@@ -1448,6 +1497,8 @@ async def test_compact_invalid_visual_review_is_unavailable_not_enriched(reason)
     assert scenario.evidence["visual_review_provenance"]["status"] == "unavailable"
     assert scenario.evidence["visual_review_provenance"]["reason"] == reason
     assert scenario.evidence["auxiliary_review_metrics"]["provider_requests"] == 1
+    assert scenario.evidence["auxiliary_review_metrics"]["attempts"] == 3
+    assert scenario.evidence["auxiliary_review_metrics"]["total_provider_requests"] == 3
     assert not any(kind == "scenario_enriched" for kind, _ in repository.events)
     assert pipeline._progress_payload()["pending"] == 0
 

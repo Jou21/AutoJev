@@ -40,7 +40,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 playwright install chromium
-uvicorn autojev.main:app --reload --host 127.0.0.1 --port 8000
+AUTOJEV_HEADLESS=false uvicorn autojev.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
 Start the React interface in a second terminal:
@@ -52,6 +52,10 @@ npm run dev
 
 Open `http://localhost:3000`. The API documentation is available at
 `http://127.0.0.1:8000/docs`.
+
+Keep `AUTOJEV_HEADLESS=false` for interactive local use: manual login requires
+a visible browser window. A headless diagnostic backend must use a separate
+temporary process/port and must not replace the everyday localhost backend.
 
 The default FastAPI CORS policy also trusts the project's published Sites
 origin, allowing that UI to reach a backend running on the user's machine.
@@ -120,9 +124,22 @@ policy or from JEV.
 In the default text mode, the auxiliary LLM receives compact accessible DOM,
 visible text and verified Playwright results; screenshots remain local and are
 still embedded in the report. Visual mode additionally sends the masked
-low-detail screenshot. If the selected model explicitly rejects image input,
-AutoJev retries that documentation call as text; authentication, rate-limit and
-generic failures are not retried, avoiding accidental double billing.
+low-detail screenshot. Explicitly rejected image input is recorded as visual
+analysis unavailable; it is not silently presented as a text-only visual check.
+Authentication and exhausted request budgets are not retried.
+
+The auxiliary request budget is local and finite (120 HTTP requests by default),
+independent from the number of CTs. Retries and updated evidence consume requests;
+exact cached evidence does not. New executions expose this budget in the form and
+use up to three review attempts, including the first, for retryable failures.
+When a completed visual run has pending reviews, **Retomar revisões visuais
+pendentes** reuses its saved captures without reopening the browser or repeating
+the exploration. It requires an explicit cost confirmation and a new finite
+request allowance. Reviews can be stopped independently of the completed run.
+Older runs may lack the original semantic text context; the UI reports that
+limitation instead of inventing missing evidence. An unavailable visual review
+does not invalidate recorded local checks or mean that the CT was never executed,
+but it must never be counted as visual approval.
 
 Scenario verdicts come from Playwright evidence, not from model prose. A
 successful action with verified assertions or an observable state change is
@@ -137,16 +154,22 @@ report: actions, assertions, before/after captures, retries and classified
 technical signals. External telemetry and isolated request cancellations do
 not automatically fail a functional interaction. Same-origin HTTP/network
 failures and JavaScript exceptions remain technical checks, not automatically
-confirmed business defects. Unassociated startup/restoration signals appear as
-context cards outside the CT counts. Historical verdicts are preserved and
+confirmed business defects. Unassociated startup/restoration signals appear in
+a separate, collapsible **Observações da execução** section, outside CT counts
+and filters. Observations identify the recorded page, time and request endpoint;
+legacy capture-time pages are not presented as event-time pages or loading phases.
+Historical verdicts are preserved and
 explained rather than silently changed. Repeated signals remain local evidence
 without repeatedly enlarging model prompts.
 
 Prompt, completion and total tokens are accumulated for both models. The live
 browser panel and React sidebar show the running usage; exploration views and
-the standalone report retain the final total and provider-reported monetary
-cost. When a provider does not return cost, AutoJev displays `—` instead of
-estimating a price.
+the standalone report retain provider-reported monetary cost as **Custo JEV**,
+**Custo LLM** (auxiliary) and **Custo total**, in USD. Attribution follows the
+caller's role even when both roles use the same model. When a provider does not
+return cost, AutoJev displays `—` instead of estimating a price; incomplete sums
+are marked partial and an explicitly reported zero remains zero. Historical
+runs that stored only a combined total retain it without an invented split.
 
 Provider API keys are encrypted by FastAPI and never returned to React. Test
 credentials exist only in the active process memory and are discarded when the
@@ -164,6 +187,10 @@ npm test
 cd backend
 pytest
 ```
+
+See the [coverage validation record](./docs/coverage-validation-2026-10-06.md)
+for the real text/visual Gemini runs, independent Playwright MCP checks,
+resolved recovery gaps and remaining application-level dependencies.
 
 The current MVP is designed for a trusted local or internal environment. It has
 no multi-user authentication and intentionally allows localhost/private target

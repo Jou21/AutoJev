@@ -185,6 +185,8 @@ class ExplorationOptionsInput(ApiModel):
         default=True,
         validation_alias=AliasChoices("capture_console_errors", "captureConsoleErrors", "console_errors"),
     )
+    auxiliary_max_requests: int | None = Field(default=None, ge=1, le=5000)
+    auxiliary_review_max_attempts: int = Field(default=3, ge=1, le=5)
     capture_network_errors: bool = Field(
         default=True,
         validation_alias=AliasChoices("capture_network_errors", "captureNetworkErrors", "network_errors"),
@@ -217,6 +219,12 @@ class ExplorationOptionsInput(ApiModel):
             return None
         cleaned = " ".join(value.split())
         return cleaned or None
+
+
+class VisualReviewResumeInput(ApiModel):
+    # Explicitly bounded additional paid work; never silently lift a run cap.
+    max_requests: int = Field(default=120, ge=1, le=5000)
+    max_attempts: int = Field(default=3, ge=1, le=5)
 
 
 class ExplorationCreate(ApiModel):

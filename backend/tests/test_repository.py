@@ -134,6 +134,15 @@ def test_usage_columns_migrate_legacy_database_and_round_trip(tmp_path):
                 report_path TEXT
             )"""
         )
+        connection.execute(
+            """INSERT INTO explorations (
+                id, app_url, agent_provider_id, agent_model_id,
+                auxiliary_provider_id, auxiliary_model_id, options_json,
+                status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("legacy-run", "https://app.test", "provider", "same-model",
+             "provider", "same-model", "{}", "completed", "now"),
+        )
 
     repo = SQLiteRepository(database_path, SecretCipher(tmp_path, "legacy-key"))
     repo.initialize()
@@ -141,7 +150,10 @@ def test_usage_columns_migrate_legacy_database_and_round_trip(tmp_path):
         columns = {
             row[1] for row in connection.execute("PRAGMA table_info(explorations)")
         }
-    assert {"prompt_tokens", "completion_tokens", "total_tokens", "cost", "cost_known"} <= columns
+    assert {"prompt_tokens", "completion_tokens", "total_tokens", "cost", "cost_known", "usage_by_role_json", "cost_complete"} <= columns
+    legacy = repo.get_exploration("legacy-run", include_details=False)["usage"]
+    assert legacy["by_role"] == {}
+    assert "cost_complete" not in legacy
 
     provider = repo.create_provider("P", "http://localhost:4000", None, True, [ProviderModel("m", "M")])
     run_id = repo.create_exploration(
@@ -159,6 +171,11 @@ def test_usage_columns_migrate_legacy_database_and_round_trip(tmp_path):
         total_tokens=19,
         cost=0.001234,
         cost_known=True,
+        cost_complete=True,
+        usage_by_role={
+            "jev": {"total_tokens": 12, "cost": 0.001, "cost_known": True},
+            "auxiliary": {"total_tokens": 7, "cost": 0.000234, "cost_known": True},
+        },
     )
     usage = repo.get_exploration(run_id, include_details=False)["usage"]
     assert usage == {
@@ -167,7 +184,32 @@ def test_usage_columns_migrate_legacy_database_and_round_trip(tmp_path):
         "total_tokens": 19,
         "cost": 0.001234,
         "cost_known": True,
+        "cost_complete": True,
+        "by_role": {
+            "jev": {"total_tokens": 12, "cost": 0.001, "cost_known": True},
+            "auxiliary": {"total_tokens": 7, "cost": 0.000234, "cost_known": True},
+        },
     }
+
+
+def test_new_run_proves_zero_cost_for_both_roles_without_calls(tmp_path):
+    repo = repository(tmp_path)
+    run_id = repo.create_exploration(ExplorationRequest(
+        app_url="https://app.test",
+        agent=ModelSelection("provider", "same-model"),
+        auxiliary_llm=ModelSelection("provider", "same-model"),
+        options=ExplorationOptions(),
+    ))
+    usage = repo.get_exploration(run_id, include_details=False)["usage"]
+    assert usage["cost"] == 0
+    assert usage["cost_known"] is True
+    assert usage["cost_complete"] is True
+    assert set(usage["by_role"]) == {"jev", "auxiliary"}
+    for bucket in usage["by_role"].values():
+        assert bucket["cost"] == 0
+        assert bucket["cost_known"] is True
+        assert bucket["cost_complete"] is True
+        assert bucket["usage_records"] == 0
 
 
 def test_restart_fails_every_nonterminal_exploration_phase(tmp_path):
