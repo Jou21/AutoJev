@@ -30,6 +30,7 @@ from autojev.services.technical_signals import (
     scenario_screenshots,
 )
 from autojev.services.scenario_documentation import local_scenario_documentation
+from autojev.services.report_localization import QA_FOCUS_LABELS, report_text
 from autojev.services.visual_checks import (
     assess_visual_findings,
     unavailable_visual_assessment,
@@ -869,7 +870,8 @@ Schema: {"action":"click","rationale":"...","target":"e1","value":null,"credenti
 Treat coverage_state as authoritative memory supplied by the exploration engine. Prioritize its current_untried semantic candidates.
 Explore methodically: finish the current screen before moving sideways, never alternate passive actions or scroll positions, and use go_back to resume parent alternatives.
 If requested_scope names a screen, menu or submenu, navigate to it first and then exhaust that focused subtree. If requested_scope is the entire application, exhaust every reachable same-origin branch.
-Use finish only when coverage_state says its completion rule is satisfied. The engine may reject a premature finish and force a safe frontier action or backtrack."""
+Use finish only when coverage_state says its completion rule is satisfied. The engine may reject a premature finish and force a safe frontier action or backtrack.
+Write rationale and human-readable scenario_hint fields in Brazilian Portuguese (pt-BR). Preserve schema keys, action/assertion enums, exact application labels, URLs and evidence excerpts in their original form."""
         page = {
             "url": observation.url,
             "title": observation.title,
@@ -1097,7 +1099,7 @@ Use finish only when coverage_state says its completion rule is satisfied. The e
                             "expected": str(href) if expected_route == "/" else expected_route,
                         }
                     )
-            rationale = (
+            rationale = report_text(
                 f"TypeSafe JEV selected {selected['action']} for {selected['name']} "
                 f"to maximize safe untested coverage ({'; '.join(signals)})."
             )
@@ -1109,13 +1111,13 @@ Use finish only when coverage_state says its completion rule is satisfied. The e
                 "assertions": assertions,
                 "scenario_hint": (
                     {
-                        "title": f"{qa_focus.replace('_', ' ').title()}: {selected['name']}",
+                        "title": f"{QA_FOCUS_LABELS[qa_focus]}: {selected['name']}",
                         "description": rationale,
                         "preconditions": [
-                            f"The browser is on {observation.url}",
-                            f"Exploration scope: {(coverage_context or {}).get('scope', 'entire application')}",
+                            f"O navegador está em {observation.url}",
+                            report_text(f"Exploration scope: {(coverage_context or {}).get('scope', 'entire application')}"),
                         ],
-                        "expected_result": (
+                        "expected_result": report_text(
                             "The selected control responds consistently, remains inside the allowed scope, "
                             "and introduces no attributable application failure. External browser signals "
                             "are recorded separately from functional checks."
@@ -1377,6 +1379,12 @@ Compare against the executed action and checks: an expected Add-to-cart/Remove c
 The AutoJev floating panel is not part of the tested application: never flag its overlap/transparency as an application defect.
 Only concrete, high-confidence deviations in the AFTER image can add negative evidence; do not approve a business rule from appearance alone.
 Never return a status or browser command."""
+        system += (
+            "\nWrite all human-readable titles, descriptions, steps, results and visual finding "
+            "expected/observed explanations in Brazilian Portuguese (pt-BR). "
+            "Preserve JSON keys, enums, URLs, selectors, product/control names, exact evidence "
+            "excerpts and technical error messages in their original form."
+        )
         contract: dict[str, Any] = {
             "title": "...", "description": "...", "preconditions": ["..."],
             "steps": ["..."], "expected_result": "...", "actual_result": "...",

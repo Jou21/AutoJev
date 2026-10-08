@@ -7,6 +7,8 @@ from hashlib import sha256
 import json
 from typing import Any
 
+from autojev.services.report_localization import REPORT_LOCALE_VERSION
+
 
 LIVE_STATUSES = {"queued", "pending", "running", "waiting_input", "postprocessing"}
 
@@ -68,7 +70,7 @@ def report_snapshot_key(exploration: dict[str, Any]) -> str:
     """
     duration = execution_duration_summary(exploration)
     snapshot = {
-        "presentation": "visual-replay-v1",
+        "presentation": f"visual-replay-v1-{REPORT_LOCALE_VERSION}",
         "status": exploration.get("status"),
         "started_at": duration["started_at"],
         "ended_at": duration["ended_at"],

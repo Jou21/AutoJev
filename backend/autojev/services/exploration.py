@@ -27,7 +27,7 @@ from autojev.adapters.playwright_executor import (
 from autojev.adapters.report import StandaloneHtmlReport
 from autojev.adapters.repository import SQLiteRepository
 from autojev.adapters.secrets import EphemeralCredentialVault, redact
-from autojev.config import Settings
+from autojev.config import DEFAULT_AUXILIARY_MAX_REQUESTS, Settings
 from autojev.domain.models import (
     ActionResult,
     AgentDecision,
@@ -76,6 +76,7 @@ class _ScenarioEnrichmentJob:
     ready_at: float = 0.0
     attempts: int = 0
     provider_requests: int = 0
+    defer_paid_until_final: bool = False
 
 
 class _LiveScenarioPipeline:
@@ -110,7 +111,7 @@ class _LiveScenarioPipeline:
         self.executor = executor
         self.secret_values = secret_values or []
         configured_budget = getattr(options, "auxiliary_max_requests", None)
-        self.request_budget = int(configured_budget if configured_budget is not None else self._setting("auxiliary_max_requests", 120))
+        self.request_budget = int(configured_budget if configured_budget is not None else self._setting("auxiliary_max_requests", DEFAULT_AUXILIARY_MAX_REQUESTS))
         self.max_attempts = clamp_review_max_attempts(
             getattr(options, "auxiliary_review_max_attempts", None)
             or self._setting("auxiliary_review_max_attempts", 3)
@@ -133,9 +134,12 @@ class _LiveScenarioPipeline:
         self._queue_sequence = 0
         self._visually_reviewed_pages: set[str] = set()
         self._visually_reviewed_families: set[str] = set()
+        self._dispatched_visual_fingerprints: set[str] = set()
+        self._deferred_visual_jobs: dict[str, _ScenarioEnrichmentJob] = {}
+        self._flushing_final_reviews = False
         if isinstance(auxiliary_client, OpenAICompatibleClient):
             # The transport enforces the same bound even for its one explicit
-            # format-compatibility retry, so 120 means at most 120 HTTP POSTs.
+            # format-compatibility retry; a configured cap is never exceeded.
             auxiliary_client.chat_request_budget = self.request_budget
 
     def _setting(self, name: str, default: Any) -> Any:
@@ -156,8 +160,45 @@ class _LiveScenarioPipeline:
             "provider_requests": int(getattr(self.auxiliary, "request_count", 0)),
             "request_budget": self.request_budget,
             "max_attempts": self.max_attempts,
+            "coalesced_visual_revisits": len(self._deferred_visual_jobs),
             "stage": "parallel_enrichment",
         }
+
+    def _hold_visual_revisit(
+        self, job: _ScenarioEnrichmentJob, cached: TestScenario | None,
+    ) -> bool:
+        """Review new CTs in parallel, coalesce paid revisits until coverage ends.
+
+        Restoration can revisit the same CT many times minutes apart, beyond
+        a short debounce. Its local evidence stays durable immediately, but
+        only the latest revisit needs another paid image review. Exact cache
+        hits remain free to apply live. Never reuse an old visual verdict for
+        changed evidence.
+        """
+        if self.closed or not job.defer_paid_until_final or cached is not None:
+            return False
+        if self.revisions.get(job.fingerprint) == job.revision:
+            self._deferred_visual_jobs[job.fingerprint] = job
+            self.repository.add_event(
+                self.exploration_id, "info", "scenario_visual_revisit_coalesced",
+                f"CT{job.sequence:03d}: atualização visual agrupada para revisar a evidência final",
+                {**self._progress_payload(), "scenario_id": f"CT{job.sequence:03d}",
+                 "revision": job.revision, "reason": "awaiting_final_visual_evidence"},
+            )
+        return True
+
+    def _flush_final_visual_jobs(self) -> None:
+        # Fill available queue slots, then let each worker completion pump the
+        # rest. Put BEFORE task_done so Queue.join cannot finish between jobs.
+        # This handles more revisits than the bounded queue can hold at once.
+        if not self._flushing_final_reviews:
+            return
+        while self._deferred_visual_jobs and not self.queue.full():
+            fingerprint = next(iter(self._deferred_visual_jobs))
+            job = self._deferred_visual_jobs.pop(fingerprint)
+            if (self.revisions.get(fingerprint) == job.revision
+                and fingerprint in self.sequences and fingerprint not in self.enriched):
+                self.queue.put_nowait(job)
 
     def _compact_queue(self) -> int:
         """Drop obsolete revisions without dropping any current CT review.
@@ -214,6 +255,12 @@ class _LiveScenarioPipeline:
             priority += 120
         if self._review_family(job) in self._visually_reviewed_families:
             priority -= 180
+        if (job.defer_paid_until_final and job.result.success
+            and all(assertion.passed for assertion in job.result.assertions)):
+            # At the final tail a healthy revisit must not spend a scarce
+            # slot before another CT's first review. Failures retain their
+            # diagnostic priority. This is ordering, never evidence reuse.
+            priority -= 1000
         # An unsuccessful retry should not monopolize the next scarce slot.
         return priority - job.retries * 80
 
@@ -397,6 +444,7 @@ class _LiveScenarioPipeline:
         self.sequences[fingerprint] = sequence
         self.enriched.discard(fingerprint)
         self.skipped.discard(fingerprint)
+        self._deferred_visual_jobs.pop(fingerprint, None)
 
         scenario = self.manager._scenario_from_evidence(
             observation, decision, result, sequence
@@ -464,6 +512,10 @@ class _LiveScenarioPipeline:
             decision=decision,
             result=result,
             sequence=sequence,
+            defer_paid_until_final=(
+                getattr(self.auxiliary, "evidence_mode", "text") == "visual"
+                and fingerprint in self._dispatched_visual_fingerprints
+            ),
         )
         self._queue_sequence += 1
         job.queue_order = self._queue_sequence
@@ -553,6 +605,8 @@ class _LiveScenarioPipeline:
         self.enriched.discard(fingerprint)
         self.skipped.discard(fingerprint)
         self.drafts.pop(fingerprint, None)
+        self._deferred_visual_jobs.pop(fingerprint, None)
+        self._dispatched_visual_fingerprints.discard(fingerprint)
         scenario_id = f"CT{stored_sequence:03d}"
         self.repository.delete_scenario(self.exploration_id, scenario_id)
         self.repository.add_event(
@@ -610,6 +664,8 @@ class _LiveScenarioPipeline:
                     # Cache hits cost nothing and remain usable after the
                     # paid-request cap, a provider pause or an auth rejection.
                     cached = await self._cached_review(job)
+                    if self._hold_visual_revisit(job, cached):
+                        continue
                     if cached is None:
                         gate_reason = await self._provider_gate(job)
                         if gate_reason:
@@ -622,6 +678,8 @@ class _LiveScenarioPipeline:
                         if self.revisions.get(job.fingerprint) != job.revision:
                             continue
                         cached = await self._cached_review(job)
+                        if self._hold_visual_revisit(job, cached):
+                            continue
 
                     if self.repository.is_cancel_requested(self.exploration_id):
                         self._mark_skipped(job, "exploration_cancelled")
@@ -630,6 +688,10 @@ class _LiveScenarioPipeline:
                     review_started_at = time.monotonic()
                     requests_before = int(getattr(self.auxiliary, "request_count", 0))
                     transport_budget = getattr(self.auxiliary_client, "chat_request_budget", None)
+                    if cached is None and getattr(self.auxiliary, "evidence_mode", "text") == "visual":
+                        # Mark BEFORE awaiting the response: a browser revisit
+                        # during an in-flight call must also be coalesced.
+                        self._dispatched_visual_fingerprints.add(job.fingerprint)
                     if isinstance(self.auxiliary_client, OpenAICompatibleClient) and cached is None:
                         # The format compatibility fallback also consumes an
                         # HTTP request. It must not silently multiply the
@@ -816,6 +878,7 @@ class _LiveScenarioPipeline:
                     if job is not None:
                         self._mark_skipped(job, exc.__class__.__name__)
             finally:
+                self._flush_final_visual_jobs()
                 self.queue.task_done()
 
     def _mark_skipped(self, job: _ScenarioEnrichmentJob, reason: str) -> None:
@@ -877,6 +940,11 @@ class _LiveScenarioPipeline:
             )
 
     def _discard_queued_jobs(self, reason: str) -> None:
+        self._flushing_final_reviews = False
+        deferred = list(self._deferred_visual_jobs.values())
+        self._deferred_visual_jobs.clear()
+        for job in deferred:
+            self._mark_skipped(job, reason)
         while True:
             try:
                 job = self.queue.get_nowait()
@@ -905,6 +973,8 @@ class _LiveScenarioPipeline:
                     completion_reason = "auxiliary_worker_stopped"
                 else:
                     completion_reason = "documentation_complete"
+                    self._flushing_final_reviews = True
+                    self._flush_final_visual_jobs()
                     timeout = self._setting("auxiliary_tail_timeout_seconds", 600.0)
                     queue_drained = asyncio.create_task(self.queue.join())
                     try:
@@ -931,6 +1001,7 @@ class _LiveScenarioPipeline:
             interrupted = exc
         finally:
             self._stop_reason = completion_reason
+            self._flushing_final_reviews = False
             if self.worker is not None:
                 if not self.worker.done():
                     self.worker.cancel()

@@ -17,6 +17,7 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 from autojev.domain.models import ActionResult, AgentDecision, Observation
+from autojev.services.report_localization import action_label, check_label, report_text
 
 _RESOURCE_HTTP = re.compile(
     r"Failed to load resource.*?status of (\d{3})", re.IGNORECASE
@@ -325,8 +326,8 @@ def build_scenario_evidence(
             {
                 "kind": "action",
                 "occurred_at": result.started_at,
-                "title": f"Executar {decision.action}",
-                "message": decision.rationale,
+                "title": action_label(decision.action),
+                "message": report_text(decision.rationale),
                 "url": result.before_url,
                 "action_step": evidence.get("action_step"),
                 "step_number": evidence.get("action_step"),
@@ -352,7 +353,7 @@ def build_scenario_evidence(
                 "kind": "observation",
                 "occurred_at": result.finished_at,
                 "title": "Depois da ação",
-                "message": result.message,
+                "message": report_text(result.message),
                 "url": result.after_url,
                 **({"screenshot": after_screenshot} if after_screenshot else {}),
             }
@@ -362,8 +363,8 @@ def build_scenario_evidence(
                 {
                     "kind": "assertion",
                     "occurred_at": result.finished_at,
-                    "title": assertion.kind,
-                    "message": assertion.message,
+                    "title": check_label(assertion.kind),
+                    "message": report_text(assertion.message),
                     "url": result.after_url,
                     "assertion": asdict(assertion),
                 }
@@ -371,6 +372,37 @@ def build_scenario_evidence(
         evidence["timeline"] = sorted(
             timeline, key=lambda entry: timestamp(entry.get("occurred_at")) or 0
         )
+    preview = evidence.get("action_preview")
+    if isinstance(preview, dict):
+        action_entries = [
+            entry for entry in evidence["timeline"] if entry.get("kind") == "action"
+        ]
+        step = evidence.get("action_step")
+        # A CT can preserve several attempts. The latest result's capture must
+        # never be painted onto actions from previous attempts just because
+        # they share a scenario. Explicit steps take precedence over timing.
+        indexed_matches = [
+            entry
+            for entry in action_entries
+            if step is not None
+            and (
+                entry.get("step_number")
+                if entry.get("step_number") is not None
+                else entry.get("action_step")
+            ) == step
+        ]
+        for entry in indexed_matches:
+            entry.setdefault("action_preview", copy.deepcopy(preview))
+        unindexed_matches = [
+            entry
+            for entry in action_entries
+            if entry.get("step_number") is None
+            and entry.get("action_step") is None
+            and entry.get("occurred_at") == result.started_at
+            and entry.get("target") == decision.target
+        ]
+        if not indexed_matches and len(unindexed_matches) == 1:
+            unindexed_matches[0].setdefault("action_preview", copy.deepcopy(preview))
     for entry in evidence["timeline"]:
         if not entry.get("id"):
             identity = {
@@ -393,6 +425,12 @@ def scenario_screenshots(evidence: dict[str, Any], result: ActionResult) -> list
     screenshots: list[str] = []
     for value in [
         *(item.get("screenshot") for item in evidence.get("timeline", [])),
+        *(
+            item["action_preview"].get("screenshot")
+            for item in evidence.get("timeline", [])
+            if item.get("kind") == "action"
+            and isinstance(item.get("action_preview"), dict)
+        ),
         evidence.get("before_screenshot"),
         result.screenshot,
     ]:

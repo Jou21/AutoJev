@@ -193,13 +193,18 @@ provider calls during it. Authentication rejection stops auxiliary calls for
 the run; explicit vision incompatibility is remembered after its first rejected
 request, with no text retry and no repeated unusable vision calls.
 The local auxiliary HTTP-request allowance is finite and independent of CT count.
-`options.auxiliary_max_requests` overrides the configured default for a new run;
+`options.auxiliary_max_requests` overrides the configured default of 300 HTTP
+requests for a new run; an explicit lower allowance is never raised silently.
 `auxiliary_review_max_attempts` defaults to 3 total attempts, including the first.
 Exact evidence cache hits remain available after the request allowance is spent.
 Retryable visual failures use bounded retries; authentication rejection and
 budget exhaustion never trigger retry loops. Rapid revisions of one CT are
-coalesced before review, while its verified actions and prior findings remain
-preserved in the timeline.
+coalesced before review. After a CT's first visual request has been dispatched,
+paid revisits are grouped until browser coverage closes; only its latest
+evidence is reviewed again. New CTs and exact cache hits continue in parallel.
+Local drafts are saved immediately, and previous findings remain in history,
+never approving changed evidence. The finite allowance is not a spending target
+or a guarantee of unlimited visual coverage; retries also consume it.
 
 For a terminal visual run, `POST /api/explorations/{id}/visual-reviews/resume`
 accepts a finite `{ "max_requests": 120, "max_attempts": 3 }` allowance for the

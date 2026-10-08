@@ -1,4 +1,6 @@
 from pathlib import Path
+import os
+import pytest
 
 from autojev.adapters.openai_compatible import ProviderConnectionError
 from autojev.api.routes import _phase_payload
@@ -52,6 +54,52 @@ def test_economical_mode_does_not_count_unrequested_visual_reviews_as_unavailabl
             assert counts["unavailable"] == (1 if mode == "visual" else 0)
             assert counts.get("not_requested", 0) == (1 if mode == "text" else 0)
             assert not counts["assessed"] and not counts["rate_limited"]
+
+
+@pytest.mark.parametrize("missing_marker", [' data-report-locale="pt-BR-v1"', ' data-report-layout="premium-v1"', None])
+def test_portuguese_presentation_refreshes_cached_english_report_without_rewriting_evidence(tmp_path, missing_marker):
+    from autojev.adapters.report import StandaloneHtmlReport
+
+    app = create_app(settings(tmp_path))
+    with TestClient(app) as client:
+        repository = app.state.repository
+        run_id = repository.create_exploration(ExplorationRequest(
+            app_url="https://example.test", agent=ModelSelection("local", "agent"),
+            auxiliary_llm=ModelSelection("local", "auxiliary"), options=ExplorationOptions(),
+        ))
+        repository.add_scenario(run_id, 1, StoredScenario(
+            id="CT001", title="Select: Name (Z to A)", description="Observed", preconditions=[],
+            steps=["Execute select on e2"], expected_result="The selected option must match the requested value.",
+            actual_result="Playwright executed select successfully", status=ScenarioStatus.PASS,
+            url="https://example.test", created_at="2026-10-08T03:00:00Z", evidence={},
+        ))
+        original = tmp_path / "artifacts" / run_id / "report.html"
+        repository.update_exploration(run_id, status="completed", report_path=str(original))
+        StandaloneHtmlReport(tmp_path / "artifacts").generate(repository.get_exploration(run_id), str(original))
+        # Missing markers or older presentation sources must invalidate the
+        # cache while leaving the original artifact immutable.
+        old_document = original.read_text()
+        if missing_marker:
+            old_document = old_document.replace(missing_marker, '')
+        old_document = old_document.replace("Relatório de testes exploratórios", "Exploratory Test Report")
+        original.write_text(old_document)
+        if missing_marker is None:
+            os.utime(original, (1, 1))
+        before = repository.get_exploration(run_id)
+        response = client.get(f"/api/explorations/{run_id}/report")
+        assert response.status_code == 200
+        assert 'data-report-locale="pt-BR-v1"' in response.text
+        assert 'data-report-layout="premium-v1"' in response.text
+        assert "Relatório de testes exploratórios" in response.text
+        assert "Selecionar opção: Name (Z to A)" in response.text
+        assert "O Playwright executou a ação selecionar opção com sucesso" in response.text
+        assert original.read_text() == old_document
+        assert repository.get_exploration(run_id) == before
+        assert client.get(f"/api/explorations/{run_id}/report").text == response.text
+        projected = client.get(f"/api/explorations/{run_id}").json()
+        assert projected["scenarios"][0]["title"] == "Selecionar opção: Name (Z to A)"
+        assert projected["scenarios"][0]["status"] == "PASS"
+        assert repository.get_exploration(run_id) == before
 
 
 def test_legacy_report_is_presented_with_ct_timeline_without_rewriting_history(tmp_path):

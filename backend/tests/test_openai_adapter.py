@@ -735,7 +735,7 @@ async def test_typesafe_agent_only_sees_current_frontier_targets():
     assert decision.assertions == [
         {"kind": "url_contains", "expected": "/settings#users"}
     ]
-    assert "choice confidence: 0.91" in decision.rationale
+    assert "confiança na escolha: 0.91" in decision.rationale
     assert set(client.questions) == {"next_move", "qa_focus", "issue_visible"}
     assert set(client.questions["next_move"]["criteria"]) == {"move_001"}
     assert client.state["candidate_moves"]["move_001"] == {
@@ -873,7 +873,7 @@ async def test_typesafe_agent_returns_prevalidated_fill_move_with_safe_value():
         "e4",
         "AutoJev QA",
     )
-    assert decision.scenario_hint["title"].startswith("Validation Error Handling")
+    assert decision.scenario_hint["title"] == "Validação e tratamento de erros: Search orders"
 
 
 @pytest.mark.asyncio
@@ -1157,6 +1157,8 @@ async def test_auxiliary_text_mode_never_sends_a_captured_screenshot(tmp_path):
 
         async def chat_json(self, _model, _system, content, **_kwargs):
             self.contents.append(content)
+            assert "Brazilian Portuguese (pt-BR)" in _system
+            assert "technical error messages in their original form" in _system
             return {"title": "Text documentation", "steps": ["Open product"]}
 
     client = FakeClient()

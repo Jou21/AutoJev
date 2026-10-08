@@ -189,6 +189,11 @@ def _action_entries(
             "step_number": step,
             "success": result.get("success"),
             "target": decision.get("target") or result.get("target"),
+            **(
+                {"action_preview": deepcopy(result["evidence"]["action_preview"])}
+                if isinstance((result.get("evidence") or {}).get("action_preview"), dict)
+                else {}
+            ),
         }
     )
     for index, assertion in enumerate(result.get("assertions") or []):
@@ -217,6 +222,55 @@ def _action_entries(
         }
     )
     return entries
+
+
+def _enrich_action_previews(data: dict[str, Any]) -> None:
+    """Copy recorded capture metadata only through an unambiguous action link.
+
+    This presentation-only enrichment also applies to runs already projected
+    with TIMELINE_VERSION. It does not re-execute actions, guess coordinates or
+    replace a previously preserved preview/verdict.
+    """
+
+    by_step: dict[Any, list[dict[str, Any]]] = {}
+    for action in data.get("actions") or []:
+        step = action.get("step_number")
+        if step is not None:
+            by_step.setdefault(step, []).append(action)
+    for scenario in [
+        *(data.get("scenarios") or []),
+        *(data.get("scenario_contexts") or []),
+    ]:
+        evidence = scenario.get("evidence") or {}
+        entries = [
+            entry
+            for entry in evidence.get("timeline") or []
+            if entry.get("kind") == "action"
+        ]
+        for entry in entries:
+            step = entry.get("step_number")
+            if step is None:
+                step = entry.get("action_step")
+            if step is None and len(entries) == 1:
+                step = evidence.get("action_step")
+            candidates = by_step.get(step, []) if step is not None else []
+            if len(candidates) != 1:
+                continue
+            preview = ((candidates[0].get("result") or {}).get("evidence") or {}).get(
+                "action_preview"
+            )
+            if isinstance(preview, dict):
+                entry.setdefault("action_preview", deepcopy(preview))
+        preview_shots = [
+            _shot(entry["action_preview"].get("screenshot"))
+            for entry in entries
+            if isinstance(entry.get("action_preview"), dict)
+            and entry["action_preview"].get("screenshot")
+        ]
+        if preview_shots:
+            scenario["screenshots"] = list(
+                dict.fromkeys([*(scenario.get("screenshots") or []), *preview_shots])
+            )
 
 
 def _verdict(scenario: dict[str, Any], *, historical: bool) -> dict[str, Any]:
@@ -305,6 +359,7 @@ def prepare_scenario_timelines(exploration: dict[str, Any]) -> dict[str, Any]:
     """Return a deterministic, read-only presentation of current/legacy runs."""
 
     data = deepcopy(exploration)
+    _enrich_action_previews(data)
     if data.get("timeline_version") == TIMELINE_VERSION:
         return data
     app_url = str(data.get("app_url") or "")
@@ -385,7 +440,17 @@ def prepare_scenario_timelines(exploration: dict[str, Any]) -> dict[str, Any]:
                         "assertion": assertion,
                     }
                 )
-        captured = {_shot(entry.get("screenshot")) for entry in entries}
+        captured = {
+            _shot(shot)
+            for entry in entries
+            for shot in (
+                entry.get("screenshot"),
+                (entry.get("action_preview") or {}).get("screenshot")
+                if isinstance(entry.get("action_preview"), dict)
+                else None,
+            )
+            if shot
+        }
         for shot in scenario_shots - captured:
             record = next((s for s in screenshots if _shot(s.get("path")) == shot), {})
             entries.append(
@@ -608,6 +673,13 @@ def prepare_scenario_timelines(exploration: dict[str, Any]) -> dict[str, Any]:
                         _shot(entry["screenshot"])
                         for entry in evidence["timeline"]
                         if entry.get("screenshot")
+                    ],
+                    *[
+                        _shot(entry["action_preview"]["screenshot"])
+                        for entry in evidence["timeline"]
+                        if entry.get("kind") == "action"
+                        and isinstance(entry.get("action_preview"), dict)
+                        and entry["action_preview"].get("screenshot")
                     ],
                 ]
             )

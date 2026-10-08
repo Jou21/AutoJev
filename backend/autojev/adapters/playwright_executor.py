@@ -5,6 +5,7 @@ import copy
 import hashlib
 import hmac
 import json
+import math
 import re
 import secrets
 import time
@@ -1519,7 +1520,7 @@ class PlaywrightExecutor:
                 }
             )
 
-    async def _capture(self, label: str) -> str | None:
+    async def _capture(self, label: str, *, viewport_only: bool = False) -> str | None:
         if not self.options.capture_screenshots or not self._page:
             return None
         self._screenshot_number += 1
@@ -1556,9 +1557,14 @@ class PlaywrightExecutor:
         # paints those styles in the live window and makes the panel flash.
         # In headed runs the stable status panel may therefore appear in the
         # evidence image; that is preferable to mutating the user's viewport.
+        screenshot_options: dict[str, Any] = {}
+        if viewport_only:
+            # Geometry for action previews is recorded in CSS pixels. Do not
+            # let a retina/device scale factor resize only the bitmap.
+            screenshot_options["scale"] = "css"
         await self._page.screenshot(
             path=str(path),
-            full_page=self.headless,
+            full_page=self.headless and not viewport_only,
             mask=masks,
             mask_color="#101416",
             # Playwright's default caret='hide' temporarily writes inline
@@ -1566,8 +1572,77 @@ class PlaywrightExecutor:
             # mutation observers. Sensitive contents are already masked.
             caret="initial",
             timeout=20_000,
+            **screenshot_options,
         )
         return filename
+
+    async def _capture_action_preview(
+        self, locator: Any, decision: AgentDecision,
+    ) -> dict[str, Any] | None:
+        """Save a masked, unannotated viewport and its checked action target.
+
+        The report draws its marker over these coordinates, never over the
+        tested application's DOM or into the evidence image. This optional
+        local evidence must not prevent an otherwise valid browser action.
+        """
+        if not self.options.capture_screenshots or self._page is None:
+            return None
+        try:
+            page = self._page
+            await locator.scroll_into_view_if_needed(timeout=2_000)
+            viewport_script = "() => ({width: innerWidth, height: innerHeight})"
+            viewport = await page.evaluate(viewport_script)
+            before = await locator.bounding_box()
+            if not isinstance(viewport, dict) or not isinstance(before, dict):
+                return None
+            image = {key: viewport.get(key) for key in ("width", "height")}
+            box = {key: before.get(key) for key in ("x", "y", "width", "height")}
+            for value in (*image.values(), *box.values()):
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                    return None
+            if min(image.values()) <= 0 or box["width"] <= 0 or box["height"] <= 0:
+                return None
+            # Do not invent a click point for an offscreen/oversized control.
+            # A preview without trusted geometry is better omitted entirely.
+            if (
+                box["x"] < 0 or box["y"] < 0
+                or box["x"] + box["width"] > image["width"]
+                or box["y"] + box["height"] > image["height"]
+            ):
+                return None
+            source_url = page.url
+            captured_at = utc_now()
+            screenshot = await self._capture(
+                f"before-{decision.action}-target", viewport_only=True,
+            )
+            if not screenshot or self._page is not page or page.url != source_url:
+                return None
+            after = await locator.bounding_box()
+            after_viewport = await page.evaluate(viewport_script)
+            if not isinstance(after, dict) or after_viewport != viewport:
+                return None
+            for key, previous in box.items():
+                current = after.get(key)
+                if (
+                    isinstance(current, bool) or not isinstance(current, (int, float))
+                    or not math.isfinite(current) or abs(current - previous) > 1
+                ):
+                    return None
+            return {
+                "version": "action-target-v1",
+                "screenshot": screenshot,
+                "captured_at": captured_at,
+                "url": self._public_url(source_url),
+                "action": decision.action,
+                "target": decision.target,
+                "coordinate_space": "screenshot-css-pixels",
+                "image": image,
+                "box": box,
+            }
+        except Exception:
+            # Disappearing controls, unsupported test doubles or screenshot
+            # failures are evidence limitations, not action/verdict failures.
+            return None
 
     async def observe(self, screenshot_label: str = "page") -> Observation:
         if not self.is_active():
@@ -2471,6 +2546,9 @@ class PlaywrightExecutor:
                 opens_new_tab = (
                     await locator.get_attribute("target", timeout=500) == "_blank"
                 )
+                preview = await self._capture_action_preview(locator, decision)
+                if preview is not None:
+                    execution_evidence["action_preview"] = preview
                 await locator.click(timeout=10_000)
                 # Same-origin links that open a new tab are part of the tested
                 # application. Adopt the tab so observations and JEV decisions
@@ -2533,6 +2611,9 @@ class PlaywrightExecutor:
                         "identity": field.get("identity"),
                         "expected_token": self._field_value_token(fill_value),
                     }
+                preview = await self._capture_action_preview(locator, decision)
+                if preview is not None:
+                    execution_evidence["action_preview"] = preview
                 await locator.fill(fill_value, timeout=10_000)
                 if decision.credential_key:
                     await locator.evaluate(
@@ -2549,15 +2630,24 @@ class PlaywrightExecutor:
                         "identity": field.get("identity"),
                         "expected_token": self._field_value_token(decision.value),
                     }
+                preview = await self._capture_action_preview(locator, decision)
+                if preview is not None:
+                    execution_evidence["action_preview"] = preview
                 await locator.select_option(decision.value, timeout=10_000)
             elif action == "press":
                 locator = await self._locator(decision.target)
                 key = decision.key or "Enter"
                 if "enter" in key.lower():
                     await self._enforce_safe_interaction(locator)
+                preview = await self._capture_action_preview(locator, decision)
+                if preview is not None:
+                    execution_evidence["action_preview"] = preview
                 await locator.press(key, timeout=10_000)
             elif action == "hover":
                 locator = await self._locator(decision.target)
+                preview = await self._capture_action_preview(locator, decision)
+                if preview is not None:
+                    execution_evidence["action_preview"] = preview
                 await locator.hover(timeout=10_000)
             elif action == "go_back":
                 if (

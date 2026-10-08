@@ -254,8 +254,8 @@ def test_report_distinguishes_strength_and_lists_individual_restrictions(tmp_pat
     path = tmp_path / "report.html"
     StandaloneHtmlReport(tmp_path).generate(run, str(path))
     document = path.read_text()
-    assert "1 PASS com asserção de negócio" in document
-    assert "1 PASS apenas de interação técnica" in document
+    assert "1 aprovado(s) com asserção de negócio" in document
+    assert "1 aprovado(s) apenas pela interação técnica" in document
     assert "Cobertura e restrições · 1 registros" in document
     assert "&lt;script&gt;bad&lt;/script&gt;" in document
     assert "token=private" not in document
@@ -342,7 +342,7 @@ def test_report_total_duration_and_unavailable_reasons_include_postprocessing_ta
     document = path.read_text()
     assert "Duração total" in document and "00:15:55" in document
     assert "00:05:54" not in document
-    assert "Inclui revisões auxiliares e geração do relatório" in document
+    assert "inclui revisões auxiliares e geração do relatório" in document
     assert "1 sem revisão antes do limite de espera das revisões auxiliares" in document
     assert "1 com tempo de resposta da LLM auxiliar excedido" in document
     assert "Código: unknown_reason" in document
@@ -537,15 +537,16 @@ def test_report_keeps_observations_outside_ct_cards_counts_and_filters(tmp_path)
     assert ct_section.count('<details class="scenario"') == 1
     assert ct_section.count('data-status="PASS"') == 1
     assert '<strong>1</strong>Total' in ct_section
-    assert '<strong>0</strong>FAIL' in ct_section
+    assert '<strong>0</strong>Reprovados' in ct_section
     assert '<details class="execution-observations">' in observations
     assert '<details class="execution-observations" open' not in document
     assert 'data-status=' not in observations
     assert '<span class="badge' not in observations
     assert "CTX-private" not in document and "Legacy context card" not in document
     assert "Evidência de contexto" not in document and "CONTEXTO" not in document
-    assert 'const statuses=["ALL", "PASS", "FAIL", "BLOCKED", "SKIPPED"]' in document
-    assert "querySelectorAll('#scenarios .scenario')" in document
+    assert 'const statusLabels = {' in document
+    assert 'BLOCKED: "Bloqueados", SKIPPED: "Sem validação"' in document
+    assert 'all("#case-rows tr[data-case-index]")' in document
     assert "Na página https://shop.test/inventory?token=%5BREDACTED%5D, ocorreu HTTP 401." in observations
     assert "Página: https://shop.test/inventory?token=%5BREDACTED%5D" in observations
     assert "Fase registrada: Carregamento da página" in observations
@@ -626,12 +627,12 @@ def test_report_partitions_legacy_observations_and_corrects_only_visible_ct_coun
     assert ct_section.count('<details class="scenario"') == 4
     for status in ("PASS", "FAIL", "BLOCKED", "SKIPPED"):
         assert ct_section.count(f'data-status="{status}"') == 1
-    for label in ("PASS", "FAIL", "BLOCKED", "Sem validação"):
+    for label in ("Aprovados", "Reprovados", "Bloqueados", "Sem validação"):
         assert f'<strong>1</strong>{label}' in ct_section
     assert '<strong>4</strong>Total' in ct_section
     assert "4 de 4 CTs receberam uma análise visual válida" in ct_section
     assert "0 em análise" in ct_section
-    assert "1 PASS com asserção de negócio" in ct_section
+    assert "1 aprovado(s) com asserção de negócio" in ct_section
     assert "1 falha(s) técnica(s)" in ct_section
     assert "Mensagem histórica preservada" in ct_section
     assert "Old pseudo test" not in document
@@ -654,8 +655,8 @@ def test_report_preserves_stored_summary_without_legacy_observations(tmp_path):
     document = path.read_text()
 
     assert '<strong>18</strong>Total' in document
-    assert '<strong>17</strong>PASS' in document
-    assert '<strong>1</strong>FAIL' in document
+    assert '<strong>17</strong>Aprovados' in document
+    assert '<strong>1</strong>Reprovados' in document
     assert run == before
 
 
@@ -686,7 +687,7 @@ def test_report_observation_deduplicates_recorded_message_and_endpoint_only(tmp_
     assert observation.count("https://shop.test") == 2  # Factual summary and page metadata.
     assert "Telemetria externa" in observation
     assert "Sem impacto funcional confirmado" in observation
-    assert "network + console" in observation
+    assert "rede + console" in observation
     assert "Correlated console detail" in observation
     assert ct_timeline.count(message) == 2
     assert ct_timeline.count(endpoint) == 2

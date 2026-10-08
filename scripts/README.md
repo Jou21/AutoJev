@@ -122,12 +122,21 @@ provedor não são considerados conhecidos. Métricas ficam em
 
 ## Limites da revisão auxiliar
 
-Por padrão há até 120 requisições auxiliares, 6 respostas de limitação e 600
+Por padrão há até 300 requisições auxiliares, 6 respostas de limitação e 600
 segundos para concluir a fila após a exploração. Uma resposta 429 transitória
 pode reenfileirar o CT até duas vezes; o tempo de espera respeita o provedor.
 Chamadas reais a modelos `:free` são espaçadas em 3,1 segundos; cache exato e
 caminhos sem requisição não acrescentam essa espera. Quota diária/autenticação rejeitada
 não dispara repetição indefinida e não existe troca automática para modelo pago.
+
+CTs e verificações locais são preservados imediatamente. A primeira revisão de
+um CT novo ocorre em paralelo; depois que uma revisão visual foi despachada,
+revisitas com imagens diferentes são agrupadas até o fim da cobertura. Só a
+última evidência de cada CT entra novamente na fila paga. Cache exato continua
+disponível em paralelo. Revisões anteriores ficam no histórico, nunca aprovam
+uma captura diferente. O teto de 300 não é meta de gasto nem garantia ilimitada:
+valores explícitos menores (como 120) continuam sendo respeitados, e retentativas
+podem consumir a margem. Há até 3 tentativas por revisão, incluindo a primeira.
 
 Configuração: `AUTOJEV_AUXILIARY_MAX_REQUESTS`,
 `AUTOJEV_AUXILIARY_MAX_RATE_LIMITS`, `AUTOJEV_AUXILIARY_TAIL_TIMEOUT_SECONDS`,

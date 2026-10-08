@@ -1,5 +1,9 @@
 # Retomada de revisões visuais — validação local
 
+Registro da primeira correção (retomada). O padrão de novas execuções e o
+agrupamento de revisitas foram ajustados posteriormente; veja
+[a validação do agendamento visual](visual-review-scheduling-validation-2026-10-07.md).
+
 ## Política implementada
 
 - Até 3 tentativas totais por revisão, incluindo a primeira; a compatibilidade de formato também respeita o limite de 3 requisições HTTP.

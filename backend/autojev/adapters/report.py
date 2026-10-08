@@ -6,7 +6,7 @@ import json
 import math
 import re
 from collections import OrderedDict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -16,6 +16,10 @@ from autojev.services.coverage_ledger import coverage_restriction_ledger
 from autojev.services.execution_summary import formatted_execution_duration, report_snapshot_key
 from autojev.services.visual_checks import visual_review_counts, visual_unavailability_label
 from autojev.services.verification_summary import verification_summary
+from autojev.services.report_localization import (
+    REPORT_LOCALE_VERSION, action_label, check_label, localize_report_presentation, report_text,
+)
+from autojev.adapters.report_premium import render_premium_report
 
 
 def _h(value: object) -> str:
@@ -71,9 +75,142 @@ class StandaloneHtmlReport:
             data = self._image_data(exploration_id, path)
             if data:
                 images.append(
-                    f'<figure><img loading="lazy" src="{data}" alt="Screenshot de evidência"><figcaption>{_h(Path(path).name)}</figcaption></figure>'
+                    f'<figure><img loading="lazy" src="{data}" alt="Captura de evidência"><figcaption>{_h(Path(path).name)}</figcaption></figure>'
                 )
         return "".join(images) or '<p class="muted">Nenhuma captura associada.</p>'
+
+    @staticmethod
+    def _preview_time(value: object) -> float | None:
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            return timestamp.timestamp()
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    @staticmethod
+    def _preview_geometry(metadata: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any] | None:
+        """Keep only executor-owned, finite CSS-pixel coordinates; never infer a target."""
+        action = metadata.get("action")
+        if (metadata.get("version") != "action-target-v1"
+                or metadata.get("coordinate_space") != "screenshot-css-pixels"
+                or not isinstance(action, str)
+                or action not in {"click", "fill", "select", "press", "hover"}):
+            return None
+        image, box = metadata.get("image"), metadata.get("box")
+        if not isinstance(image, dict) or not isinstance(box, dict):
+            return None
+
+        def number(value: object) -> bool:
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                return False
+            try:
+                return math.isfinite(value)
+            except OverflowError:
+                return False
+
+        if not all(number(image.get(key)) for key in ("width", "height")):
+            return None
+        if not all(number(box.get(key)) for key in ("x", "y", "width", "height")):
+            return None
+        width, height = image["width"], image["height"]
+        x, y, box_width, box_height = (box[key] for key in ("x", "y", "width", "height"))
+        if (width <= 0 or height <= 0 or box_width <= 0 or box_height <= 0
+                or x < 0 or y < 0 or x + box_width > width or y + box_height > height):
+            return None
+        target = metadata.get("target")
+        if (not isinstance(target, str) or not target or len(target) > 240
+                or any(ord(character) < 32 for character in target)
+                or entry.get("target") and target != entry["target"]
+                or entry.get("url") and metadata.get("url") != entry["url"]):
+            return None
+        # Values, DOM content, URLs and arbitrary capture metadata must not be
+        # copied to an HTML data attribute: it needs only geometry and the ref.
+        return {
+            "version": "action-target-v1", "coordinate_space": "screenshot-css-pixels",
+            "action": metadata["action"], "target": target,
+            "image": {key: image[key] for key in ("width", "height")},
+            "box": {key: box[key] for key in ("x", "y", "width", "height")},
+        }
+
+    def _preview_filename(self, exploration_id: str, entry: dict[str, Any]) -> str | None:
+        """Return only an existing local capture tied to this action's page."""
+        metadata = entry.get("action_preview")
+        if not isinstance(metadata, dict):
+            return None
+        screenshot = metadata.get("screenshot")
+        if (metadata.get("version") != "action-target-v1"
+                or not isinstance(screenshot, str)
+                or screenshot != Path(screenshot).name
+                or "\\" in screenshot or "\x00" in screenshot
+                or entry.get("url") and metadata.get("url") != entry["url"]
+                or Path(screenshot).suffix.lower() not in {".png", ".jpg", ".jpeg"}):
+            return None
+        candidate = (self.artifact_root / exploration_id / "screenshots" / screenshot).resolve()
+        allowed = (self.artifact_root / exploration_id / "screenshots").resolve()
+        return screenshot if allowed in candidate.parents and candidate.is_file() else None
+
+    def _action_preview(
+        self,
+        exploration_id: str,
+        entry: dict[str, Any],
+        *,
+        preceding: list[dict[str, Any]],
+        canonical_shots: set[str],
+    ) -> str:
+        metadata = entry.get("action_preview")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        filename = self._preview_filename(exploration_id, entry) or ""
+        geometry = None
+        if filename:
+            geometry = self._preview_geometry(metadata, entry)
+        if not filename:
+            # Historical captures can show the state before an action, but
+            # cannot reconstruct where it was dispatched. Stay inside this CT,
+            # require timing and the same URL, and never use an after-capture.
+            action_time = self._preview_time(entry.get("occurred_at"))
+            action_url = entry.get("url")
+            for candidate in reversed(preceding):
+                if candidate.get("kind") == "action":
+                    break
+                captured = self._preview_time(candidate.get("occurred_at"))
+                if (candidate.get("kind") == "observation" and candidate.get("screenshot")
+                        and isinstance(action_url, str) and action_url
+                        and candidate.get("url") == action_url
+                        and captured is not None and action_time is not None
+                        and captured <= action_time):
+                    filename = Path(str(candidate["screenshot"])).name
+                    break
+        if not filename:
+            return ""
+        candidate = (self.artifact_root / exploration_id / "screenshots" / filename).resolve()
+        allowed = (self.artifact_root / exploration_id / "screenshots").resolve()
+        if allowed not in candidate.parents or not candidate.is_file():
+            return ""
+        # The original capture is already embedded in a canonical timeline
+        # observation in most cases. Reference it instead of duplicating the
+        # base64 data for each action. The offline report hydrates this ref.
+        data = self._image_data(exploration_id, filename) if filename not in canonical_shots else None
+        image_source = f' src="{data}"' if data else ""
+        payload = json.dumps(geometry or {}, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        note = (
+            "O destaque indica o controle registrado imediatamente antes da interação."
+            if geometry else "Posição do alvo não registrada nesta execução."
+        )
+        return (
+            '<div class="shots action-preview-shots"><figure class="action-preview" '
+            f'data-action-preview="{_h(payload)}">'
+            '<div class="action-preview-heading"><strong>Alvo da ação</strong>'
+            '<small>Captura anterior à interação</small></div>'
+            '<div class="action-preview-frame">'
+            f'<img class="action-preview-image" loading="lazy" data-source-shot="{_h(filename)}"'
+            f'{image_source} alt="Captura anterior à ação; {_h(note)}"></div>'
+            f'<figcaption>{_h(filename)}</figcaption>'
+            f'<p class="action-preview-note">{_h(note)}</p></figure></div>'
+        )
 
     @staticmethod
     def _timeline_entry_id(scenario: dict[str, Any], index: int) -> str:
@@ -113,10 +250,10 @@ class StandaloneHtmlReport:
             '<p>A remoção anterior deste item falhou em uma verificação de negócio. '
             'Isso impediu recuperar o estado necessário para testar sua adição; '
             'a restrição permanece aberta e não conta como aprovação.</p>'
-            + '<p>' + step_note + ' · ' + _h(dependency.get("action") or "ação")
+            + '<p>' + step_note + ' · ' + _h(action_label(dependency.get("action")))
             + ' · Controle: ' + _h(dependency.get("name") or "Remove") + '</p>'
             + '<p>Verificações que reprovaram: ' + _h(
-                ", ".join(str(kind) for kind in dependency["failed_assertion_kinds"])) + '</p>'
+                ", ".join(check_label(kind) for kind in dependency["failed_assertion_kinds"])) + '</p>'
             + '<div class="url">' + _h(self._public_issue_url(dependency.get("source_url"))) + '</div>'
             + ('<div class="shots">' + self._screenshots(exploration_id, [screenshot]) + '</div>'
                + f'<a href="{image}" download="{_h(Path(screenshot).name)}">Baixar captura da ação bloqueadora</a>'
@@ -141,7 +278,7 @@ class StandaloneHtmlReport:
                 ", ".join(str(field.get("name") or "Campo sem nome") for field in blocking_fields
                           if isinstance(field, dict))) + '</p>' if blocking_fields else '')
             + '<div class="url">' + _h(self._public_issue_url(item.get("source_url") or item.get("target_url")))
-            + '</div><small>' + _h(item.get("action") or "ação") + '</small>'
+            + '</div><small>' + _h(action_label(item.get("action"))) + '</small>'
             + ('<div class="url">Estado a retomar: ' + _h(self._public_issue_url(item["target_url"])) + '</div>'
                if item.get("target_url") and item.get("target_url") != item.get("source_url") else '')
             + self._restriction_dependency(exploration_id, item, scenarios)
@@ -169,7 +306,7 @@ class StandaloneHtmlReport:
             + '<p>' + _h(result_note) + '</p>'
             + '<p>' + (f'<a href="#{anchor}">Ver ação da etapa {_h(step)} na linha do tempo</a>'
                        if anchor else f'Etapa {_h(step)} · ação registrada')
-            + ' · ' + _h(resolution.get("action")) + ' · Alvo: ' + _h(resolution.get("target")) + '</p>'
+            + ' · ' + _h(action_label(resolution.get("action"))) + ' · Alvo: ' + _h(resolution.get("target")) + '</p>'
             + '<time datetime="' + _h(resolution.get("occurred_at")) + '">' + _h(resolution.get("occurred_at")) + '</time>'
             + '<div class="url">' + _h(self._public_issue_url(resolution.get("source_url"))) + '</div>'
             + ('<div class="shots">' + self._screenshots(exploration_id, [screenshot]) + '</div>'
@@ -275,7 +412,7 @@ class StandaloneHtmlReport:
                 break
         if not reason and status == "failed":
             reason = str(exploration.get("error") or "").strip()
-        return labels.get(status, status or "Desconhecido"), reason
+        return labels.get(status, status or "Desconhecido"), report_text(reason)
 
     @staticmethod
     def _public_issue_url(value: object) -> str:
@@ -471,7 +608,8 @@ class StandaloneHtmlReport:
             "Erros de console/rede não demonstram, isoladamente, um defeito "
             "funcional. O resultado desta verificação foi preservado."
             if technical else "Reprovação baseada na imagem, não em um bug funcional confirmado. "
-            "Confira a captura e a região; a confiança é declarada pelo modelo." if visual
+            "Confira a captura e a região; a confiança é declarada pelo modelo. "
+            "O diagnóstico original do modelo é preservado no idioma em que foi recebido." if visual
             else "A aprovação se aplica a esta verificação, não a toda a "
             "funcionalidade ou aplicação."
         )
@@ -483,14 +621,14 @@ class StandaloneHtmlReport:
         assertion_values = ""
         for key, value_label in (("expected", "Esperado"), ("actual", "Obtido")):
             if key in assertion:
-                value = assertion[key]
+                value = assertion.get("expected_display", assertion[key]) if key == "expected" else assertion[key]
                 if isinstance(value, (dict, list)):
                     value = json.dumps(value, ensure_ascii=False)
                 assertion_values += f'<div><span class="muted">{value_label}: </span>{_h(value)}</div>'
         return (
             f'<div class="assertion-detail"><span class="event-chip">{label}</span> '
-            f'<strong>{_h(kind)}</strong><p>{verdict}: '
-            f'{_h(assertion.get("message"))}</p>{assertion_values}<p class="muted">{note}</p></div>'
+            f'<strong>{_h(check_label(kind))}</strong><p>{verdict}: '
+            f'{_h(report_text(assertion.get("message")))}</p>{assertion_values}<p class="muted">{note}</p></div>'
         )
 
     def _signal_detail(
@@ -518,7 +656,7 @@ class StandaloneHtmlReport:
         channels = signal.get("evidence_channels") or signal.get("types") or []
         if not isinstance(channels, list):
             channels = [channels]
-        channel_label = " + ".join(str(item) for item in channels if item)
+        channel_label = " + ".join({"network": "rede", "console": "console", "http": "rede", "pageerror": "exceção na página"}.get(str(item), str(item)) for item in channels if item)
         status = signal.get("status_code")
         classification_label = classification_label or "Impacto funcional não confirmado"
         impact = {
@@ -569,19 +707,31 @@ class StandaloneHtmlReport:
         evidence = scenario.get("evidence") or {}
         entries = list(evidence.get("timeline") or [])
         used_shots = {
-            str(item.get("screenshot")) for item in entries if item.get("screenshot")
+            Path(str(item["screenshot"])).name for item in entries if item.get("screenshot")
         }
+        # An executor-owned preview is itself the canonical capture on its
+        # action. Do not append a second, synthetic "historical" observation
+        # that would lose its known timing and duplicate the timeline entry.
+        # Invalid/unrelated preview metadata does not consume a legacy shot.
+        used_shots.update(
+            filename for item in entries
+            if item.get("kind") == "action"
+            and (filename := self._preview_filename(exploration_id, item))
+        )
         # Preserve legacy captures even if a historical record cannot establish
         # a precise timestamp or link to an action. Never invent that ordering.
         for screenshot in scenario.get("screenshots") or []:
-            if str(screenshot) not in used_shots:
+            if Path(str(screenshot)).name not in used_shots:
                 entries.append({
                     "kind": "observation",
                     "title": "Captura preservada",
                     "message": "Evidência histórica sem horário de captura registrado.",
                     "screenshot": screenshot,
                 })
-                used_shots.add(str(screenshot))
+                used_shots.add(Path(str(screenshot)).name)
+        canonical_shots = {
+            Path(str(item["screenshot"])).name for item in entries if item.get("screenshot")
+        }
         rendered: list[str] = []
         labels = {
             "observation": "Observação",
@@ -667,6 +817,9 @@ class StandaloneHtmlReport:
                 + (f'<p>{_h(entry.get("message"))}</p>' if entry.get("message") else "")
                 + (f'<div class="url">{_h(self._public_issue_url(entry_url))}</div>' if entry_url else "")
                 + detail
+                + (self._action_preview(
+                    exploration_id, entry, preceding=entries[:index], canonical_shots=canonical_shots,
+                ) if kind == "action" else "")
                 + (f'<div class="shots">{self._screenshots(exploration_id, [screenshot])}</div>' if screenshot else "")
                 + '</div></li>'
             )
@@ -705,14 +858,14 @@ class StandaloneHtmlReport:
         preconditions = "".join(
             f"<li>{_h(item)}</li>" for item in scenario.get("preconditions", [])
         ) or "<li>Nenhuma pré-condição documentada.</li>"
-        visible_status = "SEM VALIDAÇÃO" if status == "SKIPPED" else status
+        visible_status = {"PASS": "APROVADO", "FAIL": "REPROVADO", "BLOCKED": "BLOQUEADO", "SKIPPED": "SEM VALIDAÇÃO"}[status]
         evidence = scenario.get("evidence") or {}
         verdict = evidence.get("verdict") or {}
         technical_failure = isinstance(verdict, dict) and verdict.get("kind") == "technical_failure"
         if status == "FAIL" and technical_failure:
-            visible_status = "FAIL · VERIFICAÇÃO TÉCNICA"
+            visible_status = "REPROVADO · VERIFICAÇÃO TÉCNICA"
         elif status == "FAIL" and verdict.get("kind") == "visual_failure":
-            visible_status = "FAIL · INDÍCIO VISUAL"
+            visible_status = "REPROVADO · INDÍCIO VISUAL"
         badge_class = "blocked" if technical_failure else status.lower()
         verdict_detail = (
             f'<div class="verdict-note"><strong>{_h(verdict.get("label"))}</strong>'
@@ -760,7 +913,7 @@ class StandaloneHtmlReport:
           {self._timeline(exploration_id, scenario)}</div></details>"""
 
     def generate(self, exploration: dict[str, Any], output_path: str) -> str:
-        exploration = prepare_scenario_timelines(exploration)
+        exploration = localize_report_presentation(prepare_scenario_timelines(exploration))
         exploration_id = str(exploration["id"])
         recorded_scenarios = exploration.get("scenarios", [])
         legacy_observations = [
@@ -780,16 +933,16 @@ class StandaloneHtmlReport:
         strength = verification_summary(scenarios)
         strength_summary = (
             '<section class="completion" aria-label="Força das verificações"><strong>O que foi realmente verificado</strong>'
-            f'<p>{strength["business_verified"]} PASS com asserção de negócio · '
-            f'{strength["interaction_only"]} PASS apenas de interação técnica.</p>'
+            f'<p>{strength["business_verified"]} aprovado(s) com asserção de negócio · '
+            f'{strength["interaction_only"]} aprovado(s) apenas pela interação técnica.</p>'
             f'<p>{strength["business_failures"]} falha(s) de asserção de negócio · '
             f'{strength["execution_failures"]} falha(s) na execução da automação · '
             f'{strength["technical_failures"]} falha(s) técnica(s) · '
             f'{strength["visual_findings"]} indício(s) visual(is) a revisar · '
             f'{strength["interaction_failures"]} interação(ões) sem resultado esperado.</p>'
             '<p class="muted">Processamento concluído não significa todos os cenários possíveis. '
-            'PASS apenas de interação não valida o resultado de negócio. O escopo depende do usuário, '
-            'dos estados alcançados, dos valores de entrada e do viewport.</p></section>'
+            'Aprovação apenas da interação não valida o resultado de negócio. O escopo depende do usuário, '
+            'dos estados alcançados, dos valores de entrada e do tamanho da tela.</p></section>'
         )
         coverage = (exploration.get("completion") or {})
         blocked_count = int(coverage.get("blocked_candidates") or 0)
@@ -895,7 +1048,7 @@ class StandaloneHtmlReport:
                 '<p>Uma revisão visual pendente significa que falta a análise adicional das capturas pela LLM; '
                 'ações e verificações locais já registradas continuam válidas. Na aplicação, revisões pendentes podem ser retomadas com um novo limite finito, '
                 f'após confirmação de custo, sem repetir a exploração. A retomada usa até {review_attempts} tentativas por revisão, contando a primeira.</p>'
-                '<p class="muted">PASS/FAIL das verificações locais continua válido. Análise visual indisponível não significa aprovação visual; '
+                '<p class="muted">Os resultados de aprovação ou reprovação das verificações locais continuam válidos. Análise visual indisponível não significa aprovação visual; '
                 'ausência de indícios não garante cobertura visual completa.</p></section>'
             )
         tokens, _ = self._usage(exploration)
@@ -906,10 +1059,9 @@ class StandaloneHtmlReport:
             exploration_id, contexts,
         )
         generated = datetime.now().astimezone().strftime("%d/%m/%Y %H:%M:%S %Z")
-        safe_filter_data = json.dumps(["ALL", "PASS", "FAIL", "BLOCKED", "SKIPPED"])
         document = f"""<!doctype html>
-<html lang="pt-BR" data-report-schema="ct-timeline-v1" data-report-summary="execution-v2" data-coverage-ledger="execution-evidence-v1" data-cost-breakdown="roles-v1" data-visual-review-policy="bounded-v1" data-report-snapshot="{report_snapshot_key(exploration)}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AutoJev — Exploratory Test Report</title>
+<html lang="pt-BR" data-report-locale="{REPORT_LOCALE_VERSION}" data-report-schema="ct-timeline-v1" data-report-summary="execution-v2" data-coverage-ledger="execution-evidence-v1" data-cost-breakdown="roles-v1" data-visual-review-policy="bounded-v1" data-report-snapshot="{report_snapshot_key(exploration)}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AutoJev — Relatório de testes exploratórios</title>
 <style>
 :root{{--bg:#0b0e14;--panel:#141923;--line:#293142;--text:#edf1f7;--muted:#9ca8ba;--accent:#f0b44d;--pass:#3ddc97;--fail:#ff647c;--blocked:#ffa657;--skipped:#8b98aa;--info:#83bffc}}
 *{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 Inter,system-ui,sans-serif}}main{{max-width:1120px;margin:auto;padding:48px 24px}}
@@ -921,23 +1073,16 @@ class StandaloneHtmlReport:
 .url{{color:var(--muted);font:12px/1.6 ui-monospace,monospace;overflow-wrap:anywhere}}.columns,.result{{grid-template-columns:1fr 1fr;margin:15px 0}}.case-documentation{{border-top:1px solid var(--line);padding:14px 0;margin-top:16px}}.case-documentation>summary{{cursor:pointer;color:var(--muted)}}.verdict-note,.context-note{{border:1px solid var(--line);border-radius:10px;background:#10151e;padding:12px 14px;margin:16px 0}}.verdict-note p{{margin:6px 0}}.context-note{{border-color:#29465d;color:#b2cce1}}.execution-observations{{margin-top:28px;padding-top:18px;border-top:1px solid var(--line)}}.execution-observations>summary{{cursor:pointer;color:var(--muted)}}.execution-observations>summary strong{{color:var(--text)}}.execution-observations .evidence-timeline{{margin-top:16px}}
 .timeline-heading{{margin:22px 0 14px}}.evidence-timeline{{list-style:none;padding:0;margin:0}}.timeline-entry{{position:relative;display:grid;grid-template-columns:14px minmax(0,1fr);gap:14px;padding-bottom:18px}}.timeline-entry:not(:last-child)::before{{content:"";position:absolute;left:6px;top:14px;bottom:0;width:1px;background:var(--line)}}.timeline-marker{{position:relative;width:13px;height:13px;border:3px solid var(--panel);border-radius:50%;background:#728397;margin-top:6px;box-shadow:0 0 0 1px var(--line)}}.action .timeline-marker{{background:var(--accent)}}.signal .timeline-marker{{background:var(--blocked)}}.assertion .timeline-marker{{background:var(--info)}}.timeline-content{{min-width:0;border:1px solid var(--line);border-radius:10px;background:#10151e;padding:14px 16px}}.event-meta{{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:11px;color:var(--muted)}}.event-kind{{letter-spacing:.09em;text-transform:uppercase;font-weight:750}}.timeline-content h3{{font-size:16px;text-transform:none;color:var(--text);margin:7px 0}}.timeline-content p{{margin:8px 0}}.event-chip{{display:inline-block;font-size:11px;border:1px solid var(--line);padding:3px 8px;border-radius:6px;color:var(--info)}}.signal-chip{{color:var(--blocked);border-color:#6a4b24}}.signal-head{{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}}.signal-detail,.assertion-detail{{padding-top:10px;margin-top:10px;border-top:1px solid var(--line)}}.impact-note{{color:#c5bca9;font-size:13px}}.shots{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr));gap:12px;margin-top:16px}}figure{{margin:0;min-width:0}}img{{display:block;width:100%;border-radius:9px;border:1px solid var(--line)}}figcaption{{color:var(--muted);font-size:12px;margin-top:5px;overflow-wrap:anywhere}}
 @media(max-width:720px){{main{{padding:28px 14px}}h1{{font-size:30px}}.summary{{grid-template-columns:1fr 1fr}}.cost-summary,.meta,.columns,.result{{grid-template-columns:1fr}}.scenario{{padding:14px}}.scenario h2{{font-size:18px}}.scenario>summary{{gap:10px}}.timeline-entry{{gap:10px}}.timeline-content{{padding:12px}}.search{{min-width:0;width:100%;flex-basis:100%}}}}@media(prefers-reduced-motion:reduce){{*{{scroll-behavior:auto}}}}
-</style></head><body data-report-schema="ct-timeline-v1"><main>
-<div class="eyebrow">AutoJev</div><h1>Exploratory Test Report</h1><p class="muted">Relatório autônomo com evidências observadas pelo Playwright.</p>
-<div class="meta"><div><strong>Aplicação</strong><div class="url">{_h(exploration.get("app_url"))}</div></div><div><strong>Escopo</strong><div>{_h(scope)}</div></div><div><strong>Evidência da LLM</strong><div>{_h(evidence_mode_label)}</div></div><div><strong>Status</strong><div>{_h(completion_status)}</div></div><div><strong>Duração total</strong><div>{_h(self._duration(exploration))}</div><small>Inclui revisões auxiliares e geração do relatório.</small></div><div><strong>Gerado em</strong><div>{_h(generated)}</div></div></div>
-{f'<div class="completion"><strong>Motivo do encerramento:</strong>{_h(completion_reason)}</div>' if completion_reason else ''}
-<section class="summary"><div class="metric"><strong>{int(summary.get("total_scenarios", 0))}</strong>Total</div><div class="metric"><strong>{int(summary.get("pass", 0))}</strong>PASS</div><div class="metric"><strong>{int(summary.get("fail", 0))}</strong>FAIL</div><div class="metric"><strong>{int(summary.get("blocked", 0))}</strong>BLOCKED</div><div class="metric"><strong>{int(summary.get("skipped", 0))}</strong>Sem validação</div><div class="metric"><strong>{_h(tokens)}</strong>Tokens</div></section>
-{cost_summary}
-{visual_summary}
-{strength_summary}{coverage_summary}
-<div class="reading-guide"><strong>Cada caso conta sua história.</strong> Abra um CT para ver ações, capturas, verificações e sinais técnicos no momento em que foram registrados. Um sinal de console/rede não é automaticamente um defeito funcional. Registros sem vínculo confiável ficam nas Observações da execução, separadas dos CTs e de seus resultados.</div>
-<div class="report-tools"><input class="search" id="search" type="search" placeholder="Buscar por CT, URL, sinal ou evidência" aria-label="Buscar cenários"><div class="filters" id="filters"></div></div><section id="scenarios">{"".join(cards) or '<p class="muted">Nenhum cenário gerado.</p>'}</section>
-{execution_observations}
-</main><script>
-const statuses={safe_filter_data};const root=document.getElementById('filters');const search=document.getElementById('search');let active='ALL';
-function apply(){{const term=search.value.trim().toLowerCase();document.querySelectorAll('#scenarios .scenario').forEach(x=>{{x.hidden=(active!=='ALL'&&x.dataset.status!==active)||(term&&!x.textContent.toLowerCase().includes(term))}})}}
-for(const status of statuses){{const b=document.createElement('button');b.textContent=status==='SKIPPED'?'SEM VALIDAÇÃO':status==='ALL'?'TODOS':status;b.className=status==='ALL'?'active':'';b.onclick=()=>{{active=status;document.querySelectorAll('#filters button').forEach(x=>x.classList.remove('active'));b.classList.add('active');apply()}};root.appendChild(b)}}search.addEventListener('input',apply);
-document.querySelectorAll('.coverage-resolution a[href^="#"],.coverage-dependency a[href^="#"]').forEach(link=>link.addEventListener('click',()=>{{const target=document.getElementById(link.hash.slice(1));if(!target)return;let parent=target.parentElement;while(parent){{if(parent.tagName==='DETAILS')parent.open=true;parent=parent.parentElement}}}}));
-</script></body></html>"""
+</style></head>"""
+        document = render_premium_report(self, exploration, scenarios, contexts, document, {
+            "summary": summary, "tokens": tokens, "scope": scope,
+            "evidence_mode": evidence_mode_label, "status": completion_status,
+            "generated": generated, "completion_reason": completion_reason,
+            "cost_summary": cost_summary, "visual_summary": visual_summary,
+            "strength_summary": strength_summary, "coverage_summary": coverage_summary,
+            "observations": execution_observations,
+            "case_cards": cards,
+        })
         output = Path(output_path)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(document, encoding="utf-8")

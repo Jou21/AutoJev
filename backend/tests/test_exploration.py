@@ -923,8 +923,8 @@ async def test_all_local_scenarios_are_persisted_before_auxiliary_enrichment():
         async def create_scenario(self, observation, decision, result, number):
             # The complete local set must exist before the first provider call.
             assert repository.scenarios[:2] == [
-                (1, "Explore click on Dashboard"),
-                (2, "Explore click on Dashboard"),
+                (1, "Explorar: clicar em «Dashboard»"),
+                (2, "Explorar: clicar em «Dashboard»"),
             ]
             scenario = ExplorationManager._scenario_from_evidence(
                 observation, decision, result, number
@@ -965,8 +965,8 @@ async def test_all_local_scenarios_are_persisted_before_auxiliary_enrichment():
     )
 
     assert repository.scenarios[:2] == [
-        (1, "Explore click on Dashboard"),
-        (2, "Explore click on Dashboard"),
+        (1, "Explorar: clicar em «Dashboard»"),
+        (2, "Explorar: clicar em «Dashboard»"),
     ]
     assert repository.scenarios[2:] == [(1, "Enriched 1"), (2, "Enriched 2")]
     assert repository.events[1][0] == "scenario_drafts_ready"
@@ -1441,7 +1441,7 @@ async def test_compact_visual_review_keeps_local_docs_and_counts_review_separate
     await asyncio.wait_for(pipeline.finish(), timeout=1)
 
     scenario = repository.scenarios[1]
-    assert scenario.title == "Explore click on Cart"
+    assert scenario.title == "Explorar: clicar em «Cart»"
     assert "Cart count must increase." in scenario.expected_result
     assert "whole application" not in scenario.expected_result
     assert scenario.status == ScenarioStatus.FAIL
@@ -1617,14 +1617,14 @@ async def test_live_scenario_capture_persists_draft_without_waiting_for_auxiliar
     await asyncio.wait_for(
         pipeline.capture("cart", *first, sequence=1), timeout=0.2
     )
-    assert repository.scenarios[1].title == "Explore click on Cart"
+    assert repository.scenarios[1].title == "Explorar: clicar em «Cart»"
     await asyncio.wait_for(enrichment_started.wait(), timeout=0.2)
 
     second = _live_scenario_evidence(title="Checkout", target="e2")
     await asyncio.wait_for(
         pipeline.capture("checkout", *second, sequence=2), timeout=0.2
     )
-    assert repository.scenarios[2].title == "Explore click on Checkout"
+    assert repository.scenarios[2].title == "Explorar: clicar em «Checkout»"
 
     release_enrichment.set()
     await asyncio.wait_for(pipeline.finish(), timeout=1)
@@ -1814,7 +1814,7 @@ async def test_exploration_loop_advances_while_first_scenario_is_being_enriched(
                 assert second_planning_started.is_set() is True
                 assert enrichment_finished.is_set() is False
                 # CT001 is already durable while its enrichment is blocked.
-                assert repository.scenarios[1].title == "Explore click on Page 1"
+                assert repository.scenarios[1].title == "Explorar: clicar em «Page 1»"
                 release_enrichment.set()
             observation = Observation(
                 url=f"https://example.test/page-{self.execute_calls}",
@@ -1917,7 +1917,7 @@ async def test_exploration_loop_advances_while_first_scenario_is_being_enriched(
     assert [event for event in repository.events if event[0] == "failed"] == []
     assert len(repository.actions) == 2, repository.events[-5:]
     assert second_planning_started.is_set() is True
-    assert repository.scenario_writes[0] == (1, "Explore click on Page 1")
+    assert repository.scenario_writes[0] == (1, "Explorar: clicar em «Page 1»")
     assert [repository.scenarios[index].title for index in (1, 2)] == [
         "Enriched 1",
         "Enriched 2",
@@ -2066,7 +2066,7 @@ async def test_live_scenario_cancel_stops_provider_and_preserves_local_draft():
     await asyncio.wait_for(pipeline.finish(cancelled=True), timeout=0.5)
 
     assert enrichment_cancelled.is_set() is True
-    assert repository.scenarios[1].title == "Explore click on Cart"
+    assert repository.scenarios[1].title == "Explorar: clicar em «Cart»"
     assert repository.scenarios[1].status == ScenarioStatus.PASS
 
 

@@ -261,10 +261,9 @@ async def test_full_exploration_finishes_and_preserves_business_failures(
         True,
         "chromium",
         1,
-        # The expanded three-catalog fixture produces over 120 incremental
-        # reviews of 108 CTs. Keep its fake-client oracle finite while checking
-        # every final visual revision; the product's default 120-call cost
-        # safeguard remains unchanged, and these isolated calls cost no credits.
+        # Keep this fixture's explicit allowance finite and independent of the
+        # product default (300). Check every final visual revision without
+        # silently increasing its 200-call cap; these fake calls cost nothing.
         auxiliary_max_requests=200,
     )
     observed_routes, snapshots, planners = set(), [], []

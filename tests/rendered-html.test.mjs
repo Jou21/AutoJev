@@ -86,6 +86,14 @@ test("defaults auxiliary reviews to the requested Gemini without changing the JE
   assert.match(source, /available\.filter\(modelAcceptsImages\)/);
 });
 
+test("new explorations use a finite 300-call ceiling and explain coalesced visual revisits", async () => {
+  const source = await readFile(new URL("../app/AutoJevApp.tsx", import.meta.url), "utf8");
+  assert.match(source, /\[auxiliaryMaxRequests, setAuxiliaryMaxRequests\] = useState\("300"\)/);
+  assert.match(source, /Teto de requisições HTTP, não meta de gasto/);
+  assert.match(source, /revisitas visuais são agrupadas/);
+  assert.match(source, /auxiliary_max_requests: requestBudget/);
+});
+
 test("shows test-case creation running alongside browser exploration", async () => {
   const source = await readFile(new URL("../app/AutoJevApp.tsx", import.meta.url), "utf8");
 
@@ -295,7 +303,7 @@ test("renders each CT timeline with its captures, assertions and technical signa
     }],
   }));
   assert.match(html, /<details class="scenario-case-card verdict-warning"/);
-  assert.match(html, /FAIL · Verificação técnica falhou/);
+  assert.match(html, /Reprovado · Verificação técnica falhou/);
   assert.match(html, /1 de 1 CTs/);
   assert.match(html, /2 capturas/);
   assert.match(html, /\/run-1\/screenshots\/001-before\.png/);
@@ -426,7 +434,7 @@ test("filters CTs by verdict or signal and constrains screenshot URLs to the loc
   assert.doesNotMatch(html, /href="javascript:/);
   assert.doesNotMatch(html, /<script>alert\(1\)<\/script>/);
   assert.doesNotMatch(html, /<img\b/);
-  assert.match(html, /SKIPPED · Não validado/);
+  assert.match(html, /Sem validação · Não validado/);
 });
 
 test("distinguishes visual-model failures and unavailable visual review from business PASS", async () => {
@@ -445,12 +453,31 @@ test("distinguishes visual-model failures and unavailable visual review from bus
       },
     }],
   }));
-  assert.match(html, /FAIL · Indício visual · revisão necessária/);
+  assert.match(html, /Reprovado · Indício visual · revisão necessária/);
   assert.match(html, /1 indício\(s\) visual\(is\) · revisão necessária/);
   assert.match(html, /Falhou · indício visual da LLM/);
   assert.match(html, /Análise visual indisponível · CT baseado nas verificações locais/);
   assert.match(html, /O provedor limitou as chamadas/);
-  assert.match(html, /PASS · Verificações aprovadas/);
+  assert.match(html, /Aprovado · Verificações aprovadas/);
+});
+
+test("renders Portuguese expected prose while retaining the original assertion evidence", async () => {
+  const { ScenarioTimelinePanel } = await timelineComponents();
+  const assertion = {
+    kind: "no_new_application_errors", passed: true,
+    expected: "0 attributable application runtime, HTTP or network failures",
+    expected_display: "Nenhuma falha de execução, HTTP ou rede atribuível à aplicação",
+    actual: { console_errors: 0, network_errors: 0 },
+  };
+  const html = renderToStaticMarkup(createElement(ScenarioTimelinePanel, {
+    explorationId: "run", apiBase: "http://localhost:8000/api", contexts: [], scenarios: [{
+      id: "CT001", title: "Verificar falhas técnicas", status: "PASS",
+      evidence: { timeline: [{ kind: "assertion", assertion }] },
+    }],
+  }));
+  assert.match(html, /Esperado: Nenhuma falha de execução, HTTP ou rede atribuível à aplicação/);
+  assert.doesNotMatch(html, /0 attributable application runtime/);
+  assert.equal(assertion.expected, "0 attributable application runtime, HTTP or network failures");
 });
 
 test("makes missing visual reviews visible without converting local PASS to visual approval", async () => {
