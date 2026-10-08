@@ -55,6 +55,18 @@ def scenario(sequence=1, *, saved=True, status=ScenarioStatus.PASS):
     return native
 
 
+def test_completed_review_state_is_not_eligible_for_another_paid_batch():
+    item = {
+        "status": "completed", "options": {"auxiliary_evidence_mode": "visual"},
+        "scenarios": [{"evidence": {"visual_assessment": {"status": "assessed"}}}],
+        "events": [{"type": "visual_review_resume_state", "payload": {
+            "running": False, "eligible": True, "pending": 1,
+        }}],
+    }
+    summary = visual_review_resume_summary(item)
+    assert summary["pending"] == 0 and summary["eligible"] is False
+
+
 def make_service(tmp_path, count=1, *, saved=True, status=ScenarioStatus.PASS):
     config = settings(tmp_path)
     repository = SQLiteRepository(config.database_path, SecretCipher(tmp_path, "test-passphrase"))
@@ -220,6 +232,19 @@ async def test_three_failed_attempts_are_bounded_and_recorded(tmp_path, monkeypa
     assert state["failed"] == state["pending"] == 1
     assert state["reason"] == "completed_with_unavailable_reviews"
     assert repository.get_exploration(run_id)["scenarios"][0]["evidence"]["visual_assessment"]["attempts"] == 3
+
+
+@pytest.mark.asyncio
+async def test_saved_review_keeps_original_sequence_when_ct_ids_have_gaps(tmp_path, monkeypatch):
+    service, run_id, repository, _, _ = make_service(tmp_path)
+    repository.delete_scenario(run_id, "CT001")
+    repository.add_scenario(run_id, 10, scenario(10))
+    calls = generator(monkeypatch, [None])
+    service.resume(run_id, max_requests=3)
+    await service.tasks[run_id]
+    assert calls == [10]
+    stored = repository.get_exploration(run_id)["scenarios"]
+    assert [item["id"] for item in stored] == ["CT010"]
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import math
+import re
 import time
 from typing import Any
 from uuid import uuid4
@@ -44,6 +45,8 @@ def visual_review_resume_summary(item: dict[str, Any]) -> dict[str, Any]:
         result.update(copy.deepcopy(state))
         if not result.get("running"):
             result["pending"] = pending
+    result["eligible"] = (visual and str(item.get("status")) in TERMINAL_STATUSES
+                          and pending > 0 and not result.get("running"))
     return result
 
 
@@ -209,7 +212,17 @@ class VisualReviewResumeService:
     async def _review_pending(self, exploration_id: str, item: dict[str, Any],
                               pending: list[dict[str, Any]], auxiliary: Any, client: Any) -> str:
         state = self.states[exploration_id]
-        sequences = {scenario["id"]: index for index, scenario in enumerate(item.get("scenarios", []), 1)}
+        sequences = {}
+        for index, scenario in enumerate(item.get("scenarios", []), 1):
+            saved = (scenario.get("evidence") or {}).get("visual_review_input") or {}
+            saved_sequence = saved.get("sequence")
+            match = re.fullmatch(r"CT(\d+)", str(scenario["id"]))
+            # Removed/no-op drafts can leave gaps. Never renumber surviving
+            # CTs or their repository ordering merely to resume a review.
+            sequences[scenario["id"]] = (
+                saved_sequence if isinstance(saved_sequence, int) and not isinstance(saved_sequence, bool) and saved_sequence > 0
+                else int(match.group(1)) if match else index
+            )
         batch_stop_reason = None
         for original in pending:
             sequence = sequences[original["id"]]
