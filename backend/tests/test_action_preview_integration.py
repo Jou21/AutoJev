@@ -192,6 +192,7 @@ async def test_real_executor_action_previews_survive_scenario_and_standalone_rep
             assert len(previews) == 2
             assert [preview["action"] for preview in previews] == ["select", "click"]
             assert document.count('<details class="scenario"') == 2
+            assert "Captura preservada" not in document, "action-owned captures already have reliable timing"
             for preview, scenario in zip(previews, scenarios, strict=True):
                 expected_preview = scenario["evidence"]["action_preview"]
                 assert preview["box"] == expected_preview["box"]

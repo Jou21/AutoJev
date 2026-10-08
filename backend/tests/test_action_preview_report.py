@@ -90,6 +90,32 @@ def test_action_preview_embeds_capture_once_when_no_other_timeline_entry_contain
     assert document.count("data:image/png;base64,") == 1
 
 
+def test_action_owned_capture_is_not_reintroduced_as_an_untimed_observation(report):
+    scenario = {
+        "id": "CT001", "screenshots": ["before.png"],
+        "evidence": {"timeline": [_action()]},
+    }
+    original = deepcopy(scenario)
+    document = report._timeline("run", scenario)
+    assert document.count('class="timeline-entry action"') == 1
+    assert 'class="timeline-entry observation"' not in document
+    assert "Captura preservada" not in document
+    assert document.count("data:image/png;base64,") == 1
+    assert len(_PreviewParser(document).previews) == 1
+    assert scenario == original
+
+
+def test_unrelated_preview_does_not_hide_a_preserved_legacy_capture(report):
+    scenario = {
+        "id": "CT001", "screenshots": ["before.png"],
+        "evidence": {"timeline": [_action(action_preview=_metadata(url="https://shop.test/cart"))]},
+    }
+    document = report._timeline("run", scenario)
+    assert "Captura preservada" in document
+    assert document.count("data:image/png;base64,") == 1
+    assert _PreviewParser(document).previews == []
+
+
 def test_historical_action_shows_only_its_reliable_before_capture_without_inventing_coordinates(report):
     document, parsed = _timeline(report, _before(screenshot="screenshots/before.png"), _action(action_preview=None))
     assert parsed.previews == [{}]

@@ -180,6 +180,9 @@
     function prepareCapturePreview(figure) {
       const image = figure.querySelector("img");
       if (!image || figure.querySelector(".step-preview-button")) return;
+      // A print preview may reveal an unvisited CT below the viewport. Lazy
+      // loading would leave its target geometry unrendered despite a valid src.
+      image.loading = "eager";
       hydrateImage(image);
       const filename = (figure.querySelector("figcaption") || {}).textContent || "Captura registrada";
       const control = document.createElement("button");

@@ -176,3 +176,50 @@ Regressão backend: 69 testes aprovados (relatório, apresentação premium e AP
 `npm test`: build aprovado e 48 testes aprovados, incluindo 14 do explorador de
 passos/exportação. Validação sintática e `git diff --check` sem erros.
 Nenhuma exploração, chamada de IA ou publicação foi necessária para essa alteração.
+
+## Refinamento: captura anterior com destaque do alvo da ação
+
+Os passos de clique, seleção, preenchimento, tecla e passagem do cursor mostram
+a captura anterior à interação, com uma moldura vermelha, ponto central e legenda
+correspondente à ação. O destaque acompanha o redimensionamento e a ampliação.
+É uma camada de apresentação: os pixels da evidência original e seu download
+continuam intactos, sem injetar um marcador na aplicação testada.
+
+Nas novas execuções, o executor registra a caixa do controle e uma captura do
+viewport em pixels CSS, depois de trazer o alvo para a área visível. Mudança de
+posição, URL, viewport ou geometria inválida impede um destaque potencialmente
+enganoso, sem reprovar a ação por uma falha opcional de captura. Campos sensíveis
+continuam mascarados; valores digitados e credenciais não entram nos metadados.
+A prévia é evidência local, não uma imagem adicional enviada à LLM.
+
+Relatórios históricos podem reutilizar somente uma captura anterior confiável,
+da mesma página e do mesmo CT. Como não registraram a posição do alvo, exibem o
+aviso **Posição do alvo não registrada nesta execução**, sem inventar coordenadas.
+A captura que pertence à ação não gera outra observação sem horário na timeline.
+
+Validação pelo Playwright MCP e Chromium real, sem modelos nem rede externa:
+
+- Fixture local com seleção de menor preço e clique para adicionar um produto;
+  efeitos observáveis e geometria preservados até o HTML independente.
+- Desktop 1440 × 900, ampliação e mobile 390 × 844: diferença de alinhamento
+  inferior a 0,02 pixel CSS; sem vazamento horizontal no celular.
+- Abrir uma captura comum depois da ação remove o marcador anterior do modal.
+- Download de imagem mantém o arquivo original, sem desenhar sobre a evidência.
+- Impressão prepara os destaques inclusive nos CTs ainda não visitados, carrega
+  suas imagens e restaura a seleção anterior ao terminar.
+- HTML baixado foi reaberto como arquivo local: marcador e navegação funcionaram,
+  sem reaparecer o botão **Baixar relatório**. Nenhum erro de JavaScript registrado.
+- O relatório histórico foi reapresentado com captura no passo, sem marcador;
+  seu artefato original manteve o SHA-256 registrado nesta documentação.
+
+Capturas: `data/mcp-validation/action-preview-click.png`, `action-preview-zoom.png`,
+`action-preview-mobile.png`, `action-preview-historical.png` e
+`action-preview-offline.png`. HTML de conferência:
+`data/mcp-validation/action-preview-offline-verified.html`.
+
+Regressão final: 185 testes backend aprovados (captura, integração Chromium,
+timeline, relatórios, localização, API e documentação). `npm test`: build aprovado
+e 65 testes aprovados, incluindo 31 do explorador de passos. A regressão adicional
+do executor/negócio/cobertura também passou com 257 testes. Um aviso de depreciação
+Starlette/AnyIO, sem falha. Validação sintática e `git diff --check` sem erros.
+Backend local reiniciado com as alterações; nenhuma publicação realizada.

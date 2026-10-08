@@ -818,6 +818,7 @@ test("printing from overview prepares markers in unvisited CTs and later navigat
     assert.equal(figure.querySelectorAll(".action-target-overlay").length, 1);
     assert.equal(figure.querySelector(".action-target-box").style.getPropertyValue("left"), "75%");
     assert.equal(figure.querySelector("img"), actionImages[index]);
+    assert.equal(actionImages[index].loading, "eager", "unvisited action captures must load for print even below the viewport");
     assert.equal(actionImages[index].src, originalImages[index].src);
     assert.equal(cards[index].open, true);
   }
