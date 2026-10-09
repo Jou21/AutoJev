@@ -93,6 +93,35 @@ class PreviewTarget:
         await self._act("hover")
 
 
+class SelectPreviewTarget(PreviewTarget):
+    def __init__(self, events):
+        super().__init__(events)
+        self.selected_label = "Name (A to Z)"
+        self.requested_label = "Name (Z to A)"
+        self.matches = False
+        self.unavailable = False
+        self.fail_read = False
+
+    async def evaluate(self, script, *_args):
+        if "HTMLSelectElement" not in script:
+            return None
+        self.events.append("select-labels")
+        if self.fail_read:
+            raise RuntimeError("Optional label read failed")
+        if self.unavailable:
+            return None
+        return {
+            "requested_label": self.requested_label,
+            "selected_label": self.selected_label,
+            "matches": self.matches,
+        }
+
+    async def select_option(self, value, **_kwargs):
+        await self._act("select")
+        self.selected_label = self.requested_label
+        self.matches = True
+
+
 def preview_fixture(tmp_path: Path):
     events = []
     executor = PlaywrightExecutor(tmp_path, ExplorationOptions())
@@ -327,6 +356,177 @@ async def test_credential_input_value_is_never_added_to_preview(tmp_path, monkey
     assert result.success
     assert "fixture-credential" not in json.dumps(result.evidence["action_preview"])
     assert result.value == "[credential:password]"
+
+
+async def test_select_preview_records_labels_not_values_and_observed_result(tmp_path, monkeypatch):
+    executor, _target, _decision, events = preview_fixture(tmp_path)
+    target = SelectPreviewTarget(events)
+    stub_execution(monkeypatch, executor, target, events)
+    decision = AgentDecision(action="select", target="e2", value="za", rationale="fixture")
+    result, _observation = await executor.execute(decision, {})
+
+    assert result.success
+    selection = result.evidence["action_preview"]["selection"]
+    assert selection == {
+        "version": "select-labels-v1", "status": "confirmed",
+        "requested_label": "Name (Z to A)", "before_label": "Name (A to Z)",
+        "after_label": "Name (Z to A)",
+    }
+    assert "za" not in selection.values()
+    assert events.index("select-labels") < events.index("select") < len(events) - 1
+
+
+async def test_select_preview_mismatch_does_not_change_automation_verdict(tmp_path, monkeypatch):
+    executor, _target, _decision, events = preview_fixture(tmp_path)
+    target = SelectPreviewTarget(events)
+    stub_execution(monkeypatch, executor, target, events)
+
+    async def app_reverted_selection():
+        target.selected_label = "Name (A to Z)"
+        target.matches = False
+
+    monkeypatch.setattr(executor, "_wait_for_dom_settle", app_reverted_selection)
+    result, _observation = await executor.execute(
+        AgentDecision(action="select", target="e2", value="za", rationale="fixture"), {},
+    )
+    assert result.success
+    selection = result.evidence["action_preview"]["selection"]
+    assert selection["status"] == "mismatch"
+    assert selection["requested_label"] == "Name (Z to A)"
+    assert selection["after_label"] == "Name (A to Z)"
+
+
+@pytest.mark.parametrize("change", ["page", "url", "detached", "read_failure"])
+async def test_select_preview_does_not_claim_result_from_changed_control(
+    tmp_path, monkeypatch, change,
+):
+    executor, _target, _decision, events = preview_fixture(tmp_path)
+    target = SelectPreviewTarget(events)
+    stub_execution(monkeypatch, executor, target, events)
+
+    async def change_after_dispatch():
+        if change == "page":
+            executor._page = PreviewPage(events)
+        elif change == "url":
+            executor._page.url = "https://example.test/other-page"
+        elif change == "detached":
+            target.unavailable = True
+        else:
+            target.fail_read = True
+
+    monkeypatch.setattr(executor, "_wait_for_dom_settle", change_after_dispatch)
+    result, _observation = await executor.execute(
+        AgentDecision(action="select", target="e2", value="za", rationale="fixture"), {},
+    )
+    assert result.success
+    selection = result.evidence["action_preview"]["selection"]
+    assert selection["status"] == "unverified"
+    assert "after_label" not in selection
+
+
+async def test_failed_select_retains_intent_without_claiming_observed_selection(tmp_path, monkeypatch):
+    executor, _target, _decision, events = preview_fixture(tmp_path)
+    target = SelectPreviewTarget(events)
+    target.fail_action = True
+    stub_execution(monkeypatch, executor, target, events)
+    result, _observation = await executor.execute(
+        AgentDecision(action="select", target="e2", value="za", rationale="fixture"), {},
+    )
+    assert not result.success
+    assert result.evidence["action_preview"]["selection"] == {
+        "version": "select-labels-v1", "status": "unverified",
+        "requested_label": "Name (Z to A)", "before_label": "Name (A to Z)",
+    }
+
+
+@pytest.mark.parametrize("source", ["field_semantics", "dom", "secret_value", "read_failure"])
+async def test_sensitive_or_unavailable_select_labels_are_optional(tmp_path, monkeypatch, source):
+    executor, _target, _decision, events = preview_fixture(tmp_path)
+    target = SelectPreviewTarget(events)
+    stub_execution(monkeypatch, executor, target, events)
+    if source == "field_semantics":
+        executor._field_semantics["e2"] = {"sensitive": True}
+    elif source == "dom":
+        target.unavailable = True
+    elif source == "secret_value":
+        executor.secret_values = ["za"]
+    else:
+        target.fail_read = True
+    result, _observation = await executor.execute(
+        AgentDecision(action="select", target="e2", value="za", rationale="fixture"), {},
+    )
+    assert result.success
+    assert "selection" not in result.evidence["action_preview"]
+
+
+async def test_select_labels_redact_secrets_strip_controls_and_bound_length(tmp_path, monkeypatch):
+    executor, _target, _decision, events = preview_fixture(tmp_path)
+    target = SelectPreviewTarget(events)
+    target.requested_label = "  Option\x00 fixture-private " + "x" * 300
+    target.selected_label = "\n\t\x7f"
+    executor.secret_values = ["fixture-private"]
+    stub_execution(monkeypatch, executor, target, events)
+    result, _observation = await executor.execute(
+        AgentDecision(action="select", target="e2", value="option-code", rationale="fixture"), {},
+    )
+    assert result.success
+    selection = result.evidence["action_preview"]["selection"]
+    assert selection["requested_label"].startswith("Option [REDACTED]")
+    assert selection["after_label"] == selection["requested_label"]
+    assert len(selection["requested_label"]) == 240
+    assert "before_label" not in selection
+    assert "fixture-private" not in json.dumps(selection)
+    assert "option-code" not in json.dumps(selection)
+    assert all(ord(char) >= 32 for char in selection["requested_label"])
+
+
+async def test_real_select_labels_use_visible_option_label_and_checked_native_node(tmp_path):
+    playwright_api = pytest.importorskip("playwright.async_api")
+    playwright = await playwright_api.async_playwright().start()
+    browser = None
+    try:
+        try:
+            browser = await playwright.chromium.launch(headless=True)
+        except playwright_api.Error as exc:
+            pytest.skip(f"Chromium unavailable: {exc}")
+        page = await browser.new_page()
+        await page.set_content("""
+            <select id="sort">
+              <option value="az">Name (A to Z)</option>
+              <option value="za" label="Name (Z to A)">Other text</option>
+            </select>
+            <select name="session-token"><option value="secret-code">Private label</option></select>
+        """)
+        executor = PlaywrightExecutor(tmp_path, ExplorationOptions())
+        executor._page = page
+        target = await page.locator("#sort").element_handle()
+        before = await executor._select_label_snapshot(target, "za")
+        assert before == {
+            "requested_label": "Name (Z to A)", "selected_label": "Name (A to Z)",
+            "matches": False,
+        }
+        await target.select_option("za")
+        assert await executor._select_label_snapshot(target, "za") == {
+            "requested_label": "Name (Z to A)", "selected_label": "Name (Z to A)",
+            "matches": True,
+        }
+        # Equal display labels cannot confirm the wrong underlying option.
+        await page.locator("#sort option[value=az]").evaluate(
+            "option => option.label = 'Name (Z to A)'"
+        )
+        await target.select_option("az")
+        assert await executor._select_label_snapshot(target, "za") == {
+            "requested_label": "Name (Z to A)", "selected_label": "Name (Z to A)",
+            "matches": False,
+        }
+        assert await executor._select_label_snapshot(page.locator("[name=session-token]"), "secret-code") is None
+        await page.locator("#sort").evaluate("el => el.replaceWith(el.cloneNode(true))")
+        assert await executor._select_label_snapshot(target, "za") is None
+        assert "za" not in before.values()
+    finally:
+        if browser is not None:
+            await browser.close()
+        await playwright.stop()
 
 
 async def test_real_preview_is_css_sized_scrolls_and_never_mutates_application(tmp_path):

@@ -58,6 +58,14 @@ def _action(**changes):
     }
 
 
+def _selection(**changes):
+    return {
+        "version": "select-labels-v1", "requested_label": "Name (Z to A)",
+        "before_label": "Name (A to Z)", "after_label": "Name (Z to A)",
+        "status": "confirmed", **changes,
+    }
+
+
 def _timeline(report, *entries):
     scenario = {"id": "CT001", "evidence": {"timeline": list(entries)}}
     before = deepcopy(scenario)
@@ -225,3 +233,130 @@ def test_generated_offline_report_keeps_action_preview_and_does_not_duplicate_ca
     assert parsed.previews[0]["box"]["x"] == 1100.5
     assert document.count("data:image/png;base64,") == 1
     assert run == before
+
+
+def test_dropdown_preview_displays_recorded_requested_previous_and_actual_option_labels(report):
+    selection = _selection()
+    document, parsed = _timeline(report, _before(), _action(action_preview=_metadata(selection=selection)))
+    assert parsed.previews[0]["selection"] == selection
+    assert '<div class="action-selection-summary" data-selection-status="confirmed">' in document
+    assert '<span>Opção solicitada</span><strong>Name (Z to A)</strong>' in document
+    assert '<span>Antes da ação</span><strong>Name (A to Z)</strong>' in document
+    assert '<span>Selecionada depois</span><strong>Name (Z to A)</strong>' in document
+    assert '<p class="action-selection-status">Seleção confirmada</p>' in document
+    assert document.index('class="action-selection-summary"') < document.index('class="action-preview-frame"')
+    # The original before capture remains the only embedded image.
+    assert document.count("data:image/png;base64,") == 1
+
+
+@pytest.mark.parametrize("status, expected", [
+    ("confirmed", "Seleção confirmada"),
+    ("mismatch", "Seleção diferente da solicitada"),
+    ("unverified", "Seleção não confirmada"),
+])
+def test_dropdown_preview_communicates_the_recorded_selection_status(report, status, expected):
+    selection = _selection(status=status, after_label="Name (A to Z)" if status == "mismatch" else "Name (Z to A)")
+    document, parsed = _timeline(report, _action(action_preview=_metadata(selection=selection)))
+    assert parsed.previews[0]["selection"]["status"] == status
+    assert f'<p class="action-selection-status">{expected}</p>' in document
+    assert 'data-selection-status="' + status + '"' in document
+
+
+def test_dropdown_preview_trusts_value_based_mismatch_even_if_option_labels_are_identical(report):
+    selection = _selection(status="mismatch", requested_label="Mesmo nome", after_label="Mesmo nome")
+    document, parsed = _timeline(report, _action(action_preview=_metadata(selection=selection)))
+    assert parsed.previews[0]["selection"]["status"] == "mismatch"
+    assert "Seleção diferente da solicitada" in document
+
+
+@pytest.mark.parametrize("status", ["confirmed", "mismatch"])
+@pytest.mark.parametrize("missing", ["requested_label", "after_label"])
+def test_dropdown_preview_does_not_claim_verification_when_a_comparison_label_is_missing(report, status, missing):
+    selection = _selection(status=status)
+    selection.pop(missing)
+    document, parsed = _timeline(report, _action(action_preview=_metadata(selection=selection)))
+    assert parsed.previews[0]["selection"]["status"] == "unverified"
+    assert missing not in parsed.previews[0]["selection"]
+    assert "Seleção não confirmada" in document
+    assert "Seleção confirmada" not in document
+    assert "Seleção diferente da solicitada" not in document
+
+
+def test_dropdown_preview_can_confirm_without_a_previous_label(report):
+    selection = _selection()
+    selection.pop("before_label")
+    document, parsed = _timeline(report, _action(action_preview=_metadata(selection=selection)))
+    assert parsed.previews[0]["selection"]["status"] == "confirmed"
+    assert '<span>Antes da ação</span>' not in document
+    assert "Seleção confirmada" in document
+
+
+@pytest.mark.parametrize("action", ["click", "fill", "press", "hover"])
+def test_non_dropdown_actions_ignore_selection_metadata(report, action):
+    document, parsed = _timeline(report, _action(action_preview=_metadata(action=action, selection=_selection())))
+    assert "selection" not in parsed.previews[0]
+    assert "action-selection-summary" not in document
+    assert "Name (Z to A)" not in document
+
+
+@pytest.mark.parametrize("selection", [
+    None,
+    "untrusted-selection",
+    [],
+    {},
+    _selection(version="unknown-version"),
+    _selection(status="approved"),
+    _selection(status=["confirmed"]),
+    _selection(requested_label=None, before_label=None, after_label=None),
+    _selection(requested_label="", before_label="   ", after_label="\n"),
+])
+def test_invalid_dropdown_metadata_preserves_the_control_marker_without_claiming_option_labels(report, selection):
+    document, parsed = _timeline(report, _action(action_preview=_metadata(selection=selection)))
+    assert parsed.previews[0]["box"]["x"] == 1100.5
+    assert "selection" not in parsed.previews[0]
+    assert "action-selection-summary" not in document
+
+
+@pytest.mark.parametrize("invalid_label", [True, 42, [], {}, " ", "a" * 241, "Name\n(A to Z)", "Name\x7f(A to Z)", "Name\x85(A to Z)"])
+def test_dropdown_labels_must_be_bounded_nonblank_strings_without_control_characters(report, invalid_label):
+    selection = _selection(requested_label=invalid_label)
+    document, parsed = _timeline(report, _action(action_preview=_metadata(selection=selection)))
+    assert "requested_label" not in parsed.previews[0]["selection"]
+    assert parsed.previews[0]["selection"]["status"] == "unverified"
+    assert '<span>Opção solicitada</span>' not in document
+    assert "Seleção não confirmada" in document
+
+
+def test_dropdown_labels_are_escaped_and_arbitrary_values_never_enter_the_report(report):
+    malicious_label = '\"><script>unsafe-option-label</script><img src=x onerror=alert(1)>'
+    selection = _selection(
+        requested_label=malicious_label,
+        after_label=malicious_label,
+        before_label="  Name (A to Z)  ",
+        requested_value="never-expose-raw-value",
+        after_value="never-expose-another-value",
+        html="<script>arbitrary-dom-content</script>",
+        password="never-expose-password",
+    )
+    document, parsed = _timeline(report, _action(action_preview=_metadata(selection=selection)))
+    assert parsed.previews[0]["selection"] == {
+        "version": "select-labels-v1", "requested_label": malicious_label,
+        "before_label": "Name (A to Z)", "after_label": malicious_label,
+        "status": "confirmed",
+    }
+    assert '<script>unsafe-option-label</script>' not in document
+    assert '<img src=x onerror=alert(1)>' not in document
+    assert "&lt;script&gt;unsafe-option-label&lt;/script&gt;" in document
+    for private_value in ("never-expose-raw-value", "never-expose-another-value", "arbitrary-dom-content", "never-expose-password"):
+        assert private_value not in document
+
+
+def test_historical_dropdown_does_not_infer_selection_from_its_title_or_description(report):
+    document, parsed = _timeline(report, _before(), _action(
+        action_preview=None,
+        title="Selecionar opção: Name (Z to A)",
+        description="A opção Name (Z to A) deveria ficar selecionada.",
+    ))
+    assert parsed.previews == [{}]
+    assert "action-selection-summary" not in document
+    assert "Seleção confirmada" not in document

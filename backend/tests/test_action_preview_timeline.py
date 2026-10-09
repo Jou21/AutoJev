@@ -218,3 +218,47 @@ def test_action_preview_is_local_only_and_not_in_visual_prompt_input():
     assert "action_preview" not in payload["result"]["evidence"]
     assert "timeline" not in payload["result"]["evidence"]
     assert "001-action-target.png" not in str(payload)
+
+
+@pytest.mark.parametrize("status", ["confirmed", "mismatch", "unverified"])
+def test_selection_labels_follow_their_action_without_mutating_verdict_or_leaking_to_llm(status):
+    observation, decision, result = inputs()
+    decision.action = result.action = "select"
+    selection = {
+        "version": "select-labels-v1", "requested_label": "Nome (Z a A)",
+        "before_label": "Nome (A a Z)", "status": status,
+    }
+    if status != "unverified":
+        selection["after_label"] = "Nome (Z a A)" if status == "confirmed" else "Nome (A a Z)"
+    result.evidence["action_preview"].update(action="select", selection=selection)
+    original = deepcopy(result.evidence)
+    evidence = build_scenario_evidence(observation, decision, result)
+    event = next(entry for entry in evidence["timeline"] if entry["kind"] == "action")
+    assert event["action_preview"]["selection"] == selection
+    event["action_preview"]["selection"]["requested_label"] = "Outra opção"
+    assert result.evidence == original
+    assert evidence["action_preview"]["selection"] == selection
+    result.evidence = evidence
+    payload = build_visual_review_input(observation, decision, result, 1)
+    assert "selection" not in payload["result"]["evidence"]
+    assert "Nome (Z a A)" not in str(payload)
+
+
+def test_projection_keeps_different_dropdown_options_for_individual_attempts():
+    original = exploration(1, 2)
+    for attempt, action in enumerate(original["actions"], 1):
+        action["decision"]["action"] = action["result"]["action"] = "select"
+        action["result"]["evidence"]["action_preview"].update(
+            action="select", selection={
+                "version": "select-labels-v1", "requested_label": f"Opção {attempt}",
+                "after_label": f"Opção {attempt}", "status": "confirmed",
+            },
+        )
+    backup = deepcopy(original)
+    projected = prepare_scenario_timelines(original)
+    assert [entry["action_preview"]["selection"]["requested_label"] for entry in action_events(projected)] == [
+        "Opção 1", "Opção 2",
+    ]
+    assert projected["summary"] == original["summary"]
+    assert projected["scenarios"][0]["status"] == "PASS"
+    assert original == backup

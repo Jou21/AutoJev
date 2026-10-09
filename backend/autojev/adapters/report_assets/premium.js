@@ -125,7 +125,20 @@
       if (!numbers.every((number) => typeof number === "number" && Number.isFinite(number))) return null;
       if (image.width <= 0 || image.height <= 0 || box.width <= 0 || box.height <= 0
         || box.x < 0 || box.y < 0 || box.x + box.width > image.width || box.y + box.height > image.height) return null;
-      return { image, box, action: value.action };
+      const metadata = { image, box, action: value.action };
+      const selection = value.selection;
+      if (value.action === "select" && selection && typeof selection === "object"
+        && selection.version === "select-labels-v1" && ["confirmed", "mismatch", "unverified"].includes(selection.status)) {
+        const safeSelection = { version: "select-labels-v1", status: selection.status };
+        for (const field of ["requested_label", "before_label", "after_label"]) {
+          const label = selection[field];
+          if (typeof label === "string" && label.trim() && label.trim().length <= 240 && !/[\u0000-\u001f\u007f-\u009f]/.test(label)) {
+            safeSelection[field] = label.trim();
+          }
+        }
+        if (safeSelection.requested_label || safeSelection.before_label || safeSelection.after_label) metadata.selection = safeSelection;
+      }
+      return metadata;
     }
 
     function refreshActionMarker(canvas, image) {
@@ -153,13 +166,23 @@
       const tag = document.createElement("span");
       tag.className = "action-target-tag";
       const labels = { click: "Clique aqui", select: "Selecionar aqui", fill: "Preencher aqui", press: "Tecla neste controle", hover: "Passar o cursor aqui" };
-      tag.textContent = Object.prototype.hasOwnProperty.call(labels, value.action) ? labels[value.action] : "Alvo da ação";
+      const label = value.action === "select" && value.selection && value.selection.requested_label
+        ? "Selecionar: " + value.selection.requested_label
+        : Object.prototype.hasOwnProperty.call(labels, value.action) ? labels[value.action] : "Alvo da ação";
+      const tagText = document.createElement("span");
+      tagText.className = "action-target-tag-text";
+      tagText.textContent = label;
+      tag.appendChild(tagText);
+      tag.setAttribute("title", label);
       const right = value.box.x + value.box.width / 2 > value.image.width / 2;
-      const above = value.box.y + value.box.height + 42 > value.image.height;
+      // Keep the callout in the larger half of the capture. Long option labels
+      // wrap without pretending that the native dropdown was open in the PNG.
+      const above = value.box.y + value.box.height / 2 > value.image.height / 2;
       tag.classList.toggle("align-right", right);
       tag.classList.toggle("above", above);
-      tag.style.setProperty(right ? "right" : "left", percent(right
-        ? Math.max(8, value.image.width - value.box.x - value.box.width) : Math.max(8, value.box.x), value.image.width));
+      const offset = "max(8px, " + percent(right ? value.image.width - value.box.x - value.box.width : value.box.x, value.image.width) + ")";
+      tag.style.setProperty("--action-tag-offset", offset);
+      tag.style.setProperty(right ? "right" : "left", offset);
       tag.style.setProperty("top", percent(above ? value.box.y : value.box.y + value.box.height, value.image.height));
       overlay.append(box, tag);
       canvas.appendChild(overlay);

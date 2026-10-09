@@ -18,7 +18,9 @@ import pytest
 
 from autojev.adapters.playwright_executor import PlaywrightExecutor
 from autojev.adapters.report import StandaloneHtmlReport
-from autojev.domain.models import AgentDecision, ExplorationOptions, utc_now
+from autojev.domain.models import AgentDecision, ExplorationOptions, ScenarioStatus, utc_now
+from autojev.services.business_checks import check_business_outcomes
+from autojev.services.exploration import ExplorationManager
 from autojev.services.scenario_documentation import local_scenario_documentation
 from autojev.services.technical_signals import build_scenario_evidence, scenario_screenshots
 
@@ -104,6 +106,62 @@ class PreviewParser(HTMLParser):
             self.previews.append(json.loads(attributes["data-action-preview"]))
 
 
+class SelectionVerificationParser(HTMLParser):
+    """Inspect rendered comparisons, without matching embedded JS/CSS strings."""
+
+    _VOID_TAGS = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+        "meta", "param", "source", "track", "wbr",
+    }
+
+    def __init__(self, document):
+        super().__init__()
+        self.verifications = []
+        self.technical_details = []
+        self._depth = 0
+        self._verification = self._card = self._value = self._technical = None
+        self.feed(document)
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        classes = attributes.get("class", "").split()
+        if tag not in self._VOID_TAGS:
+            self._depth += 1
+        if "selection-verification" in classes:
+            block = {"result": attributes.get("data-result"), "values": {}}
+            self.verifications.append(block)
+            self._verification = (self._depth, block)
+        if "selection-choice" in classes and self._verification:
+            self._card = (self._depth, attributes.get("data-side"))
+        if "selection-choice-value" in classes and self._card:
+            self._value = (self._depth, self._card[1], [])
+        if tag == "details" and "selection-technical" in classes:
+            detail = {"open": "open" in attributes, "text": ""}
+            self.technical_details.append(detail)
+            self._technical = (self._depth, detail, [])
+
+    def handle_data(self, data):
+        if self._value:
+            self._value[2].append(data)
+        if self._technical:
+            self._technical[2].append(data)
+
+    def handle_endtag(self, tag):
+        if self._value and self._value[0] == self._depth:
+            self._verification[1]["values"][self._value[1]] = " ".join(
+                "".join(self._value[2]).split()
+            )
+            self._value = None
+        if self._card and self._card[0] == self._depth:
+            self._card = None
+        if self._verification and self._verification[0] == self._depth:
+            self._verification = None
+        if self._technical and self._technical[0] == self._depth:
+            self._technical[1]["text"] = "".join(self._technical[2])
+            self._technical = None
+        self._depth -= 1
+
+
 async def test_real_executor_action_previews_survive_scenario_and_standalone_report(tmp_path):
     playwright_api = pytest.importorskip("playwright.async_api")
     run_id = "action-preview-integration"
@@ -147,10 +205,23 @@ async def test_real_executor_action_previews_survive_scenario_and_standalone_rep
                 )
                 result, observation = await executor.execute(decision, {})
                 assert result.success, result.message
+                if action == "select":
+                    result.assertions.extend(check_business_outcomes(before, decision, result, observation))
+                    assert next(check for check in result.assertions if check.kind == "selection_matches").passed
                 assert result.assertions and all(check.passed for check in result.assertions)
                 assert result.evidence["action_preview"]["action"] == action
                 assert result.evidence["action_preview"]["target"] == target["ref"]
                 assert result.evidence["action_preview"]["image"] == {"width": 1440, "height": 900}
+                if action == "select":
+                    assert result.evidence["action_preview"]["selection"] == {
+                        "version": "select-labels-v1",
+                        "requested_label": "Menor preço",
+                        "before_label": "Nome (A a Z)",
+                        "after_label": "Menor preço",
+                        "status": "confirmed",
+                    }
+                else:
+                    assert "selection" not in result.evidence["action_preview"]
                 assert await page.locator("#sort").input_value() == "price-asc"
                 assert await page.locator(".product-name").all_text_contents() == [
                     "Copo de cerâmica", "Caderno de ideias", "Luminária de mesa",
@@ -191,6 +262,19 @@ async def test_real_executor_action_previews_survive_scenario_and_standalone_rep
             previews = PreviewParser(document).previews
             assert len(previews) == 2
             assert [preview["action"] for preview in previews] == ["select", "click"]
+            assert previews[0]["selection"] == scenarios[0]["evidence"]["action_preview"]["selection"]
+            assert "selection" not in previews[1]
+            assert "Opção solicitada" in document
+            assert "Selecionada depois" in document
+            assert "Seleção confirmada" in document
+            selection_report = SelectionVerificationParser(document)
+            assert selection_report.verifications == [{
+                "result": "pass",
+                "values": {"expected": "Menor preço", "actual": "Menor preço"},
+            }]
+            assert selection_report.technical_details
+            assert all(not detail["open"] for detail in selection_report.technical_details)
+            assert any("option_matches" in detail["text"] for detail in selection_report.technical_details)
             assert document.count('<details class="scenario"') == 2
             assert "Captura preservada" not in document, "action-owned captures already have reliable timing"
             for preview, scenario in zip(previews, scenarios, strict=True):
@@ -207,5 +291,80 @@ async def test_real_executor_action_previews_survive_scenario_and_standalone_rep
             # The report adds the marker at render time; native target pixels
             # in both before-action PNG files remain unannotated and intact.
             print(f"ACTION_PREVIEW_REPORT={report}")
+        finally:
+            await browser.close()
+
+
+async def test_reverted_selection_keeps_failed_business_verdict_and_honest_report(tmp_path):
+    playwright_api = pytest.importorskip("playwright.async_api")
+    run_id = "dropdown-mismatch-integration"
+    shots = tmp_path / run_id / "screenshots"
+    shots.mkdir(parents=True)
+    async with playwright_api.async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page(viewport={"width": 1440, "height": 900})
+            async def fulfill_local(route):
+                assert route.request.url.startswith("https://ateliereport.test/")
+                await route.fulfill(status=200, content_type="text/html", body=SHOP_HTML)
+            await page.route("**/*", fulfill_local)
+            await page.goto("https://ateliereport.test/colecao")
+            # An intentional fixture defect: an event handler discards the
+            # user's choice, while Playwright still dispatches select normally.
+            await page.locator("#sort").evaluate("el => el.onchange = () => { el.value = 'name'; }")
+            executor = PlaywrightExecutor(shots, ExplorationOptions(), headless=True)
+            executor._page, executor._browser, executor._context = page, browser, page.context
+            executor._allowed_origin = executor._origin(page.url)
+            before = await executor.observe("antes-da-selecao")
+            target = next(item for item in before.interactive_elements if item.get("name") == "Ordenar produtos")
+            decision = AgentDecision(
+                action="select", target=target["ref"], value="price-asc",
+                rationale="Selecionar menor preço e conferir a opção mantida pelo site.",
+            )
+            result, after = await executor.execute(decision, {})
+            assert result.success, "dispatch success must not conceal a failed business result"
+            selection = result.evidence["action_preview"]["selection"]
+            assert selection == {
+                "version": "select-labels-v1", "requested_label": "Menor preço",
+                "before_label": "Nome (A a Z)", "after_label": "Nome (A a Z)",
+                "status": "mismatch",
+            }
+            result.assertions.extend(check_business_outcomes(before, decision, result, after))
+            check = next(item for item in result.assertions if item.kind == "selection_matches")
+            assert not check.passed
+            result.evidence.update(before_screenshot=before.screenshot, action_step=1)
+            scenario = ExplorationManager._scenario_from_evidence(after, decision, result, 1)
+            assert scenario.status == ScenarioStatus.FAIL
+            run = {
+                "id": run_id, "status": "completed", "app_url": after.url,
+                "started_at": result.started_at, "finished_at": result.finished_at,
+                "options": asdict(executor.options), "scenarios": [asdict(scenario)],
+                "actions": [{"step_number": 1, "decision": asdict(decision), "result": result.to_dict()}],
+                "issues": [], "summary": {"total_scenarios": 1, "pass": 0, "fail": 1},
+            }
+            backup = deepcopy(run)
+            digests = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in shots.glob("*.png")}
+            report = tmp_path / "report.html"
+            StandaloneHtmlReport(tmp_path).generate(run, str(report))
+            document = report.read_text()
+            assert PreviewParser(document).previews[0]["selection"] == selection
+            assert 'data-selection-status="mismatch"' in document
+            assert "Seleção diferente da solicitada" in document
+            selection_report = SelectionVerificationParser(document)
+            assert selection_report.verifications == [{
+                "result": "fail",
+                "values": {"expected": "Menor preço", "actual": "Nome (A a Z)"},
+            }]
+            assert selection_report.technical_details
+            assert all(not detail["open"] for detail in selection_report.technical_details)
+            assert any("option_matches" in detail["text"] for detail in selection_report.technical_details)
+            assert 'data-status="FAIL"' in document
+            assert "REPROVADO" in document
+            assert run == backup
+            assert digests == {
+                path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in shots.glob("*.png")
+            }
+            assert not await page.locator(".action-target-overlay").count()
+            print(f"DROPDOWN_MISMATCH_REPORT={report}")
         finally:
             await browser.close()

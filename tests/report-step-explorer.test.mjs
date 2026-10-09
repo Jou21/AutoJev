@@ -18,6 +18,10 @@ const actionMetadata = {
   action: "select", image: { width: 1440, height: 900 },
   box: { x: 1080, y: 90, width: 216, height: 45 },
 };
+const dropdownSelection = {
+  version: "select-labels-v1", requested_label: "Name (Z to A)",
+  before_label: "Name (A to Z)", after_label: "Name (Z to A)", status: "confirmed",
+};
 const reportCss = await readFile(new URL("../backend/autojev/adapters/report_assets/premium.css", import.meta.url), "utf8");
 
 class FixtureElement {
@@ -697,6 +701,92 @@ test("action previews reuse the owning CT capture and position their target with
   assert.match(figure.querySelector(".action-preview-note").textContent, /captura original/);
 });
 
+test("dropdown markers identify the requested visible option without changing the pre-action screenshot", () => {
+  const { actionFigures, actionImages, originalImages, cards } = fixture({
+    actionPreview: true, actionPreviewMetadata: { ...actionMetadata, selection: dropdownSelection },
+  });
+  const canvas = actionFigures[0].querySelector(".action-preview-canvas");
+  const tag = canvas.querySelector(".action-target-tag");
+  assert.equal(tag.textContent, "Selecionar: Name (Z to A)");
+  assert.equal(tag.getAttribute("title"), "Selecionar: Name (Z to A)");
+  assert.equal(tag.children[0].className, "action-target-tag-text");
+  assert.equal(tag.classList.contains("align-right"), true);
+  assert.equal(tag.style.getPropertyValue("--action-tag-offset"), "max(8px, 10%)");
+  assert.deepEqual(JSON.parse(canvas.dataset.actionPreview).selection, dropdownSelection);
+  assert.equal(actionImages[0].src, originalImages[0].src, "option labels never replace or alter the original PNG");
+  assert.equal(cards[0].dataset.status, "PASS", "selection display must not rewrite a recorded test verdict");
+});
+
+for (const [name, selection] of [
+  ["missing request label", { ...dropdownSelection, requested_label: undefined }],
+  ["blank request label", { ...dropdownSelection, requested_label: "  " }],
+  ["non-string request label", { ...dropdownSelection, requested_label: ["Name (Z to A)"] }],
+  ["oversized request label", { ...dropdownSelection, requested_label: "x".repeat(241) }],
+  ["control characters", { ...dropdownSelection, requested_label: "Name\u0000 (Z to A)" }],
+  ["line breaks", { ...dropdownSelection, requested_label: "Name\n(Z to A)" }],
+  ["DEL character", { ...dropdownSelection, requested_label: "Name\u007f (Z to A)" }],
+  ["C1 control character", { ...dropdownSelection, requested_label: "Name\u0085 (Z to A)" }],
+  ["unknown version", { ...dropdownSelection, version: "guessed-label-v1" }],
+  ["unknown status", { ...dropdownSelection, status: "passed" }],
+]) {
+  test(`dropdown markers keep a generic control label for ${name}`, () => {
+    const { actionFigures } = fixture({
+      actionPreview: true, actionPreviewMetadata: { ...actionMetadata, selection },
+    });
+    assert.equal(actionFigures[0].querySelector(".action-target-tag").textContent, "Selecionar aqui");
+  });
+}
+
+test("dropdown option labels are literal text and raw values or other metadata never enter runtime marker data", () => {
+  const label = '<img src=x onerror="alert(1)">';
+  const { actionFigures } = fixture({
+    actionPreview: true, actionPreviewMetadata: {
+      ...actionMetadata,
+      selection: { ...dropdownSelection, requested_label: "  " + label + "  ", value: "private-option-value", api_key: "private-key" },
+    },
+  });
+  const canvas = actionFigures[0].querySelector(".action-preview-canvas");
+  const tag = canvas.querySelector(".action-target-tag");
+  assert.equal(tag.textContent, "Selecionar: " + label);
+  assert.equal(tag.querySelectorAll("img").length, 0);
+  assert.match(tag.outerHTML, /&lt;img src=x onerror=/);
+  assert.doesNotMatch(canvas.dataset.actionPreview, /private-option-value|private-key|api_key/);
+});
+
+test("option metadata cannot change labels for click, fill, press or hover targets", () => {
+  for (const [action, expected] of [["click", "Clique aqui"], ["fill", "Preencher aqui"], ["press", "Tecla neste controle"], ["hover", "Passar o cursor aqui"]]) {
+    const { actionFigures } = fixture({
+      actionPreview: true, actionPreviewMetadata: { ...actionMetadata, action, selection: dropdownSelection },
+    });
+    const canvas = actionFigures[0].querySelector(".action-preview-canvas");
+    assert.equal(canvas.querySelector(".action-target-tag").textContent, expected);
+    assert.equal(JSON.parse(canvas.dataset.actionPreview).selection, undefined);
+  }
+});
+
+test("long dropdown labels wrap within their anchored capture edge, with a full text title and accessible report summary styling", () => {
+  const label = "Opção detalhada ".repeat(15).trim();
+  for (const [x, y, right, above] of [[0, 0, false, false], [1224, 855, true, true]]) {
+    const { actionFigures } = fixture({
+      actionPreview: true, actionPreviewMetadata: {
+        ...actionMetadata, box: { x, y, width: 216, height: 45 },
+        selection: { ...dropdownSelection, requested_label: label },
+      },
+    });
+    const tag = actionFigures[0].querySelector(".action-target-tag");
+    assert.equal(tag.textContent, "Selecionar: " + label);
+    assert.equal(tag.getAttribute("title"), "Selecionar: " + label);
+    assert.equal(tag.classList.contains("align-right"), right);
+    assert.equal(tag.classList.contains("above"), above);
+    assert.equal(tag.style.getPropertyValue(right ? "right" : "left"), "max(8px, 0%)");
+  }
+  assert.match(reportCss, /\.action-target-tag\s*\{[^}]*max-width:\s*min\(320px, calc\(100% - var\(--action-tag-offset, 8px\) - 8px\)\)/);
+  assert.match(reportCss, /\.action-target-tag\s*\{[^}]*white-space:\s*normal;[^}]*overflow-wrap:\s*anywhere/);
+  assert.match(reportCss, /\.action-target-tag-text\s*\{[^}]*-webkit-line-clamp:\s*3/);
+  assert.match(reportCss, /\.action-selection-item > strong\s*\{[^}]*overflow-wrap:\s*anywhere/);
+  assert.match(reportCss, /\.action-selection-summary\[data-selection-status="mismatch"\] \.action-selection-status/);
+});
+
 for (const [name, metadata, imageSize] of [
   ["absent metadata", undefined],
   ["null metadata", null],
@@ -776,6 +866,35 @@ test("the enlarged action capture keeps its marker but ordinary captures clear t
   assert.equal(modalCanvas.querySelector(".action-target-overlay"), null, "ordinary capture previews must not inherit a previous action's target");
   assert.equal(previewImage.src, originalImages[0].src);
   assert.equal(download.download, "0-original.png");
+});
+
+test("enlarged dropdown previews keep the requested label even when the observed option differs", () => {
+  const selection = { ...dropdownSelection, after_label: "Name (A to Z)", status: "mismatch" };
+  const { document, actionImages } = fixture({
+    actionPreview: true, actionPreviewMetadata: { ...actionMetadata, selection },
+  });
+  actionImages[0].click();
+  const canvas = document.getElementById("evidence-preview").closest(".action-modal-canvas");
+  assert.equal(canvas.querySelector(".action-target-tag").textContent, "Selecionar: Name (Z to A)", "a pre-action annotation describes intent, not an unperformed selection");
+  assert.deepEqual(JSON.parse(canvas.dataset.actionPreview).selection, selection);
+});
+
+test("printing and offline exports preserve dropdown labels without embedding rendered markers or additional evidence bytes", async () => {
+  const { document, window, actionFigures, blobs } = fixture({
+    actionPreview: true, hash: "#view/overview", actionPreviewMetadata: { ...actionMetadata, selection: dropdownSelection },
+  });
+  window.dispatch("beforeprint");
+  assert.ok(actionFigures.every((figure) => figure.querySelector(".action-target-tag").textContent === "Selecionar: Name (Z to A)"));
+  window.dispatch("afterprint");
+  document.getElementById("download-report").click();
+  const html = await blobs[0].text();
+  assert.match(html, /&quot;selection&quot;:\{&quot;version&quot;:&quot;select-labels-v1&quot;/);
+  assert.match(html, /&quot;requested_label&quot;:&quot;Name \(Z to A\)&quot;/);
+  assert.match(html, /&quot;after_label&quot;:&quot;Name \(Z to A\)&quot;/);
+  assert.doesNotMatch(html, /class="[^"]*action-target-overlay|class="[^"]*action-preview-canvas/);
+  assert.equal((html.match(/src="data:image\/png;base64,cHJlc2VydmVk"/g) || []).length, 2);
+  const offline = fixture({ exported: true, actionPreview: true, actionPreviewMetadata: { ...actionMetadata, selection: dropdownSelection } });
+  assert.equal(offline.actionFigures[0].querySelector(".action-target-tag").textContent, "Selecionar: Name (Z to A)");
 });
 
 test("HTML export stores action metadata and a capture reference without duplicate bytes or transient markers", async () => {

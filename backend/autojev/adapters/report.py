@@ -5,7 +5,7 @@ import html
 import json
 import math
 import re
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -92,6 +92,51 @@ class StandaloneHtmlReport:
             return None
 
     @staticmethod
+    def _preview_selection(value: object) -> dict[str, Any] | None:
+        """Expose recorded option labels, never raw values or arbitrary DOM data."""
+        if (not isinstance(value, dict) or value.get("version") != "select-labels-v1"
+                or not isinstance(value.get("status"), str)
+                or value["status"] not in {"confirmed", "mismatch", "unverified"}):
+            return None
+        labels: dict[str, str] = {}
+        for key in ("requested_label", "before_label", "after_label"):
+            label = value.get(key)
+            if (isinstance(label, str) and label.strip() and len(label) <= 240
+                    and not any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in label)):
+                labels[key] = label.strip()
+        if not labels:
+            return None
+        status = value["status"]
+        # Missing/invalid labels must not turn a partial capture into a claim
+        # that the requested selection was actually observed after the action.
+        if status != "unverified" and not all(key in labels for key in ("requested_label", "after_label")):
+            status = "unverified"
+        return {"version": "select-labels-v1", **labels, "status": status}
+
+    @staticmethod
+    def _selection_summary(selection: dict[str, Any] | None) -> str:
+        if not selection:
+            return ""
+        items = "".join(
+            '<div class="action-selection-item">'
+            f'<span>{label}</span><strong>{_h(selection[key])}</strong></div>'
+            for key, label in (
+                ("requested_label", "Opção solicitada"),
+                ("before_label", "Antes da ação"),
+                ("after_label", "Selecionada depois"),
+            ) if key in selection
+        )
+        statuses = {
+            "confirmed": "Seleção confirmada",
+            "mismatch": "Seleção diferente da solicitada",
+            "unverified": "Seleção não confirmada",
+        }
+        return (
+            f'<div class="action-selection-summary" data-selection-status="{selection["status"]}">'
+            f'{items}<p class="action-selection-status">{statuses[selection["status"]]}</p></div>'
+        )
+
+    @staticmethod
     def _preview_geometry(metadata: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any] | None:
         """Keep only executor-owned, finite CSS-pixel coordinates; never infer a target."""
         action = metadata.get("action")
@@ -127,14 +172,19 @@ class StandaloneHtmlReport:
                 or entry.get("target") and target != entry["target"]
                 or entry.get("url") and metadata.get("url") != entry["url"]):
             return None
-        # Values, DOM content, URLs and arbitrary capture metadata must not be
-        # copied to an HTML data attribute: it needs only geometry and the ref.
-        return {
+        # Raw values, DOM content, URLs and arbitrary capture metadata must not
+        # be copied to an HTML data attribute. Only bounded, recorded option
+        # labels are allowed alongside geometry and the ref for select actions.
+        geometry = {
             "version": "action-target-v1", "coordinate_space": "screenshot-css-pixels",
             "action": metadata["action"], "target": target,
             "image": {key: image[key] for key in ("width", "height")},
             "box": {key: box[key] for key in ("x", "y", "width", "height")},
         }
+        selection = StandaloneHtmlReport._preview_selection(metadata.get("selection")) if action == "select" else None
+        if selection:
+            geometry["selection"] = selection
+        return geometry
 
     def _preview_filename(self, exploration_id: str, entry: dict[str, Any]) -> str | None:
         """Return only an existing local capture tied to this action's page."""
@@ -200,11 +250,13 @@ class StandaloneHtmlReport:
             "O destaque indica o controle registrado imediatamente antes da interação."
             if geometry else "Posição do alvo não registrada nesta execução."
         )
+        selection_summary = self._selection_summary(geometry.get("selection") if geometry else None)
         return (
             '<div class="shots action-preview-shots"><figure class="action-preview" '
             f'data-action-preview="{_h(payload)}">'
             '<div class="action-preview-heading"><strong>Alvo da ação</strong>'
             '<small>Captura anterior à interação</small></div>'
+            f'{selection_summary}'
             '<div class="action-preview-frame">'
             f'<img class="action-preview-image" loading="lazy" data-source-shot="{_h(filename)}"'
             f'{image_source} alt="Captura anterior à ação; {_h(note)}"></div>'
@@ -598,9 +650,335 @@ class StandaloneHtmlReport:
         except (TypeError, ValueError):
             return str(value)
 
+    @classmethod
+    def _selection_for_assertion(
+        cls, entries: list[dict[str, Any]], index: int,
+    ) -> dict[str, Any] | None:
+        """Find labels for this exact attempt, never the latest preview of a CT."""
+        entry = entries[index]
+        if (entry.get("assertion") or {}).get("kind") != "selection_matches":
+            return None
+
+        def step(item: dict[str, Any]) -> tuple[bool, int | None]:
+            values = [item[key] for key in ("step_number", "action_step") if item.get(key) is not None]
+            if not values:
+                return False, None
+            if (any(not isinstance(value, int) or isinstance(value, bool) or value < 1 for value in values)
+                    or len(set(values)) != 1):
+                return True, None
+            return True, values[0]
+
+        has_step, assertion_step = step(entry)
+        if has_step and assertion_step is None:
+            return None
+        preceding = [(position, item) for position, item in enumerate(entries[:index]) if item.get("kind") == "action"]
+        if not preceding:
+            return None
+        _, action = preceding[-1]
+        if has_step:
+            matches = [item for item in entries if item.get("kind") == "action" and step(item) == (True, assertion_step)]
+            if len(matches) != 1 or step(action) != (True, assertion_step):
+                return None
+        elif step(action) == (True, None):
+            return None
+        # A selection check cannot borrow a preview from a prior dropdown when
+        # a later click, restoration or another attempt intervened.
+        preview = action.get("action_preview")
+        if not isinstance(preview, dict) or preview.get("version") != "action-target-v1" or preview.get("action") != "select":
+            return None
+        target, url = action.get("target"), action.get("url")
+        if (not isinstance(target, str) or not target or preview.get("target") != target
+                or entry.get("target") and entry["target"] != target
+                or not isinstance(url, str) or not url or preview.get("url") != url or entry.get("url") != url):
+            return None
+        action_time = cls._preview_time(action.get("occurred_at"))
+        assertion_time = cls._preview_time(entry.get("occurred_at"))
+        capture_time = cls._preview_time(preview.get("captured_at"))
+        if (action_time is None or assertion_time is None or capture_time is None
+                or action_time > assertion_time or capture_time > assertion_time):
+            return None
+        # Ambiguous duplicate action records must not assign a label to a
+        # verification from another attempt with the same clock/target.
+        if sum(item.get("occurred_at") == action.get("occurred_at") and item.get("target") == target
+               for _, item in preceding) != 1:
+            return None
+        return cls._preview_selection(preview.get("selection"))
+
     @staticmethod
-    def _assertion_detail(assertion: dict[str, Any]) -> str:
+    def _selection_assertion_detail(
+        assertion: dict[str, Any], selection: dict[str, Any] | None,
+    ) -> str:
+        """Explain a recorded boolean business check without exposing its JSON first."""
+        passed = assertion.get("passed")
+        result = "pass" if passed is True else "fail" if passed is False else "unknown"
+        titles = {
+            "pass": "A opção correta foi selecionada",
+            "fail": "A seleção não correspondeu ao esperado",
+            "unknown": "O resultado desta verificação não foi registrado",
+        }
+        descriptions = {
+            "pass": "O navegador confirmou que a escolha corresponde à opção solicitada pelo teste.",
+            "fail": "A verificação não confirmou a opção solicitada. Compare a escolha esperada com o resultado encontrado.",
+            "unknown": "Não há um resultado confirmado para dizer se a opção escolhida corresponde à solicitada.",
+        }
+
+        def icon(name: str, css_class: str) -> str:
+            paths = {
+                "check": '<path d="m6 12 4 4 8-8"/>',
+                "cross": '<path d="m8 8 8 8m0-8-8 8"/>',
+                "question": '<path d="M9 9a3 3 0 0 1 6 0c0 2-3 2-3 4m0 3h.01"/>',
+                "choice": '<path d="m7 10 5 5 5-5"/>',
+            }
+            return (
+                f'<svg class="{css_class}" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+                'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">'
+                '<circle cx="12" cy="12" r="10"/>' + paths[name] + '</svg>'
+            )
+
+        selection = selection or {}
+        requested = selection.get("requested_label")
+        after = selection.get("after_label")
+        consistent = (
+            result == "pass" and selection.get("status") == "confirmed"
+            or result == "fail" and selection.get("status") == "mismatch"
+        )
+        # The capture snapshot precedes the observation used by the business
+        # assertion. Never present its name as the checked result if they disagree.
+        actual_label = after if consistent or result == "unknown" else None
+        # Historical captures can lack the post-action label while the business
+        # check still confirms the requested value. Use its same-attempt label
+        # only with the explicit, strictly boolean value-match evidence.
+        expected_check, actual_check = assertion.get("expected"), assertion.get("actual")
+        confirmed_requested = (
+            bool(requested) and not after and selection.get("status") == "unverified"
+            and result == "pass"
+            and isinstance(expected_check, dict) and expected_check.get("option_matches") is True
+            and isinstance(actual_check, dict) and actual_check.get("option_matches") is True
+        )
+        if confirmed_requested:
+            actual_label = requested
+        expected_value = requested or "Opção solicitada pelo teste"
+        actual_value = actual_label or {
+            "pass": "Corresponde à opção esperada",
+            "fail": "Não correspondeu à opção esperada",
+            "unknown": "Resultado não disponível",
+        }[result]
+        state_icon = "check" if result == "pass" else "cross" if result == "fail" else "question"
+        expected_icon = "check" if result == "pass" else "choice"
+        notes = []
+        if not requested or not actual_label:
+            notes.append("Os nomes das opções não foram registrados ou não puderam ser vinculados com segurança a esta verificação.")
+        if after and result != "unknown" and not consistent:
+            notes.append("A captura e a verificação representam instantes diferentes; o resultado da verificação foi preservado.")
+        if requested and actual_label == requested and result == "fail":
+            notes.append("Os textos exibidos são iguais, mas isso não garante a mesma opção: a verificação dos valores internos não passou.")
+        if result != "unknown":
+            notes.append("Esta verificação compara a opção escolhida; ela não valida, sozinha, os efeitos dessa escolha na página.")
+        else:
+            notes.append("Os nomes exibidos, sozinhos, não confirmam que a verificação passou.")
+        technical = {key: assertion[key] for key in ("kind", "expected", "actual", "passed") if key in assertion}
+        raw = json.dumps(technical, ensure_ascii=False, indent=2)
+        expected_display = assertion.get("expected_display")
+        technical_description = (
+            f'<p><span class="muted">Esperado (descrição): </span>{_h(expected_display)}</p>'
+            if isinstance(expected_display, str) and expected_display else ""
+        )
+        expected_caption = "Escolha solicitada pelo teste" if requested else "Nome da opção não disponível"
+        actual_caption = {
+            "pass": "Confirmada pela verificação no navegador",
+            "fail": "Não confirmada pela verificação no navegador",
+            "unknown": "Sem confirmação da verificação",
+        }[result]
+        if confirmed_requested:
+            actual_caption = "Opção solicitada confirmada no navegador"
+        return (
+            f'<section class="assertion-detail selection-verification" data-result="{result}" aria-label="Comparação da opção selecionada">'
+            '<div class="selection-verification-outcome">'
+            + icon(state_icon, "selection-state-icon")
+            + f'<div><h4>{titles[result]}</h4><p>{descriptions[result]}</p></div></div>'
+            '<div class="selection-comparison">'
+            '<article class="selection-choice" data-side="expected">'
+            + icon(expected_icon, "selection-choice-icon")
+            + '<small class="selection-choice-label">Opção esperada</small>'
+            f'<strong class="selection-choice-value">{_h(expected_value)}</strong>'
+            f'<p class="selection-choice-caption">{expected_caption}</p></article>'
+            '<div class="selection-comparison-connector">'
+            + icon(state_icon, "selection-state-icon")
+            + f'<span class="sr-only">{_h(titles[result])}</span></div>'
+            '<article class="selection-choice" data-side="actual">'
+            + icon(state_icon, "selection-choice-icon")
+            + '<small class="selection-choice-label">Opção encontrada</small>'
+            f'<strong class="selection-choice-value">{_h(actual_value)}</strong>'
+            f'<p class="selection-choice-caption">{actual_caption}</p></article></div>'
+            + ''.join(f'<p class="selection-verification-note">{_h(note)}</p>' for note in notes)
+            + '<details class="selection-technical"><summary>Ver dados técnicos</summary>'
+            + technical_description + f'<pre>{_h(raw)}</pre></details></section>'
+        )
+
+    @staticmethod
+    def _sort_assertion_detail(assertion: dict[str, Any]) -> str:
+        """Compare recorded product sequences without rejudging the business check."""
+        passed = assertion.get("passed")
+        result = "pass" if passed is True else "fail" if passed is False else "unknown"
+        expected = assertion.get("expected")
+        actual = assertion.get("actual")
+        expected = expected if isinstance(expected, dict) else {}
+        actual = actual if isinstance(actual, dict) else {}
+
+        def products(value: object) -> list[str] | None:
+            # Never filter malformed entries: that would shift recorded positions.
+            if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+                return None
+            return value
+
+        wanted, found = products(expected.get("products")), products(actual.get("products"))
+        comparable = wanted is not None and found is not None
+        same_members = comparable and Counter(wanted) == Counter(found)
+        columns = max(len(wanted or []), len(found or []))
+        by = expected.get("by") if isinstance(expected.get("by"), str) else None
+        descending = expected.get("descending")
+        criterion = {
+            ("name", False): "Nome: de A a Z", ("name", True): "Nome: de Z a A",
+            ("price", False): "Preço: do menor para o maior", ("price", True): "Preço: do maior para o menor",
+        }.get((by, descending), "Critério não registrado") if isinstance(by, str) and isinstance(descending, bool) else "Critério não registrado"
+        titles = {
+            "pass": "Os produtos estão na ordem correta",
+            "fail": "A ordenação dos produtos não passou na verificação",
+            "unknown": "Ordenação sem resultado confirmado",
+        }
+        descriptions = {
+            "pass": "A verificação confirmou a ordenação e a presença dos mesmos produtos.",
+            "fail": "Compare as duas fileiras para identificar mudanças de posição ou de produtos.",
+            "unknown": "As sequências registradas podem ser comparadas, mas não há aprovação confirmada.",
+        }
+
+        def icon(state: str, css_class: str) -> str:
+            path = {
+                "match": '<path d="m6 12 4 4 8-8"/>',
+                "different": '<path d="m8 8 8 8m0-8-8 8"/>',
+                "missing": '<path d="M7 12h10"/>',
+                "equivalent": '<path d="M6 9h12m-3-3 3 3-3 3M18 15H6m3-3-3 3 3 3"/>',
+                "unverified": '<path d="M9 9a3 3 0 0 1 6 0c0 2-3 2-3 4m0 3h.01"/>',
+                "reference": '<path d="M7 8h10M7 12h10M7 16h6"/>',
+            }[state]
+            return (
+                f'<svg class="{css_class}" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+                'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">'
+                '<circle cx="12" cy="12" r="10"/>' + path + '</svg>'
+            )
+
+        equivalent_positions = False
+        values = actual.get("values")
+
+        def position_state(position: int, side: str) -> tuple[str, str]:
+            items, other = (wanted, found) if side == "expected" else (found, wanted)
+            identity = items[position] if items is not None and position < len(items) else None
+            counterpart = other[position] if other is not None and position < len(other) else None
+            if not comparable or result == "unknown":
+                return "unverified", "Sem confirmação nesta posição"
+            if identity is None:
+                return "missing", "Não encontrado" if side == "actual" else "Não previsto"
+            if identity == counterpart:
+                return "match", "Mesma posição" if result == "pass" else "Mesmo produto nesta posição"
+            if result == "pass" and same_members and by in {"name", "price"}:
+                # The business check permits interchangeable equal-key items.
+                # Different identity positions cannot overrule a recorded PASS.
+                return "equivalent", "Posição equivalente · empate"
+            if side == "expected":
+                return "reference", "Posição de referência"
+            return "different", "Produto não previsto" if identity not in (wanted or []) else "Em outra posição"
+
+        def row(items: list[str] | None, side: str) -> str:
+            nonlocal equivalent_positions
+            title = "Ordem esperada" if side == "expected" else "Ordem encontrada"
+            count = f"{len(items)} {'produto' if len(items) == 1 else 'produtos'}" if items is not None else "Dados não disponíveis"
+            cards = []
+            for position in range(columns) if items is not None else []:
+                identity = items[position] if position < len(items) else None
+                state, note = position_state(position, side)
+                if state == "equivalent":
+                    equivalent_positions = True
+                name = ((identity.removeprefix("name:") or "Produto sem nome registrado") if identity else "Não encontrado" if side == "actual" else "Não previsto")
+                if identity and identity.startswith("id:"):
+                    name = "Produto · ID " + identity[3:]
+                price = ""
+                if side == "actual" and identity and by == "price" and isinstance(values, list) and items is not None and len(values) == len(items):
+                    value = values[position]
+                    if isinstance(value, (float, int)) and not isinstance(value, bool) and math.isfinite(value):
+                        price = f'<span class="sort-product-value">Preço observado: {_h(format(value, ".2f").replace(".", ","))}</span>'
+                cards.append(
+                    f'<li class="sort-product" data-state="{state}">'
+                    f'<span class="sort-position" aria-label="Posição {position + 1}">{position + 1:02d}</span>'
+                    f'<strong class="sort-product-name">{_h(name)}</strong>{price}'
+                    f'<small class="sort-product-note">{note}</small></li>'
+                )
+            contents = (
+                '<ol class="sort-products">' + ''.join(cards) + '</ol>' if cards else
+                '<p class="sort-row-empty">' + ("Sequência de produtos não disponível neste registro." if items is None else "Nenhum produto registrado.") + '</p>'
+            )
+            heading = f'<div class="sort-row-heading"><h5>{title}</h5><span>{count}</span></div>'
+            return (
+                f'<section class="sort-row" data-side="{side}" aria-label="{title}">'
+                + (heading + contents if side == "expected" else contents + heading) + '</section>'
+            )
+
+        pairs = []
+        pair_labels = {
+            "match": "Mesmo produto nesta posição",
+            "different": "Produtos diferentes nesta posição",
+            "equivalent": "Produtos em posição equivalente por empate",
+            "missing": "Produto sem correspondente nesta posição",
+            "unverified": "Comparação sem confirmação nesta posição",
+        }
+        for position in range(columns):
+            if not comparable or result == "unknown":
+                state = "unverified"
+            elif position >= len(wanted) or position >= len(found):
+                state = "missing"
+            else:
+                state = position_state(position, "actual")[0]
+            label = f"Posição {position + 1}: {pair_labels[state]}"
+            pairs.append(
+                f'<li class="sort-pair" data-state="{state}" aria-label="{label}" title="{label}">'
+                + icon(state, "sort-pair-icon") + '</li>'
+            )
+        connections = (
+            '<ol class="sort-pairs" aria-label="Comparação de cada par de produtos">' + ''.join(pairs) + '</ol>'
+        ) if pairs else ""
+        rows = row(wanted, "expected") + connections + row(found, "actual")
+        notes = []
+        if not comparable:
+            notes.append("Parte da comparação não foi registrada. Os produtos ausentes do registro não foram reconstruídos.")
+        if equivalent_positions:
+            notes.append("Produtos empatados no critério de ordenação podem trocar de posição. Essas trocas são válidas e não reprovam o teste.")
+        if result == "fail" and comparable and wanted == found:
+            notes.append("Os produtos aparecem nas mesmas posições, mas a verificação dos valores de ordenação não passou.")
+        if result == "pass" and comparable and not same_members:
+            notes.append("As listas registradas têm produtos diferentes; o resultado original foi preservado. Confira os dados técnicos.")
+        technical = {key: assertion[key] for key in ("kind", "expected", "actual", "passed") if key in assertion}
+        technical_description = assertion.get("expected_display")
+        detail = f'<p><span class="muted">Esperado (descrição): </span>{_h(technical_description)}</p>' if isinstance(technical_description, str) and technical_description else ""
+        state = "match" if result == "pass" else "different" if result == "fail" else "unverified"
+        return (
+            f'<section class="assertion-detail sort-verification" data-result="{result}" aria-label="Comparação da ordenação dos produtos">'
+            '<div class="sort-outcome">' + icon(state, "sort-state-icon")
+            + f'<div><h4>{titles[result]}</h4><p>{descriptions[result]}</p></div></div>'
+            f'<span class="sort-criterion">{criterion}</span>'
+            f'<div class="sort-comparison-scroll" role="region" aria-label="Ordem esperada e encontrada, alinhadas por posição" tabindex="0" style="--sort-columns: {max(columns, 1)}">{rows}</div>'
+            + ''.join(f'<p class="sort-verification-note">{_h(note)}</p>' for note in notes)
+            + '<details class="sort-technical"><summary>Ver dados técnicos</summary>' + detail
+            + f'<pre>{_h(json.dumps(technical, ensure_ascii=False, indent=2))}</pre></details></section>'
+        )
+
+    @classmethod
+    def _assertion_detail(
+        cls, assertion: dict[str, Any], *, selection: dict[str, Any] | None = None,
+    ) -> str:
         kind = str(assertion.get("kind") or "Verificação observada")
+        if kind == "selection_matches":
+            return cls._selection_assertion_detail(assertion, cls._preview_selection(selection))
+        if kind == "product_sort_order":
+            return cls._sort_assertion_detail(assertion)
         technical = kind in {"no_new_browser_errors", "no_new_application_errors"}
         visual = kind == "visual_model"
         label = "Indício visual da LLM" if visual else "Verificação técnica" if technical else "Verificação observada"
@@ -766,7 +1144,9 @@ class StandaloneHtmlReport:
                     } if observation else None,
                 )
             if isinstance(entry.get("assertion"), dict):
-                detail += self._assertion_detail(entry["assertion"])
+                detail += self._assertion_detail(
+                    entry["assertion"], selection=self._selection_for_assertion(entries, index),
+                )
             timestamp = entry.get("occurred_at")
             title = (
                 provenance.get("summary") if observation else None

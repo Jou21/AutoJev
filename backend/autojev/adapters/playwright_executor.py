@@ -1644,6 +1644,50 @@ class PlaywrightExecutor:
             # failures are evidence limitations, not action/verdict failures.
             return None
 
+    async def _select_label_snapshot(
+        self, locator: Any, requested_value: str,
+    ) -> dict[str, Any] | None:
+        """Read display labels, never export option values or change the DOM.
+
+        Native select popups are browser/OS UI, not screenshot evidence. These
+        labels describe the checked control without pretending its menu opened.
+        Comparing the private value happens inside this read-only DOM query.
+        """
+        try:
+            snapshot = await locator.evaluate(
+                """(el, {requested, sensitiveSelector}) => {
+                  if (!(el instanceof HTMLSelectElement) || !el.isConnected
+                    || el.matches(sensitiveSelector)
+                    || el.hasAttribute('data-autojev-secret-mask')) return null;
+                  const options = Array.from(el.options).slice(0, 1000);
+                  const requestedOption = options.find(option => option.value === requested);
+                  const selected = Array.from(el.selectedOptions);
+                  return {
+                    requested_label: requestedOption?.label ?? null,
+                    selected_label: selected.slice(0, 20).map(option => option.label).join(', '),
+                    matches: selected.length === 1 && selected[0].value === requested,
+                  };
+                }""",
+                {"requested": requested_value, "sensitiveSelector": self._SENSITIVE_FIELD_SELECTOR},
+            )
+            if not isinstance(snapshot, dict) or not isinstance(snapshot.get("matches"), bool):
+                return None
+
+            def label(value: Any) -> str | None:
+                if not isinstance(value, str):
+                    return None
+                value = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", self._redact_text(value))
+                value = " ".join(value.split())[:240].strip()
+                return value or None
+
+            return {
+                "requested_label": label(snapshot.get("requested_label")),
+                "selected_label": label(snapshot.get("selected_label")),
+                "matches": snapshot["matches"],
+            }
+        except Exception:
+            return None
+
     async def observe(self, screenshot_label: str = "page") -> Observation:
         if not self.is_active():
             raise BrowserUnavailableError("Browser page is not active")
@@ -2524,6 +2568,7 @@ class PlaywrightExecutor:
         message = ""
         recorded_value = decision.value
         execution_evidence: dict[str, Any] = {}
+        select_preview_context: tuple[Any, str, Any, dict[str, Any]] | None = None
         action_started_monotonic = time.monotonic()
         self._blocked_navigation_url = None
         await self._set_sidepanel_automation(True)
@@ -2633,6 +2678,34 @@ class PlaywrightExecutor:
                 preview = await self._capture_action_preview(locator, decision)
                 if preview is not None:
                     execution_evidence["action_preview"] = preview
+                    # Retain the checked node, not a selector that could later
+                    # resolve to a replacement control. Optional label reads
+                    # must never prevent dispatch of the authorized action.
+                    if not (field or {}).get("sensitive") and not any(
+                        secret in decision.value for secret in self.secret_values
+                    ):
+                        try:
+                            label_target = (
+                                await locator.element_handle()
+                                if hasattr(locator, "element_handle") else locator
+                            )
+                            snapshot = await self._select_label_snapshot(label_target, decision.value)
+                            if snapshot is not None:
+                                selection: dict[str, Any] = {
+                                    "version": "select-labels-v1", "status": "unverified",
+                                }
+                                for source, dest in (
+                                    ("requested_label", "requested_label"),
+                                    ("selected_label", "before_label"),
+                                ):
+                                    if snapshot[source]:
+                                        selection[dest] = snapshot[source]
+                                preview["selection"] = selection
+                                select_preview_context = (
+                                    self._page, self._page.url, label_target, selection,
+                                )
+                        except Exception:
+                            pass
                 await locator.select_option(decision.value, timeout=10_000)
             elif action == "press":
                 locator = await self._locator(decision.target)
@@ -2725,6 +2798,14 @@ class PlaywrightExecutor:
                 raise PermissionError(
                     "PolicyBlocked: cross-origin navigation was blocked before request"
                 )
+            if select_preview_context is not None:
+                selection_page, selection_url, label_target, selection = select_preview_context
+                if self._page is selection_page and self._page.url == selection_url:
+                    snapshot = await self._select_label_snapshot(label_target, decision.value)
+                    if snapshot is not None:
+                        if snapshot["selected_label"]:
+                            selection["after_label"] = snapshot["selected_label"]
+                        selection["status"] = "confirmed" if snapshot["matches"] else "mismatch"
             success = True
             message = f"Playwright executed {action} successfully"
             if execution_evidence.get("business_settle"):

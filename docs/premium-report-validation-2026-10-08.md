@@ -223,3 +223,166 @@ e 65 testes aprovados, incluindo 31 do explorador de passos. A regressão adicio
 do executor/negócio/cobertura também passou com 257 testes. Um aviso de depreciação
 Starlette/AnyIO, sem falha. Validação sintática e `git diff --check` sem erros.
 Backend local reiniciado com as alterações; nenhuma publicação realizada.
+
+## Refinamento em 09/10: opção escolhida nos dropdowns
+
+Em novas execuções, o passo de seleção registra os rótulos visíveis da opção
+solicitada, da seleção anterior e da seleção observada após a estabilização da
+página. O destaque passa a dizer, por exemplo, **Selecionar: Menor preço**.
+Um resumo junto à captura distingue a intenção do resultado, com os estados
+**Seleção confirmada**, **Seleção diferente da solicitada** ou **Seleção não
+confirmada**. A confirmação compara os valores reais no próprio navegador;
+rótulos iguais de opções diferentes não bastam para confirmar a seleção.
+
+Os metadados contêm somente rótulos limitados e redigidos, nunca os valores
+brutos das opções. Controles sensíveis são excluídos. A leitura é opcional e
+não interfere na ação, nas verificações de negócio ou no resultado do CT.
+Navegação, substituição do controle e falhas de leitura não produzem uma
+confirmação inventada. O menu nativo não é simulado sobre a imagem: a captura
+original permanece anterior à ação, fechada e intacta. Relatórios antigos não
+ganham rótulos que a execução não registrou.
+
+Conferência pelo Chromium real e Playwright MCP, inteiramente local e sem IA:
+
+- Seleção de **Menor preço**, antes **Nome (A a Z)**, confirmada na captura,
+  no resumo e na ampliação.
+- Falha proposital no site da fixture, que desfaz a escolha: o resumo mostrou
+  a opção realmente mantida; a verificação `selection_matches` falhou e o CT
+  continuou **REPROVADO**, sem confundir sucesso da automação com sucesso de negócio.
+- Desktop 1440 × 900 e celular 390 × 844, sem vazamento horizontal; rótulo
+  longo no zoom permaneceu dentro dos limites da imagem.
+- HTML baixado reaberto offline conservou opção, resumo e destaque, sem botão
+  redundante de download e sem requisições HTTP/HTTPS ou erros de JavaScript.
+- Preparação de impressão mostrou os rótulos e destaques inclusive em CTs não
+  visitados, restaurando o passo selecionado ao terminar.
+- As integrações verificaram que os PNGs e os dados originais não foram alterados;
+  os novos metadados locais não entram no payload auxiliar da LLM.
+
+Capturas: `data/mcp-validation/dropdown-option-desktop.png`,
+`dropdown-option-mobile.png` e `dropdown-option-mismatch.png`.
+Arquivo offline: `data/mcp-validation/dropdown-option-offline-20261009.html`.
+
+Regressão: 355 testes backend aprovados em três suítes (231 de captura/relatório/API,
+122 de negócio e controle obsoleto, 2 integrações Chromium). `npm test` com build
+aprovado e 81 testes frontend. Um aviso de depreciação Starlette/AnyIO, sem falha.
+Validação sintática e `git diff --check` sem erros. Backend local atualizado;
+nenhuma chamada a modelo ou publicação foi necessária.
+
+## Refinamento em 09/10: comparação didática da opção selecionada
+
+A verificação **Opção selecionada** agora apresenta dois cards: **Opção esperada**
+e **Opção encontrada**, com os nomes registrados no navegador. Quando a verificação
+passa, ambos ficam verdes com check. Quando falha, o resultado encontrado recebe
+destaque vermelho e uma explicação em português. O JSON original fica recolhido
+em **Ver dados técnicos**, acessível também pelo teclado.
+
+As cores seguem o resultado real de `selection_matches`, não a igualdade visual
+dos textos. Rótulos iguais com valores internos diferentes continuam reprovados.
+Os nomes são vinculados somente à ação anterior confiável do mesmo CT, página e
+tentativa. Registros históricos sem esses metadados recebem uma explicação simples,
+sem inventar nomes. Captura e verificação divergentes não são tratadas como o mesmo
+instante. Os dados originais e os resultados dos CTs permanecem intactos.
+
+Validação local pelo Chromium real e Playwright MCP, usando a habilidade de
+navegador (o navegador integrado estava indisponível):
+
+- Casos aprovado e reprovado, com os nomes esperados e encontrados corretos.
+- Desktop 1440 × 900, celular 390 × 844 sem vazamento horizontal, temas claro e escuro.
+- Expansão e recolhimento dos dados técnicos pelo teclado; JSON original preservado.
+- HTML baixado reaberto offline, sem requisições HTTP/HTTPS, erros de JavaScript
+  ou botão redundante de download.
+- Impressão mantém os cards e restaura o passo selecionado e o recolhimento técnico.
+- A execução real de 151 CTs foi reapresentada pela API. Quando o nome posterior
+  não foi capturado, mas a verificação confirma explicitamente o valor solicitado
+  na mesma ação, os dois cards exibem **Name (Z to A)**. A legenda **Opção solicitada
+  confirmada no navegador** distingue essa confirmação da recaptura do rótulo.
+  Falhas, resultados indefinidos, vínculos ambíguos e dados contraditórios não
+  reutilizam o nome solicitado como resultado. O HTML original manteve o mesmo SHA-256.
+
+Capturas: `data/mcp-validation/selection-verification-pass.png`,
+`selection-verification-mismatch.png`, `selection-verification-mobile.png` e
+`selection-verification-light.png`. Arquivo offline:
+`data/mcp-validation/selection-verification-offline-20261009.html`.
+
+Regressão: 208 testes backend de relatório, associação de evidências, localização
+e API, mais 2 integrações com Chromium real. `npm test`: build e 81 testes frontend
+aprovados. Um aviso de depreciação Starlette/AnyIO, sem falha. `git diff --check`
+sem erros. Nenhuma chamada de IA ou publicação foi necessária.
+
+Validação adicional da confirmação histórica: 224 testes backend aprovados e
+conferência do CT001 real pelo Playwright MCP. Captura:
+`data/mcp-validation/selection-verification-confirmed-label.png`.
+
+## Refinamento em 09/10: comparação visual da ordenação dos produtos
+
+A verificação **Ordenação dos produtos** apresenta duas fileiras de cards:
+**Ordem esperada** acima e **Ordem encontrada** abaixo. Os produtos são numerados
+e alinhados por posição, com o critério em português (nome ou preço, crescente
+ou decrescente). Checks verdes mostram posições correspondentes; diferenças
+na fileira encontrada recebem destaque vermelho. Produtos faltantes ou extras
+mantêm suas posições, sem reorganizar ou completar a evidência. O JSON original
+permanece recolhido em **Ver dados técnicos**.
+
+O resultado registrado da verificação continua soberano. Produtos empatados
+podem trocar de posição sem reprovar uma ordenação válida: esses cards ficam
+verdes com contorno tracejado e indicação de empate. Em uma verificação reprovada,
+um card verde significa apenas **Mesmo produto nesta posição**, não aprovação
+da ordenação inteira. Dados ausentes ou malformados não geram nomes, preços ou
+confirmações inventados. Preços observados não recebem uma moeda não registrada.
+
+Validação local pela habilidade de navegador e Playwright MCP (o navegador
+integrado estava indisponível):
+
+- CT001 da execução real de 151 CTs: seis produtos em cada fileira, na ordem
+  registrada, com as doze posições visíveis em desktop 1440 × 900, sem rolagem
+  vertical adicional no painel do passo.
+- Fixtures de ordem invertida e empate de preços, preservando respectivamente
+  a reprovação e a aprovação, com explicações e cores adequadas.
+- Celular 390 × 844 sem vazamento horizontal da página. As duas fileiras
+  compartilham a mesma rolagem lateral, mantendo as posições alinhadas.
+- Temas claro e escuro, foco visível e abertura dos dados técnicos pelo teclado.
+- HTML baixado reaberto offline, sem botão redundante de download, requisições
+  HTTP/HTTPS ou erros de JavaScript; impressão mostra ambas as fileiras e
+  restaura o passo selecionado e os dados técnicos recolhidos ao terminar.
+- A apresentação histórica foi regenerada pela API, sem repetir a exploração.
+  O HTML original manteve o SHA-256
+  `fbc1b6ea427cc3b0ef61e37575bc443b7849604d52da9172d926e4161f362db7`.
+
+Capturas: `data/mcp-validation/product-sort-desktop.png`, `product-sort-light.png`,
+`product-sort-mobile.png`, `product-sort-mismatch.png` e
+`product-sort-equal-price.png`. Arquivo offline:
+`data/mcp-validation/product-sort-offline-20261009.html`.
+
+Regressão: 256 testes backend de relatório, evidências, localização e API,
+incluindo 32 testes específicos da ordenação. `npm test`: build e 81 testes
+frontend aprovados. Um aviso de depreciação Starlette/AnyIO, sem falha.
+`git diff --check` sem erros. Backend local atualizado; nenhuma chamada de IA,
+nova exploração ou publicação foi necessária.
+
+### Refinamento: um indicador entre cada dupla de produtos
+
+O título **Ordem encontrada** e a contagem de produtos ficam abaixo da fileira
+inferior. Cada posição tem um único indicador central, ligado aos dois cards
+por linhas verticais curtas. Checks verdes indicam o mesmo produto na posição;
+divergências recebem um X vermelho, ausências recebem um traço vermelho,
+empates válidos usam setas verdes e comparações sem confirmação ficam neutras.
+Os ícones repetidos dentro dos cards foram removidos. Cada indicador também
+tem um rótulo acessível com sua posição e significado.
+
+Conferência pela habilidade de navegador e Playwright MCP: no CT001 real,
+os seis indicadores estão centralizados entre seus respectivos cards, e o
+rodapé está abaixo dos seis produtos encontrados. Em desktop 1440 × 900, a
+comparação completa cabe no painel sem rolagem vertical adicional. No celular
+390 × 844, cards e indicadores permanecem alinhados na rolagem lateral única,
+sem vazamento horizontal da página. Casos de ordem invertida e empate de
+preços mantiveram seus resultados originais. O arquivo baixado reaberto offline
+preservou os seis pares, sem botão de download redundante, requisições HTTP/HTTPS
+ou erros de JavaScript. A impressão também manteve os indicadores e o rodapé.
+
+Capturas: `data/mcp-validation/product-sort-pairs-desktop.png`,
+`product-sort-pairs-mobile.png` e `product-sort-pairs-mismatch.png`.
+Arquivo offline: `data/mcp-validation/product-sort-pairs-offline-20261009.html`.
+Regressão: 282 testes backend aprovados, incluindo 26 novos testes de estrutura,
+estados, acessibilidade e preservação das evidências; build e 81 testes frontend
+aprovados. Um aviso de depreciação Starlette/AnyIO, sem falha. Backend atualizado,
+`git diff --check` limpo, sem nova exploração, chamadas de IA ou publicação.
