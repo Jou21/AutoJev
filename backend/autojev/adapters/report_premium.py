@@ -226,10 +226,12 @@ def render_premium_report(renderer: Any, exploration: dict[str, Any], scenarios:
         '<div class="result-location"><button id="case-back" class="button button-ghost">← Voltar para testes</button>'
         '<h1 id="result-view-title" tabindex="-1">Resultado do teste</h1></div>'
         '<div class="result-actions"><div class="result-case-navigation" role="group" aria-label="Navegar entre testes">'
+        '<button id="case-rerun" class="button button-rerun" aria-describedby="case-rerun-feedback"><span aria-hidden="true">↻</span> Reexecutar teste</button>'
         '<button id="case-edit" class="button button-ghost" data-edit-current>Editar passos</button>'
         '<button id="case-prev" class="button button-ghost">← Teste anterior</button>'
         '<button id="case-next" class="button button-ghost">Teste seguinte →</button></div>'
         '<div id="result-report-actions" class="result-report-actions"></div></div></div>'
+        '<p id="case-rerun-feedback" class="case-rerun-feedback" role="status" aria-live="polite" hidden></p>'
         '<h2 id="case-title" class="result-title">Detalhes do caso</h2><section id="scenarios">'
         + ("".join(case_html) or _empty("Nenhum caso individual registrado nesta execução.")) + '</section>'
     )

@@ -277,11 +277,9 @@ function fixture(options = {}) {
     connection.setAttribute("type", options.runtimeType || "application/json");
     connection.textContent = typeof options.appRuntime === "string" ? options.appRuntime : JSON.stringify(options.appRuntime);
   }
-  if (visualEditor) {
-    const drafts = make("script", "", document.body);
-    drafts.id = "report-drafts";
-    drafts.textContent = typeof options.drafts === "string" ? options.drafts : JSON.stringify(options.drafts || { version: 1, cases: {} });
-  }
+  const drafts = make("script", "", document.body);
+  drafts.id = "report-drafts";
+  drafts.textContent = typeof options.drafts === "string" ? options.drafts : JSON.stringify(options.drafts || { version: 1, cases: {} });
   const navigation = make("nav", "", document.body);
   for (const view of ["overview", "tests", "results", ...(journey ? ["journey"] : [])]) {
     make("button", "", navigation, view).dataset.reportNav = view;
@@ -394,10 +392,16 @@ function fixture(options = {}) {
   make("h1", "", resultLocation, "Resultado do teste").id = "result-view-title";
   const resultActions = make("div", "result-actions", resultNavigation);
   const caseNavigation = make("div", "result-case-navigation", resultActions);
+  make("button", "", caseNavigation, "Reexecutar teste").id = "case-rerun";
   make("button", "", caseNavigation, "Teste anterior").id = "case-prev";
   make("button", "", caseNavigation, "Teste seguinte").id = "case-next";
   make("div", "", resultActions).id = "result-report-actions";
   if (visualEditor) make("button", "", resultActions, "Editar CT").dataset.editCurrent = "true";
+  const rerunFeedback = make("p", "", resultView);
+  rerunFeedback.id = "case-rerun-feedback";
+  rerunFeedback.hidden = true;
+  rerunFeedback.setAttribute("role", "status");
+  rerunFeedback.setAttribute("aria-live", "polite");
   const scenarios = make("div", "", resultView);
   scenarios.id = "scenarios";
   const originals = [];
@@ -851,6 +855,234 @@ test("offline, malformed and tampered report connections cannot open an app or c
     assert.equal(window.networkCalls, 0);
     assert.match(document.getElementById("case-editor-feedback").textContent, /Reexecução não iniciada.*Abra o relatório pela aplicação/);
   }
+});
+
+test("the result toolbar reruns only the selected CT through app confirmation, never the visual draft", () => {
+  const { document, window, cards } = fixture({ visualEditor: true,
+    runId: "source-123", locationProtocol: "blob:", locationOrigin: "http://localhost:5173",
+    appRuntime: { app_url: "http://localhost:5173", source_exploration_id: "source-123" },
+  });
+  const first = cards[0];
+  first.querySelectorAll(".case-inline-insert")[1].click();
+  document.getElementById("case-rerun").click();
+  assert.deepEqual(window.openedTabs, [["http://localhost:5173/#/reexecutar/source-123/CT001", "_blank", "noopener,noreferrer"]]);
+  const feedback = document.getElementById("case-rerun-feedback");
+  assert.equal(feedback.hidden, false);
+  assert.equal(feedback.getAttribute("role"), "status");
+  assert.equal(feedback.getAttribute("aria-live"), "polite");
+  assert.match(feedback.textContent, /Nenhuma ação foi iniciada.*cartões de banco.*não serão executados/);
+  assert.equal(document.getElementById("case-editor").hasAttribute("open"), false, "toolbar action does not require the step editor");
+  document.getElementById("case-next").click();
+  document.getElementById("case-rerun").click();
+  assert.deepEqual(window.openedTabs.at(-1), ["http://localhost:5173/#/reexecutar/source-123/CT002", "_blank", "noopener,noreferrer"]);
+  assert.equal(window.networkCalls, 0);
+  assert.deepEqual(cards.map((card) => card.dataset.status), ["PASS", "FAIL"]);
+});
+
+test("the visible rerun button explains offline or untrusted reports without contacting an app", () => {
+  for (const connection of [
+    {},
+    { locationProtocol: "file:", locationOrigin: "http://localhost:5173", appRuntime: { app_url: "http://localhost:5173", source_exploration_id: "source-123" } },
+    { locationProtocol: "blob:", locationOrigin: "http://localhost:5173", appRuntime: { app_url: "https://other.example", source_exploration_id: "source-123" } },
+  ]) {
+    const { document, window } = fixture({ runId: "source-123", ...connection });
+    const rerun = document.getElementById("case-rerun");
+    assert.equal(rerun.hidden, false, "the result screen always offers the reexecution entry point");
+    rerun.click();
+    const feedback = document.getElementById("case-rerun-feedback");
+    assert.equal(feedback.hidden, false);
+    assert.match(feedback.textContent, /Reexecução não iniciada.*Abra o relatório pela aplicação/);
+    assert.equal(window.openedTabs.length, 0);
+    assert.equal(window.networkCalls, 0);
+  }
+});
+
+test("insertion controls appear directly between steps without a toggle or modal and preserve original evidence", () => {
+  const { document, window, cards, originals, originalImages } = fixture();
+  const card = cards[0];
+  const unchangedEvidence = originals.map((entry) => entry.outerHTML.replace(/ hidden=""/g, ""));
+  const source = document.getElementById("report-data").textContent;
+  assert.equal(document.getElementById("case-editor"), null);
+  assert.equal(card.querySelector(".case-inline-add-toggle"), null, "there is no extra header button to reveal insertion controls");
+  assert.equal(card.querySelector(".case-inline-palette"), null, "the sidebar does not need a separate palette");
+  assert.equal(card.querySelector(".case-inline-database-card"), null);
+  assert.equal(card.querySelectorAll(".case-inline-gap").length, 4);
+  assert.ok(card.querySelectorAll(".case-inline-gap").every((gap) => !gap.hidden));
+  assert.ok(card.querySelectorAll(".case-inline-insert").every((control) => !control.hidden && control.textContent === "+ Adicionar aqui"));
+  card.querySelectorAll(".case-inline-insert")[1].click();
+  const draft = card.querySelector(".case-inline-draft");
+  assert.ok(draft);
+  assert.match(draft.textContent, /Consulta em banco de dados.*Não executado/);
+  draft.querySelector(".case-inline-draft-button").click();
+  const panel = card.querySelector(".case-draft-panel");
+  assert.equal(panel.hidden, false);
+  assert.match(panel.textContent, /Consulta em banco de dados/);
+  assert.match(panel.textContent, /[Nn]ão executado/);
+  assert.equal(panel.closest(".evidence-timeline"), null, "drafts are not historical evidence entries");
+  assert.equal(card.querySelectorAll(".timeline-entry").filter((entry) => !entry.hidden).length, 0);
+  assert.match(card.querySelector(".case-step-count").textContent, /^3 registros na linha do tempo/);
+  const recorded = card.querySelectorAll(".case-step-button[data-recorded-index]");
+  assert.deepEqual(recorded.map((button) => button.dataset.recordedIndex), ["0", "1", "2", "3"]);
+  assert.deepEqual(recorded.map((button) => button.querySelector(".step-number").textContent), ["i", "01", "02", "03"]);
+  assert.deepEqual(originals.map((entry) => entry.outerHTML.replace(/ hidden=""/g, "")), unchangedEvidence);
+  assert.deepEqual(document.querySelectorAll("img[src]"), originalImages);
+  assert.equal(document.getElementById("report-data").textContent, source);
+  assert.equal(card.dataset.status, "PASS");
+  assert.equal(window.networkCalls, 0);
+  const saved = JSON.parse(document.getElementById("report-drafts").textContent);
+  assert.deepEqual(saved.cases["0"], [{ id: draft.dataset.draftId, type: "database", gap: 1, order: 0 }]);
+  assert.equal(card.querySelectorAll(".case-inline-draft").length, 1);
+  assert.equal(card.querySelector(".case-inline-draft").dataset.draftId, draft.dataset.draftId);
+  assert.equal(draft.getAttribute("draggable"), "true", "saved visual cards remain movable without entering an editing mode");
+  assert.equal(draft.querySelector(".case-inline-draft-actions").hidden, false);
+  assert.equal(card.querySelectorAll(".case-inline-gap").length, 5, "a newly inserted card also exposes its adjacent insertion positions");
+  window.location.hash = "#timeline-case0-2";
+  window.dispatch("hashchange");
+  assert.equal(originals[2].hidden, false);
+  assert.equal(card.querySelector(".case-draft-panel").hidden, true);
+});
+
+test("inline database cards support trusted drag/drop, keyboard reorder, move buttons and removal", () => {
+  const { document, cards } = fixture();
+  const card = cards[0];
+  const transfer = { setData() {} };
+  card.querySelectorAll(".case-inline-gap")[1].dispatch("drop", { dataTransfer: transfer });
+  assert.equal(card.querySelectorAll(".case-inline-draft").length, 0, "arbitrary external drops do not create steps");
+  card.querySelectorAll(".case-inline-insert")[0].click();
+  card.querySelector(".case-inline-draft").dispatch("dragstart", { dataTransfer: transfer });
+  const gap = card.querySelectorAll(".case-inline-gap")[2];
+  assert.equal(gap.dispatch("dragover", { dataTransfer: transfer }).defaultPrevented, true);
+  gap.dispatch("drop", { dataTransfer: transfer });
+  const payload = () => JSON.parse(document.getElementById("report-drafts").textContent).cases["0"];
+  assert.equal(payload()[0].gap, 1);
+  let draft = card.querySelector(".case-inline-draft");
+  draft.dispatch("keydown", { key: "ArrowDown", altKey: true });
+  assert.equal(payload()[0].gap, 2);
+  draft = card.querySelector(".case-inline-draft");
+  draft.dispatch("dragstart", { dataTransfer: transfer });
+  card.querySelector(".case-inline-gap").dispatch("drop", { dataTransfer: transfer });
+  assert.equal(payload()[0].gap, 0);
+  draft = card.querySelector(".case-inline-draft");
+  assert.equal(draft.querySelector(".case-inline-move-before").disabled, true);
+  draft.querySelector(".case-inline-move-after").click();
+  assert.equal(payload()[0].gap, 1);
+  card.querySelector(".case-inline-draft-button").dispatch("keydown", { key: "ArrowUp", altKey: true });
+  assert.equal(payload()[0].gap, 0);
+  card.querySelector(".case-inline-remove").click();
+  assert.equal(card.querySelectorAll(".case-inline-draft").length, 0);
+  assert.equal(card.querySelectorAll(".case-draft-panel").length, 0);
+  assert.equal(payload(), undefined);
+  assert.deepEqual(card.querySelectorAll(".case-step-button[data-recorded-index]").map((button) => button.dataset.recordedIndex), ["0", "1", "2", "3"]);
+});
+
+test("inline drafts remain isolated by CT and synchronize with explicitly saved modal edits", () => {
+  const { document, cards } = fixture({ visualEditor: true });
+  const first = cards[0];
+  first.querySelectorAll(".case-inline-insert")[1].click();
+  document.querySelector("[data-edit-current]").click();
+  const editor = document.getElementById("case-editor-steps");
+  assert.equal(editor.querySelectorAll(".case-editor-prototype").length, 1);
+  editor.querySelectorAll(".case-editor-insert").at(-1).click();
+  assert.equal(first.querySelectorAll(".case-inline-draft").length, 1, "unsaved modal changes are not applied to the report");
+  document.getElementById("case-editor-save").click();
+  assert.equal(first.querySelectorAll(".case-inline-draft").length, 2);
+  document.getElementById("case-editor-close").click();
+  first.querySelector(".case-inline-remove").click();
+  document.querySelector("[data-edit-current]").click();
+  assert.equal(editor.querySelectorAll(".case-editor-prototype").length, 1, "opening the editor reads the newest inline autosave");
+  document.getElementById("case-editor-close").click();
+  document.getElementById("case-next").click();
+  assert.equal(cards[1].querySelectorAll(".case-inline-draft").length, 0);
+  assert.equal(cards[1].querySelector(".case-inline-add-toggle"), null);
+  assert.ok(cards[1].querySelectorAll(".case-inline-gap").every((gap) => !gap.hidden));
+  cards[1].querySelectorAll(".case-inline-insert").at(-1).click();
+  const saved = JSON.parse(document.getElementById("report-drafts").textContent);
+  assert.deepEqual(Object.keys(saved.cases), ["0", "1"]);
+  assert.equal(saved.cases["0"][0].gap, 3);
+  assert.equal(saved.cases["1"][0].gap, 3);
+  document.getElementById("case-prev").click();
+  assert.equal(first.querySelectorAll(".case-inline-draft").length, 1);
+  assert.deepEqual(cards.map((card) => card.dataset.status), ["PASS", "FAIL"]);
+});
+
+test("inline autosaves export only bounded visual draft data and rebuild offline without duplicated evidence", async () => {
+  const { document, blobs, cards, window } = fixture();
+  const source = document.getElementById("report-data").textContent;
+  cards[0].querySelectorAll(".case-inline-insert")[2].click();
+  cards[0].querySelector(".case-inline-draft-button").click();
+  document.getElementById("download-report").click();
+  const exported = await blobs.at(-1).text();
+  const payload = JSON.parse(exported.match(/<script[^>]*id="report-drafts"[^>]*>([\s\S]*?)<\/script>/)[1]);
+  assert.deepEqual(Object.keys(payload), ["version", "cases"]);
+  assert.equal(payload.version, 1);
+  assert.deepEqual(Object.keys(payload.cases["0"][0]), ["id", "type", "gap", "order"]);
+  assert.equal(payload.cases["0"][0].gap, 2);
+  assert.doesNotMatch(exported, /class="[^"]*case-inline-draft|class="[^"]*case-draft-panel/);
+  assert.doesNotMatch(exported, /<button[^>]*id="download-report"/);
+  assert.equal((exported.match(/data:image\/png;base64,cHJlc2VydmVk/g) || []).length, 2);
+  assert.equal(document.getElementById("report-data").textContent, source);
+  assert.equal(window.networkCalls, 0);
+  const reopened = fixture({ exported: true, drafts: payload });
+  assert.equal(reopened.cards[0].querySelectorAll(".case-inline-draft").length, 1);
+  assert.equal(reopened.cards[0].querySelector(".case-inline-add-toggle"), null);
+  reopened.cards[0].querySelectorAll(".case-inline-insert").at(-1).click();
+  assert.equal(reopened.cards[0].querySelectorAll(".case-inline-draft").length, 2);
+  const offlineFeedback = reopened.cards[0].querySelector(".case-inline-feedback").textContent;
+  assert.match(offlineFeedback, /somente nesta aba.*arquivo original não será alterado/);
+  assert.doesNotMatch(offlineFeedback, /baixe o relatório/);
+  assert.ok(reopened.cards[0].querySelectorAll(".case-inline-gap").every((gap) => /cart[ãõ]/.test(gap.getAttribute("aria-label"))), "insert positions describe cards, never renumbered recorded steps");
+  reopened.cards[0].querySelector(".case-inline-draft-button").click();
+  assert.equal(reopened.cards[0].querySelector(".case-draft-panel").hidden, false);
+  reopened.cards[0].querySelector(".case-inline-remove").click();
+  assert.equal(reopened.cards[0].querySelectorAll(".case-inline-draft").length, 1);
+  const removalFeedback = reopened.cards[0].querySelector(".case-inline-feedback").textContent;
+  assert.match(removalFeedback, /removida.*somente nesta aba.*arquivo original não será alterado/);
+  assert.doesNotMatch(removalFeedback, /baixe o relatório/);
+  assert.equal(reopened.cards[0].querySelectorAll(".timeline-entry").length, 3);
+  assert.equal(reopened.window.networkCalls, 0);
+  assert.deepEqual(reopened.cards.map((card) => card.dataset.status), ["PASS", "FAIL"]);
+});
+
+test("inline insertion enforces the same 100-card bound and cannot import executable fields", () => {
+  const entries = Array.from({ length: 120 }, (_, index) => ({
+    id: "db-" + (index + 1), type: "database", gap: 0, order: index % 100,
+    sql: "DELETE FROM users", credentials: "secret", status: "PASS",
+  }));
+  const { document, cards } = fixture({ drafts: { version: 1, cases: { "0": entries } } });
+  const card = cards[0];
+  assert.equal(card.querySelectorAll(".case-inline-draft").length, 100);
+  assert.equal(card.querySelector(".case-inline-add-toggle"), null);
+  assert.ok(card.querySelectorAll(".case-inline-insert").every((button) => button.disabled));
+  card.querySelector(".case-inline-insert").click();
+  assert.equal(card.querySelectorAll(".case-inline-draft").length, 100);
+  assert.match(card.querySelector(".case-inline-feedback").textContent, /Limite de 100/);
+  card.querySelector(".case-inline-draft").dispatch("dragstart", { dataTransfer: { setData() {} } });
+  card.querySelectorAll(".case-inline-gap").at(-1).dispatch("drop", { dataTransfer: { setData() {} } });
+  assert.equal(card.querySelectorAll(".case-inline-draft").length, 100, "existing cards can still be moved without increasing the bound");
+  card.querySelector(".case-inline-remove").click();
+  const payload = JSON.parse(document.getElementById("report-drafts").textContent);
+  assert.equal(payload.cases["0"].length, 99);
+  assert.ok(payload.cases["0"].every((entry) => Object.keys(entry).join(",") === "id,type,gap,order"));
+  assert.doesNotMatch(JSON.stringify(payload), /DELETE|secret|credentials|status/);
+  assert.equal(card.dataset.status, "PASS");
+});
+
+test("inline drafts do not interfere with technical filters or original keyboard navigation", () => {
+  const { document, cards } = fixture({ withSignal: true });
+  const card = cards[0];
+  card.querySelectorAll(".case-inline-insert").at(-1).click();
+  document.getElementById("show-technical").checked = false;
+  document.getElementById("settings-form").dispatch("submit");
+  const original = card.querySelectorAll(".case-step-button[data-recorded-index]");
+  assert.equal(original.at(-1).hidden, true);
+  assert.equal(card.querySelector(".case-inline-draft-button").hidden, false);
+  card.querySelector(".case-inline-draft-button").dispatch("keydown", { key: "Home" });
+  assert.equal(card.querySelector(".case-summary-panel").hidden, false);
+  document.getElementById("show-technical").checked = true;
+  document.getElementById("settings-form").dispatch("submit");
+  assert.equal(original.at(-1).hidden, false);
+  assert.equal(card.querySelectorAll(".timeline-entry").length, 4);
+  assert.equal(card.dataset.status, "PASS");
 });
 
 test("HTML exports omit only their download control while preserving the untouched offline report", async () => {

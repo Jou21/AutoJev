@@ -171,6 +171,30 @@
 
     function editorMessage(value) { text($("case-editor-feedback"), value); }
 
+    function requestCaseRerun(key, feedback) {
+      const current = key != null && byIndex.get(String(key));
+      if (!reportConnection || !current) {
+        feedback("Reexecução não iniciada. Abra o relatório pela aplicação AutoJev para reexecutar um CT. Os cartões de banco são apenas visuais e não serão executados.");
+        return;
+      }
+      const target = reportConnection.appUrl + "/#/reexecutar/" + encodeURIComponent(reportConnection.sourceId) + "/" + encodeURIComponent(String(current.id));
+      window.open(target, "_blank", "noopener,noreferrer");
+      feedback("Confirmação de reexecução solicitada na aplicação. Nenhuma ação foi iniciada por este relatório. Os cartões de banco do rascunho não serão executados.");
+    }
+
+    function saveDraftSequence(key, sequence) {
+      let gap = 0;
+      const drafts = [];
+      sequence.forEach((item) => {
+        if (item.type === "recorded") gap += 1;
+        else if (item.type === "database" && drafts.length < draftLimit) {
+          drafts.push({ id: item.id, type: "database", gap, order: drafts.length });
+        }
+      });
+      if (drafts.length) savedDrafts.set(key, drafts); else savedDrafts.delete(key);
+      if (draftSource) draftSource.textContent = serializeDrafts();
+    }
+
     function renderEditor(focusId) {
       const list = $("case-editor-steps");
       if (!list) return;
@@ -471,6 +495,173 @@
       if (reportToolbar && destination && reportToolbar.parentElement !== destination) destination.appendChild(reportToolbar);
     }
 
+    function inlineSequence(model) {
+      const steps = model.originalItems.slice(1);
+      const drafts = savedDrafts.get(model.key) || [];
+      const sequence = [];
+      for (let gap = 0; gap <= steps.length; gap += 1) {
+        drafts.filter((item) => item.gap === gap).forEach((item) => sequence.push({ type: "database", id: item.id }));
+        if (gap < steps.length) sequence.push({ type: "recorded", item: steps[gap] });
+      }
+      return sequence;
+    }
+
+    function inlineMessage(model, value) {
+      text(model.inlineFeedback, value);
+      model.inlineFeedback.hidden = !value;
+    }
+
+    function rebuildInlineSteps(model, requestedKey) {
+      // The canonical timeline stays untouched. Drafts are separate panels and
+      // navigation items, never observations, assertions, or executed actions.
+      const selected = model.items[model.selected];
+      const selectedKey = requestedKey || selected && selected.key || "original:0";
+      model.list.replaceChildren();
+      model.draftPanels.replaceChildren();
+      const sequence = inlineSequence(model);
+      const draftCount = sequence.filter((item) => item.type === "database").length;
+      const create = (tag, className, label) => {
+        const element = document.createElement(tag);
+        element.className = className;
+        if (label != null) element.textContent = label;
+        return element;
+      };
+      const commit = (nextSequence, focusKey, message) => {
+        saveDraftSequence(model.key, nextSequence);
+        rebuildInlineSteps(model, focusKey);
+        inlineMessage(model, message + ($("download-report")
+          ? " Baixe o relatório para conservar o rascunho."
+          : " As alterações ficam somente nesta aba; o arquivo original não será alterado."));
+        const current = model.items.find((item) => item.key === focusKey);
+        if (current) current.button.focus({ preventScroll: true });
+      };
+      const insert = (position) => {
+        if (draftCount >= draftLimit) { inlineMessage(model, "Limite de 100 consultas de exemplo por CT."); return; }
+        let id;
+        do {
+          draftSerial = draftSerial >= 999999999 ? 1 : draftSerial + 1;
+          id = "db-" + draftSerial;
+        } while (sequence.some((item) => item.type === "database" && item.id === id));
+        sequence.splice(position, 0, { type: "database", id });
+        commit(sequence, "draft:" + id, "Consulta adicionada ao rascunho desta aba. Nada foi executado; os registros originais foram preservados.");
+      };
+      const dropAt = (position, event) => {
+        if (!model.inlineDrag) return;
+        event.preventDefault();
+        const dragged = model.inlineDrag;
+        model.inlineDrag = null;
+        const previous = sequence.findIndex((item) => item.type === "database" && item.id === dragged);
+        if (previous < 0) return;
+        const [item] = sequence.splice(previous, 1);
+        sequence.splice(position > previous ? position - 1 : position, 0, item);
+        commit(sequence, "draft:" + item.id, "Consulta reposicionada no rascunho visual. Nada foi executado.");
+      };
+      const addGap = (position) => {
+        const gap = create("div", "case-inline-gap");
+        gap.dataset.inlineGap = String(position);
+        const label = position === 0 ? "Antes do primeiro cartão" : position === sequence.length
+          ? "Depois do último cartão" : "Entre os cartões " + position + " e " + (position + 1);
+        gap.setAttribute("aria-label", label);
+        const control = button("+ Adicionar aqui", () => insert(position), "button button-ghost case-inline-insert");
+        control.disabled = draftCount >= draftLimit;
+        control.setAttribute("aria-label", "Adicionar consulta de exemplo: " + label);
+        control.setAttribute("title", "Adicionar consulta em banco de dados · somente visual");
+        gap.appendChild(control);
+        gap.addEventListener("dragover", (event) => {
+          if (model.inlineDrag) { event.preventDefault(); gap.classList.add("drag-over"); }
+        });
+        gap.addEventListener("dragleave", () => gap.classList.remove("drag-over"));
+        gap.addEventListener("drop", (event) => dropAt(position, event));
+        model.list.appendChild(gap);
+      };
+      model.items = [model.originalItems[0]];
+      model.list.appendChild(model.originalItems[0].button);
+      sequence.forEach((entry, sequenceIndex) => {
+        addGap(sequenceIndex);
+        if (entry.type === "recorded") {
+          model.items.push(entry.item);
+          model.list.appendChild(entry.item.button);
+          return;
+        }
+        const card = create("div", "case-inline-draft");
+        card.dataset.draftId = entry.id;
+        card.setAttribute("draggable", "true");
+        card.tabIndex = 0;
+        card.setAttribute("aria-label", "Consulta em banco de dados. Rascunho visual não executado. Use Alt mais seta para cima ou para baixo para mover.");
+        const panel = create("section", "case-draft-panel");
+        panel.id = "case-draft-" + model.key + "-" + entry.id;
+        panel.dataset.draftId = entry.id;
+        const heading = create("div", "case-draft-heading");
+        const icon = create("span", "case-draft-icon", "▤");
+        icon.setAttribute("aria-hidden", "true");
+        heading.append(icon, create("h3", "", "Consulta em banco de dados"));
+        panel.append(create("span", "case-draft-status", "Rascunho visual · Não executado"), heading,
+          create("p", "case-draft-note", "Este é um passo extra de exemplo. Ele ainda não se conecta a um banco, não executa consultas e não utiliza credenciais."),
+          create("p", "case-draft-position", "Você pode reposicionar ou remover este card sem alterar as etapas, as evidências ou o resultado do teste original."));
+        model.draftPanels.appendChild(panel);
+        const item = { key: "draft:" + entry.id, node: panel, kind: "database", kindLabel: "Rascunho visual", title: "Consulta em banco de dados", draftId: entry.id };
+        const control = button("", () => selectCaseStep(model, model.items.indexOf(item)), "case-step-button case-inline-draft-button");
+        control.dataset.stepKind = "database";
+        control.dataset.stepState = "draft";
+        control.setAttribute("aria-controls", panel.id);
+        control.setAttribute("aria-label", "Consulta em banco de dados. Rascunho visual. Não executado.");
+        const copy = create("span", "step-copy");
+        const status = create("span", "step-status");
+        status.dataset.stepState = "draft";
+        const statusIcon = create("span", "step-status-icon", "◇");
+        statusIcon.setAttribute("aria-hidden", "true");
+        status.append(statusIcon, create("span", "step-status-label", "Não executado"));
+        copy.append(create("span", "step-kind", "Passo extra · rascunho"), create("span", "step-label", item.title),
+          create("small", "step-description", "Somente visual. Não interfere no resultado original."), status);
+        control.append(create("span", "step-number", "+"), copy);
+        item.button = control;
+        card.appendChild(control);
+        const move = (direction) => {
+          const current = sequence.findIndex((step) => step.type === "database" && step.id === entry.id);
+          const next = current + direction;
+          if (current < 0 || next < 0 || next >= sequence.length) return;
+          const [step] = sequence.splice(current, 1);
+          sequence.splice(next, 0, step);
+          commit(sequence, item.key, "Consulta reposicionada no rascunho visual. Nada foi executado.");
+        };
+        const actions = create("div", "case-inline-draft-actions");
+        const up = button("↑", () => move(-1), "button button-ghost case-inline-move-before");
+        const down = button("↓", () => move(1), "button button-ghost case-inline-move-after");
+        up.setAttribute("aria-label", "Mover consulta para antes");
+        down.setAttribute("aria-label", "Mover consulta para depois");
+        up.disabled = sequenceIndex === 0;
+        down.disabled = sequenceIndex === sequence.length - 1;
+        const remove = button("Remover", () => {
+          const nextSequence = sequence.filter((step) => step !== entry);
+          commit(nextSequence, "original:0", "Consulta removida do rascunho. Nenhuma etapa original foi removida.");
+        }, "button button-ghost case-inline-remove");
+        remove.setAttribute("aria-label", "Remover consulta de exemplo");
+        actions.append(up, down, remove);
+        card.appendChild(actions);
+        card.addEventListener("keydown", (event) => {
+          if (!event.altKey || !["ArrowUp", "ArrowDown"].includes(event.key)) return;
+          if (event.target !== card && event.target !== control) return;
+          event.preventDefault();
+          move(event.key === "ArrowUp" ? -1 : 1);
+        });
+        card.addEventListener("dragstart", (event) => {
+          model.inlineDrag = entry.id;
+          if (event.dataTransfer) { event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", "Consulta de exemplo não executada"); }
+        });
+        card.addEventListener("dragend", () => {
+          model.inlineDrag = null;
+          all(".drag-over", model.list).forEach((gap) => gap.classList.remove("drag-over"));
+        });
+        model.items.push(item);
+        model.list.appendChild(card);
+      });
+      addGap(sequence.length);
+      model.items.forEach((item, index) => { item.button.dataset.stepIndex = String(index); });
+      const selectedIndex = model.items.findIndex((item) => item.key === selectedKey);
+      model.selected = selectedIndex < 0 ? 0 : selectedIndex;
+      syncCaseStepAvailability(model);
+    }
+
     function selectCaseStep(model, requestedIndex, focus = false) {
       const available = model.items.map((item, index) => ({ item, index })).filter(({ item }) => !item.button.hidden);
       if (!available.length) return;
@@ -487,7 +678,9 @@
       });
       const selected = model.items[index];
       text(model.title, selected.title);
-      text(model.position, index === 0 ? "Visão geral do teste" : "Etapa " + index + " de " + (model.items.length - 1) + " · " + selected.kindLabel);
+      text(model.position, selected.kind === "summary" ? "Visão geral do teste" : selected.kind === "database"
+        ? "Passo extra · Rascunho visual · Não executado"
+        : "Etapa " + selected.originalIndex + " de " + (model.originalItems.length - 1) + " · " + selected.kindLabel);
       const cursor = available.findIndex((item) => item.index === index);
       model.previous.disabled = cursor <= 0;
       model.next.disabled = cursor === available.length - 1;
@@ -499,8 +692,8 @@
     function syncCaseStepAvailability(model) {
       const hideTechnical = document.body.classList.contains("hide-technical");
       model.items.forEach((item) => { item.button.hidden = hideTechnical && item.kind === "signal"; });
-      const visible = model.items.slice(1).filter((item) => !item.button.hidden).length;
-      const total = model.items.length - 1;
+      const visible = model.originalItems.slice(1).filter((item) => !item.button.hidden).length;
+      const total = model.originalItems.length - 1;
       text(model.count, visible === total ? total + " registros na linha do tempo" : visible + " de " + total + " registros visíveis");
       selectCaseStep(model, model.selected);
     }
@@ -638,10 +831,14 @@
       const sidebarHeader = make("div", "case-step-sidebar-header");
       const count = make("small", "case-step-count");
       sidebarHeader.append(make("h3", "", "Passos e evidências"), count);
+      const inlineFeedback = make("p", "case-inline-feedback");
+      inlineFeedback.hidden = true;
+      inlineFeedback.setAttribute("role", "status");
+      inlineFeedback.setAttribute("aria-live", "polite");
       const list = make("div", "case-step-list");
       list.setAttribute("role", "group");
       list.setAttribute("aria-label", "Selecionar passo do teste");
-      sidebar.append(sidebarHeader, list);
+      sidebar.append(sidebarHeader, inlineFeedback, list);
       const stage = make("section", "case-step-stage");
       const toolbar = make("div", "case-step-toolbar");
       const caption = make("div", "case-step-caption");
@@ -653,8 +850,12 @@
       const content = make("div", "case-step-content");
       content.tabIndex = 0;
       content.setAttribute("aria-label", "Detalhes e evidências do passo selecionado");
-      content.append(summary, timeline);
-      const model = { detail, workspace, list, content, count, position, title, items: [], selected: entries.length ? 1 : 0 };
+      const draftPanels = make("div", "case-draft-panels");
+      content.append(summary, timeline, draftPanels);
+      const model = {
+        key, detail, workspace, list, content, count, position, title, items: [], originalItems: [],
+        selected: entries.length ? 1 : 0, inlineDrag: null, inlineFeedback, draftPanels,
+      };
       const move = (direction) => {
         const available = model.items.map((item, index) => ({ item, index })).filter(({ item }) => !item.button.hidden);
         const cursor = available.findIndex((item) => item.index === model.selected);
@@ -717,8 +918,10 @@
           ? "Captura da página" : labels[item.kind];
         const sidebarTitle = item.kind === "assertion" && item.title === "Ausência de novas falhas técnicas da aplicação"
           ? "Erros durante a ação" : item.title;
-        const control = button("", () => selectCaseStep(model, index), "case-step-button");
+        const originalItem = { ...item, key: "original:" + index, originalIndex: index, kindLabel };
+        const control = button("", () => selectCaseStep(model, model.items.indexOf(originalItem)), "case-step-button");
         control.dataset.stepIndex = String(index);
+        control.dataset.recordedIndex = String(index);
         control.dataset.stepKind = item.kind;
         control.dataset.stepState = result.state;
         control.setAttribute("aria-controls", item.node.id);
@@ -732,10 +935,12 @@
         copy.append(make("span", "step-kind", kindLabel), make("span", "step-label", sidebarTitle), make("small", "step-description", description), status);
         control.append(make("span", "step-number", index ? String(index).padStart(2, "0") : "i"), copy);
         list.appendChild(control);
-        model.items.push({ ...item, button: control, kindLabel });
+        originalItem.button = control;
+        model.items.push(originalItem);
+        model.originalItems.push(originalItem);
       });
       list.addEventListener("keydown", (event) => {
-        if (!["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
+        if (event.altKey || !["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
         const target = event.target instanceof Element ? event.target.closest(".case-step-button") : null;
         if (!target) return;
         event.preventDefault();
@@ -747,7 +952,7 @@
       });
       all(".shots figure", workspace).forEach(prepareCapturePreview);
       caseExplorers.set(key, model);
-      syncCaseStepAvailability(model);
+      rebuildInlineSteps(model);
       return model;
     }
 
@@ -796,6 +1001,12 @@
       const current = byIndex.get(selectedCase);
       const position = cases.findIndex((item) => String(item.index) === selectedCase);
       text($("case-title"), current ? current.title || current.id || "Caso de teste" : "Nenhum caso disponível");
+      if ($("case-rerun")) {
+        $("case-rerun").disabled = !current;
+        $("case-rerun").setAttribute("aria-label", current ? "Reexecutar teste " + current.id : "Reexecutar teste");
+      }
+      const feedback = $("case-rerun-feedback");
+      if (feedback) { feedback.hidden = true; feedback.textContent = ""; }
       if ($("case-prev")) $("case-prev").disabled = position <= 0;
       if ($("case-next")) $("case-next").disabled = position < 0 || position >= cases.length - 1;
       all("#scenarios details.scenario[data-case-index]").forEach((detail) => {
@@ -931,14 +1142,9 @@
     listen("case-editor", "close", () => { editorDrag = null; if (editorTrigger) editorTrigger.focus(); });
     listen("case-editor-save", "click", () => {
       if (!editorCase) return;
-      let gap = 0;
-      const drafts = [];
-      editorSequence.forEach((item) => {
-        if (item.type === "recorded") gap += 1;
-        else if (drafts.length < draftLimit) drafts.push({ id: item.id, type: "database", gap, order: drafts.length });
-      });
-      if (drafts.length) savedDrafts.set(editorCase, drafts); else savedDrafts.delete(editorCase);
-      if (draftSource) draftSource.textContent = serializeDrafts();
+      saveDraftSequence(editorCase, editorSequence);
+      const explorer = caseExplorers.get(editorCase);
+      if (explorer) rebuildInlineSteps(explorer);
       editorMessage($("download-report")
         ? "Rascunho guardado nesta aba. Baixe o relatório para conservar esta versão. Resultados e evidências originais não foram alterados."
         : "Rascunho guardado nesta aba. O arquivo original não foi alterado. Nada foi executado.");
@@ -957,15 +1163,13 @@
       if (gaps.length) { gaps[gaps.length - 1].focus(); editorMessage("Escolha «Adicionar aqui» entre os passos para inserir a consulta de exemplo."); }
     });
     listen("case-editor-rerun", "click", () => {
-      const current = editorCase && byIndex.get(editorCase);
-      if (!reportConnection || !current) {
-        editorMessage("Reexecução não iniciada. Abra o relatório pela aplicação AutoJev para reexecutar um CT. Os cartões de banco são apenas visuais e não serão executados.");
-        return;
-      }
-      const target = reportConnection.appUrl + "/#/reexecutar/" + encodeURIComponent(reportConnection.sourceId) + "/" + encodeURIComponent(String(current.id));
-      window.open(target, "_blank", "noopener,noreferrer");
-      editorMessage("Confirmação de reexecução solicitada na aplicação. Nenhuma ação foi iniciada por este relatório. Os cartões de banco do rascunho não serão executados.");
+      requestCaseRerun(editorCase, editorMessage);
     });
+    listen("case-rerun", "click", () => requestCaseRerun(selectedCase, (value) => {
+      const feedback = $("case-rerun-feedback");
+      text(feedback, value);
+      if (feedback) feedback.hidden = false;
+    }));
     document.addEventListener("keydown", (event) => {
       if (event.key !== "Escape") return;
       if ($("case-editor") && $("case-editor").hasAttribute("open")) closeEditor();

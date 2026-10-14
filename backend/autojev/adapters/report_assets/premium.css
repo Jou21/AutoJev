@@ -16,6 +16,7 @@
   --blocked: #f6bc4d;
   --skipped: #a8b8ca;
   --info: #79bcff;
+  --draft: #c9a5ff;
   --radius: 14px;
   --shadow: 0 10px 32px rgb(0 0 0 / 12%);
 }
@@ -43,6 +44,9 @@ button:disabled:hover { background: #142334; border-color: var(--line); }
 .button-primary { background: var(--accent); border-color: var(--accent); color: #241b0a; font-weight: 750; }
 .button-primary:hover { background: #ffd173; border-color: #ffd173; color: #241b0a; }
 .button-ghost { background: transparent; }
+.button-rerun { border-color: color-mix(in srgb, var(--accent) 50%, var(--line)); background: var(--accent-soft); color: var(--accent); }
+.button-rerun:hover { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 15%, var(--surface)); color: var(--accent); }
+.button-rerun > span { font-size: 18px; line-height: 1; }
 input, select, textarea { width: 100%; min-height: 40px; padding: 9px 12px; background: #0a1520; color: var(--text); }
 input::placeholder, textarea::placeholder { color: #788fa5; }
 input[type="checkbox"], input[type="radio"] { width: 17px; min-height: 17px; height: 17px; accent-color: var(--accent); }
@@ -163,6 +167,7 @@ code { font-size: .9em; overflow-wrap: anywhere; }
 .result-navigation { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; margin-bottom: 18px; }
 .result-navigation > div { display: flex; flex-wrap: wrap; gap: 7px; }
 .result-navigation button { font-size: 11px; }
+.case-rerun-feedback { flex: 0 0 auto; margin: 0; padding: 10px 22px; border-bottom: 1px solid var(--line); background: var(--panel-soft); color: var(--blocked); font-size: 11px; line-height: 1.6; }
 .result-title { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 
 /* Caso selecionado e a linha do tempo das suas evidências */
@@ -370,6 +375,34 @@ figcaption { margin-top: 6px; color: var(--muted); font-size: 10px; overflow-wra
 .case-step-controls { display: flex; flex: 0 0 auto; gap: 6px; }
 .case-step-controls button { min-width: 34px; min-height: 34px; padding: 7px 10px; font-size: 11px; }
 .case-step-content { min-width: 0; min-height: 0; padding: 18px 20px; overflow: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: #3c5268 transparent; outline-offset: -3px; }
+/* Passos extras: rascunhos visuais separados dos registros executados. */
+.case-step-sidebar-header { display: grid; grid-template-columns: minmax(0, 1fr); align-items: center; gap: 3px; }
+.case-step-sidebar-header > h3 { grid-column: 1; grid-row: 1; margin: 0; }
+.case-step-sidebar-header > .case-step-count { grid-column: 1; grid-row: 2; }
+.case-inline-feedback { flex: 0 0 auto; margin: 0; padding: 8px 13px; border-bottom: 1px solid var(--line-soft); color: var(--draft); font-size: 10px; line-height: 1.5; }
+.case-inline-feedback:empty { display: none; }
+.case-inline-gap { position: relative; display: grid; place-items: center; flex: 0 0 auto; min-height: 32px; border-radius: 7px; }
+.case-inline-gap::before { content: ""; position: absolute; top: 50%; right: 7px; left: 7px; height: 1px; background: var(--line); }
+.case-inline-insert { position: relative; max-width: 100%; min-height: 25px; padding: 3px 11px; border: 1px dashed color-mix(in srgb, var(--draft) 35%, var(--line)); border-radius: 20px; background: var(--surface); color: var(--draft); font-size: 10px; line-height: 1.5; }
+.case-inline-insert:hover, .case-inline-gap.drag-over .case-inline-insert { border-color: var(--draft); background: color-mix(in srgb, var(--draft) 12%, var(--surface)); color: var(--draft); }
+.case-inline-gap.drag-over { outline: 1px dashed var(--draft); outline-offset: -2px; background: color-mix(in srgb, var(--draft) 9%, var(--surface)); }
+.case-inline-draft { flex: 0 0 auto; min-width: 0; border: 1px dashed color-mix(in srgb, var(--draft) 50%, var(--line)); border-radius: 9px; background: color-mix(in srgb, var(--draft) 5%, var(--surface)); }
+.case-inline-draft-button { min-height: 70px; border: 0; }
+.case-inline-draft-button .step-kind, .case-inline-draft-button .step-number, .case-inline-draft-button .step-status { color: var(--draft); --step-tone: var(--draft); }
+.case-inline-draft-button.active, .case-inline-draft-button[aria-pressed="true"] { background: color-mix(in srgb, var(--draft) 12%, var(--surface)); }
+.case-inline-draft-button.active::before { background: var(--draft); }
+.case-inline-draft-button.active .step-number, .case-inline-draft-button.active .step-kind { border-color: color-mix(in srgb, var(--draft) 50%, var(--line)); color: var(--draft); }
+.case-inline-draft-actions { display: flex; flex-wrap: wrap; gap: 5px; padding: 7px 9px; border-top: 1px solid color-mix(in srgb, var(--draft) 15%, var(--line-soft)); }
+.case-inline-draft-actions button { min-width: 30px; min-height: 28px; padding: 4px 8px; background: var(--surface); color: var(--muted); font-size: 10px; }
+.case-inline-remove { margin-left: auto; }
+.case-inline-remove:hover { border-color: var(--fail); color: var(--fail); }
+.case-draft-panel { max-width: 800px; margin: 6px 0; padding: clamp(20px, 3vw, 34px); border: 1px dashed color-mix(in srgb, var(--draft) 55%, var(--line)); border-radius: 14px; background: color-mix(in srgb, var(--draft) 5%, var(--surface)); }
+.case-draft-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 18px; }
+.case-draft-heading h3 { margin: 0; font-size: clamp(19px, 2vw, 26px); }
+.case-draft-status { display: inline-flex; width: fit-content; margin-bottom: 15px; padding: 4px 9px; border: 1px solid color-mix(in srgb, var(--draft) 40%, var(--line)); border-radius: 6px; background: color-mix(in srgb, var(--draft) 9%, var(--surface)); color: var(--draft); font-size: 11px; font-weight: 650; }
+.case-draft-panel p { color: var(--muted); font-size: 13px; line-height: 1.7; }
+.case-draft-panel .case-draft-note { margin: 22px 0 0; padding-top: 16px; border-top: 1px solid color-mix(in srgb, var(--draft) 16%, var(--line-soft)); font-size: 11px; }
+.case-draft-position { display: block; margin-bottom: 10px; color: var(--draft); font-size: 11px; }
 .case-summary-panel > :first-child { margin-top: 0; }
 .case-summary-panel > :last-child { margin-bottom: 0; }
 .case-summary-panel .case-documentation { margin-top: 15px; padding-bottom: 0; }
@@ -541,6 +574,8 @@ body[data-density="compact"] .timeline-content { padding: 12px 14px; }
 body[data-density="compact"] .timeline-entry, body[data-density="compact"] .execution-event { padding-bottom: 12px; }
 body[data-theme="light"] { color-scheme: light; --bg: #edf2f7; --surface: #fff; --panel: #f8fafc; --panel-soft: #f3f7fa; --line: #cdd8e4; --line-soft: #e3eaf1; --text: #172b3e; --muted: #586f84; --accent: #96610c; --accent-soft: #fff2d6; --pass: #00834e; --fail: #c42548; --blocked: #986508; --skipped: #586c80; --info: #24699f; --shadow: 0 6px 24px rgb(40 70 95 / 5%); }
 body[data-theme="light"] .report-sidebar { background: #f7fafc; }
+body[data-theme="light"] { --draft: #7653c8; }
+body[data-theme="light"] .button-rerun { border-color: color-mix(in srgb, var(--accent) 50%, var(--line)); background: var(--accent-soft); color: var(--accent); }
 body[data-theme="light"] .report-sidebar button[data-report-nav], body[data-theme="light"] .meta strong, body[data-theme="light"] .setting-field > span, body[data-theme="light"] .setting-field > label { color: #425e77; }
 body[data-theme="light"] .report-sidebar button[data-report-nav].active { color: var(--accent); background: var(--accent-soft); }
 body[data-theme="light"] button, body[data-theme="light"] .button, body[data-theme="light"] input, body[data-theme="light"] select, body[data-theme="light"] textarea, body[data-theme="light"] .timeline-content, body[data-theme="light"] .result > div, body[data-theme="light"] pre { background: #f5f8fb; color: var(--text); }
@@ -694,13 +729,13 @@ body[data-theme="light"] .dialog-toolbar, body[data-theme="light"] dialog.eviden
   .result-location { justify-content: space-between; gap: 10px; }
   #result-view-title { font-size: 15px; }
   .result-actions { gap: 10px; }
-  .result-case-navigation { flex: 1; flex-wrap: nowrap; }
-  .result-case-navigation button { flex: 1; padding: 7px 8px; font-size: 10px; }
+  .result-case-navigation { flex: 1; flex-wrap: wrap; }
+  .result-case-navigation button { flex: 1 1 calc(50% - 6px); padding: 7px 8px; font-size: 10px; }
   .result-report-actions { width: 100%; padding: 10px 0 0; border-left: 0; border-top: 1px solid var(--line-soft); }
   .result-report-actions .toolbar { justify-content: flex-start; }
   .case-workspace { grid-template-columns: minmax(0, 1fr); min-height: 0; }
   .case-step-sidebar { border-right: 0; border-bottom: 1px solid var(--line); }
-  .case-step-sidebar-header { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 11px 13px; }
+  .case-step-sidebar-header { display: grid; gap: 3px 9px; padding: 11px 13px; }
   .case-step-sidebar h3 { margin: 0; }
   .case-step-list { max-height: 190px; padding: 7px; gap: 3px; }
   .case-step-button { min-height: 52px; padding: 7px 9px; }
@@ -739,7 +774,7 @@ body[data-theme="light"] .dialog-toolbar, body[data-theme="light"] dialog.eviden
   a { color: var(--text); text-decoration: none; }.setting-row input, .switch { print-color-adjust: exact; }.metric, .badge, .progress-fill, .donut, .time-chart, .event-dot, .journey-sequence { print-color-adjust: exact; -webkit-print-color-adjust: exact; }
   .step-explorer > summary { padding: 0; }.step-explorer > .scenario-body { margin-top: 14px; padding-top: 14px; }
   .case-workspace, .case-step-stage, .case-step-content { display: block; min-height: 0; height: auto; max-height: none; padding: 0; overflow: visible; container-type: normal; }
-  .case-step-sidebar, .case-step-toolbar { display: none !important; }
+  .case-step-sidebar, .case-step-toolbar, .case-draft-panel, .case-rerun-feedback { display: none !important; }
   .case-summary-panel[hidden], .case-timeline-panels[hidden], .case-timeline-panels > .timeline-entry[hidden] { display: block !important; }
   .case-timeline-panels > .timeline-entry { display: block; margin-top: 16px; padding: 0; break-inside: avoid; }
   .case-timeline-panels .timeline-content { padding: 12px; border: 1px solid var(--line); border-radius: 8px; }
