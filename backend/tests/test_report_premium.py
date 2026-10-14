@@ -152,3 +152,21 @@ def test_timeline_end_includes_report_postprocessing_and_rule_counts_explain_the
     assert data(document)["duration_seconds"] == 180
     assert "Contagens do resultado atual de cada CT, não de todas as tentativas" in document
     assert "tentativas anteriores permanecem na linha do tempo" in document
+
+
+def test_rerun_report_explains_provenance_and_non_executable_scope(tmp_path):
+    run = fixture()
+    run["events"] = [{"type": "scenario_rerun_source", "payload": {
+        "source_exploration_id": 'original<script>bad</script>',
+        "source_scenario_id": "CT008",
+    }}]
+    run["scenarios"][0]["evidence"]["rerun_scope"] = {"local_checks": True}
+    before = deepcopy(run)
+    document = render(tmp_path, run)
+    assert 'class="reading-guide rerun-provenance"' in document
+    assert "Reexecução individual de CT008" in document
+    assert "o relatório original permanece inalterado" in document
+    assert "cartões de consulta ao banco não são executados" in document
+    assert "cartões de consulta ao banco não foram executados" in document
+    assert "original<script>bad</script>" not in document
+    assert run == before

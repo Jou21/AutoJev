@@ -205,7 +205,9 @@ class FixtureElement {
   }
   querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
   closest(selector) {
-    for (let current = this; current; current = current.parentElement) if (current.matches(selector)) return current;
+    for (let current = this; current; current = current.parentElement) {
+      if (selector.split(/,\s*/).some((branch) => current.matches(branch))) return current;
+    }
     return null;
   }
   addEventListener(type, callback) {
@@ -233,6 +235,8 @@ function fixture(options = {}) {
     emptyTimeline = false, hash = "#view/results/CT001", withSignal = false,
     exported = false, actionPreview = false,
     naturalImageSize = { width: 1440, height: 900 },
+    stepMetadata = {}, caseStatuses = ["PASS", "FAIL"],
+    journey = false, journeyCount = 9, visualEditor = false,
   } = options;
   const storedActionMetadata = Object.hasOwn(options, "actionPreviewMetadata")
     ? options.actionPreviewMetadata : actionMetadata;
@@ -240,6 +244,7 @@ function fixture(options = {}) {
   document.nodeType = 9;
   document.ownerDocument = document;
   document.createElement = (tagName) => new FixtureElement(tagName, document);
+  if (journey) document.createElementNS = (_namespace, tagName) => document.createElement(tagName);
   document.createDocumentFragment = () => {
     const fragment = document.createElement("fragment");
     fragment.nodeType = 11;
@@ -262,12 +267,23 @@ function fixture(options = {}) {
   };
   const source = make("script", "", document.body);
   source.id = "report-data";
-  source.textContent = JSON.stringify({ cases: [
-    { index: 0, id: "CT001", title: "Ordenação de produtos", status: "PASS", category: "business", page: "/inventory.html" },
-    { index: 1, id: "CT002", title: "Verificar carrinho", status: "FAIL", category: "business", page: "/cart.html" },
+  source.textContent = JSON.stringify({ run_id: options.runId, cases: [
+    { index: 0, id: "CT001", title: "Ordenação de produtos", status: caseStatuses[0], category: "business", page: "/inventory.html" },
+    { index: 1, id: "CT002", title: "Verificar carrinho", status: caseStatuses[1], category: "business", page: "/cart.html" },
   ] });
+  if (options.appRuntime !== undefined) {
+    const connection = make("script", "", document.body);
+    connection.id = "report-app-runtime";
+    connection.setAttribute("type", options.runtimeType || "application/json");
+    connection.textContent = typeof options.appRuntime === "string" ? options.appRuntime : JSON.stringify(options.appRuntime);
+  }
+  if (visualEditor) {
+    const drafts = make("script", "", document.body);
+    drafts.id = "report-drafts";
+    drafts.textContent = typeof options.drafts === "string" ? options.drafts : JSON.stringify(options.drafts || { version: 1, cases: {} });
+  }
   const navigation = make("nav", "", document.body);
-  for (const view of ["overview", "tests", "results"]) {
+  for (const view of ["overview", "tests", "results", ...(journey ? ["journey"] : [])]) {
     make("button", "", navigation, view).dataset.reportNav = view;
   }
   const main = make("main", "report-main", document.body);
@@ -279,6 +295,89 @@ function fixture(options = {}) {
   if (!exported) make("button", "", toolbar, "Baixar relatório").id = "download-report";
   for (const view of ["overview", "tests"]) {
     make("section", "report-view", main).dataset.view = view;
+  }
+  let journeyList = null;
+  let journeyRoute = null;
+  let journeyCanvas = null;
+  const canvasCalls = [];
+  if (journey) {
+    const journeyView = make("section", "report-view", main);
+    journeyView.dataset.view = "journey";
+    journeyRoute = make("div", "journey-route", journeyView);
+    journeyCanvas = make("canvas", "journey-route-canvas", journeyRoute);
+    journeyCanvas.setAttribute("aria-hidden", "true");
+    const context = {};
+    for (const method of ["setTransform", "clearRect", "beginPath", "moveTo", "lineTo", "bezierCurveTo", "stroke", "arc", "fill", "closePath", "save", "restore"]) {
+      context[method] = (...args) => {
+        assert.ok(args.every((value) => typeof value === "number" && Number.isFinite(value)), `${method} receives finite numeric canvas coordinates`);
+        canvasCalls.push({ method, args });
+      };
+    }
+    journeyCanvas.getContext = (kind) => kind === "2d" ? context : null;
+    const start = make("span", "journey-terminal journey-terminal-start", journeyRoute, "INÍCIO");
+    const end = make("span", "journey-terminal journey-terminal-end", journeyRoute, "FIM");
+    journeyList = make("ol", "journey-track", journeyRoute);
+    journeyList.setAttribute("role", "list");
+    const number = (element, property, fallback) => {
+      const camel = property.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+      return Number.parseFloat(element.style.getPropertyValue(property) || element.style[camel]) || fallback;
+    };
+    const rectangle = (left, top, width, height) => ({ left, top, width, height, right: left + width, bottom: top + height, x: left, y: top });
+    const geometry = () => {
+      const width = window.innerWidth;
+      const columns = number(journeyRoute, "--journey-columns", 4);
+      const gutter = number(journeyRoute, "--journey-gutter", 88);
+      const top = number(journeyRoute, "--journey-top", 36);
+      const bottom = number(journeyRoute, "--journey-bottom", 42);
+      const rowGap = number(journeyRoute, "--journey-row-gap", 90);
+      const rows = Math.ceil(journeyCount / columns);
+      const trackHeight = rows * 100 + Math.max(0, rows - 1) * rowGap;
+      return { width, columns, gutter, top, rowGap, trackHeight, height: top + trackHeight + bottom };
+    };
+    journeyRoute.getBoundingClientRect = () => {
+      const current = geometry();
+      return rectangle(50, 120, current.width, current.height);
+    };
+    journeyList.getBoundingClientRect = () => {
+      const current = geometry();
+      return rectangle(50 + current.gutter, 120 + current.top, current.width - current.gutter * 2, current.trackHeight);
+    };
+    journeyCanvas.getBoundingClientRect = () => journeyRoute.getBoundingClientRect();
+    for (const terminal of [start, end]) {
+      terminal.getBoundingClientRect = () => rectangle(50 + number(terminal, "left", 0), 120 + number(terminal, "top", 0), 66, 32);
+      terminal.offsetWidth = 66;
+      terminal.offsetHeight = 32;
+    }
+    for (let index = 0; index < journeyCount; index += 1) {
+      const node = make("li", "journey-node", journeyList);
+      node.dataset.journeyPosition = String(index);
+      node.getBoundingClientRect = () => {
+        const current = geometry();
+        const column = number(node, "grid-column", index % current.columns + 1) - 1;
+        const row = number(node, "grid-row", Math.floor(index / current.columns) + 1) - 1;
+        const width = (current.width - 2 * current.gutter - (current.columns - 1) * 32) / current.columns;
+        return rectangle(50 + current.gutter + column * (width + 32), 120 + current.top + row * (100 + current.rowGap), width, 100);
+      };
+      const control = make("button", "", node, "Página " + (index + 1));
+      control.dataset.journeyPage = String(index);
+      control.setAttribute("aria-controls", "journey-cases-" + index);
+      control.setAttribute("aria-expanded", "false");
+      const picker = make("section", "journey-case-picker", journeyView);
+      picker.id = "journey-cases-" + index;
+      picker.hidden = true;
+      make("button", "", picker, "Fechar lista").dataset.journeyClose = "true";
+      make("input", "", picker).dataset.journeySearch = "true";
+      make("span", "", picker).dataset.journeyCount = "true";
+      const noCases = make("p", "", picker, "Nenhum CT corresponde à busca.");
+      noCases.dataset.journeyEmpty = "true";
+      noCases.hidden = true;
+      for (const caseIndex of index === 0 ? [0, 1] : [index % 2]) {
+        const row = make("article", "journey-case-row", picker);
+        make("h3", "", row, caseIndex ? "CT002 · Verificar carrinho" : "CT001 · Ordenação de produtos");
+        make("button", "", row, "Abrir CT").dataset.openCase = String(caseIndex);
+        make("button", "", row, "Editar CT").dataset.editCase = String(caseIndex);
+      }
+    }
   }
   const testsView = document.querySelector('.report-view[data-view="tests"]');
   make("input", "", testsView).id = "search";
@@ -298,6 +397,7 @@ function fixture(options = {}) {
   make("button", "", caseNavigation, "Teste anterior").id = "case-prev";
   make("button", "", caseNavigation, "Teste seguinte").id = "case-next";
   make("div", "", resultActions).id = "result-report-actions";
+  if (visualEditor) make("button", "", resultActions, "Editar CT").dataset.editCurrent = "true";
   const scenarios = make("div", "", resultView);
   scenarios.id = "scenarios";
   const originals = [];
@@ -308,7 +408,7 @@ function fixture(options = {}) {
   for (let caseIndex = 0; caseIndex < 2; caseIndex += 1) {
     const card = make("details", "scenario", scenarios);
     card.dataset.caseIndex = String(caseIndex);
-    card.dataset.status = caseIndex ? "FAIL" : "PASS";
+    if (caseStatuses[caseIndex] !== undefined) card.dataset.status = caseStatuses[caseIndex];
     const summary = make("summary", "", card);
     make("h2", "", summary, caseIndex ? "Verificar carrinho" : "Ordenação de produtos");
     const body = make("div", "scenario-body", card);
@@ -323,6 +423,8 @@ function fixture(options = {}) {
       ["observation", "action", "assertion", ...(withSignal ? ["signal"] : [])].forEach((kind, index) => {
         const entry = make("li", `timeline-entry ${kind}`, timeline);
         entry.id = `timeline-case${caseIndex}-${index}`;
+        const metadata = stepMetadata[kind] || {};
+        for (const [name, value] of Object.entries(metadata)) entry.dataset[name] = value;
         const content = make("div", "timeline-content", entry);
         const meta = make("div", "event-meta", content);
         make("span", "event-kind", meta, kind);
@@ -380,28 +482,376 @@ function fixture(options = {}) {
       element.naturalHeight = naturalImageSize.height;
     }
   }
+  if (visualEditor) {
+    const editor = make("dialog", "case-editor-dialog", document.body);
+    editor.id = "case-editor";
+    editor.showModal = () => editor.setAttribute("open", "");
+    editor.close = () => { editor.removeAttribute("open"); editor.dispatch("close"); };
+    for (const [tag, id] of [["h2", "case-editor-title"], ["button", "case-editor-close"], ["ol", "case-editor-steps"], ["p", "case-editor-feedback"], ["button", "case-editor-save"], ["button", "case-editor-rerun"]]) {
+      make(tag, "", editor).id = id;
+    }
+    const palette = make("aside", "case-editor-palette", editor);
+    palette.id = "case-editor-palette";
+    const database = make("button", "database-step-card", palette, "Consulta em banco de dados");
+    database.id = "database-step-card";
+    database.setAttribute("draggable", "true");
+  }
   const theme = make("style", "", document.body, ".report-premium { color: white; }");
   theme.id = "report-theme";
   const runtime = make("script", "", document.body, script);
   runtime.id = "report-runtime";
   const window = new FixtureElement("window", document);
-  window.location = { hash };
+  window.location = { hash, protocol: options.locationProtocol || "file:", origin: options.locationOrigin || "null" };
   window.history = { replaceState(_state, _unused, value) { window.location.hash = value; } };
   window.matchMedia = () => ({ matches: true });
   window.requestAnimationFrame = (callback) => callback();
   window.scrollTo = () => {};
   window.innerHeight = 900;
+  window.innerWidth = options.journeyWidth || 1200;
+  window.devicePixelRatio = options.devicePixelRatio || 1;
+  window.getComputedStyle = (element) => ({ getPropertyValue: (name) => element.style.getPropertyValue(name) });
   window.setTimeout = () => {};
   window.printCalls = 0;
   window.print = () => { window.printCalls += 1; };
+  window.openedTabs = [];
+  window.open = (...values) => { window.openedTabs.push(values); };
+  window.networkCalls = 0;
+  window.fetch = () => { window.networkCalls += 1; throw new Error("Report must not make network calls"); };
   const blobs = [];
-  const fixtureURL = {
-    createObjectURL(blob) { blobs.push(blob); return "blob:fixture/" + blobs.length; },
-    revokeObjectURL() {},
-  };
-  vm.runInNewContext(script, { document, window, Element: FixtureElement, Blob, URL: fixtureURL, Map, Set, console }, { filename: "premium.js" });
-  return { document, window, cards, originals, originalImages, actionFigures, actionImages, toolbar, topbar, blobs, downloads: document.downloads };
+  class FixtureURL extends URL {
+    static createObjectURL(blob) { blobs.push(blob); return "blob:fixture/" + blobs.length; }
+    static revokeObjectURL() {}
+  }
+  vm.runInNewContext(script, { document, window, Element: FixtureElement, Blob, URL: FixtureURL, fetch: window.fetch, Map, Set, console }, { filename: "premium.js" });
+  return { document, window, cards, originals, originalImages, actionFigures, actionImages, toolbar, topbar, blobs, downloads: document.downloads, journeyList, journeyRoute, journeyCanvas, canvasCalls };
 }
+
+test("golden journey keeps chronological DOM while laying out responsive serpentine rows", () => {
+  const { document, window, journeyList, journeyRoute, canvasCalls } = fixture({ journey: true, hash: "#view/journey" });
+  const nodes = journeyList.querySelectorAll(".journey-node");
+  assert.deepEqual(nodes.map((node) => node.dataset.journeyPosition), Array.from({ length: 9 }, (_, index) => String(index)));
+  assert.equal(journeyList.tagName, "OL");
+  assert.ok(nodes.every((node) => node.tagName === "LI"));
+  for (const [width, columns, gutter] of [[1200, 4, 88], [1080, 4, 88], [1050, 3, 88], [820, 3, 88], [720, 2, 88], [560, 2, 88], [450, 1, 20], [390, 1, 20]]) {
+    window.innerWidth = width;
+    window.dispatch("resize");
+    assert.equal(journeyRoute.dataset.journeyColumns, String(columns));
+    assert.equal(Number.parseInt(journeyRoute.style.getPropertyValue("--journey-columns"), 10), columns);
+    assert.equal(Number.parseInt(journeyRoute.style.getPropertyValue("--journey-gutter"), 10), gutter);
+    nodes.forEach((node, index) => {
+      const row = Math.floor(index / columns);
+      const expectedColumn = row % 2 === 0 ? index % columns + 1 : columns - index % columns;
+      assert.equal(Number(node.style.getPropertyValue("grid-column") || node.style.gridColumn), expectedColumn);
+      assert.equal(Number(node.style.getPropertyValue("grid-row") || node.style.gridRow), row + 1);
+    });
+    assert.deepEqual(journeyList.querySelectorAll(".journey-node"), nodes);
+    assert.equal(journeyRoute.dataset.journeyReady, "true");
+  }
+  assert.ok(canvasCalls.some(({ method }) => method === "stroke"), "the route is drawn locally on the canvas");
+  assert.ok(canvasCalls.some(({ method }) => method === "bezierCurveTo"), "row transitions curve around the page cards");
+  assert.equal(journeyRoute.querySelectorAll("canvas").length, 1);
+  assert.equal(journeyRoute.querySelectorAll("svg").length, 0, "route artwork is canvas, not a generated SVG illustration");
+  assert.equal(document.body.dataset.view, "journey");
+  assert.equal(document.getElementById("view-title").textContent, "Jornada observada");
+  assert.equal(document.querySelector(".journey-heading-accent").textContent, "observada");
+});
+
+test("journey terminals stay within the board beside the actual first and last nodes, including partial rows", () => {
+  for (const journeyCount of [1, 5, 12, 14]) {
+    for (const journeyWidth of [1200, 900, 640, 390]) {
+      const { journeyRoute, journeyList, journeyCanvas, canvasCalls } = fixture({ journey: true, journeyCount, journeyWidth, devicePixelRatio: 3, hash: "#view/journey" });
+      const route = journeyRoute.getBoundingClientRect();
+      const first = journeyList.firstElementChild.getBoundingClientRect();
+      const last = journeyList.lastElementChild.getBoundingClientRect();
+      const start = journeyRoute.querySelector(".journey-terminal-start").getBoundingClientRect();
+      const end = journeyRoute.querySelector(".journey-terminal-end").getBoundingClientRect();
+      for (const terminal of [start, end]) {
+        assert.ok(terminal.left >= route.left && terminal.right <= route.right, `terminal stays horizontally inside ${journeyCount}-page ${journeyWidth}px board`);
+        assert.ok(terminal.top >= route.top && terminal.bottom <= route.bottom, `terminal stays vertically inside ${journeyCount}-page ${journeyWidth}px board`);
+      }
+      const columns = Number(journeyRoute.dataset.journeyColumns);
+      if (columns > 1) {
+        assert.equal(start.top + start.height / 2, first.top + first.height / 2);
+        assert.equal(end.top + end.height / 2, last.top + last.height / 2);
+        assert.ok(start.right <= first.left, `INÍCIO remains beside rather than on top of the first card (${journeyWidth}px)`);
+        const lastRow = Math.floor((journeyCount - 1) / columns);
+        assert.ok(lastRow % 2 === 0 ? end.left >= last.right : end.right <= last.left, `FIM follows the final card in the row's direction, not an empty grid cell (${journeyCount} pages, ${journeyWidth}px, last ${last.left}–${last.right}, terminal ${end.left}–${end.right})`);
+      } else {
+        assert.ok(start.bottom <= first.top, "single-column start is above the first card");
+        assert.ok(end.top >= last.bottom, "single-column finish is below the last card");
+      }
+      assert.equal(journeyCanvas.width, Math.round(route.width * 2), "pixel ratio is capped at two for a bounded canvas allocation");
+      assert.equal(journeyCanvas.height, Math.round(route.height * 2));
+      assert.ok(canvasCalls.every(({ args }) => args.every(Number.isFinite)));
+    }
+  }
+});
+
+test("downloaded golden journey preserves canonical page metadata and redraws offline without network calls", async () => {
+  const { document, window, blobs, journeyRoute, journeyList } = fixture({ journey: true, visualEditor: true, hash: "#view/journey", journeyCount: 14 });
+  const metadata = document.getElementById("report-data").textContent;
+  const positions = journeyList.querySelectorAll(".journey-node").map((node) => node.dataset.journeyPosition);
+  document.getElementById("download-report").click();
+  const exported = await blobs.at(-1).text();
+  assert.equal((exported.match(/<canvas[^>]*class="journey-route-canvas"/g) || []).length, 1);
+  assert.equal((exported.match(/<li[^>]*data-journey-position=/g) || []).length, 14);
+  assert.doesNotMatch(exported, /data-journey-ready=|data-journey-columns=/);
+  assert.equal(document.getElementById("report-data").textContent, metadata);
+  assert.deepEqual(journeyList.querySelectorAll(".journey-node").map((node) => node.dataset.journeyPosition), positions);
+  assert.equal(journeyRoute.dataset.journeyReady, "true", "export never resets the active report's route");
+  assert.equal(window.networkCalls, 0);
+  assert.equal(window.openedTabs.length, 0);
+  const reopened = fixture({ journey: true, exported: true, journeyCount: 14, hash: "#view/journey", journeyWidth: 390 });
+  assert.equal(reopened.journeyRoute.dataset.journeyReady, "true");
+  assert.equal(reopened.journeyRoute.dataset.journeyColumns, "1");
+  assert.equal(reopened.window.networkCalls, 0);
+});
+
+test("journey page selection offers individual CTs and restores focus on close", () => {
+  const { document, window } = fixture({ journey: true, visualEditor: true, hash: "#view/journey" });
+  const pages = document.querySelectorAll("[data-journey-page]");
+  const first = document.getElementById("journey-cases-0");
+  pages[0].click();
+  assert.equal(first.hidden, false);
+  assert.equal(first.querySelectorAll("[data-open-case]").length, 2, "a page can contain multiple individual cases");
+  assert.equal(pages[0].getAttribute("aria-expanded"), "true");
+  assert.equal(window.location.hash, "#view/journey", "choosing a page does not select a CT prematurely");
+  pages[1].click();
+  assert.equal(first.hidden, true);
+  assert.equal(pages[0].getAttribute("aria-expanded"), "false");
+  document.getElementById("journey-cases-1").querySelector("[data-journey-close]").click();
+  assert.equal(document.activeElement, pages[1]);
+  pages[0].click();
+  first.querySelectorAll("[data-open-case]")[1].click();
+  assert.equal(window.location.hash, "#view/results/CT002");
+  assert.equal(first.hidden, true);
+});
+
+test("journey CT search is accent-insensitive, scoped to its picker, and reports empty results", () => {
+  const { document, window } = fixture({ journey: true, visualEditor: true, hash: "#view/journey" });
+  document.querySelector("[data-journey-page]").click();
+  const panel = document.getElementById("journey-cases-0");
+  const search = panel.querySelector("[data-journey-search]");
+  const count = panel.querySelector("[data-journey-count]");
+  const empty = panel.querySelector("[data-journey-empty]");
+  const rows = panel.querySelectorAll(".journey-case-row");
+  assert.equal(document.activeElement, search);
+  assert.equal(count.textContent, "2 CTs nesta página");
+  for (const term of ["ordenacao", "ORDENAÇÃO", "CT001"]) {
+    search.value = term;
+    search.dispatch("input");
+    assert.deepEqual(rows.map((row) => row.hidden), [false, true]);
+    assert.equal(count.textContent, "1 de 2 CTs");
+    assert.equal(empty.hidden, true);
+  }
+  search.value = "não existe";
+  search.dispatch("input");
+  assert.deepEqual(rows.map((row) => row.hidden), [true, true]);
+  assert.equal(count.textContent, "0 de 2 CTs");
+  assert.equal(empty.hidden, false);
+  assert.equal(document.getElementById("journey-cases-1").querySelector(".journey-case-row").hidden, false, "search never filters another page's CTs");
+  search.value = "";
+  search.dispatch("input");
+  assert.deepEqual(rows.map((row) => row.hidden), [false, false]);
+  assert.equal(count.textContent, "2 CTs nesta página");
+  assert.equal(empty.hidden, true);
+  assert.equal(window.location.hash, "#view/journey");
+});
+
+test("CT visual editor shows every canonical timeline kind without cloning evidence or changing the result", () => {
+  const { document, window, originals, originalImages, cards } = fixture({ visualEditor: true, journey: true, withSignal: true, hash: "#view/journey" });
+  const before = originals.map((entry) => entry.outerHTML);
+  const source = document.getElementById("report-data").textContent;
+  const edit = document.getElementById("journey-cases-0").querySelector("[data-edit-case]");
+  edit.click();
+  const editor = document.getElementById("case-editor");
+  const list = document.getElementById("case-editor-steps");
+  assert.equal(editor.hasAttribute("open"), true);
+  assert.match(document.getElementById("case-editor-title").textContent, /CT001/);
+  assert.deepEqual(list.querySelectorAll(".case-editor-recorded").map((item) => item.dataset.stepKind), ["observation", "action", "assertion", "signal"]);
+  assert.equal(list.querySelectorAll("img, figure").length, 0);
+  assert.equal(list.querySelectorAll(".case-editor-gap").length, 5);
+  assert.ok(list.querySelectorAll(".case-editor-recorded").every((item) => !item.hasAttribute("draggable") && !item.querySelector("button")));
+  assert.match(document.getElementById("case-editor-feedback").textContent, /não executado.*não altera este resultado/);
+  assert.deepEqual(originals.map((entry) => entry.outerHTML), before);
+  assert.equal(originalImages.length, 2);
+  assert.equal(document.getElementById("report-data").textContent, source);
+  assert.equal(cards[0].dataset.status, "PASS");
+  assert.equal(window.location.hash, "#view/journey");
+  document.getElementById("case-editor-close").click();
+  assert.equal(editor.hasAttribute("open"), false);
+  assert.equal(document.activeElement, edit);
+});
+
+test("recorded editor cards preserve each explicit outcome as literal text without borrowing the case verdict", () => {
+  const { document, cards } = fixture({ visualEditor: true, stepMetadata: {
+    observation: { stepState: "recorded", stepOutcome: "Captura antes da ação" },
+    action: { stepState: "pass", stepOutcome: "Ação concluída" },
+    assertion: { stepState: "fail", stepOutcome: "<b>Conferência não passou</b>" },
+  } });
+  document.querySelector("[data-edit-current]").click();
+  const list = document.getElementById("case-editor-steps");
+  assert.deepEqual(list.querySelectorAll(".case-editor-state").map((item) => item.textContent), [
+    "Captura antes da ação", "Ação concluída", "<b>Conferência não passou</b>",
+  ]);
+  assert.equal(list.querySelectorAll("b").length, 0);
+  assert.equal(cards[0].dataset.status, "PASS", "a failed recorded check never rewrites the preserved passing case verdict");
+  const fallback = fixture({ visualEditor: true, stepMetadata: { action: { stepState: "pass", stepOutcome: " " } } });
+  fallback.document.querySelector("[data-edit-current]").click();
+  assert.equal(fallback.document.getElementById("case-editor-steps").querySelectorAll(".case-editor-state")[1].textContent, "Passou");
+});
+
+test("database placeholders support drag/drop, accessible insertion and reorder while original steps remain fixed", () => {
+  const { document, originals } = fixture({ visualEditor: true });
+  document.querySelector("[data-edit-current]").click();
+  const list = document.getElementById("case-editor-steps");
+  const palette = document.getElementById("database-step-card");
+  const transfer = { setData() {} };
+  const gap = list.querySelectorAll(".case-editor-gap")[1];
+  const before = originals.map((entry) => entry.outerHTML);
+  gap.dispatch("drop", { dataTransfer: transfer });
+  assert.equal(list.querySelectorAll(".case-editor-prototype").length, 0, "external text drops cannot create a database placeholder");
+  palette.dispatch("dragstart", { dataTransfer: transfer });
+  assert.equal(gap.dispatch("dragover", { dataTransfer: transfer }).defaultPrevented, true);
+  gap.dispatch("drop", { dataTransfer: transfer });
+  let prototype = list.querySelector(".case-editor-prototype");
+  assert.ok(prototype);
+  assert.match(prototype.textContent, /sem conexão, SQL ou credenciais.*Não executado/);
+  assert.deepEqual(list.querySelectorAll("[data-editor-step]").map((item) => item.dataset.editorStep), ["recorded", "database", "recorded", "recorded"]);
+  prototype.dispatch("keydown", { key: "ArrowDown", altKey: true });
+  prototype = list.querySelector(".case-editor-prototype");
+  assert.equal(document.activeElement, prototype);
+  assert.deepEqual(list.querySelectorAll("[data-editor-step]").map((item) => item.dataset.editorStep), ["recorded", "recorded", "database", "recorded"]);
+  prototype.dispatch("dragstart", { dataTransfer: transfer });
+  list.querySelector(".case-editor-gap").dispatch("drop", { dataTransfer: transfer });
+  assert.equal(list.querySelectorAll("[data-editor-step]")[0].dataset.editorStep, "database");
+  list.querySelectorAll(".case-editor-insert").at(-1).click();
+  assert.equal(list.querySelectorAll(".case-editor-prototype").length, 2);
+  list.querySelector(".case-editor-prototype").querySelectorAll("button").at(-1).click();
+  assert.equal(list.querySelectorAll(".case-editor-prototype").length, 1);
+  assert.deepEqual(list.querySelectorAll(".case-editor-recorded").map((item) => item.dataset.recordedIndex), ["0", "1", "2"]);
+  assert.deepEqual(originals.map((entry) => entry.outerHTML), before);
+});
+
+test("saved visual drafts are per CT, export as bounded JSON only, and reopen offline", async () => {
+  const { document, blobs, originals } = fixture({ visualEditor: true, journey: true });
+  const originalSource = document.getElementById("report-data").textContent;
+  document.querySelector("[data-edit-current]").click();
+  document.getElementById("case-editor-steps").querySelectorAll(".case-editor-insert")[1].click();
+  document.getElementById("case-editor-save").click();
+  assert.match(document.getElementById("case-editor-feedback").textContent, /Baixe o relatório para conservar/);
+  document.getElementById("case-editor-close").click();
+  const second = document.getElementById("journey-cases-0").querySelectorAll("[data-edit-case]")[1];
+  second.click();
+  assert.equal(document.getElementById("case-editor-steps").querySelectorAll(".case-editor-prototype").length, 0);
+  document.getElementById("case-editor-steps").querySelectorAll(".case-editor-insert").at(-1).click();
+  document.getElementById("case-editor-save").click();
+  document.getElementById("download-report").click();
+  const exported = await blobs.at(-1).text();
+  const payload = JSON.parse(exported.match(/<script[^>]*id="report-drafts"[^>]*>([\s\S]*?)<\/script>/)[1]);
+  assert.deepEqual(Object.keys(payload.cases), ["0", "1"]);
+  assert.deepEqual(payload.cases["0"].map(({ type, gap }) => ({ type, gap })), [{ type: "database", gap: 1 }]);
+  assert.deepEqual(payload.cases["1"].map(({ type, gap }) => ({ type, gap })), [{ type: "database", gap: 3 }]);
+  assert.doesNotMatch(exported, /<li[^>]*class="case-editor-step/);
+  assert.doesNotMatch(exported, /<dialog[^>]*id="case-editor"[^>]*\bopen=/);
+  assert.equal((exported.match(/data:image\/png;base64,cHJlc2VydmVk/g) || []).length, 2);
+  assert.equal(document.getElementById("report-data").textContent, originalSource);
+  assert.equal(originals.length, 6);
+  const reopened = fixture({ visualEditor: true, exported: true, drafts: payload });
+  reopened.document.querySelector("[data-edit-current]").click();
+  assert.equal(reopened.document.getElementById("case-editor-steps").querySelectorAll(".case-editor-prototype").length, 1);
+  reopened.document.getElementById("case-editor-save").click();
+  assert.match(reopened.document.getElementById("case-editor-feedback").textContent, /O arquivo original não foi alterado/);
+});
+
+test("visual drafts discard invalid imported fields and bound placeholders to 100 per CT", () => {
+  const drafts = { version: 1, cases: { "0": [
+    { id: "db-1", type: "database", gap: 1, order: 0, sql: "DELETE", status: "PASS" },
+    { id: "db-1", type: "database", gap: 1, order: 1 },
+    { id: "<script>", type: "database", gap: 1, order: 1 },
+    { id: "db-2", type: "execute", gap: 1, order: 1 },
+    { id: "db-3", type: "database", gap: 999, order: 1 },
+    { id: "db-4", type: "database", gap: -1, order: 1 },
+    null,
+  ] } };
+  const { document } = fixture({ visualEditor: true, drafts });
+  document.querySelector("[data-edit-current]").click();
+  assert.equal(document.querySelectorAll(".case-editor-prototype").length, 1);
+  document.getElementById("case-editor-save").click();
+  const saved = JSON.parse(document.getElementById("report-drafts").textContent);
+  assert.deepEqual(saved.cases["0"], [{ id: "db-1", type: "database", gap: 1, order: 0 }]);
+  const bounded = fixture({ visualEditor: true, drafts: { version: 1, cases: { "0": Array.from({ length: 120 }, (_, index) => ({
+    id: "db-" + (index + 1), type: "database", gap: 0, order: index % 100,
+  })) } } });
+  bounded.document.querySelector("[data-edit-current]").click();
+  assert.equal(bounded.document.querySelectorAll(".case-editor-prototype").length, 100);
+  assert.ok(bounded.document.querySelectorAll(".case-editor-insert").every((control) => control.disabled));
+  bounded.document.querySelector(".case-editor-insert").click();
+  assert.equal(bounded.document.querySelectorAll(".case-editor-prototype").length, 100);
+  assert.match(bounded.document.getElementById("case-editor-feedback").textContent, /Limite de 100/);
+});
+
+test("empty and malformed draft reports retain an honest visual-only editor and rerun feedback", () => {
+  for (const drafts of ["{invalid", "null", '{"version":99,"cases":{}}']) {
+    const { document, window, cards } = fixture({ visualEditor: true, emptyTimeline: true, drafts });
+    document.querySelector("[data-edit-current]").click();
+    assert.match(document.querySelector(".case-editor-empty").textContent, /não tem passos registrados/);
+    assert.equal(document.querySelectorAll(".case-editor-recorded").length, 0);
+    document.getElementById("case-editor-steps").querySelector(".case-editor-insert").click();
+    assert.equal(document.querySelectorAll(".case-editor-prototype").length, 1);
+    document.getElementById("case-editor-rerun").click();
+    assert.match(document.getElementById("case-editor-feedback").textContent, /Reexecução não iniciada.*Abra o relatório pela aplicação/);
+    assert.equal(cards[0].dataset.status, "PASS");
+    assert.equal(window.location.hash, "#view/results/CT001");
+    document.dispatch("keydown", { key: "Escape" });
+    assert.equal(document.getElementById("case-editor").hasAttribute("open"), false);
+  }
+});
+
+test("a connected blob report hands off only to same-origin app confirmation and never executes or fetches", async () => {
+  const { document, window, blobs, cards } = fixture({ visualEditor: true,
+    runId: "source-123", locationProtocol: "blob:", locationOrigin: "http://localhost:5173",
+    appRuntime: { app_url: "http://localhost:5173", source_exploration_id: "source-123" },
+  });
+  document.querySelector("[data-edit-current]").click();
+  assert.equal(document.getElementById("case-editor-rerun").textContent, "Reexecutar este teste");
+  document.getElementById("case-editor-steps").querySelector(".case-editor-insert").click();
+  document.getElementById("case-editor-save").click();
+  document.getElementById("case-editor-rerun").click();
+  assert.deepEqual(window.openedTabs, [["http://localhost:5173/#/reexecutar/source-123/CT001", "_blank", "noopener,noreferrer"]]);
+  assert.equal(window.networkCalls, 0);
+  assert.equal(cards[0].dataset.status, "PASS");
+  assert.match(document.getElementById("case-editor-feedback").textContent, /Nenhuma ação foi iniciada.*cartões de banco.*não serão executados/);
+  document.getElementById("download-report").click();
+  const exported = await blobs.at(-1).text();
+  assert.doesNotMatch(exported, /<script[^>]*id="report-app-runtime"/);
+  assert.match(exported, /<script[^>]*id="report-drafts"/);
+  assert.equal(document.getElementById("report-app-runtime").getAttribute("type"), "application/json", "export removes the connection only from its detached snapshot");
+});
+
+test("offline, malformed and tampered report connections cannot open an app or contact any server", () => {
+  const valid = { app_url: "http://localhost:5173", source_exploration_id: "source-123" };
+  for (const invalid of [
+    { locationProtocol: "file:" }, { locationProtocol: "https:" }, { locationOrigin: "null" },
+    { appRuntime: "{invalid" }, { appRuntime: null }, { runtimeType: "text/javascript" },
+    { appRuntime: { ...valid, app_url: "https://other.example" } },
+    { appRuntime: { ...valid, app_url: "javascript:alert(1)" } },
+    { appRuntime: { ...valid, app_url: "http://secret@localhost:5173" } },
+    { appRuntime: { ...valid, app_url: "http://localhost:5173/other" } },
+    { appRuntime: { ...valid, app_url: "http://localhost:5173/?token=secret" } },
+    { appRuntime: { ...valid, source_exploration_id: "other-run" } },
+  ]) {
+    const { document, window } = fixture({ visualEditor: true, runId: "source-123",
+      locationProtocol: "blob:", locationOrigin: "http://localhost:5173", appRuntime: valid, ...invalid,
+    });
+    document.querySelector("[data-edit-current]").click();
+    assert.equal(document.getElementById("case-editor-rerun").textContent, "Como reexecutar");
+    document.getElementById("case-editor-rerun").click();
+    assert.equal(window.openedTabs.length, 0);
+    assert.equal(window.networkCalls, 0);
+    assert.match(document.getElementById("case-editor-feedback").textContent, /Reexecução não iniciada.*Abra o relatório pela aplicação/);
+  }
+});
 
 test("HTML exports omit only their download control while preserving the untouched offline report", async () => {
   const { document, window, cards, originals, originalImages, toolbar, blobs, downloads } = fixture({ hash: "#view/overview", withSignal: true });
@@ -544,6 +994,81 @@ test("step explorer moves canonical evidence without duplicating cards, anchors 
   assert.equal(cards[0].querySelector(".case-summary-panel").hidden, true);
   assert.equal(cards[0].querySelectorAll('.case-step-button[aria-current="step"]').length, 1);
   assert.equal(cards[0].querySelectorAll('.case-step-button[aria-pressed="true"]').length, 1);
+});
+
+test("each sidebar step explains its own recorded outcome without inheriting the case verdict", () => {
+  const { cards } = fixture({
+    withSignal: true,
+    stepMetadata: {
+      observation: { stepState: "recorded", stepOutcome: "Captura registrada", stepDescription: "Página antes de selecionar a ordenação." },
+      action: { stepState: "pass", stepOutcome: "Concluída", stepDescription: "A opção solicitada foi selecionada." },
+      assertion: { stepState: "fail", stepOutcome: "Não passou", stepDescription: "A ordem dos produtos não corresponde à opção solicitada." },
+      signal: { stepState: "warning", stepOutcome: "Requer atenção", stepDescription: "Um sinal técnico foi registrado para análise." },
+    },
+  });
+  const buttons = cards[0].querySelectorAll(".case-step-button");
+  assert.deepEqual(buttons.map((button) => button.dataset.stepState), ["pass", "recorded", "pass", "fail", "warning"]);
+  assert.deepEqual(buttons.map((button) => button.querySelector(".step-status-label").textContent), [
+    "Aprovado", "Captura registrada", "Concluída", "Não passou", "Requer atenção",
+  ]);
+  assert.equal(buttons[0].querySelector(".step-label").textContent, "Resultado do caso");
+  assert.equal(buttons[1].querySelector(".step-kind").textContent, "Captura da página");
+  assert.equal(buttons[2].querySelector(".step-kind").textContent, "Ação realizada");
+  assert.equal(buttons[3].querySelector(".step-kind").textContent, "Conferência");
+  assert.equal(buttons[3].querySelector(".step-description").textContent, "A ordem dos produtos não corresponde à opção solicitada.");
+  assert.match(buttons[3].getAttribute("aria-label"), /Conferir resultado.*A ordem dos produtos.*Resultado: Não passou/);
+  assert.equal(buttons[3].querySelector(".step-status-icon").getAttribute("aria-hidden"), "true");
+  assert.equal(cards[0].dataset.status, "PASS", "displaying a failed step never rewrites the preserved case verdict");
+});
+
+test("legacy or invalid step metadata stays unknown even when the case passed", () => {
+  for (const metadata of [{}, { stepState: "PASS", stepOutcome: "Passou" }, { stepState: "toString", stepOutcome: "Passou" }]) {
+    const { cards } = fixture({ withSignal: true, stepMetadata: { assertion: metadata, action: metadata } });
+    const buttons = cards[0].querySelectorAll(".case-step-button");
+    for (const button of buttons.slice(1)) {
+      assert.equal(button.dataset.stepState, "unknown");
+      assert.equal(button.querySelector(".step-status-label").textContent, "Sem resultado");
+      assert.doesNotMatch(button.getAttribute("aria-label"), /Aprovado|Passou/);
+    }
+    assert.equal(buttons[1].querySelector(".step-kind").textContent, "Captura da página", "capture type is descriptive, not an approval");
+  }
+});
+
+test("recorded captures and informational observations are never presented as passing checks", () => {
+  for (const [state, outcome] of [["recorded", "Captura registrada"], ["info", "Página observada"]]) {
+    const { cards } = fixture({ stepMetadata: { observation: { stepState: state, stepOutcome: outcome } } });
+    const control = cards[0].querySelectorAll(".case-step-button")[1];
+    assert.equal(control.dataset.stepState, state);
+    assert.equal(control.querySelector(".step-status-label").textContent, outcome);
+    assert.doesNotMatch(control.getAttribute("aria-label"), /Passou|Aprovado/);
+    assert.match(control.querySelector(".step-description").textContent, /não é uma aprovação/);
+  }
+});
+
+test("summary labels use only recognized case results", () => {
+  for (const [status, state, label] of [
+    ["PASS", "pass", "Aprovado"], ["FAIL", "fail", "Reprovado"],
+    ["BLOCKED", "warning", "Bloqueado"], ["SKIPPED", "unknown", "Sem validação"],
+    [undefined, "unknown", "Sem resultado"], ["passed", "unknown", "Sem resultado"],
+    ["toString", "unknown", "Sem resultado"],
+  ]) {
+    const { cards } = fixture({ caseStatuses: [status, "FAIL"] });
+    const summary = cards[0].querySelectorAll(".case-step-button")[0];
+    assert.equal(summary.dataset.stepState, state);
+    assert.equal(summary.querySelector(".step-status-label").textContent, label);
+  }
+});
+
+test("step descriptions and outcome labels render literally without executing markup", () => {
+  const description = '<img src=x onerror="alert(1)">';
+  const outcome = "<b>Concluída</b>";
+  const { cards } = fixture({ stepMetadata: { action: { stepState: "pass", stepDescription: description, stepOutcome: outcome } } });
+  const control = cards[0].querySelectorAll(".case-step-button")[2];
+  assert.equal(control.querySelector(".step-description").textContent, description);
+  assert.equal(control.querySelector(".step-status-label").textContent, outcome);
+  assert.equal(control.querySelectorAll("img, b").length, 0);
+  assert.match(control.outerHTML, /&lt;img src=x onerror=/);
+  assert.match(control.outerHTML, /&lt;b&gt;Concluída&lt;\/b&gt;/);
 });
 
 test("step selection supports clicks and keyboard navigation, retaining independent CT state", () => {

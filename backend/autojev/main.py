@@ -15,6 +15,7 @@ from autojev.config import Settings
 from autojev.config import settings as default_settings
 from autojev.services.exploration import ExplorationManager
 from autojev.services.visual_review_resume import VisualReviewResumeService
+from autojev.services.scenario_rerun import ScenarioRerunService
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -41,7 +42,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.exploration_manager = manager
         review_resume = VisualReviewResumeService(manager, runtime_settings)
         app.state.visual_review_resume_service = review_resume
+        reruns = ScenarioRerunService(manager, runtime_settings)
+        app.state.scenario_rerun_service = reruns
         yield
+        await reruns.shutdown()
         await review_resume.shutdown()
         await manager.shutdown()
 

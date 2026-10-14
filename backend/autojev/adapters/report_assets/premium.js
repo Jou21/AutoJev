@@ -14,6 +14,8 @@
       const exportRoot = document.documentElement.cloneNode(true);
       const downloadControl = exportRoot.querySelector("#download-report");
       if (downloadControl) downloadControl.remove();
+      const appRuntime = exportRoot.querySelector("#report-app-runtime");
+      if (appRuntime) appRuntime.remove();
       return "<!DOCTYPE html>\n" + exportRoot.outerHTML;
     })();
     const cases = Array.isArray(data.cases) ? data.cases : [];
@@ -21,6 +23,23 @@
     const byId = new Map(cases.map((item) => [String(item.id), item]));
     const $ = (id) => document.getElementById(id);
     const all = (selector, scope = document) => Array.from(scope.querySelectorAll(selector));
+    const reportConnection = (() => {
+      const runtime = $("report-app-runtime");
+      // Only a report explicitly opened by the app in its same-origin blob can
+      // hand off to the app. Downloaded/file reports never contact a server.
+      if (!runtime || runtime.getAttribute("type") !== "application/json" || window.location.protocol !== "blob:"
+        || !window.location.origin || window.location.origin === "null") return null;
+      let value;
+      try { value = JSON.parse(runtime.textContent || "{}"); } catch { return null; }
+      if (!value || typeof value.app_url !== "string" || typeof value.source_exploration_id !== "string"
+        || !value.source_exploration_id || value.source_exploration_id !== data.run_id) return null;
+      try {
+        const url = new URL(value.app_url);
+        if (!["http:", "https:"].includes(url.protocol) || url.origin !== window.location.origin
+          || url.username || url.password || url.pathname !== "/" || url.search || url.hash) return null;
+        return { appUrl: url.origin, sourceId: value.source_exploration_id };
+      } catch { return null; }
+    })();
     const statusLabels = {
       ALL: "Todos os status", PASS: "Aprovados", FAIL: "Reprovados",
       BLOCKED: "Bloqueados", SKIPPED: "Sem validação",
@@ -72,6 +91,376 @@
     const sourceScopes = new Map();
     const sourceImages = new Map();
     const caseExplorers = new Map();
+    // Drafts belong to this offline report only. They are never test results,
+    // executable steps, browser storage, or instructions sent to a backend.
+    const draftSource = $("report-drafts");
+    const savedDrafts = new Map();
+    const draftLimit = 100;
+    let draftSerial = 0;
+    let editorCase = null;
+    let editorSequence = [];
+    let editorTrigger = null;
+    let editorDrag = null;
+    const editorKinds = { action: "Ação realizada", assertion: "Conferência", signal: "Sinal técnico", observation: "Registro da página" };
+    const editorStates = { pass: "Passou", fail: "Não passou", unknown: "Sem resultado", recorded: "Captura registrada", info: "Informativo", warning: "Atenção" };
+
+    function originalEditorSteps(key) {
+      const detail = all("#scenarios details.scenario[data-case-index]").find((item) => item.dataset.caseIndex === key);
+      const timeline = detail && detail.querySelector(".evidence-timeline");
+      const entries = timeline && Array.from(timeline.children).filter((item) => item.classList.contains("timeline-entry"));
+      if (entries && entries.length) return entries.map((item) => ({
+        title: (item.querySelector("h3") || {}).textContent || "Registro da execução",
+        kind: Object.keys(editorKinds).find((kind) => item.classList.contains(kind)) || "observation",
+        state: Object.prototype.hasOwnProperty.call(editorStates, item.dataset.stepState) ? item.dataset.stepState : "unknown",
+        outcome: Object.prototype.hasOwnProperty.call(editorStates, item.dataset.stepState) && typeof item.dataset.stepOutcome === "string"
+          ? item.dataset.stepOutcome.trim() : "",
+      }));
+      const payload = byIndex.get(key);
+      return Array.isArray(payload && payload.editor_steps) ? payload.editor_steps.slice(0, 5000).filter((item) => item && typeof item === "object").map((item) => ({
+        title: typeof item.title === "string" ? item.title : "Registro da execução",
+        kind: Object.prototype.hasOwnProperty.call(editorKinds, item.kind) ? item.kind : "observation",
+        state: Object.prototype.hasOwnProperty.call(editorStates, item.state) ? item.state : "unknown",
+        outcome: Object.prototype.hasOwnProperty.call(editorStates, item.state) && typeof item.outcome === "string" ? item.outcome.trim() : "",
+      })) : [];
+    }
+
+    function readSavedDrafts() {
+      if (!draftSource || draftSource.textContent.length > 2000000) return;
+      let value;
+      try { value = JSON.parse(draftSource.textContent || "{}"); } catch { return; }
+      if (!value || value.version !== 1 || !value.cases || typeof value.cases !== "object" || Array.isArray(value.cases)) return;
+      cases.forEach((item) => {
+        const key = String(item.index);
+        if (!Object.prototype.hasOwnProperty.call(value.cases, key) || !Array.isArray(value.cases[key])) return;
+        const count = originalEditorSteps(key).length;
+        const ids = new Set();
+        const drafts = value.cases[key].slice(0, draftLimit).filter((draft) => {
+          if (!draft || draft.type !== "database" || typeof draft.id !== "string" || !/^db-\d{1,9}$/.test(draft.id)
+            || ids.has(draft.id) || !Number.isInteger(draft.gap) || draft.gap < 0 || draft.gap > count
+            || !Number.isInteger(draft.order) || draft.order < 0 || draft.order >= draftLimit) return false;
+          ids.add(draft.id);
+          draftSerial = Math.max(draftSerial, Number(draft.id.slice(3)));
+          return true;
+        }).map((draft) => ({ id: draft.id, type: "database", gap: draft.gap, order: draft.order }))
+          .sort((left, right) => left.gap - right.gap || left.order - right.order);
+        if (drafts.length) savedDrafts.set(key, drafts);
+      });
+    }
+
+    function serializeDrafts() {
+      const values = Object.create(null);
+      savedDrafts.forEach((drafts, key) => { values[key] = drafts; });
+      // Even a hostile imported report cannot add closing script tags through a
+      // draft. Serialization is allowlisted above and escaped at the boundary.
+      return JSON.stringify({ version: 1, cases: values }).replace(/</g, "\\u003c");
+    }
+
+    function exportDocument() {
+      if (!originalDocument || !draftSource) return originalDocument;
+      return originalDocument.replace(/(<script\b(?=[^>]*\bid=["']report-drafts["'])[^>]*>)[\s\S]*?(<\/script\s*>)/i,
+        (_match, start, end) => start + serializeDrafts() + end);
+    }
+
+    function closeEditor() {
+      const dialog = $("case-editor");
+      if (!dialog) return;
+      editorDrag = null;
+      if (typeof dialog.close === "function") dialog.close(); else dialog.removeAttribute("open");
+      if (editorTrigger) editorTrigger.focus();
+    }
+
+    function editorMessage(value) { text($("case-editor-feedback"), value); }
+
+    function renderEditor(focusId) {
+      const list = $("case-editor-steps");
+      if (!list) return;
+      list.replaceChildren();
+      const create = (tag, className, label) => {
+        const element = document.createElement(tag);
+        element.className = className;
+        if (label != null) element.textContent = label;
+        return element;
+      };
+      const placeholderCount = editorSequence.filter((item) => item.type === "database").length;
+      const insert = (position) => {
+        if (placeholderCount >= draftLimit) { editorMessage("Limite de 100 consultas de exemplo por CT."); return; }
+        let id;
+        do {
+          draftSerial = draftSerial >= 999999999 ? 1 : draftSerial + 1;
+          id = "db-" + draftSerial;
+        } while (editorSequence.some((item) => item.type === "database" && item.id === id));
+        editorSequence.splice(position, 0, { type: "database", id });
+        renderEditor(id);
+        editorMessage("Consulta adicionada ao rascunho visual. Nada foi executado.");
+      };
+      const dropAt = (position, event) => {
+        if (!editorDrag) return;
+        event.preventDefault();
+        const dragged = editorDrag;
+        editorDrag = null;
+        if (dragged === "new") { insert(position); return; }
+        const previous = editorSequence.findIndex((item) => item.type === "database" && item.id === dragged);
+        if (previous < 0) return;
+        const [item] = editorSequence.splice(previous, 1);
+        editorSequence.splice(position > previous ? position - 1 : position, 0, item);
+        renderEditor(item.id);
+        editorMessage("Consulta reposicionada no rascunho visual. Os registros originais foram preservados.");
+      };
+      const addGap = (position) => {
+        const gap = create("li", "case-editor-gap");
+        gap.dataset.editorGap = String(position);
+        gap.setAttribute("aria-label", position === 0 ? "Antes do primeiro passo" : position === editorSequence.length ? "Depois do último passo" : "Entre os passos " + position + " e " + (position + 1));
+        const control = button("+ Adicionar aqui", () => insert(position), "button button-ghost case-editor-insert");
+        control.disabled = placeholderCount >= draftLimit;
+        control.setAttribute("aria-label", "Adicionar consulta de exemplo: " + gap.getAttribute("aria-label"));
+        gap.appendChild(control);
+        gap.addEventListener("dragover", (event) => { if (editorDrag) { event.preventDefault(); gap.classList.add("drag-over"); } });
+        gap.addEventListener("dragleave", () => gap.classList.remove("drag-over"));
+        gap.addEventListener("drop", (event) => dropAt(position, event));
+        list.appendChild(gap);
+      };
+      if (!editorSequence.length) list.appendChild(create("li", "case-editor-empty", "Este CT não tem passos registrados. Você pode inserir uma consulta de exemplo; ela não será executada."));
+      editorSequence.forEach((item, index) => {
+        addGap(index);
+        const card = create("li", "case-editor-step " + (item.type === "database" ? "case-editor-prototype" : "case-editor-recorded"));
+        card.dataset.editorStep = item.type;
+        if (item.type === "recorded") {
+          card.dataset.recordedIndex = String(item.stepIndex);
+          card.dataset.stepKind = item.step.kind;
+          card.dataset.stepState = item.step.state;
+          card.append(create("small", "case-editor-kind", "Registro original · " + editorKinds[item.step.kind]),
+            create("h3", "", item.step.title), create("span", "case-editor-state", item.step.outcome || editorStates[item.step.state]),
+            create("small", "case-editor-readonly", "Somente leitura · resultado e evidências preservados"));
+        } else {
+          card.dataset.draftId = item.id;
+          card.setAttribute("draggable", "true");
+          card.tabIndex = 0;
+          card.setAttribute("aria-label", "Consulta em banco de dados. Exemplo visual não executado. Use Alt mais seta para cima ou para baixo para mover.");
+          card.append(create("small", "case-editor-kind", "Novo passo · rascunho visual"),
+            create("h3", "", "Consulta em banco de dados"),
+            create("p", "", "Exemplo sem conexão, SQL ou credenciais. Não executado."));
+          const move = (direction) => {
+            const current = editorSequence.findIndex((entry) => entry.type === "database" && entry.id === item.id);
+            const next = current + direction;
+            if (current < 0 || next < 0 || next >= editorSequence.length) return;
+            editorSequence.splice(current, 1);
+            editorSequence.splice(next, 0, item);
+            renderEditor(item.id);
+            editorMessage("Consulta reposicionada no rascunho visual.");
+          };
+          const controls = create("div", "case-editor-step-actions");
+          const up = button("↑ Mover antes", () => move(-1), "button button-ghost");
+          const down = button("↓ Mover depois", () => move(1), "button button-ghost");
+          up.disabled = index === 0;
+          down.disabled = index === editorSequence.length - 1;
+          const remove = button("Remover", () => {
+            editorSequence = editorSequence.filter((entry) => entry !== item);
+            renderEditor();
+            editorMessage("Consulta removida do rascunho. Nenhum registro original foi removido.");
+            const gap = list.querySelector(".case-editor-insert");
+            if (gap) gap.focus();
+          }, "button button-ghost");
+          controls.append(up, down, remove);
+          card.appendChild(controls);
+          card.addEventListener("keydown", (event) => {
+            if (event.target !== card || !event.altKey || !["ArrowUp", "ArrowDown"].includes(event.key)) return;
+            event.preventDefault();
+            move(event.key === "ArrowUp" ? -1 : 1);
+          });
+          card.addEventListener("dragstart", (event) => {
+            editorDrag = item.id;
+            if (event.dataTransfer) { event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", "Consulta de exemplo não executada"); }
+          });
+          card.addEventListener("dragend", () => { editorDrag = null; all(".drag-over", list).forEach((gap) => gap.classList.remove("drag-over")); });
+        }
+        list.appendChild(card);
+      });
+      addGap(editorSequence.length);
+      if (focusId) {
+        const target = all("[data-draft-id]", list).find((item) => item.dataset.draftId === focusId);
+        if (target) target.focus();
+      }
+    }
+
+    function openEditor(key, trigger) {
+      key = String(key);
+      const current = byIndex.get(key);
+      const dialog = $("case-editor");
+      if (!current || !dialog || !$("case-editor-steps")) return;
+      editorCase = key;
+      editorTrigger = trigger;
+      editorDrag = null;
+      const steps = originalEditorSteps(key);
+      const drafts = savedDrafts.get(key) || [];
+      editorSequence = [];
+      for (let gap = 0; gap <= steps.length; gap += 1) {
+        drafts.filter((item) => item.gap === gap).forEach((item) => editorSequence.push({ type: "database", id: item.id }));
+        if (gap < steps.length) editorSequence.push({ type: "recorded", stepIndex: gap, step: steps[gap] });
+      }
+      text($("case-editor-title"), "Editor visual · " + current.id + " · " + (current.title || "Caso de teste"));
+      text($("case-editor-rerun"), reportConnection ? "Reexecutar este teste" : "Como reexecutar");
+      editorMessage("Rascunho visual · não executado · não altera este resultado.");
+      renderEditor();
+      if (typeof dialog.showModal === "function") dialog.showModal(); else dialog.setAttribute("open", "");
+      if ($("case-editor-close")) $("case-editor-close").focus();
+    }
+
+    readSavedDrafts();
+
+    function closeJourneyPickers(restoreFocus = false) {
+      let trigger = null;
+      all("[data-journey-page]").forEach((control) => {
+        if (control.getAttribute("aria-expanded") === "true") trigger = control;
+        control.setAttribute("aria-expanded", "false");
+      });
+      all(".journey-case-picker").forEach((panel) => { panel.hidden = true; });
+      if (restoreFocus && trigger) trigger.focus();
+    }
+
+    function filterJourneyCases(panel) {
+      const search = panel.querySelector("[data-journey-search]");
+      const term = normalize(search ? search.value : "");
+      const rows = all(".journey-case-row", panel);
+      let visible = 0;
+      rows.forEach((row) => {
+        row.hidden = !!term && !normalize([row.dataset.search || "", row.textContent].join(" ")).includes(term);
+        if (!row.hidden) visible += 1;
+      });
+      text(panel.querySelector("[data-journey-count]"), term ? visible + " de " + rows.length + " CTs" : rows.length + " CTs nesta página");
+      const empty = panel.querySelector("[data-journey-empty]");
+      if (empty) empty.hidden = visible > 0;
+    }
+
+    // Keep records in discovery order in the DOM. Only their visual grid
+    // positions and a decorative, local canvas form the reference's S path.
+    function layoutJourneyRoute() {
+      const route = document.querySelector(".journey-route");
+      const track = route && route.querySelector(".journey-track");
+      if (!route || !track || typeof route.getBoundingClientRect !== "function") return;
+      const width = route.getBoundingClientRect().width;
+      if (!(width > 0)) return;
+      const nodes = all(".journey-node[data-journey-position]", track);
+      if (!nodes.length) return;
+      const columns = width >= 1080 ? 4 : width >= 820 ? 3 : width >= 560 ? 2 : 1;
+      route.dataset.journeyColumns = String(columns);
+      route.style.setProperty("--journey-columns", String(columns));
+      track.style.setProperty("--journey-columns", String(columns));
+      // Multi-column terminals need 66px plus a 12px gap and safe outer margin.
+      route.style.setProperty("--journey-gutter", (columns === 1 ? 20 : 88) + "px");
+      route.style.setProperty("--journey-top", (columns === 1 ? 66 : 36) + "px");
+      route.style.setProperty("--journey-bottom", (columns === 1 ? 66 : 42) + "px");
+      route.style.setProperty("--journey-row-gap", (columns === 1 ? 44 : 90) + "px");
+      nodes.forEach((node, index) => {
+        const row = Math.floor(index / columns);
+        const column = row % 2 === 0 ? index % columns : columns - 1 - index % columns;
+        node.style.setProperty("grid-row", String(row + 1));
+        node.style.setProperty("grid-column", String(column + 1));
+      });
+      const bounds = route.getBoundingClientRect();
+      const boxes = nodes.map((node) => {
+        const box = node.getBoundingClientRect();
+        return { left: box.left - bounds.left, right: box.right - bounds.left,
+          top: box.top - bounds.top, bottom: box.bottom - bounds.top,
+          cx: box.left + box.width / 2 - bounds.left, cy: box.top + box.height / 2 - bounds.top };
+      });
+      if (![bounds.width, bounds.height, ...boxes.flatMap((box) => Object.values(box))].every(Number.isFinite)
+          || !(bounds.height > 0)) return;
+      const first = boxes[0], last = boxes[boxes.length - 1];
+      const start = route.querySelector(".journey-terminal-start");
+      const end = route.querySelector(".journey-terminal-end");
+      const labelWidth = 66, labelHeight = 32;
+      const place = (label, x, y) => {
+        const position = { x: Math.max(4, Math.min(bounds.width - labelWidth - 4, x)),
+          y: Math.max(4, Math.min(bounds.height - labelHeight - 4, y)) };
+        if (label) {
+          label.style.setProperty("left", position.x + "px");
+          label.style.setProperty("top", position.y + "px");
+        }
+        return position;
+      };
+      const rightwardEnd = Math.floor((nodes.length - 1) / columns) % 2 === 0;
+      const startAt = columns === 1
+        ? place(start, first.cx - labelWidth / 2, first.top - labelHeight - 16)
+        : place(start, first.left - labelWidth - 12, first.cy - labelHeight / 2);
+      const endAt = columns === 1
+        ? place(end, last.cx - labelWidth / 2, last.bottom + 16)
+        : place(end, rightwardEnd ? last.right + 12 : last.left - labelWidth - 12, last.cy - labelHeight / 2);
+      route.dataset.journeyReady = "true";
+      const canvas = route.querySelector(".journey-route-canvas");
+      if (!canvas || typeof canvas.getContext !== "function") return;
+      let context;
+      try { context = canvas.getContext("2d"); } catch { return; }
+      if (!context) return;
+      const ratio = Math.min(2, Math.max(1, Number(window.devicePixelRatio) || 1));
+      const pixelWidth = Math.ceil(bounds.width * ratio), pixelHeight = Math.ceil(bounds.height * ratio);
+      if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
+      if (canvas.height !== pixelHeight) canvas.height = pixelHeight;
+      context.setTransform(ratio, 0, 0, ratio, 0, 0);
+      context.clearRect(0, 0, bounds.width, bounds.height);
+      const lines = [], turns = [];
+      const line = (x1, y1, x2, y2) => lines.push({ x1, y1, x2, y2 });
+      if (columns === 1) line(first.cx, startAt.y + labelHeight, first.cx, first.top);
+      else line(startAt.x + labelWidth, first.cy, first.left, first.cy);
+      boxes.slice(1).forEach((next, index) => {
+        const previous = boxes[index];
+        if (columns === 1) {
+          line(previous.cx, previous.bottom, next.cx, next.top);
+        } else if (Math.floor(index / columns) === Math.floor((index + 1) / columns)) {
+          const right = Math.floor(index / columns) % 2 === 0;
+          line(right ? previous.right : previous.left, previous.cy, right ? next.left : next.right, next.cy);
+        } else {
+          const right = Math.floor(index / columns) % 2 === 0;
+          const x1 = right ? previous.right : previous.left, x2 = right ? next.right : next.left;
+          const turn = right ? bounds.width - 8 : 8;
+          lines.push({ x1, y1: previous.cy, x2, y2: next.cy, turn });
+          turns.push({ x: (x1 + x2) / 8 + turn * .75, y: (previous.cy + next.cy) / 2 });
+        }
+      });
+      if (columns === 1) line(last.cx, last.bottom, last.cx, endAt.y);
+      else line(rightwardEnd ? last.right : last.left, last.cy,
+        rightwardEnd ? endAt.x : endAt.x + labelWidth, last.cy);
+      const light = document.body.dataset.theme === "light";
+      const computedGold = typeof window.getComputedStyle === "function"
+        ? window.getComputedStyle(route).getPropertyValue("--journey-gold").trim() : "";
+      const gold = computedGold || (light ? "#c88a09" : "#ffca38");
+      context.beginPath();
+      lines.forEach((segment) => {
+        context.moveTo(segment.x1, segment.y1);
+        if (segment.turn !== undefined) context.bezierCurveTo(segment.turn, segment.y1, segment.turn, segment.y2, segment.x2, segment.y2);
+        else context.lineTo(segment.x2, segment.y2);
+      });
+      context.lineCap = "round";
+      context.lineJoin = "round";
+      context.strokeStyle = gold;
+      context.lineWidth = 6;
+      context.shadowColor = light ? "rgba(204,144,12,.35)" : "rgba(255,191,35,.7)";
+      context.shadowBlur = light ? 9 : 18;
+      context.stroke();
+      context.shadowBlur = 0;
+      context.strokeStyle = light ? gold : "#ffdb72";
+      context.lineWidth = 2;
+      context.stroke();
+      turns.forEach((point) => {
+        context.beginPath();
+        context.arc(point.x, point.y, 7, 0, Math.PI * 2);
+        context.fillStyle = gold;
+        context.shadowBlur = light ? 6 : 14;
+        context.fill();
+        context.shadowBlur = 0;
+        context.strokeStyle = light ? "#fff8df" : "#fff5cb";
+        context.lineWidth = 2;
+        context.stroke();
+      });
+    }
+    let journeyFrame = 0;
+    function scheduleJourneyLayout() {
+      if (journeyFrame) return;
+      journeyFrame = window.requestAnimationFrame(() => {
+        journeyFrame = 0;
+        layoutJourneyRoute();
+      });
+    }
+
     // Reuse the export controls in the full-canvas result header, keeping a
     // single instance and its listeners when navigating to another report view.
     const reportToolbar = document.querySelector(".report-topbar .toolbar");
@@ -98,7 +487,7 @@
       });
       const selected = model.items[index];
       text(model.title, selected.title);
-      text(model.position, index === 0 ? "Resumo do CT" : "Registro " + index + " de " + (model.items.length - 1) + " · " + selected.kindLabel);
+      text(model.position, index === 0 ? "Visão geral do teste" : "Etapa " + index + " de " + (model.items.length - 1) + " · " + selected.kindLabel);
       const cursor = available.findIndex((item) => item.index === index);
       model.previous.disabled = cursor <= 0;
       model.next.disabled = cursor === available.length - 1;
@@ -287,21 +676,63 @@
       if (caseHeader) caseHeader.addEventListener("click", (event) => event.preventDefault());
       const meta = detail.querySelector(".case-meta");
       if (meta) meta.textContent = meta.textContent.replace(" · clique para ver a linha do tempo", "");
-      const labels = { action: "Ação", assertion: "Verificação", signal: "Sinal técnico", observation: "Observação", summary: "Visão do caso" };
-      const symbols = { action: "→", assertion: "◇", signal: "!", observation: "◉", summary: "i" };
-      [{ node: summary, kind: "summary", title: "Resumo do CT" }, ...entries.map((node) => ({
+      const labels = { action: "Ação realizada", assertion: "Conferência", signal: "Sinal técnico", observation: "Registro da página", summary: "Visão do caso" };
+      const states = {
+        pass: { symbol: "✓", outcome: "Passou" },
+        fail: { symbol: "×", outcome: "Não passou" },
+        unknown: { symbol: "?", outcome: "Sem resultado" },
+        recorded: { symbol: "▣", outcome: "Captura registrada" },
+        info: { symbol: "i", outcome: "Informativo" },
+        warning: { symbol: "!", outcome: "Atenção" },
+      };
+      const summaryResults = {
+        PASS: { state: "pass", outcome: "Aprovado", description: "Visão geral da ação e das conferências deste caso." },
+        FAIL: { state: "fail", outcome: "Reprovado", description: "Veja o motivo da reprovação e as conferências deste caso." },
+        BLOCKED: { state: "warning", outcome: "Bloqueado", description: "Um impedimento não permitiu concluir o teste." },
+        SKIPPED: { state: "unknown", outcome: "Sem validação", description: "O caso não foi validado nesta execução." },
+      };
+      const fallbackDescriptions = {
+        action: "A interação foi registrada; o resultado não foi informado.",
+        assertion: "Conferência registrada, sem resultado informado.",
+        signal: "Registro técnico para análise; não reprova o caso por si só.",
+        observation: "Estado da página registrado; não é uma aprovação do teste.",
+      };
+      [{ node: summary, kind: "summary", title: "Resultado do caso" }, ...entries.map((node) => ({
         node, kind: Object.keys(labels).find((kind) => node.classList.contains(kind)) || "observation",
         title: (node.querySelector("h3") || {}).textContent || "Registro da execução",
       }))].forEach((item, index) => {
+        // A case verdict never supplies the outcome of an individual step.
+        // Only explicit server metadata can classify a check or interaction;
+        // older reports remain honest about their missing step-level results.
+        const hasState = Object.prototype.hasOwnProperty.call(states, item.node.dataset.stepState);
+        const result = item.kind === "summary"
+          ? Object.prototype.hasOwnProperty.call(summaryResults, detail.dataset.status)
+            ? summaryResults[detail.dataset.status]
+            : { state: "unknown", outcome: "Sem resultado", description: "O resultado deste caso não foi informado." }
+          : { state: hasState ? item.node.dataset.stepState : "unknown" };
+        const state = states[result.state];
+        const outcome = result.outcome || (hasState && item.node.dataset.stepOutcome || "").trim() || state.outcome;
+        const description = result.description || (item.node.dataset.stepDescription || "").trim() || fallbackDescriptions[item.kind];
+        const kindLabel = item.kind === "observation" && item.node.querySelector(".shots img")
+          ? "Captura da página" : labels[item.kind];
+        const sidebarTitle = item.kind === "assertion" && item.title === "Ausência de novas falhas técnicas da aplicação"
+          ? "Erros durante a ação" : item.title;
         const control = button("", () => selectCaseStep(model, index), "case-step-button");
         control.dataset.stepIndex = String(index);
         control.dataset.stepKind = item.kind;
+        control.dataset.stepState = result.state;
         control.setAttribute("aria-controls", item.node.id);
+        control.setAttribute("aria-label", (index ? "Etapa " + index + ": " : "") + sidebarTitle + ". " + description + " Resultado: " + outcome + ".");
         const copy = make("span", "step-copy");
-        copy.append(make("span", "step-kind", labels[item.kind]), make("span", "step-label", item.title));
-        control.append(make("span", "step-number", index ? String(index).padStart(2, "0") : "i"), copy, make("span", "step-indicator", symbols[item.kind]));
+        const status = make("span", "step-status");
+        status.dataset.stepState = result.state;
+        const icon = make("span", "step-status-icon", state.symbol);
+        icon.setAttribute("aria-hidden", "true");
+        status.append(icon, make("span", "step-status-label", outcome));
+        copy.append(make("span", "step-kind", kindLabel), make("span", "step-label", sidebarTitle), make("small", "step-description", description), status);
+        control.append(make("span", "step-number", index ? String(index).padStart(2, "0") : "i"), copy);
         list.appendChild(control);
-        model.items.push({ ...item, button: control, kindLabel: labels[item.kind] });
+        model.items.push({ ...item, button: control, kindLabel });
       });
       list.addEventListener("keydown", (event) => {
         if (!["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
@@ -386,12 +817,20 @@
         if (current) nav.setAttribute("aria-current", "page"); else nav.removeAttribute("aria-current");
       });
       text($("view-title"), views[view][0]);
+      if (view === "journey" && $("view-title")) {
+        text($("view-title"), "Jornada ");
+        const accent = document.createElement("span");
+        accent.className = "journey-heading-accent";
+        accent.textContent = "observada";
+        $("view-title").appendChild(accent);
+      }
       text($("view-subtitle"), views[view][1]);
       if (view === "results") updateCaseNavigation();
       if (view === "evidence" || view === "journey") {
         const section = all(".report-view[data-view]").find((item) => item.dataset.view === view);
         if (section) all("img[data-source-shot]", section).forEach(hydrateImage);
       }
+      if (view === "journey") scheduleJourneyLayout();
       const heading = view === "results" ? $("result-view-title") || $("view-title") : $("view-title");
       if (focus && heading) {
         heading.tabIndex = -1;
@@ -413,6 +852,7 @@
     function openCase(index, focus = true) {
       const key = String(index);
       if (!byIndex.has(key)) return;
+      closeJourneyPickers();
       selectedCase = key;
       navigate("results", focus);
     }
@@ -452,10 +892,91 @@
       event.preventDefault();
       navigate(nav.dataset.reportNav);
     }));
-    all("[data-open-case]").forEach((control) => control.addEventListener("click", (event) => {
-      event.preventDefault();
-      openCase(control.dataset.openCase);
-    }));
+    document.addEventListener("click", (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target) return;
+      const open = target.closest("[data-open-case]");
+      if (open) { event.preventDefault(); openCase(open.dataset.openCase); return; }
+      const edit = target.closest("[data-edit-case], [data-edit-current]");
+      if (edit) {
+        event.preventDefault();
+        openEditor(edit.hasAttribute("data-edit-current") ? selectedCase : edit.dataset.editCase, edit);
+        return;
+      }
+      const page = target.closest("[data-journey-page]");
+      if (page) {
+        event.preventDefault();
+        const panel = $(page.getAttribute("aria-controls"));
+        if (!panel || !panel.classList.contains("journey-case-picker")) return;
+        const wasOpen = !panel.hidden;
+        closeJourneyPickers();
+        if (!wasOpen) {
+          panel.hidden = false;
+          page.setAttribute("aria-expanded", "true");
+          filterJourneyCases(panel);
+          const first = panel.querySelector("[data-journey-search]") || panel.querySelector("[data-open-case], [data-edit-case], [data-journey-close]");
+          if (first) first.focus();
+          panel.scrollIntoView({ block: "nearest", behavior: prefersReducedMotion() ? "auto" : "smooth" });
+        }
+        return;
+      }
+      if (target.closest("[data-journey-close]")) closeJourneyPickers(true);
+    });
+    document.addEventListener("input", (event) => {
+      const search = event.target instanceof Element ? event.target.closest("[data-journey-search]") : null;
+      const panel = search && search.closest(".journey-case-picker");
+      if (panel) filterJourneyCases(panel);
+    });
+    listen("case-editor-close", "click", closeEditor);
+    listen("case-editor", "close", () => { editorDrag = null; if (editorTrigger) editorTrigger.focus(); });
+    listen("case-editor-save", "click", () => {
+      if (!editorCase) return;
+      let gap = 0;
+      const drafts = [];
+      editorSequence.forEach((item) => {
+        if (item.type === "recorded") gap += 1;
+        else if (drafts.length < draftLimit) drafts.push({ id: item.id, type: "database", gap, order: drafts.length });
+      });
+      if (drafts.length) savedDrafts.set(editorCase, drafts); else savedDrafts.delete(editorCase);
+      if (draftSource) draftSource.textContent = serializeDrafts();
+      editorMessage($("download-report")
+        ? "Rascunho guardado nesta aba. Baixe o relatório para conservar esta versão. Resultados e evidências originais não foram alterados."
+        : "Rascunho guardado nesta aba. O arquivo original não foi alterado. Nada foi executado.");
+    });
+    listen("database-step-card", "dragstart", (event) => {
+      if (!editorCase) return;
+      editorDrag = "new";
+      if (event.dataTransfer) { event.dataTransfer.effectAllowed = "copy"; event.dataTransfer.setData("text/plain", "Consulta de exemplo não executada"); }
+    });
+    listen("database-step-card", "dragend", () => {
+      editorDrag = null;
+      all(".drag-over", $("case-editor-steps") || document).forEach((gap) => gap.classList.remove("drag-over"));
+    });
+    listen("database-step-card", "click", () => {
+      const gaps = all(".case-editor-insert", $("case-editor-steps") || document);
+      if (gaps.length) { gaps[gaps.length - 1].focus(); editorMessage("Escolha «Adicionar aqui» entre os passos para inserir a consulta de exemplo."); }
+    });
+    listen("case-editor-rerun", "click", () => {
+      const current = editorCase && byIndex.get(editorCase);
+      if (!reportConnection || !current) {
+        editorMessage("Reexecução não iniciada. Abra o relatório pela aplicação AutoJev para reexecutar um CT. Os cartões de banco são apenas visuais e não serão executados.");
+        return;
+      }
+      const target = reportConnection.appUrl + "/#/reexecutar/" + encodeURIComponent(reportConnection.sourceId) + "/" + encodeURIComponent(String(current.id));
+      window.open(target, "_blank", "noopener,noreferrer");
+      editorMessage("Confirmação de reexecução solicitada na aplicação. Nenhuma ação foi iniciada por este relatório. Os cartões de banco do rascunho não serão executados.");
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") return;
+      if ($("case-editor") && $("case-editor").hasAttribute("open")) closeEditor();
+      else closeJourneyPickers(true);
+    });
+    window.addEventListener("resize", scheduleJourneyLayout);
+    window.addEventListener("afterprint", scheduleJourneyLayout);
+    const journeyRoute = document.querySelector(".journey-route");
+    if (journeyRoute && typeof window.ResizeObserver === "function") {
+      new window.ResizeObserver(scheduleJourneyLayout).observe(journeyRoute);
+    }
     // Preserve links from the coverage ledger into original case timeline entries.
     document.addEventListener("click", (event) => {
       const link = event.target instanceof Element ? event.target.closest('a[href^="#timeline-"]') : null;
@@ -575,7 +1096,7 @@
       ]));
       saveBlob(new Blob(["\ufeff" + rows.map((row) => row.map(csvCell).join(";")).join("\r\n")], { type: "text/csv;charset=utf-8" }), "autojev-casos.csv");
     });
-    listen("download-report", "click", () => saveBlob(new Blob([originalDocument], { type: "text/html;charset=utf-8" }), "autojev-relatorio.html"));
+    listen("download-report", "click", () => saveBlob(new Blob([exportDocument()], { type: "text/html;charset=utf-8" }), "autojev-relatorio.html"));
     listen("print-report", "click", () => window.print());
 
     let printState = null;

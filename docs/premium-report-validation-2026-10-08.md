@@ -435,3 +435,48 @@ Regressão: 325 testes backend aprovados, incluindo 43 novos testes de apresenta
 técnica; build e 81 testes frontend aprovados. Um aviso de depreciação
 Starlette/AnyIO, sem falha. Backend local atualizado; `git diff --check` limpo.
 Nenhuma chamada a modelos, nova exploração ou publicação foi necessária.
+
+## 2026-10-13 — Resumo didático do CT e resultados por etapa
+
+O resumo apresenta o resultado preservado do caso, a ação solicitada e uma
+lista das conferências registradas, com explicações simples e indicadores
+individuais. A justificativa do JEV, as probabilidades, a documentação e o
+veredito detalhado permanecem disponíveis em uma seção inicialmente recolhida.
+Uma revisão de imagens sem indícios não é apresentada como aprovação visual
+completa. Resultados ausentes não são convertidos em aprovações.
+
+A lateral mostra o tipo, a finalidade e o resultado de cada etapa:
+
+- Conferência: aprovada, reprovada ou sem resultado registrado.
+- Ação: concluída, não concluída ou sem confirmação de conclusão.
+- Captura: evidência registrada em azul, nunca uma verificação aprovada.
+- Sinal técnico: ocorrência para consulta, sem reprovação automática do CT.
+
+Validação com a habilidade Browser (indisponível nesta sessão) e fallback para
+Playwright MCP, usando a execução salva `62dbcc08-8156-411c-873c-d2632e740690`:
+
+- CT001: resumo da seleção `Name (Z to A)` e três conferências aprovadas;
+  seis etapas e resumo visíveis na lateral em 1440 × 900, sem rolagem extra.
+- CT012: reprovação por indício visual preservada, apesar das verificações
+  locais aprovadas. A etapa visual aparece reprovada de forma independente.
+- Celular 390 × 844: cards empilhados e sem vazamento horizontal.
+- Temas claro/escuro, navegação pelo teclado e impressão com restauração
+  dos detalhes recolhidos após a impressão.
+- HTML baixado reaberto offline, com os resultados por etapa e sem botão
+  redundante de download, erros JavaScript ou requisições HTTP/HTTPS.
+- HTML original preservado com o mesmo SHA-256 documentado anteriormente.
+
+Capturas: `data/mcp-validation/ct-summary-desktop-final.png`,
+`ct-summary-mobile-final.png` e `ct-summary-light.png`.
+Arquivo offline: `data/mcp-validation/ct-summary-offline-20261013.html`.
+
+Regressão específica: 336 testes backend e 86 testes frontend aprovados,
+incluindo 55 novos casos de resumo/metadados e cinco novos testes da lateral.
+Build aprovado; `git diff --check` limpo. A suíte backend completa foi
+interrompida após 6min41s, com 616 testes aprovados e nenhuma falha reportada
+até esse ponto; não se declara aprovação da suíte inteira. O aviso de
+depreciação Starlette/AnyIO já existente permanece.
+
+Nenhuma exploração foi repetida, nenhum resultado histórico foi alterado
+e não houve chamadas pagas aos modelos. Para ver o novo layout, basta reabrir
+o relatório pela aplicação; arquivos HTML já baixados não se atualizam sozinhos.

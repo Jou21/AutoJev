@@ -48,6 +48,7 @@ from autojev.services.auxiliary_review_policy import (
 from autojev.services.visual_review_input import build_visual_review_input
 from autojev.services.action_dispatch import is_stale_undispatched_action
 from autojev.services.coverage import CoveragePlanner, canonical_url
+from autojev.services.rerun_recipe import build_rerun_recipe
 from autojev.services.scenario_documentation import local_scenario_documentation
 from autojev.services.technical_signals import (
     build_scenario_evidence,
@@ -3138,6 +3139,12 @@ class ExplorationManager:
                     f"Executando · {decision.action}"
                     f"{' ' + str(decision.target) if decision.target else ''}",
                 )
+                # Capture preconditions before dispatch can mutate the page.
+                # Private replay metadata is persisted only on the action,
+                # never passed to auxiliary models or copied into CT evidence.
+                rerun_recipe = build_rerun_recipe(
+                    observation, decision, item["app_url"], secret_values=secret_values,
+                )
                 result, next_observation = await asyncio.wait_for(
                     executor.execute(decision, credentials),
                     timeout=self._operation_timeout(deadline),
@@ -3263,6 +3270,9 @@ class ExplorationManager:
                 )
                 safe_decision = redact(asdict(decision), secret_values)
                 safe_result = redact(result.to_dict(), secret_values)
+                # The builder has already rejected secret/credential values.
+                # Redacting hashes with short credentials would corrupt them.
+                safe_result.setdefault("evidence", {})["rerun_recipe"] = rerun_recipe
                 self.repository.add_action(
                     exploration_id, next_action, safe_decision, safe_result
                 )

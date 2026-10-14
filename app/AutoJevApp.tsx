@@ -78,6 +78,22 @@ type View =
   | "settings"
   | "detail";
 
+type AppRoute = { view: View; explorationId?: string; rerunScenarioId?: string };
+
+type ScenarioRerunPreflight = {
+  available: boolean;
+  code?: string;
+  reason?: string;
+  title?: string;
+  url?: string;
+  scenario_id?: string;
+  source_exploration_id?: string;
+  checks?: string[];
+  effects?: string[];
+  manual_preparation_required?: boolean;
+  scope?: { local_checks?: boolean; visual_review?: boolean; database_steps?: boolean; missing_visual_checks?: boolean };
+};
+
 type Model = {
   id?: string;
   model_id?: string;
@@ -183,6 +199,9 @@ type ScenarioCase = {
   created_at?: string;
   screenshots?: string[];
   evidence?: {
+    action_dispatched?: boolean;
+    rerun_blocked_reason?: string;
+    rerun_blocked_explanation?: string;
     timeline?: ScenarioTimelineEntry[];
     technical_signals?: ScenarioTechnicalSignal[];
     assertions?: ScenarioAssertion[];
@@ -228,10 +247,33 @@ type UsageBucket = {
   cost_complete?: boolean;
 };
 
+type RerunPreparation = {
+  version?: number;
+  attempts?: number;
+  expected_url?: string;
+  current_url?: string;
+  reason_code?: string | null;
+  reason_label?: string | null;
+  instruction?: string;
+};
+
 type Exploration = {
   id: string;
   app_url: string;
   status: string;
+  rerun?: {
+    running?: boolean;
+    phase?: "queued" | "preparing" | "waiting_preparation" | "validating_preparation" | "executing" | "generating_report" | "finished";
+    source_exploration_id?: string;
+    source_scenario_id?: string;
+    exploration_id?: string;
+    reason?: string;
+    reason_label?: string;
+    action_dispatched?: boolean;
+    preparation?: RerunPreparation;
+    outcome?: string;
+    finished_at?: string;
+  };
   created_at?: string;
   updated_at?: string;
   started_at?: string;
@@ -301,6 +343,8 @@ type Exploration = {
     test_scenarios?: number;
   };
   pages_visited?: number;
+  steps_completed?: number;
+  actions?: { result?: { success?: boolean; finished_at?: string } | null }[];
   actions_count?: number;
   issues_count?: number;
   scenarios_count?: number;
@@ -691,13 +735,98 @@ export function explorationDuration(exploration: Exploration, now = Date.now()) 
   return `${minutes}m ${seconds}s`;
 }
 
-export function explorationDetailState(explorationId: string | undefined, selected: Exploration | null, loading: boolean, settledId: string | null) {
+export function awaitingRerunReport(exploration: Exploration | null, now = Date.now()) {
+  // A rerun's terminal browser status can precede its asynchronous HTML report.
+  // Keep fetching until the artifact or failure event arrives, with a finite
+  // grace period so a broken renderer/API cannot leave an endless polling loop.
+  const finished = Date.parse(exploration?.finished_at || exploration?.rerun?.finished_at || exploration?.updated_at || exploration?.created_at || "");
+  const reportFailed = (exploration?.events || []).some((event) => event.type === "report_failed");
+  return !!exploration?.rerun && !exploration.report_available && !reportFailed
+    && Number.isFinite(finished) && finished <= now + 30000 && now - finished < 120000;
+}
+
+export function explorationDetailState(explorationId: string | undefined, selected: Exploration | null, loading: boolean, settledId: string | null, now = Date.now()) {
   const exploration = selected?.id === explorationId ? selected : null;
   return {
     exploration,
     loading: loading || (!exploration && settledId !== explorationId),
-    shouldPoll: !exploration || isLive(exploration.status) || !!exploration.visual_review_resume?.running,
+    shouldPoll: !exploration || isLive(exploration.status) || !!exploration.visual_review_resume?.running || awaitingRerunReport(exploration, now),
   };
+}
+
+export function scenarioRerunPhaseStepState(exploration: Exploration, stepKey: string, now = Date.now()): "done" | "active" | "pending" {
+  const rerun = exploration.rerun;
+  if (!rerun) return "pending";
+  // Dispatch alone is not proof that the browser finished the action. A closed
+  // or cancelled browser can leave its real-world effect unknown.
+  const actionCompleted = (typeof exploration.steps_completed === "number" && exploration.steps_completed >= 1)
+    || (exploration.actions || []).some((action) => typeof action.result?.success === "boolean");
+  const live = isLive(exploration.status);
+  if (stepKey === "preparing") {
+    if (rerun.phase === "executing" || actionCompleted) return "done";
+    return live && ["queued", "preparing", "waiting_preparation", "validating_preparation"].includes(rerun.phase || "") ? "active" : "pending";
+  }
+  if (stepKey === "executing") {
+    if (actionCompleted) return "done";
+    return live && rerun.phase === "executing" ? "active" : "pending";
+  }
+  if (stepKey === "reporting") {
+    if (exploration.report_available === true) return "done";
+    const reportFailed = (exploration.events || []).some((event) => event.type === "report_failed");
+    return !reportFailed && (rerun.phase === "generating_report" || rerun.phase === "finished") && awaitingRerunReport(exploration, now) ? "active" : "pending";
+  }
+  return "pending";
+}
+
+export function scenarioRerunPreparationKey(exploration: Exploration | null) {
+  const preparation = exploration?.rerun?.preparation;
+  return `${exploration?.id || ""}:${preparation?.version ?? preparation?.attempts ?? 0}`;
+}
+
+export function scenarioRerunPreparationConsent(exploration: Exploration | null, confirmation: { key: string; confirmed: boolean }) {
+  return exploration?.rerun?.phase === "waiting_preparation"
+    && confirmation.key === scenarioRerunPreparationKey(exploration) && confirmation.confirmed;
+}
+
+export function scenarioRerunFeedback(exploration: Exploration) {
+  const rerun = exploration.rerun;
+  if (!rerun || isLive(exploration.status)) return null;
+  const blocked = (exploration.scenarios || []).find((scenario) => scenario.status.toLowerCase() === "blocked");
+  const reason = rerun.reason || blocked?.evidence?.rerun_blocked_reason || exploration.error;
+  const preparationMessages: Record<string, string> = {
+    before_url_changed: "A página aberta não é a mesma em que o teste original começou. Faça login e abra a página esperada antes de confirmar a preparação.",
+    before_effect_changed: "A página apresenta conteúdo ou controles diferentes do teste original. Recrie as condições iniciais antes de tentar novamente.",
+    before_state_changed: "Os dados ou as opções da página estão diferentes do teste original. Recrie as condições iniciais antes de tentar novamente.",
+    missing_target: "O controle usado pelo teste não foi encontrado na página preparada.",
+    ambiguous_target: "Mais de um controle corresponde ao original. A ação não foi repetida para evitar escolher o controle errado.",
+    cross_origin_source: "A página aberta está fora do site autorizado para este teste.",
+    authentication_required: "O login ou outra etapa de autenticação precisa ser concluído antes de repetir o teste.",
+  };
+  const actionCompleted = (exploration.steps_completed || 0) > 0 || (exploration.actions_count || 0) > 0
+    || (exploration.counters?.actions || 0) > 0 || (exploration.actions || []).some((action) => typeof action.result?.success === "boolean");
+  const dispatched = rerun.action_dispatched === true || blocked?.evidence?.action_dispatched === true;
+  const notStarted = !actionCompleted && !dispatched && exploration.status.toLowerCase() !== "failed"
+    && (!!blocked || !!preparationMessages[reason || ""]);
+  if (!notStarted && !exploration.error) return null;
+  return {
+    notStarted,
+    title: notStarted ? "Reexecução não iniciada" : "A execução encontrou um erro",
+    nextStep: notStarted ? "Inicie uma nova reexecução pela execução original e prepare o login e a página esperada antes de continuar." : undefined,
+    detail: rerun.reason_label || blocked?.evidence?.rerun_blocked_explanation || preparationMessages[reason || ""]
+      || (notStarted ? "A preparação do navegador não pôde ser confirmada. Nenhuma ação do CT foi executada; o relatório original permanece preservado." : exploration.error || "Não foi possível concluir a reexecução."),
+  };
+}
+
+export function ScenarioRerunPreparation({ preparation, validating = false }: { preparation?: RerunPreparation; validating?: boolean }) {
+  return <div className="rerun-preparation-guide">
+    {preparation?.reason_label && <p className="rerun-preparation-reason" role="status"><AlertCircle size={17} /><span>{preparation.reason_label} <strong>Nenhuma ação do CT foi executada.</strong></span></p>}
+    <div className="rerun-page-comparison" aria-label="Comparação da página para reexecução">
+      <div><span>Página esperada pelo teste</span><strong>{preparation?.expected_url || "Consulte a página inicial do CT original"}</strong></div>
+      <ArrowRight size={18} aria-hidden="true" />
+      <div><span>Página aberta no navegador</span><strong>{preparation?.current_url || "Aguardando leitura do navegador"}</strong></div>
+    </div>
+    <p>{validating ? "Conferindo a página e os pré-requisitos. Aguarde o resultado antes de confirmar novamente." : preparation?.instruction || "No navegador da reexecução, faça login se necessário, abra a página esperada e recrie os dados e opções iniciais do CT. Depois confirme abaixo para conferir a preparação."}</p>
+  </div>;
 }
 
 function formatTokens(value?: number) {
@@ -738,13 +867,36 @@ function errorMessage(error: unknown) {
   return "Não foi possível concluir a solicitação.";
 }
 
-function parseRoute(): { view: View; explorationId?: string } {
-  if (typeof window === "undefined") return { view: "dashboard" };
-  const hash = window.location.hash || "#/dashboard";
+export function parseAppHash(hash: string): AppRoute {
+  const rerun = hash.match(/^#\/reexecutar\/([^/]+)\/([^/]+)$/);
+  try {
+    if (rerun) return { view: "detail", explorationId: decodeURIComponent(rerun[1]), rerunScenarioId: decodeURIComponent(rerun[2]) };
+  } catch { return { view: "dashboard" }; }
   const detail = hash.match(/^#\/exploracoes\/([^/]+)$/);
-  if (detail) return { view: "detail", explorationId: decodeURIComponent(detail[1]) };
+  try {
+    if (detail) return { view: "detail", explorationId: decodeURIComponent(detail[1]) };
+  } catch { return { view: "dashboard" }; }
   const route = NAV_ITEMS.find((item) => item.hash === hash);
   return { view: route?.view || "dashboard" };
+}
+
+function parseRoute(): AppRoute {
+  return parseAppHash(typeof window === "undefined" ? "#/dashboard" : window.location.hash || "#/dashboard");
+}
+
+export function connectReportToApplication(html: string, sourceExplorationId: string, appOrigin: string) {
+  const url = new URL(appOrigin);
+  if (!["http:", "https:"].includes(url.protocol) || url.origin !== appOrigin || !sourceExplorationId) return html;
+  const runtime = JSON.stringify({ app_url: url.origin, source_exploration_id: sourceExplorationId }).replace(/</g, "\\u003c");
+  const clean = html.replace(/<script\b(?=[^>]*\bid=["']report-app-runtime["'])[^>]*>[\s\S]*?<\/script\s*>/gi, "");
+  return clean.replace(/<head\b[^>]*>/i, (head) => head + '<script id="report-app-runtime" type="application/json">' + runtime + "</script>");
+}
+
+export async function confirmScenarioRerun(request: ApiRequest, sourceId: string, scenarioId: string, consent: boolean, available: boolean) {
+  if (!consent || !available) throw new Error("Confirme os efeitos da reexecução antes de iniciar.");
+  return request<Exploration>(`/explorations/${encodeURIComponent(sourceId)}/scenarios/${encodeURIComponent(scenarioId)}/rerun`, {
+    method: "POST", body: JSON.stringify({ confirm: true }),
+  });
 }
 
 function resolveAssetUrl(value?: string | null) {
@@ -937,7 +1089,7 @@ function ArchitectureFlow({ compact = false }: { compact?: boolean }) {
 }
 
 export default function AutoJevApp() {
-  const [route, setRoute] = useState<{ view: View; explorationId?: string }>({ view: "dashboard" });
+  const [route, setRoute] = useState<AppRoute>({ view: "dashboard" });
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [providers, setProviders] = useState<Provider[]>([]);
@@ -1106,6 +1258,10 @@ export default function AutoJevApp() {
   useEffect(() => {
     if (route.view !== "detail" || !route.explorationId || !explorationDetailState(route.explorationId, selectedExploration, detailLoading, settledExplorationId).shouldPoll) return;
     const timer = window.setInterval(async () => {
+      if (!explorationDetailState(route.explorationId, selectedExploration, detailLoading, settledExplorationId).shouldPoll) {
+        window.clearInterval(timer);
+        return;
+      }
       const data = await loadExploration(route.explorationId as string, true);
       if (data && !isLive(data.status)) void loadCore(true);
     }, pollInterval);
@@ -1341,8 +1497,85 @@ export default function AutoJevApp() {
           </div>
         </Modal>
       )}
+      {route.explorationId && route.rerunScenarioId && <ScenarioRerunDialog
+        key={`${route.explorationId}/${route.rerunScenarioId}`}
+        sourceId={route.explorationId}
+        scenarioId={route.rerunScenarioId}
+        request={request}
+        onClose={() => navigate(`#/exploracoes/${encodeURIComponent(route.explorationId!)}`)}
+        onCreated={(created) => {
+          setExplorations((current) => [created, ...current.filter((item) => item.id !== created.id)]);
+          toast("Nova execução criada. Prepare o navegador e confirme a continuação para repetir o CT.", "success");
+          navigate(`#/exploracoes/${encodeURIComponent(created.id)}`);
+        }}
+      />}
     </div>
   );
+}
+
+export function ScenarioRerunConsent({ preflight, loading, error, busy, consent, onConsent, onConfirm, onClose }: {
+  preflight: ScenarioRerunPreflight | null;
+  loading: boolean;
+  error: string;
+  busy: boolean;
+  consent: boolean;
+  onConsent: (value: boolean) => void;
+  onConfirm: () => void;
+  onClose: () => void;
+}) {
+  return <div className="modal-form rerun-confirmation">
+    {loading ? <p className="rerun-loading" role="status"><Spinner />Verificando se o CT pode ser reexecutado…</p> : error ? <p className="rerun-error" role="alert">{error}</p> : preflight && <>
+      <div className="rerun-case"><span className="section-kicker">{preflight.scenario_id || "Caso de teste original"}</span><strong>{preflight.title || "Reexecução de um CT"}</strong>{preflight.url && <span>{preflight.url}</span>}</div>
+      {!preflight.available ? <div className="rerun-unavailable" role="status"><AlertCircle size={20} /><div><strong>Reexecução indisponível para este CT</strong><p>{preflight.reason || "Esta execução não preservou uma receita segura para repetir a ação. Execute uma nova exploração para registrar receitas de reexecução."}</p></div></div> : <>
+        <div className="rerun-effects"><strong>Antes de confirmar</strong><p>A ação original será repetida uma única vez e pode alterar dados na aplicação testada. Não é uma simulação.</p>
+          <ul>{(preflight.effects?.length ? preflight.effects : ["Um novo navegador será aberto para preparar o teste.", "Somente a ação original deste CT será repetida.", "Um novo resultado e novas evidências serão registrados, preservando a execução original."]).map((effect, index) => <li key={index}>{effect}</li>)}</ul>
+        </div>
+        <p className="rerun-local-note"><ShieldCheck size={17} />As verificações locais salvas serão repetidas, sem chamadas à LLM. Revisões visuais e cartões de banco do rascunho não serão executados.</p>
+        {preflight.scope?.missing_visual_checks && <p className="rerun-local-note">Este CT também tinha análise visual; ela não será repetida nem apresentada como validada.</p>}
+        <div className="rerun-preparation"><strong>Você prepara o navegador antes da ação</strong><p>Faça login, recrie as pré-condições do CT e abra a página esperada. A execução aguardará sua confirmação em «Continuar reexecução» antes de realizar a ação.</p></div>
+        <label className="rerun-consent"><input type="checkbox" checked={consent} disabled={busy} onChange={(event) => onConsent(event.target.checked)} /><span>Entendo que esta reexecução é real, pode modificar dados da aplicação e não executará os cartões de banco do rascunho.</span></label>
+      </>}
+    </>}
+    <div className="modal-actions"><button type="button" className="button ghost" disabled={busy} onClick={onClose}>Voltar sem reexecutar</button><button type="button" className="button primary" disabled={loading || busy || !!error || !preflight?.available || !consent} onClick={onConfirm}>{busy ? <Spinner /> : <Play size={16} />}{busy ? "Criando execução…" : "Confirmar reexecução real"}</button></div>
+  </div>;
+}
+
+function ScenarioRerunDialog({ sourceId, scenarioId, request, onClose, onCreated }: {
+  sourceId: string;
+  scenarioId: string;
+  request: ApiRequest;
+  onClose: () => void;
+  onCreated: (exploration: Exploration) => void;
+}) {
+  const [preflight, setPreflight] = useState<ScenarioRerunPreflight | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [consent, setConsent] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const confirming = useRef(false);
+  useEffect(() => {
+    const controller = new AbortController();
+    void request<ScenarioRerunPreflight>(`/explorations/${encodeURIComponent(sourceId)}/scenarios/${encodeURIComponent(scenarioId)}/rerun`, { signal: controller.signal })
+      .then((value) => { if (!controller.signal.aborted) setPreflight(value); })
+      .catch((caught) => { if (!controller.signal.aborted) setError(errorMessage(caught)); })
+      .finally(() => { if (!controller.signal.aborted) setLoading(false); });
+    return () => controller.abort();
+  }, [request, sourceId, scenarioId]);
+  const confirm = async () => {
+    if (confirming.current || !consent || !preflight?.available || loading) return;
+    confirming.current = true;
+    setBusy(true);
+    setError("");
+    try {
+      const created = await confirmScenarioRerun(request, sourceId, scenarioId, consent, preflight.available);
+      if (!created || typeof created.id !== "string" || !created.id) throw new Error("A API não informou a nova execução. Atualize o histórico antes de tentar novamente.");
+      onCreated(created);
+    } catch (caught) { setError(errorMessage(caught)); }
+    finally { confirming.current = false; setBusy(false); }
+  };
+  return <Modal title="Reexecutar um caso de teste" description="Nova execução isolada; o resultado original não será alterado." onClose={() => { if (!confirming.current) onClose(); }}>
+    <ScenarioRerunConsent preflight={preflight} loading={loading} error={error} busy={busy} consent={consent} onConsent={setConsent} onConfirm={() => void confirm()} onClose={onClose} />
+  </Modal>;
 }
 
 function PageHeader({
@@ -2282,6 +2515,7 @@ function ExplorationDetailView({
   const [cancelling, setCancelling] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [openingReport, setOpeningReport] = useState(false);
+  const [rerunPreparationConfirmation, setRerunPreparationConfirmation] = useState({ key: "", confirmed: false });
   const [detailTab, setDetailTab] = useState<"overview" | "scenarios" | "coverage" | "activity" | "evidence" | "config">("overview");
   if (loading && !exploration) return <div className="detail-loading"><Spinner size={24} /><span>Carregando exploração…</span></div>;
   if (!exploration) {
@@ -2289,6 +2523,10 @@ function ExplorationDetailView({
   }
 
   const status = explorationStatus(exploration.status);
+  const rerun = exploration.rerun;
+  const rerunFeedback = scenarioRerunFeedback(exploration);
+  const rerunPreparationConfirmed = scenarioRerunPreparationConsent(exploration, rerunPreparationConfirmation);
+  const validatingRerunPreparation = rerun?.phase === "validating_preparation";
   const phase = exploration.phase || (isLive(exploration.status) ? "exploring" : "complete");
   const configuredStepLimit = typeof exploration.options?.max_steps === "number" ? exploration.options.max_steps : null;
   const phaseProgress = exploration.phase_progress || {
@@ -2322,7 +2560,11 @@ function ExplorationDetailView({
   const terminalOutcomeVisible = phase === "complete" && !isLive(exploration.status);
   const parallelScenarioPipelineStarted = events.some((event) => event.type === "scenario_parallel_started");
   const scenariosRunningInParallel = isLive(exploration.status) && browserPhaseActive && parallelScenarioPipelineStarted;
-  const phaseSteps = [
+  const phaseSteps = rerun ? [
+    { key: "preparing", label: "Preparar navegador", detail: "pré-condições manuais" },
+    { key: "executing", label: "Reexecutar o CT", detail: "uma ação original" },
+    { key: "reporting", label: "Novo relatório", detail: exploration.report_available ? "pronto" : "pendente" },
+  ] : [
     { key: "exploring", label: "Explorar", detail: `${exploration.browser_progress?.current ?? counters.actions} ações` },
     {
       key: "documenting",
@@ -2334,6 +2576,7 @@ function ExplorationDetailView({
     { key: "reporting", label: "Relatório", detail: exploration.report_available ? "pronto" : "pendente" },
   ];
   const phaseStepState = (stepKey: string): "done" | "active" | "pending" => {
+    if (rerun) return scenarioRerunPhaseStepState(exploration, stepKey);
     if (phase === "complete") return "done";
     if (stepKey === "exploring") {
       if (browserPhaseActive || phase === "preparing") return "active";
@@ -2345,14 +2588,27 @@ function ExplorationDetailView({
     }
     return phase === "reporting" ? "active" : "pending";
   };
-  const phaseHeadline = terminalOutcomeVisible && actionLimitReached
+  const phaseHeadline = rerun
+    ? rerunFeedback?.notStarted ? "Reexecução não iniciada"
+      : rerun.phase === "generating_report" ? "Montando o relatório da reexecução"
+      : validatingRerunPreparation ? "Conferindo a preparação do CT"
+      : rerun.phase === "waiting_preparation" ? "Prepare o CT antes de continuar"
+      : rerun.phase === "executing" ? "Reexecutando a ação original do CT"
+        : rerun.phase === "finished" ? `Reexecução ${status.label.toLocaleLowerCase("pt-BR")}` : "Preparando a reexecução do CT"
+    : terminalOutcomeVisible && actionLimitReached
     ? `Limite de ${exploration.browser_progress?.total || configuredStepLimit || counters.actions} ações atingido`
     : terminalOutcomeVisible && completedWithRestrictions
       ? "Exploração concluída com restrições"
       : phase === "documenting"
         ? visualEvidenceMode ? "Analisando as capturas dos CTs" : "Revisando as evidências dos CTs"
         : exploration.phase_label || status.label;
-  const phaseDescription = terminalOutcomeVisible && actionLimitReached
+  const phaseDescription = rerun
+    ? rerunFeedback?.notStarted ? `${rerunFeedback.detail} O resultado original não foi alterado.`
+      : validatingRerunPreparation ? "O AutoJev está conferindo a página, os controles e as condições iniciais antes de executar a ação salva."
+      : rerun.phase === "waiting_preparation" ? "Faça login e recrie as pré-condições no novo navegador. A ação só será executada se a página e os pré-requisitos corresponderem ao CT original."
+      : rerun.phase === "executing" ? "Somente a ação salva e suas verificações locais serão repetidas. Não há exploração autônoma nem chamadas à LLM."
+        : "Esta é uma execução separada. O resultado e as evidências originais permanecem preservados; os cartões de banco do rascunho não são executados."
+    : terminalOutcomeVisible && actionLimitReached
     ? "A automação não falhou na ação 67: ela concluiu o limite configurado e preservou tudo o que encontrou. A cobertura ficou parcial porque ainda havia opções a explorar."
     : terminalOutcomeVisible && completedWithRestrictions
       ? "A cobertura alcançável terminou. As verificações que não puderam ser concluídas foram preservadas com suas evidências e restrições, sem serem contadas como testes aprovados."
@@ -2374,10 +2630,12 @@ function ExplorationDetailView({
   };
 
   const resume = async () => {
+    if (rerun && !rerunPreparationConfirmed) return;
     setResuming(true);
+    if (rerun) setRerunPreparationConfirmation({ key: scenarioRerunPreparationKey(exploration), confirmed: false });
     try {
       await request(`/explorations/${encodeURIComponent(exploration.id)}/resume`, { method: "POST" });
-      toast("Exploração retomada.", "success");
+      toast(rerun ? "Preparação enviada para conferência. A ação só será executada se os pré-requisitos corresponderem." : "Exploração retomada.", rerun ? "info" : "success");
       onRefresh();
     } catch (error) {
       toast(errorMessage(error), "error");
@@ -2416,7 +2674,8 @@ function ExplorationDetailView({
         else onReport(data);
       } else if (contentType.includes("text/html")) {
         const html = await response.text();
-        const blobUrl = URL.createObjectURL(new Blob([html], { type: "text/html" }));
+        const connectedHtml = connectReportToApplication(html, exploration.id, window.location.origin);
+        const blobUrl = URL.createObjectURL(new Blob([connectedHtml], { type: "text/html" }));
         window.open(blobUrl, "_blank", "noopener,noreferrer");
         window.setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
       } else {
@@ -2449,12 +2708,14 @@ function ExplorationDetailView({
         </div>
       </header>
 
-      {exploration.error && <div className="callout error-callout"><AlertCircle size={19} /><div><strong>A execução encontrou um erro</strong><span>{exploration.error}</span></div></div>}
+      {rerun && <section className="panel rerun-provenance" aria-label="Origem da reexecução"><RefreshCcw size={20} /><div><strong>Reexecução de {rerun.source_scenario_id || "um CT"}</strong><p>Nova execução com evidências próprias. O relatório original não é alterado. Verificações locais apenas; cartões de banco e análises da LLM não são executados.</p>{rerun.source_exploration_id && <button type="button" className="text-button" onClick={() => navigate(`#/exploracoes/${encodeURIComponent(rerun.source_exploration_id!)}`)}>Abrir execução original <ArrowRight size={14} /></button>}</div></section>}
 
-      <section className={`execution-command panel phase-${phase}`} aria-live="polite">
+      {(rerunFeedback || exploration.error) && <div className={`callout ${rerunFeedback?.notStarted ? "warning-callout" : "error-callout"}`} role="status"><AlertCircle size={19} /><div><strong>{rerunFeedback?.title || "A execução encontrou um erro"}</strong><span>{rerunFeedback?.detail || exploration.error}</span>{rerunFeedback?.nextStep && <span>{rerunFeedback.nextStep}</span>}</div></div>}
+
+      <section className={`execution-command panel phase-${phase} ${rerunFeedback?.notStarted ? "execution-not-started" : ""}`} aria-live="polite">
         <div className="execution-command-head">
-          <span className={`phase-symbol ${isLive(exploration.status) ? "live" : ""}`}>
-            {isLive(exploration.status) ? <Spinner size={22} /> : status.value === "failed" ? <AlertCircle size={22} /> : <CheckCircle2 size={22} />}
+          <span className={`phase-symbol ${isLive(exploration.status) ? "live" : rerunFeedback?.notStarted ? "warning" : status.value === "failed" ? "error" : ""}`}>
+            {isLive(exploration.status) ? <Spinner size={22} /> : status.value === "failed" || rerunFeedback?.notStarted ? <AlertCircle size={22} /> : <CheckCircle2 size={22} />}
           </span>
           <div className="execution-command-copy">
             <span className="section-kicker">{isLive(exploration.status) ? <><span className="live-pulse" />Agora no AutoJev</> : "Resultado da execução"}</span>
@@ -2507,10 +2768,10 @@ function ExplorationDetailView({
       />}
 
       {waitingForInput && (
-        <section className="panel intervention-card intervention-wide">
+        <section className={`panel intervention-card intervention-wide ${rerun ? "rerun-intervention" : ""}`}>
           <span className="section-kicker"><span className="live-pulse" />Ação necessária</span>
-          <div><h2>Faça login no navegador</h2><p>{waitingEvent?.message || "O navegador está aguardando sua intervenção para continuar."}</p></div>
-          <button className="button primary" onClick={() => void resume()} disabled={resuming}>{resuming ? <Spinner /> : <Play size={16} />}Continuar exploração</button>
+          <div><h2>{rerun ? validatingRerunPreparation ? "Conferindo a preparação do CT" : rerun.preparation?.reason_code ? "Ajuste a página e tente novamente" : "Prepare o CT no navegador" : "Faça login no navegador"}</h2>{rerun ? <ScenarioRerunPreparation preparation={rerun.preparation} validating={validatingRerunPreparation} /> : <p>{waitingEvent?.message || "O navegador está aguardando sua intervenção para continuar."}</p>}{rerun && <label className="rerun-consent"><input type="checkbox" checked={rerunPreparationConfirmed} disabled={resuming || validatingRerunPreparation} onChange={(event) => setRerunPreparationConfirmation({ key: scenarioRerunPreparationKey(exploration), confirmed: event.target.checked })} /><span>Preparei a página e autorizo a ação original, se a conferência dos pré-requisitos passar.</span></label>}</div>
+          <button className="button primary" onClick={() => void resume()} disabled={resuming || (!!rerun && !rerunPreparationConfirmed)}>{resuming || validatingRerunPreparation ? <Spinner /> : <Play size={16} />}{validatingRerunPreparation ? "Conferindo preparação…" : rerun ? "Continuar reexecução" : "Continuar exploração"}</button>
         </section>
       )}
 

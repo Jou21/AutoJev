@@ -196,6 +196,155 @@ async function timelineComponents() {
   return componentModule.exports;
 }
 
+test("CT rerun routes and app report bootstrap preserve explicit confirmation boundaries", async () => {
+  const { parseAppHash, connectReportToApplication } = await timelineComponents();
+  assert.deepEqual(parseAppHash("#/reexecutar/source-123/CT%2F001"), { view: "detail", explorationId: "source-123", rerunScenarioId: "CT/001" });
+  assert.deepEqual(parseAppHash("#/reexecutar/%E0%A4%A/CT001"), { view: "dashboard" });
+  const html = connectReportToApplication('<html><head><script id="report-app-runtime" type="application/json">{"app_url":"https://other.example"}</script></head><body>Report</body></html>', 'source</script><script>alert(1)</script>', "http://localhost:5173");
+  assert.equal((html.match(/<script id="report-app-runtime"/g) || []).length, 1);
+  assert.doesNotMatch(html, /https:\/\/other.example/);
+  assert.match(html, /source\\u003c\/script>/);
+  const runtime = JSON.parse(html.match(/<script id="report-app-runtime" type="application\/json">([\s\S]*?)<\/script>/)[1]);
+  assert.equal(runtime.app_url, "http://localhost:5173");
+  assert.equal(runtime.source_exploration_id, 'source</script><script>alert(1)</script>');
+});
+
+test("real CT rerun POST requires both explicit consent and available saved recipe and sends no draft data", async () => {
+  const { confirmScenarioRerun } = await timelineComponents();
+  const calls = [];
+  const request = async (...values) => { calls.push(values); return { id: "new-run", status: "queued" }; };
+  for (const [consent, available] of [[false, false], [false, true], [true, false]]) {
+    await assert.rejects(confirmScenarioRerun(request, "source", "CT001", consent, available), /Confirme os efeitos/);
+  }
+  assert.equal(calls.length, 0);
+  const created = await confirmScenarioRerun(request, "source/run", "CT/001", true, true);
+  assert.equal(created.id, "new-run");
+  assert.deepEqual(calls, [["/explorations/source%2Frun/scenarios/CT%2F001/rerun", { method: "POST", body: '{"confirm":true}' }]]);
+});
+
+test("real CT rerun consent explains data effects, manual preparation and unavailable historical recipes", async () => {
+  const { ScenarioRerunConsent } = await timelineComponents();
+  const handlers = { onConsent() {}, onConfirm() { throw new Error("Rendering must never execute a CT"); }, onClose() {} };
+  const available = { available: true, scenario_id: "CT001", title: "Ação original", url: "https://example.test/cart", scope: { missing_visual_checks: true } };
+  const blocked = renderToStaticMarkup(createElement(ScenarioRerunConsent, { preflight: available, loading: false, error: "", busy: false, consent: false, ...handlers }));
+  assert.match(blocked, /ação original será repetida uma única vez e pode alterar dados/);
+  assert.match(blocked, /sem chamadas à LLM/);
+  assert.match(blocked, /cartões de banco do rascunho não serão executados/);
+  assert.match(blocked, /recrie as pré-condições/);
+  assert.match(blocked, /Continuar reexecução/);
+  assert.match(blocked, /type="button"[^>]*disabled=""[^>]*>.*Confirmar reexecução real/);
+  const ready = renderToStaticMarkup(createElement(ScenarioRerunConsent, { preflight: available, loading: false, error: "", busy: false, consent: true, ...handlers }));
+  assert.doesNotMatch(ready, /class="button primary"[^>]*disabled/);
+  const historical = renderToStaticMarkup(createElement(ScenarioRerunConsent, { preflight: { available: false, reason: "Receita não registrada nesta execução histórica." }, loading: false, error: "", busy: false, consent: false, ...handlers }));
+  assert.match(historical, /Reexecução indisponível.*Receita não registrada/);
+  assert.doesNotMatch(historical, /type="checkbox"/);
+});
+
+test("terminal CT reruns keep polling for their new report and stop on ready, renderer failure or bounded expiry", async () => {
+  const { explorationDetailState } = await timelineComponents();
+  const finishedAt = "2026-10-14T12:00:00Z";
+  const finished = Date.parse(finishedAt);
+  const pending = { id: "new-run", status: "completed", app_url: "https://example.test", report_available: false,
+    finished_at: finishedAt, rerun: { phase: "finished", running: false, source_exploration_id: "original" }, events: [],
+  };
+  const state = (value, elapsed = 1000) => explorationDetailState("new-run", value, false, "new-run", finished + elapsed);
+  assert.equal(state(pending).shouldPoll, true, "terminal browser status does not imply its report is already ready");
+  assert.equal(state({ ...pending, status: "cancelled" }).shouldPoll, true, "cancelled reruns also produce a separate report");
+  assert.equal(state({ ...pending, report_available: true }).shouldPoll, false);
+  assert.equal(state({ ...pending, events: [{ type: "report_failed" }] }).shouldPoll, false);
+  assert.equal(state(pending, 119999).shouldPoll, true);
+  assert.equal(state(pending, 120000).shouldPoll, false, "a missing renderer response is bounded to two minutes");
+  assert.equal(state({ ...pending, finished_at: undefined }).shouldPoll, false, "missing timestamps cannot create an unbounded wait");
+  assert.equal(state({ ...pending, finished_at: "not-a-date" }).shouldPoll, false, "invalid timestamps cannot create an unbounded wait");
+  assert.equal(state(pending, -30001).shouldPoll, false, "an implausible future timestamp cannot extend the grace period");
+  assert.equal(state(pending, -30000).shouldPoll, true, "small clock skew is tolerated");
+  assert.equal(state({ ...pending, finished_at: undefined, rerun: { ...pending.rerun, finished_at: finishedAt } }).shouldPoll, true, "the saved rerun completion timestamp is an allowed fallback");
+  assert.equal(state({ ...pending, rerun: undefined }).shouldPoll, false, "normal terminal explorations retain their existing behavior");
+  assert.equal(state({ ...pending, rerun: undefined, status: "running" }).shouldPoll, true, "ordinary live exploration polling is preserved");
+  const source = await readFile(new URL("../app/AutoJevApp.tsx", import.meta.url), "utf8");
+  assert.match(source, /setInterval\(async \(\) => \{\s*if \(!explorationDetailState\([^;]+\.shouldPoll\) \{\s*window\.clearInterval\(timer\);\s*return;\s*\}\s*const data = await loadExploration/, "expiry is rechecked on every timer tick, even when API requests fail and do not update selected state");
+});
+
+test("CT rerun phase checks require completed browser evidence and a real report artifact", async () => {
+  const { scenarioRerunPhaseStepState } = await timelineComponents();
+  const finishedAt = "2026-10-14T12:00:00Z";
+  const now = Date.parse(finishedAt) + 1000;
+  const base = { id: "rerun", app_url: "https://example.test", status: "cancelled", finished_at: finishedAt,
+    steps_completed: 0, actions: [], report_available: false,
+    rerun: { phase: "finished", running: false }, events: [],
+  };
+  const states = (value) => ["preparing", "executing", "reporting"].map((key) => scenarioRerunPhaseStepState(value, key, now));
+  assert.deepEqual(states(base), ["pending", "pending", "active"], "cancellation before dispatch must not show completed preparation or execution");
+  assert.deepEqual(states({ ...base, status: "partial", rerun: { ...base.rerun, action_dispatched: true },
+    events: [{ type: "scenario_rerun_state", payload: { action_dispatched: true } }],
+    actions: [{ result: { evidence: { action_dispatched: true } } }],
+  }), ["pending", "pending", "active"], "dispatch with an unknown effect is not a completed action");
+  assert.deepEqual(states({ ...base, status: "partial", report_available: true }), ["pending", "pending", "done"], "a blocked CT can have a completed report without having run its action");
+  assert.deepEqual(states({ ...base, status: "completed", steps_completed: 1 }), ["done", "done", "active"]);
+  assert.deepEqual(states({ ...base, actions: [{ result: { success: false, finished_at: finishedAt } }] }), ["done", "done", "active"], "a stored failed result proves the execution phase finished, not that the CT passed");
+  assert.deepEqual(states({ ...base, report_available: true, steps_completed: 1 }), ["done", "done", "done"]);
+  assert.deepEqual(states({ ...base, events: [{ type: "report_failed" }] }), ["pending", "pending", "pending"], "renderer failure is never a green completed report");
+  assert.equal(scenarioRerunPhaseStepState(base, "reporting", now + 120000), "pending", "an expired renderer wait is not completed");
+  assert.deepEqual(states({ ...base, finished_at: "invalid" }), ["pending", "pending", "pending"]);
+  assert.deepEqual(states({ ...base, status: "waiting_input", rerun: { phase: "waiting_preparation", running: true } }), ["active", "pending", "pending"]);
+  assert.deepEqual(states({ ...base, status: "waiting_input", rerun: { phase: "validating_preparation", running: true } }), ["active", "pending", "pending"], "checking prerequisites is not execution of the CT action");
+  assert.deepEqual(states({ ...base, status: "running", rerun: { phase: "executing", running: true } }), ["done", "active", "pending"], "the executing phase proves preparation was advanced but not that the action finished");
+  assert.deepEqual(states({ ...base, rerun: undefined }), ["pending", "pending", "pending"], "the helper is scoped to CT reruns only");
+});
+
+test("rerun preparation consent is scoped to the current run and rejected-preparation version", async () => {
+  const { scenarioRerunPreparationKey, scenarioRerunPreparationConsent } = await timelineComponents();
+  const waiting = { id: "rerun-a", status: "waiting_input", rerun: { phase: "waiting_preparation", preparation: { version: 1, attempts: 0 } } };
+  const confirmation = { key: scenarioRerunPreparationKey(waiting), confirmed: true };
+  assert.equal(scenarioRerunPreparationConsent(waiting, confirmation), true);
+  assert.equal(scenarioRerunPreparationConsent(waiting, { ...confirmation, confirmed: false }), false);
+  assert.equal(scenarioRerunPreparationConsent({ ...waiting, id: "rerun-b" }, confirmation), false, "confirmation cannot authorize another rerun");
+  assert.equal(scenarioRerunPreparationConsent({ ...waiting, rerun: { ...waiting.rerun, preparation: { version: 2, attempts: 1 } } }, confirmation), false, "a rejected preparation requires a fresh explicit checkbox");
+  assert.equal(scenarioRerunPreparationConsent({ ...waiting, rerun: { ...waiting.rerun, phase: "validating_preparation" } }, confirmation), false, "a double resume is blocked while the backend is checking preparation");
+  assert.equal(scenarioRerunPreparationConsent({ ...waiting, rerun: { ...waiting.rerun, phase: "executing" } }, confirmation), false);
+  assert.equal(scenarioRerunPreparationConsent(null, confirmation), false);
+});
+
+test("rerun preparation compares the expected and open pages with readable correction instructions", async () => {
+  const { ScenarioRerunPreparation } = await timelineComponents();
+  const html = renderToStaticMarkup(createElement(ScenarioRerunPreparation, { preparation: {
+    version: 2, attempts: 1, expected_url: "https://example.test/inventory", current_url: "https://example.test/login",
+    reason_code: "before_url_changed", reason_label: "A página aberta não é a página original.",
+    instruction: "Faça login e abra a lista de produtos antes de continuar.",
+  } }));
+  assert.match(html, /Página esperada pelo teste/);
+  assert.match(html, /https:\/\/example.test\/inventory/);
+  assert.match(html, /Página aberta no navegador/);
+  assert.match(html, /https:\/\/example.test\/login/);
+  assert.match(html, /A página aberta não é a página original/);
+  assert.match(html, /Nenhuma ação do CT foi executada/);
+  assert.match(html, /Faça login e abra a lista de produtos/);
+  assert.doesNotMatch(html, /before_url_changed|"version"/);
+  const validating = renderToStaticMarkup(createElement(ScenarioRerunPreparation, { validating: true }));
+  assert.match(validating, /Conferindo a página e os pré-requisitos/);
+  assert.match(validating, /Aguarde o resultado antes de confirmar novamente/);
+});
+
+test("blocked historical reruns explain that the action did not start without hiding real errors or unknown effects", async () => {
+  const { scenarioRerunFeedback } = await timelineComponents();
+  const historic = { id: "old-rerun", status: "partial", steps_completed: 0, actions: [], error: "before_url_changed", rerun: { phase: "finished", reason: "before_url_changed" } };
+  const feedback = scenarioRerunFeedback(historic);
+  assert.equal(feedback.notStarted, true);
+  assert.equal(feedback.title, "Reexecução não iniciada");
+  assert.match(feedback.nextStep, /Inicie uma nova reexecução pela execução original/);
+  assert.match(feedback.nextStep, /prepare o login e a página esperada/);
+  assert.match(feedback.detail, /A página aberta não é a mesma/);
+  assert.doesNotMatch(feedback.detail, /before_url_changed/);
+  assert.equal(scenarioRerunFeedback({ ...historic, rerun: { ...historic.rerun, reason_label: "Abra a lista de produtos." } }).detail, "Abra a lista de produtos.");
+  assert.equal(scenarioRerunFeedback({ ...historic, error: "missing_target", rerun: { phase: "finished" }, scenarios: [{ id: "CT001", status: "BLOCKED", evidence: { rerun_blocked_explanation: "O botão original não está disponível." } }] }).detail, "O botão original não está disponível.");
+  for (const executed of [{ steps_completed: 1 }, { actions_count: 1 }, { counters: { actions: 1 } }, { actions: [{ result: { success: false } }] }, { rerun: { ...historic.rerun, action_dispatched: true } }, { scenarios: [{ id: "CT001", status: "blocked", evidence: { action_dispatched: true } }] }]) {
+    assert.equal(scenarioRerunFeedback({ ...historic, ...executed }).notStarted, false, "a completed or dispatched action must not be described as never started");
+  }
+  assert.equal(scenarioRerunFeedback({ ...historic, status: "failed", error: "Browser launch failed" }).title, "A execução encontrou um erro");
+  assert.equal(scenarioRerunFeedback({ ...historic, status: "waiting_input" }), null);
+  assert.equal(scenarioRerunFeedback({ ...historic, rerun: undefined }), null);
+});
+
 test("renders separate JEV, auxiliary LLM and total costs without losing precision", async () => {
   const { CostBreakdown } = await timelineComponents();
   const html = renderToStaticMarkup(createElement(CostBreakdown, {

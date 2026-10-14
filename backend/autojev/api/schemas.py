@@ -9,12 +9,24 @@ from pydantic import (
     ConfigDict,
     Field,
     SecretStr,
+    StrictBool,
     field_validator,
 )
 
 
 class ApiModel(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+
+class ScenarioRerunInput(ApiModel):
+    confirm: StrictBool
+
+    @field_validator("confirm")
+    @classmethod
+    def explicit_confirmation(cls, value: bool) -> bool:
+        if value is not True:
+            raise ValueError("Confirme explicitamente a reexecução deste CT.")
+        return value
 
 
 class ProviderModelInput(ApiModel):

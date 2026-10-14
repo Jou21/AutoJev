@@ -12,12 +12,13 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from autojev.services.scenario_timeline import prepare_scenario_timelines
+from autojev.services.rerun_projection import without_rerun_recipes
 from autojev.services.coverage_ledger import coverage_restriction_ledger
 from autojev.services.execution_summary import formatted_execution_duration, report_snapshot_key
 from autojev.services.visual_checks import visual_review_counts, visual_unavailability_label
-from autojev.services.verification_summary import verification_summary
+from autojev.services.verification_summary import NON_BUSINESS_CHECKS, verification_summary
 from autojev.services.report_localization import (
-    REPORT_LOCALE_VERSION, action_label, check_label, localize_report_presentation, report_text,
+    ACTION_LABELS, CHECK_LABELS, REPORT_LOCALE_VERSION, action_label, check_label, localize_report_presentation, report_text,
 )
 from autojev.adapters.report_premium import render_premium_report
 
@@ -44,6 +45,20 @@ RESTRICTION_REASONS = {
     "form_probe_target_not_empty": "O campo continuou preenchido após as tentativas de limpeza; a validação de campo vazio não pôde ser isolada",
 }
 
+# Presentation only: never turn these descriptions into new assertions or
+# copy protected field values into a second human-readable summary.
+CHECK_EXPLANATIONS = {
+    "selection_matches": "Conferir se a opção escolhida corresponde à solicitada.",
+    "product_sort_order": "Conferir a ordem dos produtos, sem perder ou acrescentar itens.",
+    "no_new_browser_errors": "Conferir novos erros atribuídos à aplicação durante a ação.",
+    "no_new_application_errors": "Conferir novos erros atribuídos à aplicação durante a ação.",
+    "observable_state_change": "Conferir se a interação produziu uma mudança na página.",
+    "field_value_matches": "Conferir se o campo manteve o valor preenchido.",
+    "field_retains_value": "Conferir se o campo manteve o valor preenchido.",
+    "other_fields_unchanged": "Conferir se os outros campos foram preservados.",
+    "visual_model": "Revisar uma possível diferença apontada nas imagens; não confirma um defeito funcional sozinha.",
+}
+
 
 class StandaloneHtmlReport:
     """Renders a self-contained, escaped HTML report with inline PNG evidence."""
@@ -56,7 +71,7 @@ class StandaloneHtmlReport:
     def __init__(self, artifact_root: Path) -> None:
         self.artifact_root = artifact_root.resolve()
 
-    def _image_data(self, exploration_id: str, relative_path: str) -> str | None:
+    def _image_path(self, exploration_id: str, relative_path: str) -> Path | None:
         candidate = (
             self.artifact_root
             / exploration_id
@@ -65,6 +80,12 @@ class StandaloneHtmlReport:
         ).resolve()
         allowed = (self.artifact_root / exploration_id / "screenshots").resolve()
         if allowed not in candidate.parents or not candidate.is_file():
+            return None
+        return candidate
+
+    def _image_data(self, exploration_id: str, relative_path: str) -> str | None:
+        candidate = self._image_path(exploration_id, relative_path)
+        if candidate is None:
             return None
         mime = "image/png" if candidate.suffix.lower() == ".png" else "image/jpeg"
         return f"data:{mime};base64,{base64.b64encode(candidate.read_bytes()).decode('ascii')}"
@@ -1198,6 +1219,30 @@ class StandaloneHtmlReport:
             + '</div>'
         )
 
+    @staticmethod
+    def _step_presentation(entry: dict[str, Any], kind: str, *, capture_exists: bool = False) -> tuple[str, str, str]:
+        """A capture is evidence, not a passed test; use only recorded booleans."""
+        if kind == "assertion":
+            assertion = entry.get("assertion")
+            assertion = assertion if isinstance(assertion, dict) else {}
+            purpose = CHECK_EXPLANATIONS.get(str(assertion.get("kind")), "Comparar o resultado observado com o esperado.")
+            if assertion.get("passed") is True:
+                return "pass", "Aprovada", purpose
+            if assertion.get("passed") is False:
+                return "fail", "Reprovada", purpose
+            return "unknown", "Sem resultado registrado", purpose
+        if kind == "action":
+            if entry.get("success") is True:
+                return "pass", "Ação concluída", "A ação foi executada; isso, sozinho, não confirma o resultado esperado."
+            if entry.get("success") is False:
+                return "fail", "Não concluída", "A automação não concluiu a ação; isso não confirma um defeito no site."
+            return "unknown", "Sem confirmação", "Não há confirmação registrada da conclusão desta ação."
+        if kind == "signal":
+            return "warning", "Ocorrência registrada", "Ocorrência técnica; sozinha, não reprova o teste."
+        if capture_exists:
+            return "recorded", "Captura registrada", "Captura salva; não é uma conferência do teste."
+        return "info", "Registro disponível", "Observação salva; não é uma conferência do teste."
+
     def _timeline(
         self, exploration_id: str, scenario: dict[str, Any], *, observation: bool = False,
     ) -> str:
@@ -1305,8 +1350,13 @@ class StandaloneHtmlReport:
                 f'<p class="muted">{f"Etapa {_h(step)}" if step is not None else ""}'
                 f'{f" · Alvo: {_h(entry.get('target'))}" if entry.get("target") else ""}</p>'
             ) if step is not None or entry.get("target") else ""
+            step_state, step_outcome, step_description = self._step_presentation(
+                entry, kind, capture_exists=bool(kind == "observation" and screenshot and self._image_path(exploration_id, screenshot)),
+            )
             rendered.append(
-                f'<li id="{self._timeline_entry_id(scenario, index)}" class="timeline-entry {kind}"><div class="timeline-marker" aria-hidden="true"></div>'
+                f'<li id="{self._timeline_entry_id(scenario, index)}" class="timeline-entry {kind}" '
+                f'data-step-state="{step_state}" data-step-outcome="{_h(step_outcome)}" '
+                f'data-step-description="{_h(step_description)}"><div class="timeline-marker" aria-hidden="true"></div>'
                 '<div class="timeline-content"><div class="event-meta">'
                 f'<span class="event-kind">{labels[kind]}</span>'
                 f'<time datetime="{_h(timestamp)}">{_h(self._timeline_time(timestamp))}</time></div>'
@@ -1349,6 +1399,109 @@ class StandaloneHtmlReport:
             + "".join(timelines) + '</details></section>'
         )
 
+    def _scenario_summary(self, scenario: dict[str, Any], status: str) -> str:
+        """Didactic, read-only overview of this CT's recorded result and checks."""
+        evidence = scenario.get("evidence") or {}
+        recorded_assertions = evidence.get("assertions")
+        if not isinstance(recorded_assertions, list):
+            recorded_assertions = [item.get("assertion") for item in evidence.get("timeline") or []
+                                   if isinstance(item, dict) and item.get("kind") == "assertion"]
+        assertions = [item for item in recorded_assertions if isinstance(item, dict)]
+        confirmed = sum(item.get("passed") is True for item in assertions)
+        failed = sum(item.get("passed") is False for item in assertions)
+        total = len(assertions)
+        verdict = evidence.get("verdict") or {}
+        kind = verdict.get("kind") if isinstance(verdict, dict) else None
+        headline, symbol = {
+            "PASS": ("Este teste passou", "✓"),
+            "FAIL": ("Este teste não passou", "×"),
+            "BLOCKED": ("Não foi possível concluir este teste", "!"),
+            "SKIPPED": ("Este teste está sem validação", "–"),
+        }[status]
+        if status == "PASS":
+            explanation = (
+                f"{confirmed} de {total} conferências tiveram o resultado esperado."
+                if total and confirmed == total and evidence.get("action_succeeded") is not False else
+                "Resultado salvo como aprovado, mas há conferências não confirmadas ou sem resultado. Consulte os detalhes."
+                if total else "Resultado salvo como aprovado. Não há conferências detalhadas registradas neste caso."
+            )
+        elif status == "FAIL":
+            explanation = (
+                "A automação não conseguiu concluir a ação. Veja o passo em que ela parou."
+                if evidence.get("action_succeeded") is False or kind == "execution_failure" else
+                "A revisão das imagens apontou uma possível diferença visual. Confira as evidências; isso não confirma um defeito funcional."
+                if kind == "visual_failure" else
+                "Uma verificação técnica não passou. Confira o erro registrado e seu possível impacto no uso."
+                if kind == "technical_failure" else
+                f"{failed} de {total} conferências não tiveram o resultado esperado."
+                if failed else "O resultado salvo é reprovado. Consulte os passos e as evidências para entender o motivo."
+            )
+        else:
+            explanation = (
+                "Uma restrição impediu concluir a validação. Veja o motivo nos detalhes; este caso não conta como aprovado."
+                if status == "BLOCKED" else "Não há validação concluída para este caso. Ele não conta como aprovado."
+            )
+        actions = [item for item in evidence.get("timeline") or []
+                   if isinstance(item, dict) and item.get("kind") == "action"]
+        action_title = "Ação sem detalhamento registrado"
+        if len(actions) > 1:
+            action_title = f"{len(actions)} ações registradas neste caso"
+        elif actions:
+            entry = actions[0]
+            preview = entry.get("action_preview")
+            preview = preview if isinstance(preview, dict) else {}
+            # A single, page/target-bound preview can describe a requested
+            # choice. Its before-image cannot prove what was selected after.
+            if (preview.get("version") == "action-target-v1"
+                    and entry.get("target") and preview.get("target") == entry["target"]
+                    and entry.get("url") and preview.get("url") == entry["url"]
+                    and isinstance(preview.get("action"), str) and preview["action"] in ACTION_LABELS):
+                action_title = action_label(preview["action"])
+                selection = self._preview_selection(preview.get("selection")) if preview["action"] == "select" else None
+                if selection and selection.get("requested_label"):
+                    action_title = f'Selecionar a opção “{selection["requested_label"]}”'
+            elif entry.get("title") in ACTION_LABELS.values():
+                action_title = str(entry["title"])
+            else:
+                action_title = "Interagir com a página"
+        checks = []
+        for assertion in assertions:
+            check_kind = str(assertion.get("kind") or "")
+            state, outcome, description = self._step_presentation({"assertion": assertion}, "assertion")
+            label = check_label(check_kind) if check_kind in CHECK_LABELS else "Conferência registrada"
+            icon = {"pass": "✓", "fail": "×", "unknown": "?"}[state]
+            checks.append(
+                f'<li class="ct-summary-check" data-state="{state}">'
+                f'<span class="ct-summary-check-icon" aria-hidden="true">{icon}</span>'
+                f'<div><strong>{_h(label)}</strong><small>{_h(description)}</small></div>'
+                f'<span class="ct-summary-check-status">{_h(outcome)}</span></li>'
+            )
+        business_confirmed = any(a.get("passed") is True and str(a.get("kind")) in CHECK_LABELS
+                                 and str(a.get("kind")) not in NON_BUSINESS_CHECKS for a in assertions)
+        scope = (
+            "Este resultado vale para a ação e as conferências deste caso, não para toda a aplicação."
+            if business_confirmed else
+            "Este caso não tem uma regra de negócio confirmada. Executar uma ação ou não registrar erros não garante que toda a funcionalidade esteja correta."
+        )
+        if isinstance(evidence.get("rerun_scope"), dict):
+            scope += " Reexecução individual: análises por modelo e cartões de consulta ao banco não foram executados."
+        blocked_explanation = evidence.get("rerun_blocked_explanation")
+        if status == "BLOCKED" and isinstance(blocked_explanation, str) and blocked_explanation:
+            explanation = blocked_explanation + " Este caso não conta como aprovado."
+        checklist = ('<ul>' + ''.join(checks) + '</ul>') if checks else (
+            '<p class="ct-summary-empty">Nenhuma conferência detalhada foi registrada. Consulte os passos e as evidências disponíveis.</p>'
+        )
+        return (
+            f'<section class="ct-overview" data-result="{status}" aria-label="Resumo do teste">'
+            '<header class="ct-overview-result">'
+            f'<span class="ct-summary-symbol" aria-hidden="true">{symbol}</span>'
+            f'<div><h3>{headline}</h3><p>{_h(explanation)}</p></div></header>'
+            '<div class="ct-summary-action"><span class="ct-summary-eyebrow">O que foi testado</span>'
+            f'<h3>{_h(action_title)}</h3><div class="url">Página: {_h(self._public_issue_url(scenario.get("url")))}</div></div>'
+            '<section class="ct-summary-checks" aria-label="Conferências do teste"><h4>O que conferimos</h4>'
+            f'{checklist}</section><p class="ct-summary-scope">{_h(scope)}</p></section>'
+        )
+
     def _scenario_card(self, exploration_id: str, scenario: dict[str, Any]) -> str:
         status = str(scenario.get("status", "SKIPPED"))
         if status not in {"PASS", "FAIL", "BLOCKED", "SKIPPED"}:
@@ -1375,7 +1528,9 @@ class StandaloneHtmlReport:
         signal_count = len(evidence.get("technical_signals") or [])
         case_label = str(scenario.get("id") or "CT")
         details = f"""
-            <details class="case-documentation"><summary>Descrição e passos do caso</summary>
+            <details class="case-documentation ct-summary-details"><summary>Ver detalhes do planejamento e da execução</summary>
+            <h3>Por que esta ação foi escolhida</h3><p>{_h(scenario.get("description"))}</p>
+            {verdict_detail}
             <div class="columns"><section><h3>Pré-condições</h3><ul>{preconditions}</ul></section><section><h3>Passos</h3><ol>{steps}</ol></section></div>
             <div class="result"><section><h3>Esperado</h3><p>{_h(scenario.get("expected_result"))}</p></section><section><h3>Obtido</h3><p>{_h(scenario.get("actual_result"))}</p></section></div></details>"""
         visual_detail = ""
@@ -1384,9 +1539,9 @@ class StandaloneHtmlReport:
         if visual.get("requested"):
             visual_meta = " · visual: " + ("analisado" if visual.get("status") == "assessed" else "em análise" if visual.get("status") == "pending" else "indisponível")
             if visual.get("status") == "assessed":
-                text = (f"{visual.get('accepted_count', 0)} indício(s) visual(is) · revisão necessária"
-                        if visual.get("accepted_count") else "Capturas analisadas · nenhum indício visual aceito")
-                note = "A confiança é declarada pelo modelo. Não há aprovação visual completa nem bug funcional confirmado apenas pela imagem."
+                text = (f"Revisão das imagens: {visual.get('accepted_count', 0)} possível(is) diferença(s) para conferir"
+                        if visual.get("accepted_count") else "Imagens revisadas: nenhuma diferença visual apontada")
+                note = "A revisão usa as capturas deste caso. Não garante que toda a aparência esteja correta nem confirma, sozinha, um defeito funcional."
                 if visual.get("context_limited") is True or visual.get("review_scope") == "saved_capture_only_legacy":
                     note += " Contexto textual limitado: esta revisão usa as capturas salvas; o DOM e o texto visível originais não foram preservados. Não equivale a uma análise com contexto semântico completo."
             elif visual.get("status") == "pending":
@@ -1403,15 +1558,15 @@ class StandaloneHtmlReport:
                     if reason in {"visual_assessment_not_returned", "visual_assessment_schema_invalid"} else
                     visual_unavailability_label(reason).capitalize() + ". As verificações locais foram preservadas."
                 )
-            visual_detail = f'<div class="context-note"><strong>{_h(text)}</strong><p>{_h(note)}</p></div>'
+            visual_detail = f'<div class="context-note ct-summary-visual" data-visual-status="{_h(visual.get("status"))}"><strong>{_h(text)}</strong><p>{_h(note)}</p></div>'
         return f"""<details class="scenario" data-status="{status}">
           <summary><div><span class="case-id">{_h(case_label)}</span><h2>{_h(scenario.get("title"))}</h2><span class="case-meta">{signal_count} sinal(is) técnico(s){visual_meta} · clique para ver a linha do tempo</span></div><span class="badge {badge_class}">{visible_status}</span></summary>
-          <div class="scenario-body"><p>{_h(scenario.get("description"))}</p>
-          <div class="url">{_h(self._public_issue_url(scenario.get("url")))}</div>
-          {verdict_detail}{visual_detail}{details}<h3 class="timeline-heading">Linha do tempo · ações e evidências</h3>
+          <div class="scenario-body">{self._scenario_summary(scenario, status)}
+          {visual_detail}{details}<h3 class="timeline-heading">Linha do tempo · ações e evidências</h3>
           {self._timeline(exploration_id, scenario)}</div></details>"""
 
     def generate(self, exploration: dict[str, Any], output_path: str) -> str:
+        exploration = without_rerun_recipes(exploration)
         exploration = localize_report_presentation(prepare_scenario_timelines(exploration))
         exploration_id = str(exploration["id"])
         recorded_scenarios = exploration.get("scenarios", [])

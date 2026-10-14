@@ -45,6 +45,11 @@ def _icon(name: str) -> str:
         "settings": '<path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3"/><circle cx="16" cy="17" r="3"/>',
         "download": '<path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5"/>',
         "robot": '<rect x="3" y="6" width="18" height="15" rx="5"/><path d="M12 2v4M7 12h1m8 0h1M8 17h8M1 11v6m22-6v6"/>',
+        "database": '<ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 4 16 4 16 0V5M4 12c0 4 16 4 16 0"/>',
+        "file": '<path d="M14 3H5v18h14V8z"/><path d="M14 3v5h5M8 12h8M8 16h8"/>',
+        "eye": '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+        "chevron": '<path d="m9 5 7 7-7 7"/>',
+        "info": '<circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/>',
     }
     return f'<svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{paths.get(name, paths["tests"])}</svg>'
 
@@ -197,6 +202,19 @@ def render_premium_report(renderer: Any, exploration: dict[str, Any], scenarios:
     top_pages = _pages_table(list(pages.values())[:6], compact=True)
     meta = f'<div class="meta"><div><strong>Aplicação</strong><div class="url">{_h(renderer._public_issue_url(exploration.get("app_url")))}</div></div><div><strong>Escopo</strong><div>{_h(fragments["scope"])}</div></div><div><strong>Evidência da LLM</strong><div>{_h(fragments["evidence_mode"])}</div></div><div><strong>Status</strong><div>{_h(fragments["status"])}</div></div><div><strong>Duração total</strong><div>{_h(renderer._duration(exploration))}</div></div><div><strong>Gerado em</strong><div>{_h(fragments["generated"])}</div></div></div>'
     overview = meta + '<p class="muted">A duração total inclui revisões auxiliares e geração do relatório.</p>' + metrics_html + '<div class="dashboard-grid">' + _panel("Resultado dos testes", donut, "Distribuição dos resultados registrados") + _panel("Atividade ao longo da execução", chart, "Início dos CTs por intervalo · não representa uso de CPU") + _panel("Natureza das verificações", categories_html, "Classificação derivada das evidências de cada CT") + _panel("Páginas com casos registrados", top_pages, "Contagem de CTs, não percentual de cobertura da página") + '</div>' + fragments["cost_summary"] + fragments["visual_summary"] + fragments["strength_summary"]
+    rerun_source = next((event.get("payload") for event in exploration.get("events", [])
+                         if event.get("type") == "scenario_rerun_source"
+                         and isinstance(event.get("payload"), dict)), None)
+    if rerun_source:
+        overview = (
+            '<div class="reading-guide rerun-provenance"><strong>Reexecução individual de '
+            + _h(rerun_source.get("source_scenario_id")) + '.</strong> '
+            'Este é um novo resultado; o relatório original permanece inalterado. '
+            'Foram previstas somente a ação original e as conferências locais. '
+            'Análises por modelo e cartões de consulta ao banco não são executados. '
+            '<br>Execução de origem: <span class="url">'
+            + _h(rerun_source.get("source_exploration_id")) + '</span></div>' + overview
+        )
     if shown_total != total:
         overview += f'<p class="reading-guide">Resumo histórico preservado: {shown_total} CTs registrados; detalhes individuais disponíveis de {total}. As listas e filtros usam somente os detalhes preservados.</p>'
     if fragments["completion_reason"]:
@@ -208,6 +226,7 @@ def render_premium_report(renderer: Any, exploration: dict[str, Any], scenarios:
         '<div class="result-location"><button id="case-back" class="button button-ghost">← Voltar para testes</button>'
         '<h1 id="result-view-title" tabindex="-1">Resultado do teste</h1></div>'
         '<div class="result-actions"><div class="result-case-navigation" role="group" aria-label="Navegar entre testes">'
+        '<button id="case-edit" class="button button-ghost" data-edit-current>Editar passos</button>'
         '<button id="case-prev" class="button button-ghost">← Teste anterior</button>'
         '<button id="case-next" class="button button-ghost">Teste seguinte →</button></div>'
         '<div id="result-report-actions" class="result-report-actions"></div></div></div>'
@@ -233,11 +252,13 @@ def render_premium_report(renderer: Any, exploration: dict[str, Any], scenarios:
         app_name = urlsplit(public_app).hostname or "Aplicação em teste"
     except ValueError:
         app_name = "Aplicação em teste"
-    payload = {"cases": cases, "pages": [item["page"] for item in pages.values()], "started_at": exploration.get("started_at"), "duration_seconds": duration}
+    payload = {"run_id": str(exploration["id"]), "cases": cases, "pages": [item["page"] for item in pages.values()], "started_at": exploration.get("started_at"), "duration_seconds": duration}
     data = '<script id="report-data" type="application/json">' + _json(payload) + '</script>'
     head = legacy_document.split('</head>', 1)[0]
     head = head.replace('<html lang="pt-BR"', f'<html data-report-layout="{REPORT_LAYOUT_VERSION}" lang="pt-BR"', 1)
-    css, js = (ASSETS / "premium.css").read_text(), (ASSETS / "premium.js").read_text()
+    css = (ASSETS / "premium.css").read_text() + '\n' + (ASSETS / "journey.css").read_text()
+    js = (ASSETS / "premium.js").read_text()
+    data = _case_editor() + data + '<script id="report-drafts" type="application/json">{"version":1,"cases":{}}</script>'
     return head + f'<style>{css}</style></head><body class="report-premium" data-view="overview" data-theme="dark" data-density="comfortable" data-report-schema="ct-timeline-v1"><aside class="report-sidebar"><div class="report-brand"><span class="brand-mark">{_icon("robot")}</span><div><strong class="brand-name">AUTOJEV</strong><span class="brand-caption">Relatório exploratório</span></div></div><nav aria-label="Seções do relatório">{nav}</nav><div class="sidebar-footer"><span class="legend-dot"></span>Relatório local e independente<small>Dados preservados · sem chamadas de IA</small></div></aside><main class="report-main"><header class="report-topbar"><div><span class="page-kicker">{_h(app_name)} / RELATÓRIO</span><h1 id="view-title" tabindex="-1">Visão geral</h1><p id="view-subtitle">Uma visão clara dos testes, resultados e evidências da execução.</p></div><div class="toolbar"><button id="print-report" class="button button-ghost">Imprimir</button><button id="download-report" class="button button-primary">{_icon("download")}Baixar relatório</button></div></header>{views}<noscript><style>.report-view[hidden],#scenarios .scenario[hidden]{{display:block!important}}.report-sidebar,.report-tools,.result-navigation,.toolbar{{display:none!important}}</style><p>JavaScript está desativado. Todas as seções são exibidas para leitura; abra os casos para ver suas evidências.</p></noscript></main><dialog id="evidence-dialog" class="evidence-dialog"><div class="dialog-toolbar"><strong id="evidence-caption">Captura registrada</strong><a id="download-evidence" class="button button-ghost" download>Baixar captura</a><button id="close-evidence" class="button button-ghost" aria-label="Fechar captura">Fechar ✕</button></div><div class="dialog-content"><img id="evidence-preview" alt="Captura de evidência ampliada"></div></dialog>{data}<script>{js}</script></body></html>'
 
 
@@ -295,14 +316,107 @@ def _journey(exploration: dict[str, Any], cases: list[dict[str, Any]], renderer:
                 routes.append(url)
     if not routes:
         return _empty("A sequência de navegação não foi preservada nesta execução. As páginas dos CTs continuam disponíveis em Regras e cobertura.")
-    nodes = []
-    for position, url in enumerate(dict.fromkeys(routes)):
+    nodes, pickers = [], []
+    discovered = list(dict.fromkeys(routes))
+    for position, url in enumerate(discovered):
         associated = [case for case in cases if case["url"] == url]
-        first = associated[0] if associated else None
-        content = f'<span class="event-chip">{position+1:02d}</span><h3>{_h(_page(url))}</h3><p>{len(associated)} CTs · {sum(item["status"] == "FAIL" for item in associated)} reprovados</p><small>{routes.count(url)} visita(s) registrada(s)</small>'
-        nodes.append(f'<article class="journey-node">{content}' + (f'<button class="button button-ghost" data-open-case="{first["index"]}">Abrir primeiro CT →</button>' if first else '<p class="muted">Navegação sem CT atribuído.</p>') + '</article>')
+        failures = sum(item["status"] == "FAIL" for item in associated)
+        visits = routes.count(url)
+        test_word = "teste" if len(associated) == 1 else "testes"
+        stage = "Primeira página visitada" if position == 0 else "Última página descoberta" if position == len(discovered) - 1 else "Página visitada"
+        try:
+            parsed = urlsplit(url)
+            variant = (f"?{parsed.query}" if parsed.query else "") + (f"#{parsed.fragment}" if parsed.fragment else "")
+        except ValueError:
+            variant = ""
+        visit_word = "visita" if visits == 1 else "visitas"
+        failure_word = "reprovado" if failures == 1 else "reprovados"
+        content = (
+            '<span class="journey-card-top">'
+            f'<span class="journey-number">{position+1:02d}</span>'
+            f'<span class="journey-page-info"><span class="journey-stage-label journey-sr-only">{stage}</span>'
+            f'<span class="journey-page-title" role="heading" aria-level="3">{_h(_page(url))}</span>'
+            + (f'<small class="page-variant">{_h(variant)}</small>' if variant else '')
+            + '</span></span><span class="journey-card-bottom"><span class="journey-node-stats">'
+            f'<span>{_icon("file")}<span><strong>{len(associated)}</strong> {test_word}</span></span>'
+            f'<span>{_icon("eye")}<span><strong>{visits}</strong> {visit_word}</span></span></span>'
+            f'<span class="journey-failures {"has-failures" if failures else "journey-sr-only"}">{failures} {failure_word}</span>'
+            + (f'<span class="journey-card-arrow">{_icon("chevron")}</span>' if associated else '<span class="journey-no-tests">Sem CT atribuído a esta página.</span>')
+            + '</span>'
+        )
+        picker_id = f"journey-cases-{position}"
+        label = f'Página {position+1:02d}: {_page(url)}{variant}. {len(associated)} {test_word}, {visits} {visit_word}, {failures} {failure_word}. Abrir testes desta página.'
+        control = (
+            f'<button type="button" class="journey-page-card" data-journey-page="{position}" '
+            f'aria-label="{_h(label)}" aria-controls="{picker_id}" aria-expanded="false">{content}</button>'
+            if associated else f'<div class="journey-page-card journey-page-empty">{content}</div>'
+        )
+        nodes.append(
+            f'<li class="journey-node" data-journey-position="{position+1}">{control}</li>'
+        )
+        if associated:
+            rows = ''.join(
+                '<article class="journey-case-row">'
+                f'<span class="case-id">{_h(case["id"])}</span><strong>{_h(case["title"])}</strong>'
+                f'<span class="badge {case["status"].lower()}">{STATUS_LABELS[case["status"]]}</span>'
+                '<div class="journey-case-actions">'
+                f'<button class="button button-ghost" data-open-case="{case["index"]}">Ver resultado</button>'
+                f'<button class="button button-ghost" data-edit-case="{case["index"]}">Editar passos</button>'
+                '</div></article>' for case in associated
+            )
+            pickers.append(
+                f'<section id="{picker_id}" class="journey-case-picker panel" tabindex="-1" aria-label="Testes da página {_h(_page(url))}" hidden>'
+                '<header class="journey-picker-heading"><div>'
+                f'<h3>{len(associated)} {test_word} desta página</h3><p class="url">{_h(url)}</p></div>'
+                '<button class="button button-ghost" data-journey-close aria-label="Fechar testes desta página">Fechar ✕</button></header>'
+                '<div class="report-tools journey-picker-tools"><input type="search" class="search" data-journey-search '
+                'aria-label="Buscar teste nesta página" placeholder="Buscar por número, título ou resultado">'
+                f'<span class="muted" data-journey-count>{len(associated)} {test_word}</span></div>'
+                f'<div class="journey-case-list">{rows}</div><p class="empty-state" data-journey-empty hidden>Nenhum teste encontrado nesta página.</p></section>'
+            )
     sequence = ' <span class="journey-connector" aria-hidden="true">→</span> '.join(f'<span>{_h(_page(url))}</span>' for url in routes)
-    return '<div class="reading-guide"><strong>Jornada observada nesta execução.</strong> Este mapa é reconstruído das URLs antes e depois das ações. Não representa um teste end-to-end único nem comprova uma jornada de compra completa. As repetições e os retornos são preservados na sequência.</div>' + _panel("Mapa de páginas visitadas", '<div class="journey-map">' + ''.join(nodes) + '</div>', "Páginas em ordem da primeira visita registrada") + _panel("Sequência real de navegação", '<div class="journey-sequence">' + sequence + '</div>', f'{len(routes)} posições de navegação, com retornos e mudanças de rota observadas')
+    page_list = (
+        '<section class="journey-map-panel" aria-label="Mapa das páginas em ordem de descoberta">'
+        '<div class="journey-map-meta">'
+        f'<span class="event-chip">{len(discovered)} {"página descoberta" if len(discovered) == 1 else "páginas descobertas"}</span></div>'
+        '<div class="journey-route"><canvas class="journey-route-canvas" aria-hidden="true" focusable="false"></canvas>'
+        '<span class="journey-terminal journey-terminal-start" aria-hidden="true">INÍCIO</span>'
+        '<span class="journey-terminal journey-terminal-end" aria-hidden="true">FIM</span>'
+        '<ol class="journey-track" role="list" aria-label="Páginas em ordem da primeira visita">'
+        + ''.join(nodes) + '</ol></div></section>'
+    )
+    return (
+        '<div class="reading-guide journey-info-strip">' + _icon("info") + '<div><strong>Jornada observada nesta execução.</strong> '
+        'Cada cartão representa uma página, na ordem em que foi descoberta. Não representa um teste end-to-end único '
+        'nem comprova uma jornada de compra completa. As repetições e os retornos são preservados na sequência. '
+        '“FIM” indica apenas o fim das páginas descobertas.</div></div>'
+        + page_list + ''.join(pickers)
+        + '<details class="journey-sequence-details panel"><summary>Ver a sequência real de navegação</summary>'
+        f'<p class="muted">{len(routes)} posições de navegação, com retornos e mudanças de rota observadas</p>'
+        f'<div class="journey-sequence">{sequence}</div></details>'
+    )
+
+
+def _case_editor() -> str:
+    return (
+        '<dialog id="case-editor" class="case-editor-dialog" aria-labelledby="case-editor-title">'
+        '<header class="case-editor-header"><div><span class="page-kicker">Roteiro do teste</span>'
+        '<h2 id="case-editor-title">Editar passos do teste</h2></div>'
+        '<button id="case-editor-close" class="button button-ghost" aria-label="Fechar editor de passos">Fechar ✕</button></header>'
+        '<div class="case-editor-notice">Rascunho visual · não executado · não altera este resultado. '
+        'As etapas registradas ficam preservadas; os cards extras não executam consultas nem acessam bancos de dados.</div>'
+        '<div class="case-editor-layout"><aside id="case-editor-palette" class="case-editor-palette">'
+        '<span class="ct-summary-eyebrow">Adicionar ao roteiro</span>'
+        f'<button id="database-step-card" class="database-step-card" draggable="true">{_icon("database")}'
+        '<strong>Consulta em banco de dados</strong><small>Somente visual · sem conexão ou execução</small></button>'
+        '<p class="muted">Arraste o card para um espaço entre as etapas ou use “Adicionar aqui”.</p></aside>'
+        '<section class="case-editor-canvas" aria-label="Etapas do roteiro"><h3>Passos do teste</h3>'
+        '<p class="muted">Etapas originais são somente leitura. Posicione seus novos cards entre elas.</p>'
+        '<ol id="case-editor-steps"></ol></section></div>'
+        '<footer class="case-editor-footer"><p id="case-editor-feedback" role="status" aria-live="polite"></p>'
+        '<div><button id="case-editor-rerun" class="button button-ghost">Ver disponibilidade de reexecução</button>'
+        '<button id="case-editor-save" class="button button-primary">Guardar rascunho neste relatório</button></div></footer></dialog>'
+    )
 
 
 def _settings(exploration: dict[str, Any], fragments: dict[str, Any]) -> str:

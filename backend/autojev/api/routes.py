@@ -26,17 +26,19 @@ from autojev.domain.models import (
 from autojev.services.scenario_timeline import prepare_scenario_timelines
 from autojev.services.coverage_ledger import coverage_restriction_ledger
 from autojev.services.execution_summary import execution_duration_summary, report_snapshot_key
-from autojev.services.report_localization import REPORT_LOCALE_VERSION, localize_report_presentation
+from autojev.services.report_localization import REPORT_LOCALE_VERSION, check_label, localize_report_presentation
 from autojev.adapters.report_premium import ASSETS as REPORT_ASSETS, REPORT_LAYOUT_VERSION, render_premium_report
 from autojev.services.visual_checks import visual_review_counts
 from autojev.services.verification_summary import verification_summary
 from autojev.services.visual_review_resume import visual_review_resume_summary
+from autojev.services.rerun_projection import without_rerun_recipes
 
 from .schemas import (
     ConnectionTestInput,
     ExplorationCreate,
     ProviderCreate,
     ProviderUpdate,
+    ScenarioRerunInput,
     VisualReviewResumeInput,
 )
 
@@ -318,6 +320,7 @@ def _phase_payload(result: dict[str, Any], events: list[dict[str, Any]]) -> dict
 
 
 def _exploration_payload(item: dict[str, Any]) -> dict[str, Any]:
+    item = without_rerun_recipes(item)
     result = localize_report_presentation(prepare_scenario_timelines(item)) if "scenarios" in item else dict(item)
     exploration_id = result["id"]
     result["detail_url"] = f"/api/explorations/{exploration_id}"
@@ -805,12 +808,59 @@ async def get_exploration(
     exploration_id: str, request: Request
 ) -> dict[str, Any]:
     try:
+        rerun = request.app.state.scenario_rerun_service.state_for(exploration_id)
         item = _repository(request).get_exploration(exploration_id)
         result = _exploration_payload(item)
         result["visual_review_resume"] = request.app.state.visual_review_resume_service.state_for(exploration_id, item)
+        if rerun.get("source_exploration_id"):
+            result["rerun"] = rerun
         return result
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/explorations/{exploration_id}/scenarios/{scenario_id}/rerun")
+async def scenario_rerun_preflight(
+    exploration_id: str, scenario_id: str, request: Request,
+) -> dict[str, Any]:
+    """Read-only availability: opening this screen never opens a browser."""
+    try:
+        result = request.app.state.scenario_rerun_service.preflight(exploration_id, scenario_id)
+        return {
+            **result, "checks": [check_label(kind) for kind in result.get("checks") or []],
+            "source_exploration_id": exploration_id, "scenario_id": scenario_id,
+            "manual_preparation_required": True,
+            "effects": [
+                "A ação original será repetida uma única vez e pode modificar dados na aplicação em teste.",
+                "Prepare o login e o estado da página no navegador antes de continuar.",
+                "O resultado ficará em uma nova execução; o relatório original será preservado.",
+                "Cards extras de banco de dados são apenas visuais e não serão executados.",
+                "Esta reexecução usa verificações locais, sem chamadas ao JEV ou à LLM auxiliar.",
+            ],
+        }
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/explorations/{exploration_id}/scenarios/{scenario_id}/rerun", status_code=status.HTTP_202_ACCEPTED)
+async def scenario_rerun_start(
+    exploration_id: str, scenario_id: str, body: ScenarioRerunInput, request: Request,
+) -> dict[str, Any]:
+    # CORS is not an authorization check. Reject browser requests from an
+    # unrelated/null origin even if a future CORS configuration is permissive.
+    origin = request.headers.get("origin")
+    allowed = {*request.app.state.settings.cors_origins, str(request.base_url).rstrip("/")}
+    if origin is not None and origin not in allowed:
+        raise HTTPException(status_code=403, detail="Abra a reexecução pela aplicação AutoJev.")
+    try:
+        new_id = request.app.state.scenario_rerun_service.submit(exploration_id, scenario_id)
+        result = _exploration_payload(_repository(request).get_exploration(new_id))
+        result["rerun"] = request.app.state.scenario_rerun_service.state_for(new_id)
+        return result
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.post("/explorations/{exploration_id}/cancel", status_code=status.HTTP_202_ACCEPTED)
@@ -820,6 +870,8 @@ async def cancel_exploration(
     try:
         _repository(request).request_cancel(exploration_id)
         request.app.state.exploration_manager.cancel(exploration_id)
+        if request.app.state.scenario_rerun_service.state_for(exploration_id).get("source_exploration_id"):
+            request.app.state.scenario_rerun_service.cancel(exploration_id)
         return _exploration_payload(
             _repository(request).get_exploration(exploration_id, include_details=False)
         )
@@ -833,6 +885,8 @@ async def resume_exploration(
 ) -> dict[str, Any]:
     try:
         request.app.state.exploration_manager.resume_after_user_input(exploration_id)
+        if request.app.state.scenario_rerun_service.state_for(exploration_id).get("source_exploration_id"):
+            request.app.state.scenario_rerun_service.resume(exploration_id)
         return _exploration_payload(
             _repository(request).get_exploration(exploration_id, include_details=False)
         )
@@ -912,6 +966,7 @@ async def get_report(exploration_id: str, request: Request) -> FileResponse:
             Path(getfile(localize_report_presentation)).stat().st_mtime,
             Path(getfile(render_premium_report)).stat().st_mtime,
             (REPORT_ASSETS / "premium.css").stat().st_mtime,
+            (REPORT_ASSETS / "journey.css").stat().st_mtime,
             (REPORT_ASSETS / "premium.js").stat().st_mtime,
         )
         if valid_presentation(path) and path.stat().st_mtime >= presentation_modified:
