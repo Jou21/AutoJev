@@ -386,3 +386,52 @@ Regressão: 282 testes backend aprovados, incluindo 26 novos testes de estrutura
 estados, acessibilidade e preservação das evidências; build e 81 testes frontend
 aprovados. Um aviso de depreciação Starlette/AnyIO, sem falha. Backend atualizado,
 `git diff --check` limpo, sem nova exploração, chamadas de IA ou publicação.
+
+## Refinamento em 09/10: novas falhas técnicas em linguagem visual
+
+A verificação **Ausência de novas falhas técnicas da aplicação** agora apresenta
+dois grupos: **Execução da aplicação** (console e erros de execução) e
+**Requisições de rede** (HTTP e conexão). Cada grupo compara **Esperado** e
+**Encontrado** com números grandes e um indicador central acessível. Pares
+confirmados ficam verdes; contagens positivas em comparação com zero recebem
+destaque vermelho. Em uma verificação reprovada com ocorrências, o outro canal
+com zero pode continuar verde: esse check compara apenas suas contagens, não
+aprova a verificação inteira. O resultado original é sempre preservado.
+
+Contagens ausentes, booleanas, negativas ou de formato incompatível aparecem
+como **Não informado**, nunca como zero. Resultados indefinidos e contradições
+continuam explicitamente identificados. A expectativa reconhece o formato
+atual e o legado conhecido, sem inventar metas para descrições desconhecidas.
+O JSON, a mensagem e a descrição original ficam em **Ver dados técnicos**,
+recolhidos inicialmente. O rodapé limita a interpretação à verificação e à
+captura configurada: zero não promete ausência de todos os erros da aplicação,
+e falha técnica não confirma, sozinha, um defeito funcional.
+
+Validação pela habilidade de navegador e Playwright MCP, com o navegador
+integrado indisponível:
+
+- CT001 real de 151 CTs: os dois canais exibem 0 × 0 com checks verdes.
+  Em desktop 1440 × 900, o componente cabe inteiro sem rolagem adicional
+  no painel do passo; conectores centralizados entre os respectivos cards.
+- Fixture reprovada com duas falhas de rede: 0 × 2 em vermelho; execução
+  com 0 × 0 em verde, mantendo o CT e a verificação reprovados.
+- Fixture sem confirmação e com contagem ausente: **Não informado**, sem
+  aprovação inferida ou preenchimento artificial de zero.
+- Celular 390 × 844 sem vazamento horizontal, canais empilhados com seus
+  pares lado a lado; dados técnicos alcançáveis pela rolagem do painel.
+- Temas claro e escuro, rótulos acessíveis e abertura/recolhimento pelo teclado.
+- HTML baixado reaberto offline com os dois pares intactos, sem botão
+  redundante de download, chamadas HTTP/HTTPS ou erros de JavaScript.
+- Impressão conserva os quatro cards e restaura os dados técnicos recolhidos.
+- HTML original da execução real manteve o SHA-256 já documentado, sem
+  repetir a exploração nem alterar evidências ou resultados históricos.
+
+Capturas: `data/mcp-validation/technical-check-desktop.png`,
+`technical-check-mobile.png`, `technical-check-light.png`,
+`technical-check-failure.png` e `technical-check-unknown-mobile.png`.
+Arquivo offline: `data/mcp-validation/technical-check-offline-20261009.html`.
+
+Regressão: 325 testes backend aprovados, incluindo 43 novos testes de apresentação
+técnica; build e 81 testes frontend aprovados. Um aviso de depreciação
+Starlette/AnyIO, sem falha. Backend local atualizado; `git diff --check` limpo.
+Nenhuma chamada a modelos, nova exploração ou publicação foi necessária.

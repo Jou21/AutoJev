@@ -970,6 +970,126 @@ class StandaloneHtmlReport:
             + f'<pre>{_h(json.dumps(technical, ensure_ascii=False, indent=2))}</pre></details></section>'
         )
 
+    @staticmethod
+    def _technical_assertion_detail(assertion: dict[str, Any]) -> str:
+        """Explain recorded technical counters without changing their verdict or scope."""
+        passed = assertion.get("passed")
+        result = "pass" if passed is True else "fail" if passed is False else "unknown"
+        actual = assertion.get("actual")
+        expected = assertion.get("expected")
+
+        def count(value: object) -> int | None:
+            return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+        zero_templates = {
+            "0 attributable application runtime, HTTP or network failures",
+            "Nenhuma falha de execução, HTTP ou rede atribuível à aplicação",
+            "0 new console or network errors", "0",
+        }
+        zero_expected = (
+            isinstance(expected, str) and expected in zero_templates
+        ) or (type(expected) is int and expected == 0)
+        channels = [
+            ("console_errors", "Execução da aplicação", "Erros de execução e de console", '<path d="m7 8 4 4-4 4m6 0h4"/><rect x="3" y="4" width="18" height="16" rx="3"/>'),
+            ("network_errors", "Requisições de rede", "Falhas de HTTP e de conexão", '<path d="M12 8v8M6 16H4v4h4v-4H6m12 0h-2v4h4v-4h-2M6 16v-4h12v4"/><rect x="9" y="3" width="6" height="5" rx="1"/>'),
+        ]
+        recorded = {
+            key: count(actual.get(key)) if isinstance(actual, dict) else None
+            for key, *_ in channels
+        }
+        reference = {
+            key: count(expected.get(key)) if isinstance(expected, dict) else 0 if zero_expected else None
+            for key, *_ in channels
+        }
+        has_occurrences = any(value is not None and value > 0 for value in recorded.values())
+        complete_zero = all(value == 0 for value in recorded.values())
+        if result == "pass" and complete_zero:
+            title = "Nenhuma nova falha técnica registrada"
+            description = "As duas contagens registradas são zero nesta verificação."
+        elif result == "pass":
+            title = "Verificação técnica registrada como aprovada"
+            description = "Confira as contagens disponíveis abaixo; o resultado original foi preservado."
+        elif result == "fail":
+            title = "Foram registradas novas falhas técnicas" if has_occurrences else "Verificação técnica reprovada"
+            description = "O destaque mostra em qual tipo de registro houve ocorrências." if has_occurrences else "O registro indica uma reprovação; consulte os dados técnicos para mais detalhes."
+        else:
+            title = "Verificação técnica sem resultado confirmado"
+            description = "As contagens disponíveis não substituem um resultado confirmado da verificação."
+
+        def icon(state: str, css_class: str) -> str:
+            path = {
+                "match": '<path d="m6 12 4 4 8-8"/>',
+                "different": '<path d="m8 8 8 8m0-8-8 8"/>',
+                "unverified": '<path d="M9 9a3 3 0 0 1 6 0c0 2-3 2-3 4m0 3h.01"/>',
+            }[state]
+            return (
+                f'<svg class="{css_class}" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+                'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">'
+                '<circle cx="12" cy="12" r="10"/>' + path + '</svg>'
+            )
+
+        cards = []
+        for key, label, explanation, channel_path in channels:
+            wanted, found = reference[key], recorded[key]
+            if wanted == 0 and found is not None and found > 0:
+                state = "different"
+                caption = f"{found} {'nova falha registrada' if found == 1 else 'novas falhas registradas'} nesta verificação."
+                comparison_label = "Há falhas registradas; o esperado era zero"
+            elif wanted == 0 and found == 0 and (result == "pass" or (result == "fail" and has_occurrences)):
+                state = "match"
+                caption = "Nenhuma nova falha registrada neste tipo de registro."
+                comparison_label = "Zero esperado e zero registrado neste tipo; não é o resultado da verificação inteira"
+            else:
+                state = "unverified"
+                caption = (
+                    "Contagem não registrada separadamente nesta verificação." if found is None else
+                    "Critério esperado não disponível para esta comparação." if wanted != 0 else
+                    "Contagem disponível, mas sem confirmação de aprovação neste registro."
+                )
+                comparison_label = "Comparação sem confirmação"
+            values = []
+            for side, value_label, value in (("expected", "Esperado", wanted), ("actual", "Encontrado", found)):
+                values.append(
+                    f'<div class="technical-value" data-side="{side}">'
+                    f'<small class="technical-value-label">{value_label}</small>'
+                    f'<strong class="technical-value-count">{value if value is not None else "Não informado"}</strong>'
+                    + (f'<span class="technical-value-unit">{"falha" if value == 1 else "falhas"}</span>' if value is not None else '<span class="technical-value-unit">Sem contagem disponível</span>')
+                    + '</div>'
+                )
+            cards.append(
+                f'<article class="technical-channel" data-channel="{key}" data-state="{state}" aria-label="{label}">'
+                '<header class="technical-channel-heading">'
+                '<svg class="technical-channel-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" '
+                'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">'
+                + channel_path + f'</svg><div><h5>{label}</h5><p>{explanation}</p></div></header>'
+                + '<div class="technical-comparison">' + values[0]
+                + f'<span class="technical-pair" role="img" aria-label="{comparison_label}" title="{comparison_label}">'
+                + icon(state, "technical-pair-icon") + '</span>' + values[1] + '</div>'
+                + f'<p class="technical-channel-caption">{caption}</p></article>'
+            )
+        notes = []
+        if result == "pass" and has_occurrences:
+            notes.append("O resultado foi registrado como aprovado, mas há contagens acima de zero. A divergência foi preservada para conferência.")
+        if result == "fail" and complete_zero:
+            notes.append("As contagens são zero, mas o resultado registrado é reprovado. Não alteramos essa reprovação apenas pelas quantidades.")
+        if not isinstance(actual, dict):
+            notes.append("O registro não separa as contagens por tipo. Nenhum valor foi estimado a partir dos dados antigos.")
+        technical = {key: assertion[key] for key in ("kind", "expected", "actual", "passed", "message") if key in assertion}
+        expected_display = assertion.get("expected_display")
+        detail = f'<p><span class="muted">Esperado (descrição): </span>{_h(expected_display)}</p>' if isinstance(expected_display, str) and expected_display else ""
+        state = "match" if result == "pass" and complete_zero else "different" if result == "fail" else "unverified"
+        return (
+            f'<section class="assertion-detail technical-verification" data-result="{result}" aria-label="Verificação de novas falhas técnicas">'
+            '<div class="technical-outcome">' + icon(state, "technical-state-icon")
+            + f'<div><h4>{title}</h4><p>{description}</p></div></div>'
+            + '<div class="technical-channels">' + ''.join(cards) + '</div>'
+            + ''.join(f'<p class="technical-verification-note">{note}</p>' for note in notes)
+            + '<p class="technical-verification-note">As contagens se referem a esta verificação e dependem da captura configurada. '
+            'Uma falha técnica não confirma, sozinha, um defeito funcional. O resultado desta verificação foi preservado.</p>'
+            + '<details class="technical-raw"><summary>Ver dados técnicos</summary>' + detail
+            + f'<pre>{_h(json.dumps(technical, ensure_ascii=False, indent=2))}</pre></details></section>'
+        )
+
     @classmethod
     def _assertion_detail(
         cls, assertion: dict[str, Any], *, selection: dict[str, Any] | None = None,
@@ -979,13 +1099,12 @@ class StandaloneHtmlReport:
             return cls._selection_assertion_detail(assertion, cls._preview_selection(selection))
         if kind == "product_sort_order":
             return cls._sort_assertion_detail(assertion)
-        technical = kind in {"no_new_browser_errors", "no_new_application_errors"}
+        if kind in {"no_new_browser_errors", "no_new_application_errors"}:
+            return cls._technical_assertion_detail(assertion)
         visual = kind == "visual_model"
-        label = "Indício visual da LLM" if visual else "Verificação técnica" if technical else "Verificação observada"
+        label = "Indício visual da LLM" if visual else "Verificação observada"
         note = (
-            "Erros de console/rede não demonstram, isoladamente, um defeito "
-            "funcional. O resultado desta verificação foi preservado."
-            if technical else "Reprovação baseada na imagem, não em um bug funcional confirmado. "
+            "Reprovação baseada na imagem, não em um bug funcional confirmado. "
             "Confira a captura e a região; a confiança é declarada pelo modelo. "
             "O diagnóstico original do modelo é preservado no idioma em que foi recebido." if visual
             else "A aprovação se aplica a esta verificação, não a toda a "
