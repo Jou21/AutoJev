@@ -280,13 +280,15 @@ def test_case_editor_is_a_closed_visual_draft_shell_with_a_draggable_database_pa
     notice = dialog.one("div", "case-editor-notice").text
     assert "Rascunho visual · não executado · não altera este resultado" in notice
     assert "As etapas registradas ficam preservadas" in notice
-    assert "não executam consultas nem acessam bancos de dados" in notice
+    assert "reexecução confirmada na aplicação" in notice
+    assert "não inicia ações, integrações ou capturas" in notice
     palette = dialog.one("aside", id="case-editor-palette")
     database = palette.one("button", id="database-step-card")
     assert database.attrs["draggable"] == "true"
     assert database.one("strong").text == "Consulta em banco de dados"
     assert "Somente visual · sem conexão ou execução" in database.text
     assert database.one("svg").attrs["aria-hidden"] == "true"
+    assert "escolher SWS, SQL ou Aguardar print" in palette.text
     assert dialog.one("ol", id="case-editor-steps").content == []
     assert "Etapas originais são somente leitura" in dialog.text
     feedback = dialog.one("p", id="case-editor-feedback")

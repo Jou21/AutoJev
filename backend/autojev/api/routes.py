@@ -24,6 +24,8 @@ from autojev.domain.models import (
     ProviderModel,
 )
 from autojev.services.scenario_timeline import prepare_scenario_timelines
+from autojev.services.scenario_step_order import presentation_scenario_steps
+from autojev.services.rerun_step_progress import build_step_plan, project_step_progress
 from autojev.services.coverage_ledger import coverage_restriction_ledger
 from autojev.services.execution_summary import execution_duration_summary, report_snapshot_key
 from autojev.services.report_localization import REPORT_LOCALE_VERSION, check_label, localize_report_presentation
@@ -32,12 +34,14 @@ from autojev.services.visual_checks import visual_review_counts
 from autojev.services.verification_summary import verification_summary
 from autojev.services.visual_review_resume import visual_review_resume_summary
 from autojev.services.rerun_projection import without_rerun_recipes
+from autojev.services.user_image_upload import UploadedImageError, validate_user_image
 
 from .schemas import (
     ConnectionTestInput,
     ExplorationCreate,
     ProviderCreate,
     ProviderUpdate,
+    ScenarioCapturePrintInput,
     ScenarioRerunInput,
     VisualReviewResumeInput,
 )
@@ -47,6 +51,40 @@ router = APIRouter(prefix="/api")
 
 def _repository(request: Request) -> SQLiteRepository:
     return request.app.state.repository
+
+
+def _require_rerun_origin(request: Request) -> None:
+    # CORS does not authorize a state-changing browser request.
+    origin = request.headers.get("origin")
+    allowed = {*request.app.state.settings.cors_origins, str(request.base_url).rstrip("/")}
+    if origin is not None and origin not in allowed:
+        raise HTTPException(status_code=403, detail="Abra a reexecução pela aplicação AutoJev.")
+
+
+def _attach_rerun_state(result: dict[str, Any], rerun: dict[str, Any], repository: SQLiteRepository | None = None) -> dict[str, Any]:
+    # Older saved reruns did not persist a safe structural plan. Rebuild it
+    # read-only from the original when it remains available; GET never starts
+    # a replay or writes source data to recover this presentation.
+    plan = rerun.get("step_plan")
+    if not plan and repository is not None and rerun.get("source_exploration_id"):
+        try:
+            source = prepare_scenario_timelines(repository.get_exploration(rerun["source_exploration_id"]))
+            scenario = next((value for value in source.get("scenarios", [])
+                             if value.get("id") == rerun.get("source_scenario_id")), None)
+            if scenario is not None:
+                evidence = scenario.get("evidence") or {}
+                plan = build_step_plan(presentation_scenario_steps(evidence), rerun.get("capture_plan") or {}, evidence)
+        except NotFoundError:
+            pass
+    result["rerun"] = {**rerun, "step_progress": project_step_progress(result, rerun, plan)}
+    if rerun.get("phase") in {"waiting_capture", "capturing_print"}:
+        waiting = rerun["phase"] == "waiting_capture"
+        result["phase"] = "waiting_input" if waiting else "exploring"
+        result["phase_label"] = "Aguardando sua imagem" if waiting else "Salvando a imagem anexada"
+        result["phase_description"] = "Cole, arraste ou escolha uma imagem na aplicação AutoJev e confirme para continuar."
+        # Executing the sole saved action is not completion of its capture plan.
+        result["overall_progress"] = min(result.get("overall_progress") or 0, 95)
+    return result
 
 
 def _provider_payload(provider: Provider) -> dict[str, Any]:
@@ -322,6 +360,12 @@ def _phase_payload(result: dict[str, Any], events: list[dict[str, Any]]) -> dict
 def _exploration_payload(item: dict[str, Any]) -> dict[str, Any]:
     item = without_rerun_recipes(item)
     result = localize_report_presentation(prepare_scenario_timelines(item)) if "scenarios" in item else dict(item)
+    for scenario in result.get("scenarios", []):
+        evidence = scenario.get("evidence")
+        if isinstance(evidence, dict):
+            # Script positions are a view, never a replacement for the actual
+            # chronology or timestamps kept in the recorded evidence.
+            evidence["presentation_steps"] = presentation_scenario_steps(evidence)
     exploration_id = result["id"]
     result["detail_url"] = f"/api/explorations/{exploration_id}"
     result["report_url"] = (
@@ -409,15 +453,24 @@ def _exploration_payload(item: dict[str, Any]) -> dict[str, Any]:
         )
         result["visual_review_resume"] = visual_review_resume_summary(result)
     if "screenshots" in result:
+        uploaded_paths = {
+            str(entry.get("screenshot"))
+            for scenario in result.get("scenarios", [])
+            for entry in [*(scenario.get("evidence", {}).get("timeline") or []),
+                          *(scenario.get("evidence", {}).get("manual_captures") or [])]
+            if isinstance(entry, dict) and entry.get("image_source") == "user_upload" and entry.get("screenshot")
+        }
         result["screenshots"] = [
             {
                 **screenshot,
+                "image_source": "user_upload" if str(screenshot["path"]) in uploaded_paths else screenshot.get("image_source", "browser_capture"),
                 "url": f"/api/explorations/{exploration_id}/screenshots/{screenshot['path']}",
             }
             for screenshot in result["screenshots"]
         ]
-        if result["screenshots"]:
-            result["latest_screenshot_url"] = result["screenshots"][-1]["url"]
+        browser_screenshots = [shot for shot in result["screenshots"] if shot.get("image_source") != "user_upload"]
+        if browser_screenshots:
+            result["latest_screenshot_url"] = browser_screenshots[-1]["url"]
             result["screenshot_url"] = result["latest_screenshot_url"]
     return result
 
@@ -813,7 +866,7 @@ async def get_exploration(
         result = _exploration_payload(item)
         result["visual_review_resume"] = request.app.state.visual_review_resume_service.state_for(exploration_id, item)
         if rerun.get("source_exploration_id"):
-            result["rerun"] = rerun
+            _attach_rerun_state(result, rerun, _repository(request))
         return result
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -832,9 +885,9 @@ async def scenario_rerun_preflight(
             "manual_preparation_required": True,
             "effects": [
                 "A ação original será repetida uma única vez e pode modificar dados na aplicação em teste.",
-                "Prepare o login e o estado da página no navegador antes de continuar.",
+                "Preencha o login no navegador e confirme a continuação para tentar entrar; se já estiver conectado, apenas os pré-requisitos serão conferidos.",
                 "O resultado ficará em uma nova execução; o relatório original será preservado.",
-                "Cards extras de banco de dados são apenas visuais e não serão executados.",
+                "SWS e consultas de banco de dados não serão executados; pausas para print exigem confirmação manual.",
                 "Esta reexecução usa verificações locais, sem chamadas ao JEV ou à LLM auxiliar.",
             ],
         }
@@ -846,19 +899,41 @@ async def scenario_rerun_preflight(
 async def scenario_rerun_start(
     exploration_id: str, scenario_id: str, body: ScenarioRerunInput, request: Request,
 ) -> dict[str, Any]:
-    # CORS is not an authorization check. Reject browser requests from an
-    # unrelated/null origin even if a future CORS configuration is permissive.
-    origin = request.headers.get("origin")
-    allowed = {*request.app.state.settings.cors_origins, str(request.base_url).rstrip("/")}
-    if origin is not None and origin not in allowed:
-        raise HTTPException(status_code=403, detail="Abra a reexecução pela aplicação AutoJev.")
+    _require_rerun_origin(request)
     try:
-        new_id = request.app.state.scenario_rerun_service.submit(exploration_id, scenario_id)
+        service = request.app.state.scenario_rerun_service
+        new_id = (
+            service.submit(exploration_id, scenario_id, capture_plan=body.capture_plan.model_dump())
+            if body.capture_plan is not None else service.submit(exploration_id, scenario_id)
+        )
         result = _exploration_payload(_repository(request).get_exploration(new_id))
-        result["rerun"] = request.app.state.scenario_rerun_service.state_for(new_id)
+        _attach_rerun_state(result, service.state_for(new_id), _repository(request))
         return result
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/explorations/{exploration_id}/capture-print", status_code=status.HTTP_202_ACCEPTED)
+async def scenario_rerun_capture_print(
+    exploration_id: str, body: ScenarioCapturePrintInput, request: Request,
+) -> dict[str, Any]:
+    _require_rerun_origin(request)
+    try:
+        service = request.app.state.scenario_rerun_service
+        # Decoding/verification can be costly. Only the subsequent synchronous
+        # state check and exclusive file acceptance run on the event loop.
+        image = await run_in_threadpool(validate_user_image, body.image_data_url)
+        state_value = service.capture_print(exploration_id, body.checkpoint_id, body.checkpoint_version, image)
+        result = _exploration_payload(_repository(request).get_exploration(exploration_id))
+        return _attach_rerun_state(result, state_value, _repository(request))
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except UploadedImageError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="Não foi possível salvar a imagem. A execução continua pausada; tente anexá-la novamente.") from exc
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -960,6 +1035,7 @@ async def get_report(exploration_id: str, request: Request) -> FileResponse:
             path.stat().st_mtime,
             Path(getfile(StandaloneHtmlReport)).stat().st_mtime,
             Path(getfile(prepare_scenario_timelines)).stat().st_mtime,
+            Path(getfile(presentation_scenario_steps)).stat().st_mtime,
             Path(getfile(coverage_restriction_ledger)).stat().st_mtime,
             Path(getfile(execution_duration_summary)).stat().st_mtime,
             Path(getfile(visual_review_counts)).stat().st_mtime,

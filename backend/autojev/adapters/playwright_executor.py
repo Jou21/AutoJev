@@ -542,6 +542,7 @@ class PlaywrightExecutor:
       button.type = 'button';
       button.textContent = 'Continuar exploração';
       button.addEventListener('click', () => {
+        if (button.disabled) return;
         try {
           const fn = window.__autojev_resume;
           if (typeof fn === 'function') fn();
@@ -699,16 +700,17 @@ class PlaywrightExecutor:
         except Exception:
             pass
 
-    async def show_intervention_panel(self, message: str) -> None:
+    async def show_intervention_panel(self, message: str, *, title: str = "Faça login para continuar",
+                                      button_label: str = "Continuar exploração", button_disabled: bool = False) -> None:
         """Mostra a seção de ação (botão Continuar) mantendo o log visível."""
+        self._intervention_message = message
         if not self._page or self.headless:
             return
-        self._intervention_message = message
         if not await self._ensure_sidepanel():
             return
         try:
             await self._page.evaluate(
-                """(message) => {
+                """([message, panelTitle, buttonLabel, buttonDisabled]) => {
                   const panel = document.getElementById('autojev-sidepanel');
                   const action = document.getElementById('autojev-panel-action');
                   const text = document.getElementById('autojev-action-text');
@@ -717,7 +719,9 @@ class PlaywrightExecutor:
                   const hint = document.getElementById('autojev-panel-hint');
                   if (text) text.textContent = message;
                   if (action) action.hidden = false;
-                  if (button) { button.disabled = false; button.textContent = 'Continuar exploração'; }
+                  if (button) {
+                    button.disabled = buttonDisabled; button.textContent = buttonLabel;
+                  }
                   if (kicker) kicker.textContent = 'AUTOJEV · AÇÃO NECESSÁRIA';
                   if (hint) hint.textContent = 'Aguardando você';
                   if (panel) {
@@ -725,9 +729,9 @@ class PlaywrightExecutor:
                     panel.setAttribute('aria-live', 'assertive');
                   }
                   const title = document.getElementById('autojev-panel-title');
-                  if (title) title.textContent = 'Faça login para continuar';
+                  if (title) title.textContent = panelTitle;
                 }""",
-                message,
+                [message, title, button_label, button_disabled],
             )
         except Exception:
             pass
@@ -756,7 +760,9 @@ class PlaywrightExecutor:
                   const rail = panel?.querySelector('.autojev-panel-rail');
                   if (rail) rail.setAttribute('aria-expanded', savedPinned ? 'true' : 'false');
                   const button = document.getElementById('autojev-action-button');
-                  if (button) { button.disabled = false; button.textContent = 'Continuar exploração'; }
+                  if (button) {
+                    button.disabled = false; button.textContent = 'Continuar exploração';
+                  }
                 }"""
             )
         except Exception:
@@ -764,6 +770,20 @@ class PlaywrightExecutor:
 
     def notify_user_input(self) -> None:
         self._user_input_event.set()
+
+    async def wait_for_capture_confirmation(self, message: str) -> None:
+        """Passive guidance only: the tested page has no capture capability.
+
+        Exposed page bindings are callable by the tested site's JavaScript.
+        The capture endpoint in the trusted AutoJev application is therefore
+        the only confirmation channel; this waiter is cancelled by its caller.
+        """
+        while True:
+            await self.show_intervention_panel(message, title="Aguardando seu print",
+                button_label="Anexe na aplicação AutoJev", button_disabled=True)
+            # Restore passive guidance after a full navigation, even when the
+            # bootstrap has already recreated a hidden default panel.
+            await asyncio.sleep(1.0)
 
     def protect_authenticated_history(self) -> None:
         """Keep coverage backtracking inside the authenticated application."""
@@ -828,14 +848,57 @@ class PlaywrightExecutor:
         if self._automatic_login_attempted:
             return LoginAttempt("manual_required", "already_attempted")
         self._automatic_login_attempted = True
-        username, password = credentials.get("username"), credentials.get("password")
-        if not username or not password:
-            return LoginAttempt("manual_required", "incomplete_credentials")
+        return await self._attempt_guarded_login(credentials, observation)
+
+    async def attempt_filled_login(self, observation: Observation | None = None) -> LoginAttempt:
+        """Submit an already-filled login only after an explicit Continue click.
+
+        This is not automatic exploration: the caller must obtain a new user
+        confirmation for each call. It never fills fields, guesses credentials,
+        presses Enter, or consumes the separate automatic-login attempt.
+        """
         if not self.is_active():
             raise BrowserUnavailableError("Browser page is not active")
-        for value in (username, password):
-            if value not in self.secret_values:
-                self.secret_values.append(value)
+        if self._origin(self._page.url) != self._allowed_origin:
+            return LoginAttempt("manual_required", "unsafe_origin")
+        # Mask even anonymous/email username controls before the refresh can
+        # capture a bitmap. This reads no values and changes no input contents.
+        await self._page.evaluate("""panel => {
+          const visible = el => {
+            if (el.closest(panel)) return false;
+            const b=el.getBoundingClientRect(),s=getComputedStyle(el);
+            return b.width>0 && b.height>0 && s.visibility!=='hidden' && s.display!=='none';
+          };
+          for (const password of Array.from(document.querySelectorAll('input[type="password"]')).filter(visible)) {
+            password.setAttribute('data-autojev-secret-mask','true');
+            const scope=password.form || password.closest('[role="form"]');
+            if (!scope) continue;
+            for (const field of Array.from(document.querySelectorAll('input')).filter(el=>visible(el)
+              && (el.form || el.closest('[role="form"]'))===scope && ['text','email','tel'].includes(el.type))) {
+              field.setAttribute('data-autojev-secret-mask','true');
+            }
+          }
+        }""", self.PANEL_SELECTOR)
+        # Login forms can rerender while the person types. Refresh node guards
+        # before resolving the single, visible submit; never reuse old refs.
+        observation = await self.observe("before-user-login")
+        return await self._attempt_guarded_login(None, observation)
+
+    async def _attempt_guarded_login(
+        self, credentials: dict[str, str] | None, observation: Observation,
+    ) -> LoginAttempt:
+        filled_login = credentials is None
+        username, password = "", ""
+        if credentials is not None:
+            username, password = credentials.get("username"), credentials.get("password")
+            if not username or not password:
+                return LoginAttempt("manual_required", "incomplete_credentials")
+        if not self.is_active():
+            raise BrowserUnavailableError("Browser page is not active")
+        if not filled_login:
+            for value in (username, password):
+                if value not in self.secret_values:
+                    self.secret_values.append(value)
         # A caller may provide credentials after the first observation. Keep
         # stale-ref comparison on the same redacted representation in that case.
         for semantics in self._ref_semantics.values():
@@ -935,7 +998,12 @@ class PlaywrightExecutor:
                   if (new URL(action,location.href).origin !== location.origin || !['get','post'].includes(method.toLowerCase())) return {reason:'unsafe_form_action'};
                   const ref = node => Object.keys(selectors).find(key => document.querySelector(selectors[key]) === node);
                   const refs = [username,password,submit].map(ref);
-                  return refs.every(Boolean) ? {refs} : {reason:'unobserved_controls'};
+                  const identity = [username,password,submit].map(el => ({
+                    attributes:['id','name','type','autocomplete','aria-label','placeholder','formaction','formmethod']
+                      .map(attribute=>el.getAttribute(attribute)),
+                    action:el.form?.action || null, method:el.form?.method || null,
+                  }));
+                  return refs.every(Boolean) ? {refs,identity} : {reason:'unobserved_controls'};
                 }"""),
                 {"selectors": self._ref_selectors, "panel": self.PANEL_SELECTOR},
             )
@@ -944,13 +1012,7 @@ class PlaywrightExecutor:
             for ref in plan["refs"]:
                 handles.append(await (await self._locator(ref)).element_handle())
             username_field, password_field, submit = handles
-            control_identity = await page.evaluate(
-                """controls => controls.map(el => ({
-                  attributes:['id','name','type','autocomplete','aria-label','placeholder','formaction','formmethod']
-                    .map(attribute=>el.getAttribute(attribute)),
-                  action:el.form?.action || null, method:el.form?.method || null,
-                }))""", handles,
-            )
+            control_identity = plan["identity"]
 
             async def controls_unchanged() -> bool:
                 if self._page is not page or self._origin(page.url) != self._allowed_origin:
@@ -984,6 +1046,18 @@ class PlaywrightExecutor:
 
             if not await controls_unchanged():
                 return LoginAttempt("manual_required", "controls_changed")
+            if filled_login:
+                # Values remain private/volatile redaction material for this
+                # browser run, not credentials, events or CT evidence. Retain
+                # the masks after return: a delayed rejection may echo input.
+                username, password = await page.evaluate(
+                    "controls => controls.slice(0,2).map(el => el.value)", handles,
+                )
+                if not username or not password:
+                    return LoginAttempt("manual_required", "incomplete_credentials")
+                for value in (username, password):
+                    if value not in self.secret_values:
+                        self.secret_values.append(value)
             # Mask before filling (email/anonymous inputs may lack the semantic
             # keywords used by the ordinary screenshot mask).
             for field in (username_field, password_field):
@@ -1004,22 +1078,23 @@ class PlaywrightExecutor:
                   window.addEventListener('submit',window.__autojevLoginSubmitGuard);
                 }""", password_field,
             )
-            await username_field.fill(username, timeout=3_000)
+            if not filled_login:
+                await username_field.fill(username, timeout=3_000)
+                if not await controls_unchanged():
+                    return LoginAttempt("manual_required", "controls_changed")
+                await password_field.fill(password, timeout=3_000)
             if not await controls_unchanged():
                 return LoginAttempt("manual_required", "controls_changed")
-            await password_field.fill(password, timeout=3_000)
-            if not await controls_unchanged():
+            if filled_login and not await page.evaluate(
+                "({controls,values}) => controls.slice(0,2).every((el,i) => el.value === values[i])",
+                {"controls": handles, "values": [username, password]},
+            ):
                 return LoginAttempt("manual_required", "controls_changed")
-            submit_started = True
-            await submit.click(timeout=4_000)
-            deadline = time.monotonic() + 8
-            await self._wait_for_dom_settle()
-            clear_reads = 0
-            previous_signature = None
 
             async def probe() -> dict[str, Any]:
                 return await page.evaluate(
-                    self._login_challenge_script("""panel => {
+                    self._observed_node_guard_script(self._login_challenge_script("""panel => {
+                      __OBSERVED_NODE_GUARD_JS__
                       const visible = el => {
                         if (el.closest(panel)) return false;
                         const b=el.getBoundingClientRect(),s=getComputedStyle(el);
@@ -1028,15 +1103,27 @@ class PlaywrightExecutor:
                       const text=Array.from(document.body?.children || []).filter(el=>!el.matches(panel)).map(el=>el.innerText || '').join(' ').trim();
                       __LOGIN_CHALLENGE_JS__
                       const passwordVisible = Array.from(document.querySelectorAll('input[type="password"]')).some(visible);
-                      const rejected = Array.from(document.querySelectorAll('[role="alert"],[data-test="error"],.error-message,.error_message')).some(el =>
+                      const errors = Array.from(document.querySelectorAll('[role="alert"],[data-test="error"],.error-message,.error_message')).filter(el =>
                         visible(el) && el.textContent.trim() && (passwordVisible || /invalid (login|credentials|password)|login failed|senha inv[áa]lida|credenciais inv[áa]lidas/i.test(el.textContent)));
                       const busy = Array.from(document.querySelectorAll('[aria-busy="true"],[role="progressbar"]')).some(visible)
                         || /^(loading|carregando|aguarde|signing in|redirecionando)[. …]*$/i.test(text);
-                      return {ready:document.readyState!=='loading' && text.length>0 && !busy, challenge:authenticationChallenge, rejected,
+                      return {ready:document.readyState!=='loading' && text.length>0 && !busy, challenge:authenticationChallenge, rejected:errors.length>0,
+                        rejection_signature:JSON.stringify(errors.map(el=>[observedNodeGuard(el),el.textContent.trim()])),
                         signature:JSON.stringify([location.href,document.title,text])};
-                    }"""), self.PANEL_SELECTOR,
+                    }""")), self.PANEL_SELECTOR,
                 )
 
+            # A denied deep-link can leave a stale login error visible. Only a
+            # new/changed post-submit error is evidence of this attempt failing.
+            baseline_rejection = (await probe())["rejection_signature"]
+            if not await controls_unchanged():
+                return LoginAttempt("manual_required", "controls_changed")
+            submit_started = True
+            await submit.click(timeout=4_000)
+            deadline = time.monotonic() + 8
+            await self._wait_for_dom_settle()
+            clear_reads = 0
+            previous_signature = None
             while time.monotonic() < deadline:
                 if not self.is_active():
                     raise BrowserUnavailableError("Browser page is not active")
@@ -1045,13 +1132,15 @@ class PlaywrightExecutor:
                     return LoginAttempt("manual_required", "unsafe_authentication_request")
                 if state["challenge"]:
                     return LoginAttempt("manual_required", "authentication_challenge")
-                if state["rejected"]:
+                if state["rejected"] and state["rejection_signature"] != baseline_rejection:
                     return LoginAttempt("rejected", "login_rejected")
+                if not state["rejected"]:
+                    baseline_rejection = state["rejection_signature"]
                 stable = state["signature"] == previous_signature
                 previous_signature = state["signature"]
                 clear_reads = clear_reads + 1 if stable and state["ready"] and not self._pending_app_requests and not await self.is_login_page() else 0
                 if clear_reads >= 3:
-                    observed = await self.observe("after-automatic-login")
+                    observed = await self.observe("after-user-login" if filled_login else "after-automatic-login")
                     verified = await probe()
                     if (
                         verified["ready"] and not verified["challenge"] and not verified["rejected"]
@@ -1096,7 +1185,7 @@ class PlaywrightExecutor:
                 continue
             try:
                 exists = await self._page.evaluate(
-                    "!!document.getElementById('autojev-sidepanel')"
+                    "!!document.getElementById('autojev-sidepanel') && !document.getElementById('autojev-panel-action')?.hidden"
                 )
             except Exception:
                 exists = True
@@ -1104,6 +1193,18 @@ class PlaywrightExecutor:
                 await self.show_intervention_panel(self._intervention_message or "Preencha usuário e senha na página.")
         self._user_input_event.clear()
         await self.hide_intervention_panel()
+
+    async def capture_print(self, label: str) -> dict[str, Any]:
+        """One user-requested masked bitmap, with no action or assertion run."""
+        if not self._page or not self.is_active():
+            raise BrowserUnavailableError("Browser closed before manual capture")
+        url = self._page.url
+        if self._allowed_origin and self._origin(url) != self._allowed_origin:
+            raise BrowserUnavailableError("Manual capture is outside the authorized origin")
+        screenshot = await self._capture(label)
+        if not screenshot:
+            raise RuntimeError("Manual screenshot could not be saved")
+        return {"screenshot": screenshot, "url": self._public_url(url), "captured_at": utc_now()}
 
     @staticmethod
     def _validate_url(url: str) -> None:
@@ -1546,6 +1647,17 @@ class PlaywrightExecutor:
         sensitive = self._page.locator(self._SENSITIVE_FIELD_SELECTOR)
         if await sensitive.count():
             masks.append(sensitive)
+        # Preparation checks also capture the page before the explicit login
+        # helper runs. Mask anonymous username/email controls in a visible
+        # password form here, in the screenshot compositor, without reading
+        # values or changing DOM contents/styles. Ordinary checkout fields in
+        # forms without a password remain visible.
+        login_fields = self._page.locator(
+            ':is(form,[role="form"]):has(input[type="password"]:visible) '
+            ':is(input:not([type]),input[type="text"],input[type="email"],input[type="tel"]):visible'
+        )
+        if await login_fields.count():
+            masks.append(login_fields)
         for secret in self.secret_values:
             try:
                 text_locator = self._page.get_by_text(secret, exact=False)
@@ -2913,3 +3025,4 @@ class PlaywrightExecutor:
         self._authenticated_history_root_url = None
         self._mark_inactive()
         self._sidepanel_init_installed = False
+        self.secret_values.clear()

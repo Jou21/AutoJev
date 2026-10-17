@@ -1,12 +1,19 @@
 import asyncio
+import base64
 import copy
+import hashlib
 import json
+import re
 import time
 from dataclasses import asdict
+from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 
+from autojev.adapters.playwright_executor import LoginAttempt
 from autojev.adapters.repository import SQLiteRepository
 from autojev.adapters.secrets import EphemeralCredentialVault, SecretCipher
 from autojev.config import Settings
@@ -23,16 +30,21 @@ from autojev.services.scenario_rerun import ScenarioRerunService, STATE_EVENT, r
 URL = "https://example.test/inventory.html"
 
 
-def observed(ref="e1", *, selected="az"):
+def observed(ref="e1", *, selected="az", with_products=False):
     element = {"ref": ref, "tag": "select", "role": "combobox", "name": "Sort products",
                "enabled": True, "has_value": False, "selected_values": [selected],
                "selected_index": 0 if selected == "az" else 1,
                "options": [{"value": "az", "label": "Name (A to Z)"},
                            {"value": "za", "label": "Name (Z to A)"}]}
-    return Observation(URL, "Products", "Sort products", [element], screenshot=f"{selected}.png",
-                       page_state={"fields": [{"ref": ref, "id": "sort", "identity": "sort",
-                                                "name": "Sort products", "type": "select-one",
-                                                "has_value": False, "selected_values": [selected]}]})
+    observation = Observation(URL, "Products", "Sort products", [element], screenshot=f"{selected}.png",
+                              page_state={"fields": [{"ref": ref, "id": "sort", "identity": "sort",
+                                                       "name": "Sort products", "type": "select-one",
+                                                       "has_value": False, "selected_values": [selected]}]})
+    if with_products:
+        products = [{"id": "backpack", "name": "Backpack", "price": "$29.99"},
+                    {"id": "light", "name": "Bike Light", "price": "$9.99"}]
+        observation.page_state["products"] = list(reversed(products)) if selected == "za" else products
+    return observation
 
 
 def action_result(before, after, decision):
@@ -44,7 +56,7 @@ def action_result(before, after, decision):
     return result
 
 
-def make_service(tmp_path):
+def make_service(tmp_path, *, with_products=False):
     settings = Settings(data_dir=tmp_path, database_path=tmp_path / "db.sqlite3",
                         artifact_dir=tmp_path / "artifacts", secret_key="test",
                         cors_origins=(), headless=True, browser="chromium", http_timeout_seconds=1)
@@ -53,7 +65,7 @@ def make_service(tmp_path):
     source_id = repository.create_exploration(ExplorationRequest(URL,
         ModelSelection("unused", "unused-agent"), ModelSelection("unused", "unused-aux"), ExplorationOptions()))
     repository.update_exploration(source_id, status="completed", finished_at="2026-10-14T12:00:02+00:00")
-    before, after = observed(), observed(selected="za")
+    before, after = observed(with_products=with_products), observed(selected="za", with_products=with_products)
     decision = AgentDecision("select", "Change sorting", target="e1", value="za")
     result = action_result(before, after, decision)
     result.assertions.extend(check_business_outcomes(before, decision, result, after))
@@ -91,6 +103,7 @@ def install_browser(monkeypatch, *, before=None, after=None, closed=False,
         def __init__(self, artifact_dir, options, **kwargs):
             self.artifact_dir, self.options, self.kwargs = artifact_dir, options, kwargs
             self.actions, self.started, self.closed = [], [], False
+            self.manual_captures = []
             self.inactive = asyncio.Event()
             if closed:
                 self.inactive.set()
@@ -104,8 +117,14 @@ def install_browser(monkeypatch, *, before=None, after=None, closed=False,
         async def observe(self, label):
             return copy.deepcopy(before or observed("e42"))
 
-        async def show_intervention_panel(self, message):
+        async def attempt_filled_login(self, observation=None):
+            reason = ("authentication_challenge" if observation and
+                      observation.page_state.get("authentication_challenge") else "incomplete_credentials")
+            return LoginAttempt("manual_required", reason, observation)
+
+        async def show_intervention_panel(self, message, **kwargs):
             self.preparation_message = message
+            self.intervention_options = kwargs
 
         async def hide_intervention_panel(self):
             pass
@@ -116,6 +135,15 @@ def install_browser(monkeypatch, *, before=None, after=None, closed=False,
 
         async def wait_until_inactive(self):
             await self.inactive.wait()
+
+        async def wait_for_capture_confirmation(self, message):
+            self.capture_confirmation_message = message
+            # The tested site's overlay is informational only. Its DOM/bindings
+            # cannot grant capture authority; the application endpoint owns it.
+            await asyncio.Event().wait()
+
+        async def capture_print(self, label):
+            raise AssertionError("User-provided evidence must not capture the tested page")
 
         async def execute(self, decision, credentials):
             assert credentials == {}, "No credentials or draft steps are executed automatically"
@@ -167,6 +195,9 @@ def test_preflight_is_read_only_and_does_not_expose_private_recipe(tmp_path):
     preflight = service.preflight(source_id, "CT001")
     assert preflight["available"] is True
     assert preflight["checks"] == ["selection_matches", "no_new_browser_errors"]
+    assert preflight["scope"]["missing_visual_checks"] is False
+    assert preflight["scope"]["visual_review_omitted"] is False
+    assert preflight["scope"]["visual_review"] is False
     assert "digest" not in json.dumps(preflight)
     assert "fingerprint" not in json.dumps(preflight)
     assert repository.get_exploration(source_id) == original
@@ -298,7 +329,10 @@ async def test_premature_confirmation_can_be_corrected_then_executes_once(tmp_pa
 @pytest.mark.asyncio
 async def test_repeated_mismatch_uses_one_absolute_preparation_deadline(tmp_path, monkeypatch):
     service, repository, source_id, _, _ = make_service(tmp_path)
-    service.intervention_timeout_seconds = 0.15
+    # Leave room for SQLite/event-loop work when Chromium tests run in
+    # parallel, while still distinguishing one shared deadline from a new
+    # full timeout after every mismatch (which would take at least 1.85 s).
+    service.intervention_timeout_seconds = 1.2
     page = observed("e42")
     page.url = "https://example.test/"
     browsers = install_browser(monkeypatch, before=page)
@@ -306,13 +340,13 @@ async def test_repeated_mismatch_uses_one_absolute_preparation_deadline(tmp_path
     task = service.tasks[new_id]
     await wait_preparation(service, new_id, 1)
     started = time.monotonic()
-    await asyncio.sleep(0.10)
+    await asyncio.sleep(0.65)
     service.resume(new_id)
     await wait_preparation(service, new_id, 2)
     service.resume(new_id)
     await wait_preparation(service, new_id, 3)
     await task
-    assert time.monotonic() - started < 0.22
+    assert time.monotonic() - started < 1.5
     item = repository.get_exploration(new_id)
     assert item["status"] == "partial" and item["error"] == "preparation_timeout"
     assert item["actions"] == [] and browsers[0].actions == [] and browsers[0].closed
@@ -423,18 +457,107 @@ async def test_a_failed_reproduced_check_is_a_real_fail_not_blocked(tmp_path, mo
 
 
 @pytest.mark.asyncio
-async def test_visual_checks_never_reuse_the_original_visual_approval(tmp_path, monkeypatch):
-    service, repository, source_id, scenario, _ = make_service(tmp_path)
-    scenario.evidence["assertions"].append({"kind": "visual_model", "expected": "No overlap", "passed": True})
+@pytest.mark.parametrize("assessment_status", ["assessed", "pending", "unavailable"])
+async def test_optional_visual_review_cannot_invent_a_missing_original_check(
+    tmp_path, monkeypatch, assessment_status,
+):
+    service, repository, source_id, scenario, reports = make_service(tmp_path, with_products=True)
+    original_assessment = {
+        "requested": True, "status": assessment_status,
+        "model": "original-review-model", "summary": "Original review, not evidence of the replay",
+    }
+    scenario.evidence["visual_assessment"] = original_assessment
+    replace_scenario(repository, source_id, scenario)
+    original = repository.get_exploration(source_id)
+    original_checks = original["scenarios"][0]["evidence"]["assertions"]
+    assert [item["kind"] for item in original_checks] == [
+        "selection_matches", "product_sort_order", "no_new_browser_errors",
+    ]
+    preflight = service.preflight(source_id, "CT001")
+    assert preflight["available"] is True
+    assert preflight["scope"]["missing_visual_checks"] is False
+    assert preflight["scope"]["visual_review_omitted"] is True
+    assert preflight["scope"]["visual_review"] is False
+    assert "bloqueado" not in preflight["reason"]
+    browsers = install_browser(
+        monkeypatch, before=observed("e42", with_products=True),
+        after=observed("e42", selected="za", with_products=True),
+    )
+    new_id = service.submit(source_id, "CT001")
+    await wait_phase(service, new_id, "waiting_preparation")
+    assert browsers[0].actions == []
+    service.resume(new_id)
+    await service.tasks[new_id]
+    replay = repository.get_exploration(new_id)
+    result = replay["scenarios"][0]
+    evidence = result["evidence"]
+    assert replay["status"] == "completed" and result["status"] == "PASS"
+    assert not replay.get("error")
+    assert evidence["missing_original_checks"] == []
+    assert [(item["kind"], item["expected"]) for item in evidence["assertions"]] == [
+        (item["kind"], item["expected"]) for item in original_checks
+    ]
+    assert all(item["passed"] is True for item in evidence["assertions"])
+    assert evidence["visual_assessment"] == {
+        "requested": False, "status": "disabled", "reason": "single_ct_rerun_local_only",
+    }
+    assert evidence["rerun_scope"] == preflight["scope"]
+    assert len(browsers[0].actions) == len(replay["actions"]) == len(replay["scenarios"]) == 1
+    assert browsers[0].closed and len(reports) == 1
+    assert replay["usage"]["total_tokens"] == 0 and replay["options"]["auxiliary_max_requests"] == 0
+    assert repository.get_exploration(source_id) == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed", ["business_check", "execution"])
+async def test_optional_visual_review_does_not_mask_a_failed_local_replay(tmp_path, monkeypatch, failed):
+    service, repository, source_id, scenario, _ = make_service(tmp_path, with_products=True)
     scenario.evidence["visual_assessment"] = {"requested": True, "status": "assessed"}
     replace_scenario(repository, source_id, scenario)
+    install_browser(
+        monkeypatch, before=observed("e42", with_products=True),
+        after=observed("e42", selected="az", with_products=True),
+        action_success=failed != "execution",
+    )
+    new_id = service.submit(source_id, "CT001")
+    await wait_phase(service, new_id, "waiting_preparation")
+    service.resume(new_id)
+    await service.tasks[new_id]
+    replay = repository.get_exploration(new_id)
+    result = replay["scenarios"][0]
+    assert result["status"] == "FAIL"
+    missing = result["evidence"]["missing_original_checks"]
+    assert "visual_model" not in missing
+    if failed == "execution":
+        # A failed dispatch prevents local checks from running. Those are
+        # genuinely missing local checks, not a phantom auxiliary review.
+        assert replay["status"] == "partial" and replay["error"] == "missing_original_checks"
+        assert missing == ["selection_matches", "product_sort_order", "no_new_browser_errors"]
+    else:
+        assert replay["status"] == "completed" and not replay.get("error")
+        assert missing == []
+    assert result["evidence"]["visual_assessment"]["status"] == "disabled"
+    assert (any(item["passed"] is False for item in result["evidence"]["assertions"])
+            or result["evidence"]["action_succeeded"] is False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("review_requested", [False, True])
+async def test_visual_checks_never_reuse_the_original_visual_approval(tmp_path, monkeypatch, review_requested):
+    service, repository, source_id, scenario, _ = make_service(tmp_path)
+    scenario.evidence["assertions"].append({"kind": "visual_model", "expected": "No overlap", "passed": True})
+    scenario.evidence["visual_assessment"] = {"requested": review_requested, "status": "assessed"}
+    replace_scenario(repository, source_id, scenario)
     assert service.preflight(source_id, "CT001")["scope"]["missing_visual_checks"] is True
+    assert service.preflight(source_id, "CT001")["scope"]["visual_review_omitted"] is True
     install_browser(monkeypatch)
     new_id = service.submit(source_id, "CT001")
     await wait_phase(service, new_id, "waiting_preparation")
     service.resume(new_id)
     await service.tasks[new_id]
-    result = repository.get_exploration(new_id)["scenarios"][0]
+    replay = repository.get_exploration(new_id)
+    result = replay["scenarios"][0]
+    assert replay["status"] == "partial" and replay["error"] == "missing_original_checks"
     assert result["status"] == "BLOCKED"
     assert result["evidence"]["missing_original_checks"] == ["visual_model"]
     assert result["evidence"]["visual_assessment"]["status"] == "disabled"
@@ -575,3 +698,520 @@ def test_restart_reconciles_durable_rerun_without_redispatch(tmp_path):
     assert restarted.tasks == {}
     assert restarted.state_for(source_id)["reason"] == "backend_restart_interrupted"
     assert repository.get_exploration(source_id)["status"] == "cancelled"
+
+
+def capture_plan(*checkpoints):
+    return {"version": 1, "checkpoints": [
+        {"id": identity, "gap": gap, "order": order}
+        for identity, gap, order in checkpoints
+    ]}
+
+
+async def wait_capture(service, run_id, identity):
+    for _ in range(300):
+        state = service.state_for(run_id)
+        if state.get("phase") == "waiting_capture" and state.get("capture_checkpoint", {}).get("id") == identity:
+            return copy.deepcopy(state["capture_checkpoint"])
+        if state.get("phase") == "finished":
+            raise AssertionError(f"Capture finished prematurely: {state}")
+        await asyncio.sleep(0.001)
+    raise AssertionError(f"Expected capture {identity}; got {service.states[run_id]}")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gap, expected_actions, capture_phase", [
+    (0, 0, "before_action"), (3, 1, "after_action"),
+])
+async def test_print_checkpoint_waits_for_explicit_capture_and_never_redispatches(
+    tmp_path, monkeypatch, user_print_image, gap, expected_actions, capture_phase,
+):
+    service, repository, source_id, _, reports = make_service(tmp_path)
+    original = repository.get_exploration(source_id)
+    browsers = install_browser(monkeypatch)
+    plan = capture_plan(("db-1", gap, 0))
+    new_id = service.submit(source_id, "CT001", capture_plan=plan)
+    task = service.tasks[new_id]
+    await wait_phase(service, new_id, "waiting_preparation")
+    service.resume(new_id)
+    checkpoint = await wait_capture(service, new_id, "db-1")
+    assert len(browsers[0].actions) == expected_actions
+    assert not browsers[0].manual_captures and not task.done()
+    assert repository.get_exploration(new_id)["status"] == "waiting_input"
+    assert service.state_for(new_id)["capture_count"] == 1
+    assert service.state_for(new_id)["captures_completed"] == 0
+    # Continue is preparation authority only, never capture authority. A fresh
+    # GET or unrelated event must not release this separate checkpoint gate.
+    service.resume(new_id)
+    await asyncio.sleep(0.02)
+    assert not task.done() and not browsers[0].manual_captures
+    assert len(browsers[0].actions) == expected_actions
+    accepted = service.capture_print(new_id, checkpoint["id"], checkpoint["version"], user_print_image["data_url"])
+    assert accepted["phase"] == "capturing_print"
+    with pytest.raises(ValueError):
+        service.capture_print(new_id, checkpoint["id"], checkpoint["version"], user_print_image["data_url"])
+    await task
+    replay = repository.get_exploration(new_id)
+    assert replay["status"] == "completed" and replay["scenarios"][0]["status"] == "PASS"
+    assert len(replay["actions"]) == len(browsers[0].actions) == 1
+    evidence = replay["scenarios"][0]["evidence"]
+    manual = evidence["manual_captures"]
+    assert len(manual) == 1 and not browsers[0].manual_captures
+    assert manual[0]["checkpoint_id"] == "db-1" and manual[0]["planned_gap"] == gap
+    assert manual[0]["capture_phase"] == capture_phase
+    assert manual[0]["kind"] == "observation" and "passed" not in manual[0]
+    assert manual[0]["title"] == "Imagem anexada pelo usuário"
+    assert manual[0]["source"] == "user_upload" and "url" not in manual[0]
+    assert manual[0]["attachment"]["sha256"] == user_print_image["sha256"]
+    assert manual[0]["attachment"]["width"] == user_print_image["width"]
+    assert manual[0]["attachment"]["height"] == user_print_image["height"]
+    attachment_path = Path(manual[0]["screenshot"])
+    assert re.fullmatch(r"user-upload-[a-f0-9]{32}\.png", str(attachment_path))
+    if not attachment_path.is_absolute():
+        attachment_path = service.settings.artifact_dir / new_id / "screenshots" / attachment_path
+    assert attachment_path.read_bytes() == user_print_image["bytes"]
+    assert hashlib.sha256(attachment_path.read_bytes()).hexdigest() == user_print_image["sha256"]
+    assert manual[0]["occurred_at"] == manual[0]["attached_at"]
+    # Neither persisted state nor logs may contain the image's base64 body.
+    assert user_print_image["data_url"] not in json.dumps(replay)
+    assert any(entry["screenshot"] == manual[0]["screenshot"] for entry in evidence["timeline"]
+               if entry.get("screenshot"))
+    assert any(shot["path"] == manual[0]["screenshot"] and shot["scenario_id"] == "CT001"
+               for shot in replay["screenshots"])
+    assert all(item["passed"] is True for item in evidence["assertions"])
+    assert replay["usage"]["total_tokens"] == 0 and replay["options"]["auxiliary_max_requests"] == 0
+    assert service.state_for(new_id)["captures_completed"] == 1
+    assert browsers[0].closed and len(reports) == 1
+    assert repository.get_exploration(source_id) == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_gap", [0, 3])
+async def test_multiple_print_checkpoints_have_distinct_nonces_and_app_confirmation_is_explicit(
+    tmp_path, monkeypatch, user_print_image, first_gap,
+):
+    service, repository, source_id, _, _ = make_service(tmp_path)
+    browsers = install_browser(monkeypatch)
+    # Input order is deliberately reversed; source gap/order is authoritative.
+    plan = capture_plan(("db-2", 3, 1), ("db-1", first_gap, 0))
+    new_id = service.submit(source_id, "CT001", capture_plan=plan)
+    task = service.tasks[new_id]
+    await wait_phase(service, new_id, "waiting_preparation")
+    service.resume(new_id)
+    first = await wait_capture(service, new_id, "db-1")
+    assert len(browsers[0].actions) == (0 if first_gap == 0 else 1)
+    service.capture_print(new_id, first["id"], first["version"], user_print_image["data_url"])
+    second = await wait_capture(service, new_id, "db-2")
+    assert second["version"] > first["version"]
+    for identity, version in [(first["id"], first["version"]),
+                              (second["id"], first["version"]), ("db-99", second["version"])]:
+        with pytest.raises(ValueError):
+            service.capture_print(new_id, identity, version, user_print_image["data_url"])
+    await asyncio.sleep(0.02)
+    assert not task.done() and not browsers[0].manual_captures
+    assert service.state_for(new_id)["captures_completed"] == 1
+    assert len(browsers[0].actions) == 1
+    service.capture_print(new_id, second["id"], second["version"], user_print_image["data_url"])
+    await task
+    replay = repository.get_exploration(new_id)
+    assert replay["status"] == "completed"
+    assert [item["checkpoint_id"] for item in replay["scenarios"][0]["evidence"]["manual_captures"]] == ["db-1", "db-2"]
+    assert len({item["screenshot"] for item in replay["scenarios"][0]["evidence"]["manual_captures"]}) == 2
+    assert len(replay["actions"]) == len(browsers[0].actions) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop", ["timeout", "cancel", "closed", "shutdown"])
+@pytest.mark.parametrize("gap", [0, 3])
+async def test_unfinished_capture_never_fabricates_print_and_preserves_dispatched_checks(
+    tmp_path, monkeypatch, stop, gap,
+):
+    service, repository, source_id, _, _ = make_service(tmp_path)
+    original = repository.get_exploration(source_id)
+    service.capture_timeout_seconds = 0.03 if stop == "timeout" else 2
+    browsers = install_browser(monkeypatch)
+    new_id = service.submit(source_id, "CT001", capture_plan=capture_plan(("db-1", gap, 0)))
+    task = service.tasks[new_id]
+    await wait_phase(service, new_id, "waiting_preparation")
+    service.resume(new_id)
+    await wait_capture(service, new_id, "db-1")
+    if stop == "cancel":
+        service.cancel(new_id)
+    elif stop == "closed":
+        browsers[0].inactive.set()
+    elif stop == "shutdown":
+        await service.shutdown()
+    await asyncio.gather(task, return_exceptions=True)
+    replay = repository.get_exploration(new_id)
+    assert replay["status"] == ("partial" if stop == "timeout" else "cancelled")
+    assert len(replay["actions"]) == len(browsers[0].actions) == (1 if gap == 3 else 0)
+    assert browsers[0].closed and not browsers[0].manual_captures
+    assert service.state_for(new_id)["captures_completed"] == 0
+    if gap == 3:
+        scenario = replay["scenarios"][0]
+        assert scenario["status"] == "PASS", "A pending print must not erase the already observed local checks"
+        assert len(scenario["evidence"]["assertions"]) == 2
+        assert all(item["passed"] is True for item in scenario["evidence"]["assertions"])
+        assert not scenario["evidence"].get("manual_captures")
+    assert repository.get_exploration(source_id) == original
+
+
+@pytest.mark.parametrize("plan", [
+    {"version": True, "checkpoints": []},
+    {"version": 2, "checkpoints": []},
+    {"version": 1, "checkpoints": "db-1"},
+    {"version": 1, "checkpoints": [], "sql": "SELECT private"},
+    capture_plan(("db-1", -1, 0)), capture_plan(("db-1", 10000, 0)),
+    capture_plan(("db-1", True, 0)), capture_plan(("other-id", 1, 0)),
+    capture_plan(("db-1", 1, 0), ("db-1", 2, 0)),
+    {"version": 1, "checkpoints": [{"id": "db-1", "gap": 1, "order": 0, "sql": "SELECT private"}]},
+    capture_plan(*[(f"db-{index + 1}", 1, index) for index in range(101)]),
+])
+def test_capture_plan_is_bounded_data_not_custom_execution(tmp_path, plan):
+    service, repository, source_id, _, _ = make_service(tmp_path)
+    original = repository.get_exploration(source_id)
+    with pytest.raises(ValueError):
+        service.submit(source_id, "CT001", capture_plan=plan)
+    assert len(repository.list_explorations()) == 1 and not service.tasks
+    assert repository.get_exploration(source_id) == original
+
+
+@pytest.mark.asyncio
+async def test_before_action_print_does_not_weaken_original_precondition_guards(tmp_path, monkeypatch, user_print_image):
+    service, repository, source_id, _, _ = make_service(tmp_path)
+    page = observed("e42")
+    browsers = install_browser(monkeypatch, before=page)
+    new_id = service.submit(source_id, "CT001", capture_plan=capture_plan(("db-1", 0, 0)))
+    task = service.tasks[new_id]
+    await wait_phase(service, new_id, "waiting_preparation")
+    service.resume(new_id)
+    checkpoint = await wait_capture(service, new_id, "db-1")
+    page.url = "https://other.test/inventory.html"
+    service.capture_print(new_id, checkpoint["id"], checkpoint["version"], user_print_image["data_url"])
+    await task
+    replay = repository.get_exploration(new_id)
+    assert replay["status"] == "partial" and not replay["actions"] and not browsers[0].actions
+    assert replay["scenarios"][0]["status"] == "BLOCKED"
+    assert browsers[0].closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", ["empty", "wrong_type", "svg", "html", "malformed", "mismatched_mime", "oversized", "too_many_pixels", "too_wide", "corrupt", "animated"])
+async def test_invalid_attachment_keeps_checkpoint_waiting_without_files_or_redispatch(
+    tmp_path, monkeypatch, user_print_image, invalid,
+):
+    service, repository, source_id, _, _ = make_service(tmp_path)
+    browsers = install_browser(monkeypatch)
+    new_id = service.submit(source_id, "CT001", capture_plan=capture_plan(("db-1", 3, 0)))
+    task = service.tasks[new_id]
+    await wait_phase(service, new_id, "waiting_preparation")
+    service.resume(new_id)
+    checkpoint = await wait_capture(service, new_id, "db-1")
+
+    def data_url(mime, content):
+        return f"data:{mime};base64," + base64.b64encode(content).decode("ascii")
+
+    invalid_data = {
+        "empty": "",
+        "wrong_type": None,
+        "svg": data_url("image/svg+xml", b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'),
+        "html": data_url("text/html", b"<script>alert(1)</script>"),
+        "malformed": "data:image/png;base64,not!base64",
+        "mismatched_mime": user_print_image["data_url"].replace("image/png", "image/jpeg"),
+    }.get(invalid)
+    if invalid == "oversized":
+        invalid_data = data_url("image/png", b"x" * (10 * 1024 * 1024 + 1))
+    elif invalid == "too_many_pixels":
+        buffer = BytesIO()
+        Image.new("RGB", (6000, 5001)).save(buffer, format="PNG")
+        invalid_data = data_url("image/png", buffer.getvalue())
+    elif invalid == "too_wide":
+        buffer = BytesIO()
+        Image.new("RGB", (16385, 1)).save(buffer, format="PNG")
+        invalid_data = data_url("image/png", buffer.getvalue())
+    elif invalid == "corrupt":
+        invalid_data = data_url("image/png", user_print_image["bytes"][:-40])
+    elif invalid == "animated":
+        buffer = BytesIO()
+        Image.new("RGB", (2, 2), "red").save(
+            buffer, format="PNG", save_all=True, append_images=[Image.new("RGB", (2, 2), "blue")],
+        )
+        invalid_data = data_url("image/png", buffer.getvalue())
+    run_files = sorted(str(path) for path in (service.settings.artifact_dir / new_id).rglob("*") if path.is_file())
+    with pytest.raises(ValueError):
+        service.capture_print(new_id, checkpoint["id"], checkpoint["version"], invalid_data)
+    await asyncio.sleep(0.02)
+    assert not task.done() and service.state_for(new_id)["phase"] == "waiting_capture"
+    assert not service.capture_events[new_id].is_set()
+    assert service.state_for(new_id)["captures_completed"] == 0
+    assert sorted(str(path) for path in (service.settings.artifact_dir / new_id).rglob("*") if path.is_file()) == run_files
+    assert not browsers[0].manual_captures
+    assert len(browsers[0].actions) == 1
+    # A rejected image does not consume the nonce: replace it, confirm once,
+    # and finish without replaying the already executed select action.
+    service.capture_print(new_id, checkpoint["id"], checkpoint["version"], user_print_image["data_url"])
+    await task
+    replay = repository.get_exploration(new_id)
+    assert replay["status"] == "completed" and replay["scenarios"][0]["status"] == "PASS"
+    assert len(replay["actions"]) == len(browsers[0].actions) == 1
+    assert service.state_for(new_id)["captures_completed"] == 1
+    assert len(replay["scenarios"][0]["evidence"]["manual_captures"]) == 1
+    assert all(item["passed"] is True for item in replay["scenarios"][0]["evidence"]["assertions"])
+    assert browsers[0].closed
+
+
+@pytest.mark.asyncio
+async def test_attachment_storage_failure_preserves_checks_without_fabricating_evidence(
+    tmp_path, monkeypatch, user_print_image,
+):
+    service, repository, source_id, _, _ = make_service(tmp_path)
+    original = repository.get_exploration(source_id)
+    browsers = install_browser(monkeypatch)
+    new_id = service.submit(source_id, "CT001", capture_plan=capture_plan(("db-1", 3, 0)))
+    task = service.tasks[new_id]
+    await wait_phase(service, new_id, "waiting_preparation")
+    service.resume(new_id)
+    checkpoint = await wait_capture(service, new_id, "db-1")
+
+    def storage_failure(_run, _image):
+        raise OSError("Fixture image cannot be written")
+
+    store_image = service._store_uploaded_image
+    monkeypatch.setattr(service, "_store_uploaded_image", storage_failure)
+    with pytest.raises(OSError):
+        service.capture_print(new_id, checkpoint["id"], checkpoint["version"], user_print_image["data_url"])
+    await asyncio.sleep(0.02)
+    assert not task.done() and service.state_for(new_id)["phase"] == "waiting_capture"
+    assert not service.capture_events[new_id].is_set()
+    assert service.state_for(new_id)["captures_completed"] == 0
+    pending = repository.get_exploration(new_id)
+    assert not pending["scenarios"][0]["evidence"].get("manual_captures")
+    assert all(item["passed"] is True for item in pending["scenarios"][0]["evidence"]["assertions"])
+    monkeypatch.setattr(service, "_store_uploaded_image", store_image)
+    service.capture_print(new_id, checkpoint["id"], checkpoint["version"], user_print_image["data_url"])
+    await task
+    replay = repository.get_exploration(new_id)
+    assert replay["status"] == "completed" and replay["scenarios"][0]["status"] == "PASS"
+    assert len(replay["actions"]) == len(browsers[0].actions) == 1
+    assert service.state_for(new_id)["captures_completed"] == 1
+    assert len(replay["scenarios"][0]["evidence"]["manual_captures"]) == 1
+    assert all(item["passed"] is True for item in replay["scenarios"][0]["evidence"]["assertions"])
+    assert repository.get_exploration(source_id) == original and browsers[0].closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("format_name,mime,extension", [("JPEG", "image/jpeg", ".jpg"), ("WEBP", "image/webp", ".webp")])
+async def test_supported_raster_attachments_preserve_bytes_and_metadata(
+    tmp_path, monkeypatch, format_name, mime, extension,
+):
+    service, repository, source_id, _, _ = make_service(tmp_path)
+    browsers = install_browser(monkeypatch)
+    buffer = BytesIO()
+    Image.new("RGB", (48, 24), "purple").save(buffer, format=format_name)
+    content = buffer.getvalue()
+    image_data = f"data:{mime};base64," + base64.b64encode(content).decode("ascii")
+    new_id = service.submit(source_id, "CT001", capture_plan=capture_plan(("db-1", 3, 0)))
+    task = service.tasks[new_id]
+    await wait_phase(service, new_id, "waiting_preparation")
+    service.resume(new_id)
+    checkpoint = await wait_capture(service, new_id, "db-1")
+    service.capture_print(new_id, checkpoint["id"], checkpoint["version"], image_data)
+    await task
+    replay = repository.get_exploration(new_id)
+    assert replay["status"] == "completed"
+    entry = replay["scenarios"][0]["evidence"]["manual_captures"][0]
+    assert entry["attachment"]["mime_type"] == mime
+    assert entry["attachment"]["size_bytes"] == len(content)
+    assert entry["attachment"]["sha256"] == hashlib.sha256(content).hexdigest()
+    assert (entry["attachment"]["width"], entry["attachment"]["height"]) == (48, 24)
+    image_path = Path(entry["screenshot"])
+    if not image_path.is_absolute():
+        image_path = service.settings.artifact_dir / new_id / "screenshots" / image_path
+    assert image_path.suffix == extension and image_path.read_bytes() == content
+    assert len(browsers[0].actions) == 1 and not browsers[0].manual_captures
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interruption", ["cancel", "closed"])
+async def test_accepted_image_survives_interruption_racing_checkpoint_wakeup(
+    tmp_path, monkeypatch, user_print_image, interruption,
+):
+    service, repository, source_id, _, _ = make_service(tmp_path)
+    original = repository.get_exploration(source_id)
+    browsers = install_browser(monkeypatch)
+    new_id = service.submit(source_id, "CT001", capture_plan=capture_plan(("db-1", 3, 0)))
+    task = service.tasks[new_id]
+    await wait_phase(service, new_id, "waiting_preparation")
+    service.resume(new_id)
+    checkpoint = await wait_capture(service, new_id, "db-1")
+    service.capture_print(new_id, checkpoint["id"], checkpoint["version"], user_print_image["data_url"])
+    # Do not yield between accepting the image and interrupting the waiter.
+    if interruption == "cancel":
+        service.cancel(new_id)
+    else:
+        browsers[0].inactive.set()
+    await asyncio.gather(task, return_exceptions=True)
+    replay = repository.get_exploration(new_id)
+    assert replay["status"] == "cancelled"
+    assert replay["scenarios"][0]["status"] == "PASS"
+    assert len(replay["actions"]) == len(browsers[0].actions) == 1
+    images = replay["scenarios"][0]["evidence"]["manual_captures"]
+    assert len(images) == 1 and images[0]["attachment"]["sha256"] == user_print_image["sha256"]
+    image_path = service.settings.artifact_dir / new_id / "screenshots" / images[0]["screenshot"]
+    assert image_path.read_bytes() == user_print_image["bytes"]
+    assert len([event for event in replay["events"] if event["type"] == "manual_print_attached"]) == 1
+    assert len([shot for shot in replay["screenshots"] if shot.get("image_source") == "user_upload"]) == 1
+    assert repository.get_exploration(source_id) == original and browsers[0].closed
+
+
+def install_filled_login_browser(monkeypatch, *, outcomes=None, after_login=None):
+    """Fixture-only login submission; credential values never leave its DOM."""
+    from autojev.services import scenario_rerun
+
+    browsers = install_browser(monkeypatch)
+    base_executor = scenario_rerun.PlaywrightExecutor
+
+    class FilledLoginExecutor(base_executor):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.page = Observation(
+                "https://example.test/", "Login", "Sign in", [
+                    {"ref": "login-user", "tag": "input", "name": "Username", "type": "text", "has_value": True},
+                    {"ref": "login-password", "tag": "input", "name": "Password", "type": "password", "has_value": True},
+                    {"ref": "login-submit", "tag": "button", "name": "Login", "type": "submit"},
+                ],
+            )
+            self.login_outcomes = list(outcomes or [("success", "authenticated")])
+            self.login_attempts = []
+            self.flow = []
+
+        async def start(self, url):
+            self.started.append(url)
+            return copy.deepcopy(self.page)
+
+        async def observe(self, label):
+            self.flow.append(("observe", label))
+            return copy.deepcopy(self.page)
+
+        async def is_login_page(self):
+            return ExplorationManager._needs_login(self.page)
+
+        async def attempt_filled_login(self, observation=None):
+            assert isinstance(observation, Observation)
+            assert ExplorationManager._needs_login(observation)
+            self.login_attempts.append(copy.deepcopy(observation))
+            self.flow.append(("login", observation.url))
+            status, reason = self.login_outcomes.pop(0)
+            if status == "success":
+                self.page = copy.deepcopy(after_login or observed("e42"))
+            return LoginAttempt(status, reason, copy.deepcopy(self.page))
+
+        async def execute(self, decision, credentials):
+            self.flow.append(("execute", decision.target))
+            return await super().execute(decision, credentials)
+
+    monkeypatch.setattr(scenario_rerun, "PlaywrightExecutor", FilledLoginExecutor)
+    return browsers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("confirmation", ["browser", "application"])
+async def test_explicit_continue_submits_filled_login_then_revalidates_before_one_action(
+    tmp_path, monkeypatch, confirmation,
+):
+    service, repository, source_id, _, _ = make_service(tmp_path)
+    source = repository.get_exploration(source_id)
+    browsers = install_filled_login_browser(monkeypatch)
+    new_id = service.submit(source_id, "CT001")
+    task = service.tasks[new_id]
+    await wait_preparation(service, new_id, 1)
+    browser = browsers[0]
+    await asyncio.sleep(0.01)
+    assert not browser.login_attempts and not browser.actions and not task.done()
+    if confirmation == "browser":
+        browser.prepared.set()
+    else:
+        service.resume(new_id)
+    await task
+    replay = repository.get_exploration(new_id)
+    assert len(browser.login_attempts) == 1
+    assert replay["status"] == "completed" and replay["scenarios"][0]["status"] == "PASS"
+    assert len(browser.actions) == len(replay["actions"]) == 1
+    assert browser.actions[0].target == "e42"
+    kinds = [kind for kind, _ in browser.flow]
+    assert kinds.index("login") < kinds.index("execute")
+    assert "observe" in kinds[kinds.index("login") + 1:kinds.index("execute")]
+    attempt = service.state_for(new_id)["preparation"]["login_attempt"]
+    assert attempt["status"] == "success" and attempt["reason"] == "authenticated"
+    assert repository.get_exploration(source_id) == source
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,reason", [
+    ("rejected", "login_rejected"),
+    ("manual_required", "incomplete_credentials"),
+    ("manual_required", "unsafe_origin"),
+    ("manual_required", "authentication_challenge"),
+])
+async def test_unsuccessful_filled_login_stays_paused_until_another_explicit_continue(
+    tmp_path, monkeypatch, status, reason,
+):
+    service, repository, source_id, _, _ = make_service(tmp_path)
+    browsers = install_filled_login_browser(monkeypatch, outcomes=[
+        (status, reason), ("success", "authenticated"),
+    ])
+    new_id = service.submit(source_id, "CT001")
+    task = service.tasks[new_id]
+    await wait_preparation(service, new_id, 1)
+    service.resume(new_id)
+    await wait_preparation(service, new_id, 2)
+    retry = service.state_for(new_id)["preparation"]
+    assert retry["login_attempt"]["status"] == status
+    assert retry["login_attempt"]["reason"] == reason
+    assert retry["login_attempt"]["reason_label"]
+    waiting = repository.get_exploration(new_id)
+    assert waiting["status"] == "waiting_input" and not waiting["actions"] and not waiting["scenarios"]
+    await asyncio.sleep(0.01)
+    assert len(browsers[0].login_attempts) == 1 and not browsers[0].actions and not task.done()
+    service.resume(new_id)
+    await task
+    replay = repository.get_exploration(new_id)
+    assert replay["status"] == "completed" and replay["scenarios"][0]["status"] == "PASS"
+    assert len(browsers[0].login_attempts) == 2 and len(browsers[0].actions) == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_login_before_continue_bypasses_filled_login_submission(tmp_path, monkeypatch):
+    service, repository, source_id, _, _ = make_service(tmp_path)
+    browsers = install_filled_login_browser(monkeypatch)
+    new_id = service.submit(source_id, "CT001")
+    task = service.tasks[new_id]
+    await wait_preparation(service, new_id, 1)
+    browsers[0].page = observed("e42")
+    await asyncio.sleep(0.01)
+    assert not browsers[0].actions and not task.done()
+    service.resume(new_id)
+    await task
+    assert not browsers[0].login_attempts and len(browsers[0].actions) == 1
+    assert repository.get_exploration(new_id)["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_successful_login_cannot_bypass_the_original_ct_preconditions(tmp_path, monkeypatch):
+    service, repository, source_id, _, _ = make_service(tmp_path)
+    wrong_preconditions = observed("e42")
+    wrong_preconditions.page_state["cart"] = {"count": 9}
+    browsers = install_filled_login_browser(monkeypatch, after_login=wrong_preconditions)
+    new_id = service.submit(source_id, "CT001")
+    task = service.tasks[new_id]
+    await wait_preparation(service, new_id, 1)
+    service.resume(new_id)
+    await wait_preparation(service, new_id, 2)
+    browser = browsers[0]
+    assert len(browser.login_attempts) == 1 and not browser.actions and not task.done()
+    waiting = repository.get_exploration(new_id)
+    assert waiting["status"] == "waiting_input" and not waiting["actions"] and not waiting["scenarios"]
+    browser.page = observed("e42")
+    service.resume(new_id)
+    await task
+    assert len(browser.login_attempts) == len(browser.actions) == 1
+    assert repository.get_exploration(new_id)["status"] == "completed"

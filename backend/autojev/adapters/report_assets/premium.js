@@ -91,8 +91,9 @@
     const sourceScopes = new Map();
     const sourceImages = new Map();
     const caseExplorers = new Map();
-    // Drafts belong to this offline report only. They are never test results,
-    // executable steps, browser storage, or instructions sent to a backend.
+    // Drafts never change this report's test results. Only their allowlisted
+    // manual-capture checkpoints may be handed to a separate app confirmation.
+    // No integration instructions, queries, or credentials leave this report.
     const draftSource = $("report-drafts");
     const savedDrafts = new Map();
     const draftLimit = 100;
@@ -101,6 +102,20 @@
     let editorSequence = [];
     let editorTrigger = null;
     let editorDrag = null;
+    let stepPickerRequest = null;
+    const draftKinds = {
+      database: { title: "Consulta em banco de dados", symbol: "▤", description: "Exemplo sem conexão, SQL ou credenciais. Não executado." },
+      sws: { title: "Executar SWS", symbol: "↗", description: "Etapa de SWS planejada. A integração ainda não está disponível e nada será executado." },
+      sql: { title: "Executar SQL", symbol: "▤", description: "Etapa de SQL planejada. A integração ainda não está disponível e nenhuma consulta será executada." },
+      wait_print: { title: "Aguardar print", symbol: "▣", description: "Na reexecução, pausa para você colar com Ctrl+V, arrastar ou escolher uma imagem na aplicação AutoJev. Pode ser de qualquer conteúdo. Confira a prévia e clique em ‘Anexar print e continuar’. A imagem fica no novo relatório; nada é capturado automaticamente." },
+    };
+    const isDraft = (item) => !!item && typeof item === "object" && !Array.isArray(item)
+      && typeof item.type === "string" && Object.prototype.hasOwnProperty.call(draftKinds, item.type);
+    const draftFields = (item) => {
+      const copy = { id: item.id, type: item.type };
+      if (item.type === "sws" || item.type === "sql") copy.wait_for_print = item.wait_for_print === true;
+      return copy;
+    };
     const editorKinds = { action: "Ação realizada", assertion: "Conferência", signal: "Sinal técnico", observation: "Registro da página" };
     const editorStates = { pass: "Passou", fail: "Não passou", unknown: "Sem resultado", recorded: "Captura registrada", info: "Informativo", warning: "Atenção" };
 
@@ -135,13 +150,13 @@
         const count = originalEditorSteps(key).length;
         const ids = new Set();
         const drafts = value.cases[key].slice(0, draftLimit).filter((draft) => {
-          if (!draft || draft.type !== "database" || typeof draft.id !== "string" || !/^db-\d{1,9}$/.test(draft.id)
+          if (!isDraft(draft) || typeof draft.id !== "string" || !/^db-\d{1,9}$/.test(draft.id)
             || ids.has(draft.id) || !Number.isInteger(draft.gap) || draft.gap < 0 || draft.gap > count
             || !Number.isInteger(draft.order) || draft.order < 0 || draft.order >= draftLimit) return false;
           ids.add(draft.id);
           draftSerial = Math.max(draftSerial, Number(draft.id.slice(3)));
           return true;
-        }).map((draft) => ({ id: draft.id, type: "database", gap: draft.gap, order: draft.order }))
+        }).map((draft) => ({ ...draftFields(draft), gap: draft.gap, order: draft.order }))
           .sort((left, right) => left.gap - right.gap || left.order - right.order);
         if (drafts.length) savedDrafts.set(key, drafts);
       });
@@ -164,6 +179,7 @@
     function closeEditor() {
       const dialog = $("case-editor");
       if (!dialog) return;
+      if (stepPickerRequest) closeStepPicker();
       editorDrag = null;
       if (typeof dialog.close === "function") dialog.close(); else dialog.removeAttribute("open");
       if (editorTrigger) editorTrigger.focus();
@@ -171,26 +187,116 @@
 
     function editorMessage(value) { text($("case-editor-feedback"), value); }
 
+    function closeStepPicker(choice) {
+      const request = stepPickerRequest;
+      stepPickerRequest = null;
+      const dialog = $("step-picker");
+      if (dialog) {
+        if (typeof dialog.close === "function") dialog.close(); else dialog.removeAttribute("open");
+      }
+      if (request && request.trigger) request.trigger.focus({ preventScroll: true });
+      if (request && ["sws", "sql", "wait_print"].includes(choice)) request.insert(choice);
+    }
+
+    function openStepPicker(trigger, position, insert, key) {
+      const dialog = $("step-picker");
+      if (!dialog) return;
+      if (stepPickerRequest) closeStepPicker();
+      stepPickerRequest = { trigger, insert };
+      const current = byIndex.get(String(key));
+      text($("step-picker-position"), (current ? current.id + " · " : "") + position + " · Planeje o passo sem alterar o resultado original.");
+      if (typeof dialog.showModal === "function") dialog.showModal(); else dialog.setAttribute("open", "");
+      const firstChoice = dialog.querySelector('[data-step-choice="sws"]');
+      if (firstChoice) firstChoice.focus();
+    }
+
+    function appendDraftOptions(container, item, onChange, editor = false) {
+      if (!["sws", "sql"].includes(item.type)) return;
+      const options = document.createElement("div");
+      options.className = "case-draft-config";
+      const label = document.createElement("label");
+      label.className = "case-draft-wait-option";
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.className = editor ? "case-editor-wait-print" : "case-draft-wait-print";
+      input.dataset.draftId = item.id;
+      input.checked = item.wait_for_print === true;
+      input.setAttribute("aria-label", "Aguardar print · pausar para anexar uma imagem na reexecução");
+      const copy = document.createElement("span");
+      const title = document.createElement("strong");
+      title.textContent = "Aguardar print";
+      const description = document.createElement("small");
+      description.textContent = "Pausar na reexecução para colar ou anexar uma imagem de sua escolha no AutoJev. A integração SWS ou SQL permanece desativada.";
+      copy.append(title, description);
+      label.append(input, copy);
+      input.addEventListener("change", () => { item.wait_for_print = input.checked; onChange(); });
+      const unavailable = document.createElement("div");
+      unavailable.className = "case-draft-integration";
+      const action = document.createElement("button");
+      action.type = "button";
+      action.className = "button button-ghost case-draft-disabled-action";
+      action.textContent = item.type === "sws" ? "Escolher SWS" : "Executar SQL";
+      action.disabled = true;
+      const soon = document.createElement("small");
+      soon.className = "case-draft-coming-soon";
+      soon.textContent = "Em breve · integração indisponível";
+      unavailable.append(action, soon);
+      options.append(label, unavailable);
+      container.appendChild(options);
+    }
+
+    function caseCapturePlan(key) {
+      // Construct a new minimal object, not a serialization of arbitrary draft
+      // data. SWS/SQL can request a print, never execution of an integration.
+      const count = originalEditorSteps(String(key)).length;
+      const ids = new Set();
+      const checkpoints = (savedDrafts.get(String(key)) || []).filter((item) => {
+        if (!(item.type === "wait_print" || (["sws", "sql"].includes(item.type) && item.wait_for_print === true))
+          || typeof item.id !== "string" || !/^db-\d{1,9}$/.test(item.id) || ids.has(item.id)
+          || !Number.isInteger(item.gap) || item.gap < 0 || item.gap > count
+          || !Number.isInteger(item.order) || item.order < 0 || item.order >= draftLimit) return false;
+        ids.add(item.id);
+        return true;
+      }).slice(0, draftLimit).map((item) => ({ id: item.id, gap: item.gap, order: item.order }))
+        .sort((left, right) => left.gap - right.gap || left.order - right.order);
+      return checkpoints.length ? { version: 1, checkpoints } : null;
+    }
+
     function requestCaseRerun(key, feedback) {
       const current = key != null && byIndex.get(String(key));
       if (!reportConnection || !current) {
-        feedback("Reexecução não iniciada. Abra o relatório pela aplicação AutoJev para reexecutar um CT. Os cartões de banco são apenas visuais e não serão executados.");
+        feedback("Reexecução não iniciada. Abra o relatório pela aplicação AutoJev para reexecutar um CT e confirmar as pausas para print. Este arquivo não inicia ações nem capturas. SWS e SQL permanecem desativados.");
         return;
       }
-      const target = reportConnection.appUrl + "/#/reexecutar/" + encodeURIComponent(reportConnection.sourceId) + "/" + encodeURIComponent(String(current.id));
+      const editor = $("case-editor");
+      if (editor && editor.hasAttribute("open") && editorCase === String(key)
+        && JSON.stringify(draftsInSequence(editorSequence)) !== JSON.stringify(savedDrafts.get(String(key)) || [])) {
+        feedback("Guarde o rascunho antes de reexecutar para incluir as pausas para print que você acabou de editar. Nenhuma reexecução foi solicitada.");
+        return;
+      }
+      const plan = caseCapturePlan(key);
+      const target = reportConnection.appUrl + "/#/reexecutar/" + encodeURIComponent(reportConnection.sourceId) + "/" + encodeURIComponent(String(current.id))
+        + (plan ? "?capture_plan=" + encodeURIComponent(JSON.stringify(plan)) : "");
       window.open(target, "_blank", "noopener,noreferrer");
-      feedback("Confirmação de reexecução solicitada na aplicação. Nenhuma ação foi iniciada por este relatório. Os cartões de banco do rascunho não serão executados.");
+      feedback("Confirmação de reexecução solicitada na aplicação. Nenhuma ação foi iniciada por este relatório. "
+        + (plan ? plan.checkpoints.length + " pausa(s) para print do rascunho salvo serão apresentadas para confirmação. SWS e SQL não serão executados. Salve alterações do editor antes de reexecutar."
+          : "Os passos extras do rascunho não serão executados. Salve alterações do editor antes de reexecutar."));
     }
 
-    function saveDraftSequence(key, sequence) {
+    function draftsInSequence(sequence) {
       let gap = 0;
       const drafts = [];
       sequence.forEach((item) => {
         if (item.type === "recorded") gap += 1;
-        else if (item.type === "database" && drafts.length < draftLimit) {
-          drafts.push({ id: item.id, type: "database", gap, order: drafts.length });
+        else if (isDraft(item) && drafts.length < draftLimit) {
+          drafts.push({ ...draftFields(item), gap, order: drafts.length });
         }
       });
+      return drafts;
+    }
+
+    function saveDraftSequence(key, sequence) {
+      const drafts = draftsInSequence(sequence);
       if (drafts.length) savedDrafts.set(key, drafts); else savedDrafts.delete(key);
       if (draftSource) draftSource.textContent = serializeDrafts();
     }
@@ -205,17 +311,18 @@
         if (label != null) element.textContent = label;
         return element;
       };
-      const placeholderCount = editorSequence.filter((item) => item.type === "database").length;
-      const insert = (position) => {
-        if (placeholderCount >= draftLimit) { editorMessage("Limite de 100 consultas de exemplo por CT."); return; }
+      const placeholderCount = editorSequence.filter(isDraft).length;
+      const insert = (position, type = "database") => {
+        if (editorSequence.filter(isDraft).length >= draftLimit) { editorMessage("Limite de 100 passos extras por CT."); return; }
+        if (!Object.prototype.hasOwnProperty.call(draftKinds, type)) return;
         let id;
         do {
           draftSerial = draftSerial >= 999999999 ? 1 : draftSerial + 1;
           id = "db-" + draftSerial;
-        } while (editorSequence.some((item) => item.type === "database" && item.id === id));
-        editorSequence.splice(position, 0, { type: "database", id });
+        } while (editorSequence.some((item) => isDraft(item) && item.id === id));
+        editorSequence.splice(position, 0, draftFields({ type, id }));
         renderEditor(id);
-        editorMessage("Consulta adicionada ao rascunho visual. Nada foi executado.");
+        editorMessage(draftKinds[type].title + " adicionado ao rascunho visual. Nada foi executado.");
       };
       const dropAt = (position, event) => {
         if (!editorDrag) return;
@@ -223,30 +330,32 @@
         const dragged = editorDrag;
         editorDrag = null;
         if (dragged === "new") { insert(position); return; }
-        const previous = editorSequence.findIndex((item) => item.type === "database" && item.id === dragged);
+        const previous = editorSequence.findIndex((item) => isDraft(item) && item.id === dragged);
         if (previous < 0) return;
         const [item] = editorSequence.splice(previous, 1);
         editorSequence.splice(position > previous ? position - 1 : position, 0, item);
         renderEditor(item.id);
-        editorMessage("Consulta reposicionada no rascunho visual. Os registros originais foram preservados.");
+        editorMessage("Passo extra reposicionado no rascunho visual. Os registros originais foram preservados.");
       };
       const addGap = (position) => {
         const gap = create("li", "case-editor-gap");
         gap.dataset.editorGap = String(position);
         gap.setAttribute("aria-label", position === 0 ? "Antes do primeiro passo" : position === editorSequence.length ? "Depois do último passo" : "Entre os passos " + position + " e " + (position + 1));
-        const control = button("+ Adicionar aqui", () => insert(position), "button button-ghost case-editor-insert");
+        const control = button("+ Adicionar aqui", () => openStepPicker(control, gap.getAttribute("aria-label"), (type) => insert(position, type), editorCase), "button button-ghost case-editor-insert");
         control.disabled = placeholderCount >= draftLimit;
-        control.setAttribute("aria-label", "Adicionar consulta de exemplo: " + gap.getAttribute("aria-label"));
+        control.setAttribute("aria-label", "Adicionar passo: " + gap.getAttribute("aria-label"));
+        control.setAttribute("aria-haspopup", "dialog");
+        control.setAttribute("aria-controls", "step-picker");
         gap.appendChild(control);
         gap.addEventListener("dragover", (event) => { if (editorDrag) { event.preventDefault(); gap.classList.add("drag-over"); } });
         gap.addEventListener("dragleave", () => gap.classList.remove("drag-over"));
         gap.addEventListener("drop", (event) => dropAt(position, event));
         list.appendChild(gap);
       };
-      if (!editorSequence.length) list.appendChild(create("li", "case-editor-empty", "Este CT não tem passos registrados. Você pode inserir uma consulta de exemplo; ela não será executada."));
+      if (!editorSequence.length) list.appendChild(create("li", "case-editor-empty", "Este CT não tem passos registrados. Você pode planejar passos extras; eles não serão executados."));
       editorSequence.forEach((item, index) => {
         addGap(index);
-        const card = create("li", "case-editor-step " + (item.type === "database" ? "case-editor-prototype" : "case-editor-recorded"));
+        const card = create("li", "case-editor-step " + (isDraft(item) ? "case-editor-prototype" : "case-editor-recorded"));
         card.dataset.editorStep = item.type;
         if (item.type === "recorded") {
           card.dataset.recordedIndex = String(item.stepIndex);
@@ -256,21 +365,23 @@
             create("h3", "", item.step.title), create("span", "case-editor-state", item.step.outcome || editorStates[item.step.state]),
             create("small", "case-editor-readonly", "Somente leitura · resultado e evidências preservados"));
         } else {
+          const metadata = draftKinds[item.type];
           card.dataset.draftId = item.id;
+          card.dataset.draftType = item.type;
           card.setAttribute("draggable", "true");
           card.tabIndex = 0;
-          card.setAttribute("aria-label", "Consulta em banco de dados. Exemplo visual não executado. Use Alt mais seta para cima ou para baixo para mover.");
+          card.setAttribute("aria-label", metadata.title + ". Exemplo visual não executado. Use Alt mais seta para cima ou para baixo para mover.");
           card.append(create("small", "case-editor-kind", "Novo passo · rascunho visual"),
-            create("h3", "", "Consulta em banco de dados"),
-            create("p", "", "Exemplo sem conexão, SQL ou credenciais. Não executado."));
+            create("h3", "", metadata.title), create("p", "", metadata.description));
+          appendDraftOptions(card, item, () => editorMessage("Configuração atualizada no editor. Salve o rascunho para mantê-la. Nenhuma captura ou integração foi executada."), true);
           const move = (direction) => {
-            const current = editorSequence.findIndex((entry) => entry.type === "database" && entry.id === item.id);
+            const current = editorSequence.findIndex((entry) => isDraft(entry) && entry.id === item.id);
             const next = current + direction;
             if (current < 0 || next < 0 || next >= editorSequence.length) return;
             editorSequence.splice(current, 1);
             editorSequence.splice(next, 0, item);
             renderEditor(item.id);
-            editorMessage("Consulta reposicionada no rascunho visual.");
+            editorMessage("Passo extra reposicionado no rascunho visual.");
           };
           const controls = create("div", "case-editor-step-actions");
           const up = button("↑ Mover antes", () => move(-1), "button button-ghost");
@@ -280,7 +391,7 @@
           const remove = button("Remover", () => {
             editorSequence = editorSequence.filter((entry) => entry !== item);
             renderEditor();
-            editorMessage("Consulta removida do rascunho. Nenhum registro original foi removido.");
+            editorMessage("Passo extra removido do rascunho. Nenhum registro original foi removido.");
             const gap = list.querySelector(".case-editor-insert");
             if (gap) gap.focus();
           }, "button button-ghost");
@@ -293,7 +404,7 @@
           });
           card.addEventListener("dragstart", (event) => {
             editorDrag = item.id;
-            if (event.dataTransfer) { event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", "Consulta de exemplo não executada"); }
+            if (event.dataTransfer) { event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", "Passo extra não executado"); }
           });
           card.addEventListener("dragend", () => { editorDrag = null; all(".drag-over", list).forEach((gap) => gap.classList.remove("drag-over")); });
         }
@@ -318,7 +429,7 @@
       const drafts = savedDrafts.get(key) || [];
       editorSequence = [];
       for (let gap = 0; gap <= steps.length; gap += 1) {
-        drafts.filter((item) => item.gap === gap).forEach((item) => editorSequence.push({ type: "database", id: item.id }));
+        drafts.filter((item) => item.gap === gap).forEach((item) => editorSequence.push(draftFields(item)));
         if (gap < steps.length) editorSequence.push({ type: "recorded", stepIndex: gap, step: steps[gap] });
       }
       text($("case-editor-title"), "Editor visual · " + current.id + " · " + (current.title || "Caso de teste"));
@@ -500,7 +611,7 @@
       const drafts = savedDrafts.get(model.key) || [];
       const sequence = [];
       for (let gap = 0; gap <= steps.length; gap += 1) {
-        drafts.filter((item) => item.gap === gap).forEach((item) => sequence.push({ type: "database", id: item.id }));
+        drafts.filter((item) => item.gap === gap).forEach((item) => sequence.push(draftFields(item)));
         if (gap < steps.length) sequence.push({ type: "recorded", item: steps[gap] });
       }
       return sequence;
@@ -519,7 +630,7 @@
       model.list.replaceChildren();
       model.draftPanels.replaceChildren();
       const sequence = inlineSequence(model);
-      const draftCount = sequence.filter((item) => item.type === "database").length;
+      const draftCount = sequence.filter(isDraft).length;
       const create = (tag, className, label) => {
         const element = document.createElement(tag);
         element.className = className;
@@ -535,26 +646,27 @@
         const current = model.items.find((item) => item.key === focusKey);
         if (current) current.button.focus({ preventScroll: true });
       };
-      const insert = (position) => {
-        if (draftCount >= draftLimit) { inlineMessage(model, "Limite de 100 consultas de exemplo por CT."); return; }
+      const insert = (position, type) => {
+        if (sequence.filter(isDraft).length >= draftLimit) { inlineMessage(model, "Limite de 100 passos extras por CT."); return; }
+        if (!["sws", "sql", "wait_print"].includes(type)) return;
         let id;
         do {
           draftSerial = draftSerial >= 999999999 ? 1 : draftSerial + 1;
           id = "db-" + draftSerial;
-        } while (sequence.some((item) => item.type === "database" && item.id === id));
-        sequence.splice(position, 0, { type: "database", id });
-        commit(sequence, "draft:" + id, "Consulta adicionada ao rascunho desta aba. Nada foi executado; os registros originais foram preservados.");
+        } while (sequence.some((item) => isDraft(item) && item.id === id));
+        sequence.splice(position, 0, draftFields({ type, id }));
+        commit(sequence, "draft:" + id, draftKinds[type].title + " adicionado ao rascunho desta aba. Nada foi executado; os registros originais foram preservados.");
       };
       const dropAt = (position, event) => {
         if (!model.inlineDrag) return;
         event.preventDefault();
         const dragged = model.inlineDrag;
         model.inlineDrag = null;
-        const previous = sequence.findIndex((item) => item.type === "database" && item.id === dragged);
+        const previous = sequence.findIndex((item) => isDraft(item) && item.id === dragged);
         if (previous < 0) return;
         const [item] = sequence.splice(previous, 1);
         sequence.splice(position > previous ? position - 1 : position, 0, item);
-        commit(sequence, "draft:" + item.id, "Consulta reposicionada no rascunho visual. Nada foi executado.");
+        commit(sequence, "draft:" + item.id, "Passo extra reposicionado no rascunho visual. Nada foi executado.");
       };
       const addGap = (position) => {
         const gap = create("div", "case-inline-gap");
@@ -562,10 +674,12 @@
         const label = position === 0 ? "Antes do primeiro cartão" : position === sequence.length
           ? "Depois do último cartão" : "Entre os cartões " + position + " e " + (position + 1);
         gap.setAttribute("aria-label", label);
-        const control = button("+ Adicionar aqui", () => insert(position), "button button-ghost case-inline-insert");
+        const control = button("+ Adicionar aqui", () => openStepPicker(control, label, (type) => insert(position, type), model.key), "button button-ghost case-inline-insert");
         control.disabled = draftCount >= draftLimit;
-        control.setAttribute("aria-label", "Adicionar consulta de exemplo: " + label);
-        control.setAttribute("title", "Adicionar consulta em banco de dados · somente visual");
+        control.setAttribute("aria-label", "Adicionar passo: " + label);
+        control.setAttribute("title", "Planejar um passo extra · não altera este resultado");
+        control.setAttribute("aria-haspopup", "dialog");
+        control.setAttribute("aria-controls", "step-picker");
         gap.appendChild(control);
         gap.addEventListener("dragover", (event) => {
           if (model.inlineDrag) { event.preventDefault(); gap.classList.add("drag-over"); }
@@ -583,28 +697,37 @@
           model.list.appendChild(entry.item.button);
           return;
         }
+        const metadata = draftKinds[entry.type];
         const card = create("div", "case-inline-draft");
         card.dataset.draftId = entry.id;
+        card.dataset.draftType = entry.type;
         card.setAttribute("draggable", "true");
         card.tabIndex = 0;
-        card.setAttribute("aria-label", "Consulta em banco de dados. Rascunho visual não executado. Use Alt mais seta para cima ou para baixo para mover.");
+        card.setAttribute("aria-label", metadata.title + ". Rascunho visual não executado. Use Alt mais seta para cima ou para baixo para mover.");
         const panel = create("section", "case-draft-panel");
         panel.id = "case-draft-" + model.key + "-" + entry.id;
         panel.dataset.draftId = entry.id;
+        panel.dataset.draftType = entry.type;
         const heading = create("div", "case-draft-heading");
-        const icon = create("span", "case-draft-icon", "▤");
+        const icon = create("span", "case-draft-icon", metadata.symbol);
         icon.setAttribute("aria-hidden", "true");
-        heading.append(icon, create("h3", "", "Consulta em banco de dados"));
+        heading.append(icon, create("h3", "", metadata.title));
         panel.append(create("span", "case-draft-status", "Rascunho visual · Não executado"), heading,
-          create("p", "case-draft-note", "Este é um passo extra de exemplo. Ele ainda não se conecta a um banco, não executa consultas e não utiliza credenciais."),
+          create("p", "case-draft-note", entry.type === "database"
+            ? "Este é um passo extra de exemplo. Ele ainda não se conecta a um banco, não executa consultas e não utiliza credenciais." : metadata.description),
           create("p", "case-draft-position", "Você pode reposicionar ou remover este card sem alterar as etapas, as evidências ou o resultado do teste original."));
+        appendDraftOptions(panel, entry, () => {
+          saveDraftSequence(model.key, sequence);
+          inlineMessage(model, "Preferência de captura guardada no rascunho. Nenhum print ou integração foi executado." + ($("download-report")
+            ? " Baixe o relatório para conservar a configuração." : " As alterações ficam somente nesta aba."));
+        });
         model.draftPanels.appendChild(panel);
-        const item = { key: "draft:" + entry.id, node: panel, kind: "database", kindLabel: "Rascunho visual", title: "Consulta em banco de dados", draftId: entry.id };
+        const item = { key: "draft:" + entry.id, node: panel, kind: entry.type, kindLabel: "Rascunho visual", title: metadata.title, draftId: entry.id };
         const control = button("", () => selectCaseStep(model, model.items.indexOf(item)), "case-step-button case-inline-draft-button");
-        control.dataset.stepKind = "database";
+        control.dataset.stepKind = entry.type;
         control.dataset.stepState = "draft";
         control.setAttribute("aria-controls", panel.id);
-        control.setAttribute("aria-label", "Consulta em banco de dados. Rascunho visual. Não executado.");
+        control.setAttribute("aria-label", metadata.title + ". Rascunho visual. Não executado.");
         const copy = create("span", "step-copy");
         const status = create("span", "step-status");
         status.dataset.stepState = "draft";
@@ -612,30 +735,30 @@
         statusIcon.setAttribute("aria-hidden", "true");
         status.append(statusIcon, create("span", "step-status-label", "Não executado"));
         copy.append(create("span", "step-kind", "Passo extra · rascunho"), create("span", "step-label", item.title),
-          create("small", "step-description", "Somente visual. Não interfere no resultado original."), status);
+          create("small", "step-description", entry.type === "wait_print" ? "Pausa para colar ou anexar sua imagem na próxima reexecução." : "Planejado. Não interfere no resultado original."), status);
         control.append(create("span", "step-number", "+"), copy);
         item.button = control;
         card.appendChild(control);
         const move = (direction) => {
-          const current = sequence.findIndex((step) => step.type === "database" && step.id === entry.id);
+          const current = sequence.findIndex((step) => isDraft(step) && step.id === entry.id);
           const next = current + direction;
           if (current < 0 || next < 0 || next >= sequence.length) return;
           const [step] = sequence.splice(current, 1);
           sequence.splice(next, 0, step);
-          commit(sequence, item.key, "Consulta reposicionada no rascunho visual. Nada foi executado.");
+          commit(sequence, item.key, "Passo extra reposicionado no rascunho visual. Nada foi executado.");
         };
         const actions = create("div", "case-inline-draft-actions");
         const up = button("↑", () => move(-1), "button button-ghost case-inline-move-before");
         const down = button("↓", () => move(1), "button button-ghost case-inline-move-after");
-        up.setAttribute("aria-label", "Mover consulta para antes");
-        down.setAttribute("aria-label", "Mover consulta para depois");
+        up.setAttribute("aria-label", "Mover passo extra para antes");
+        down.setAttribute("aria-label", "Mover passo extra para depois");
         up.disabled = sequenceIndex === 0;
         down.disabled = sequenceIndex === sequence.length - 1;
         const remove = button("Remover", () => {
           const nextSequence = sequence.filter((step) => step !== entry);
-          commit(nextSequence, "original:0", "Consulta removida do rascunho. Nenhuma etapa original foi removida.");
+          commit(nextSequence, "original:0", "Passo extra removido do rascunho. Nenhuma etapa original foi removida.");
         }, "button button-ghost case-inline-remove");
-        remove.setAttribute("aria-label", "Remover consulta de exemplo");
+        remove.setAttribute("aria-label", "Remover passo extra");
         actions.append(up, down, remove);
         card.appendChild(actions);
         card.addEventListener("keydown", (event) => {
@@ -646,7 +769,7 @@
         });
         card.addEventListener("dragstart", (event) => {
           model.inlineDrag = entry.id;
-          if (event.dataTransfer) { event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", "Consulta de exemplo não executada"); }
+          if (event.dataTransfer) { event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", "Passo extra não executado"); }
         });
         card.addEventListener("dragend", () => {
           model.inlineDrag = null;
@@ -678,7 +801,7 @@
       });
       const selected = model.items[index];
       text(model.title, selected.title);
-      text(model.position, selected.kind === "summary" ? "Visão geral do teste" : selected.kind === "database"
+      text(model.position, selected.kind === "summary" ? "Visão geral do teste" : selected.draftId
         ? "Passo extra · Rascunho visual · Não executado"
         : "Etapa " + selected.originalIndex + " de " + (model.originalItems.length - 1) + " · " + selected.kindLabel);
       const cursor = available.findIndex((item) => item.index === index);
@@ -831,6 +954,9 @@
       const sidebarHeader = make("div", "case-step-sidebar-header");
       const count = make("small", "case-step-count");
       sidebarHeader.append(make("h3", "", "Passos e evidências"), count);
+      if (timeline.dataset.stepOrder === "planned") {
+        sidebarHeader.append(make("small", "case-step-order-note", "Ordem dos passos planejada · horários reais preservados"));
+      }
       const inlineFeedback = make("p", "case-inline-feedback");
       inlineFeedback.hidden = true;
       inlineFeedback.setAttribute("role", "status");
@@ -914,8 +1040,8 @@
         const state = states[result.state];
         const outcome = result.outcome || (hasState && item.node.dataset.stepOutcome || "").trim() || state.outcome;
         const description = result.description || (item.node.dataset.stepDescription || "").trim() || fallbackDescriptions[item.kind];
-        const kindLabel = item.kind === "observation" && item.node.querySelector(".shots img")
-          ? "Captura da página" : labels[item.kind];
+        const kindLabel = item.node.dataset.imageSource === "user_upload" ? "Imagem do usuário"
+          : item.kind === "observation" && item.node.querySelector(".shots img") ? "Captura da página" : labels[item.kind];
         const sidebarTitle = item.kind === "assertion" && item.title === "Ausência de novas falhas técnicas da aplicação"
           ? "Erros durante a ação" : item.title;
         const originalItem = { ...item, key: "original:" + index, originalIndex: index, kindLabel };
@@ -1017,6 +1143,7 @@
     }
 
     function showView(view, focus) {
+      if (stepPickerRequest) closeStepPicker();
       if (!Object.prototype.hasOwnProperty.call(views, view)) view = "overview";
       activeView = view;
       document.body.dataset.view = view;
@@ -1138,7 +1265,27 @@
       const panel = search && search.closest(".journey-case-picker");
       if (panel) filterJourneyCases(panel);
     });
+    all("#step-picker [data-step-choice]").forEach((control) => control.addEventListener("click", () => {
+      if (!$("step-picker").hasAttribute("open")) return;
+      closeStepPicker(control.dataset.stepChoice);
+    }));
+    listen("step-picker-close", "click", () => closeStepPicker());
+    listen("step-picker", "cancel", (event) => { event.preventDefault(); closeStepPicker(); });
+    listen("step-picker", "keydown", (event) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      closeStepPicker();
+    });
+    listen("step-picker", "close", () => {
+      // Native dialog.close() can be called independently. A queued close
+      // event from a previous opening must not cancel a freshly opened picker.
+      if (!stepPickerRequest || $("step-picker").hasAttribute("open")) return;
+      const request = stepPickerRequest;
+      stepPickerRequest = null;
+      if (request.trigger) request.trigger.focus({ preventScroll: true });
+    });
     listen("case-editor-close", "click", closeEditor);
+    listen("case-editor", "cancel", (event) => { event.preventDefault(); closeEditor(); });
     listen("case-editor", "close", () => { editorDrag = null; if (editorTrigger) editorTrigger.focus(); });
     listen("case-editor-save", "click", () => {
       if (!editorCase) return;
@@ -1160,7 +1307,7 @@
     });
     listen("database-step-card", "click", () => {
       const gaps = all(".case-editor-insert", $("case-editor-steps") || document);
-      if (gaps.length) { gaps[gaps.length - 1].focus(); editorMessage("Escolha «Adicionar aqui» entre os passos para inserir a consulta de exemplo."); }
+      if (gaps.length) { gaps[gaps.length - 1].focus(); editorMessage("Escolha «Adicionar aqui» entre as etapas e selecione o tipo de passo."); }
     });
     listen("case-editor-rerun", "click", () => {
       requestCaseRerun(editorCase, editorMessage);
@@ -1171,8 +1318,9 @@
       if (feedback) feedback.hidden = false;
     }));
     document.addEventListener("keydown", (event) => {
-      if (event.key !== "Escape") return;
-      if ($("case-editor") && $("case-editor").hasAttribute("open")) closeEditor();
+      if (event.defaultPrevented || event.key !== "Escape") return;
+      if ($("step-picker") && $("step-picker").hasAttribute("open")) { event.preventDefault(); closeStepPicker(); }
+      else if ($("case-editor") && $("case-editor").hasAttribute("open")) { event.preventDefault(); closeEditor(); }
       else closeJourneyPickers(true);
     });
     window.addEventListener("resize", scheduleJourneyLayout);
@@ -1421,7 +1569,7 @@
     });
     listen("evidence-dialog", "close", () => { if (previewTrigger) previewTrigger.focus(); });
     document.addEventListener("keydown", (event) => {
-      if (event.key === "Escape" && $("evidence-dialog") && $("evidence-dialog").hasAttribute("open")) closeEvidence();
+      if (!event.defaultPrevented && event.key === "Escape" && $("evidence-dialog") && $("evidence-dialog").hasAttribute("open")) closeEvidence();
     });
 
     function filterTimeline() {

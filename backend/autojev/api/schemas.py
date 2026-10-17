@@ -10,22 +10,68 @@ from pydantic import (
     Field,
     SecretStr,
     StrictBool,
+    StrictInt,
+    StrictStr,
     field_validator,
 )
+
+from autojev.services.user_image_upload import MAX_IMAGE_DATA_URL_LENGTH
 
 
 class ApiModel(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
 
+class CaptureCheckpointInput(ApiModel):
+    id: StrictStr = Field(pattern=r"^db-[0-9]{1,9}$")
+    gap: StrictInt = Field(ge=0, le=10000)
+    order: StrictInt = Field(ge=0, le=10000)
+
+
+class ScenarioCapturePlanInput(ApiModel):
+    version: StrictInt = Field(ge=1, le=1)
+    checkpoints: list[CaptureCheckpointInput] = Field(max_length=100)
+
+    @field_validator("checkpoints")
+    @classmethod
+    def unique_checkpoints(cls, value: list[CaptureCheckpointInput]) -> list[CaptureCheckpointInput]:
+        if len({item.id for item in value}) != len(value):
+            raise ValueError("Cada pausa para print deve ter um identificador único.")
+        if len({(item.gap, item.order) for item in value}) != len(value):
+            raise ValueError("As pausas para print precisam ter posições distintas.")
+        return value
+
+
 class ScenarioRerunInput(ApiModel):
     confirm: StrictBool
+    capture_plan: ScenarioCapturePlanInput | None = None
+
+    @field_validator("capture_plan", mode="before")
+    @classmethod
+    def capture_plan_must_be_an_object(cls, value: Any) -> Any:
+        if value is None:
+            raise ValueError("Um plano de prints informado precisa ser um objeto válido.")
+        return value
 
     @field_validator("confirm")
     @classmethod
     def explicit_confirmation(cls, value: bool) -> bool:
         if value is not True:
             raise ValueError("Confirme explicitamente a reexecução deste CT.")
+        return value
+
+
+class ScenarioCapturePrintInput(ApiModel):
+    confirm: StrictBool
+    checkpoint_id: StrictStr = Field(pattern=r"^db-[0-9]{1,9}$")
+    checkpoint_version: StrictInt = Field(ge=1, le=10000)
+    image_data_url: StrictStr = Field(min_length=1, max_length=MAX_IMAGE_DATA_URL_LENGTH)
+
+    @field_validator("confirm")
+    @classmethod
+    def explicit_capture_confirmation(cls, value: bool) -> bool:
+        if value is not True:
+            raise ValueError("Confirme explicitamente a captura para continuar este CT.")
         return value
 
 

@@ -22,6 +22,7 @@ from autojev.adapters.openai_compatible import (
 )
 from autojev.adapters.playwright_executor import (
     BrowserUnavailableError,
+    LoginAttempt,
     PlaywrightExecutor,
 )
 from autojev.adapters.report import StandaloneHtmlReport
@@ -1121,10 +1122,32 @@ class ExplorationManager:
         return has_password and has_login_copy
 
     LOGIN_PANEL_MESSAGE = (
-        "1) Preencha usuário e senha na página. "
-        "2) Clique no botão Login do próprio site e aguarde entrar. "
-        "3) Só então clique em Continuar exploração abaixo."
+        "Preencha usuário e senha na página e clique em Continuar exploração abaixo. "
+        "O AutoJev tentará entrar usando os campos preenchidos, sem enviar credenciais à IA. "
+        "Você também pode fazer login pelo próprio site. CAPTCHA e etapas adicionais devem ser concluídos manualmente."
     )
+
+    @staticmethod
+    def _filled_login_feedback(attempt: LoginAttempt) -> dict[str, str]:
+        """Only fixed local messages may leave the credential submission path."""
+        messages = {
+            "authenticated": "Login realizado. Conferindo a página e os pré-requisitos do teste.",
+            "incomplete_credentials": "Preencha usuário e senha no site e clique em Continuar exploração para tentar entrar.",
+            "login_rejected": "O site não aceitou o login. Corrija os campos na página e clique em Continuar exploração para uma nova tentativa.",
+            "login_not_confirmed": "Não foi possível confirmar a entrada. Confira a resposta do site; nenhuma nova tentativa ocorrerá sem outro clique seu.",
+            "authentication_challenge": "Conclua o CAPTCHA ou a etapa adicional no próprio site e depois continue.",
+            "unsafe_origin": "O login está fora do site autorizado. Volte ao site do teste antes de continuar.",
+            "unsafe_form_action": "O formulário de login não possui um envio seguro para este site. Faça o login manualmente no site.",
+            "unsafe_authentication_request": "Um envio inseguro de credenciais foi bloqueado. Confira o site e faça o login manualmente.",
+            "controls_changed": "Os campos de login mudaram. Confira os campos e confirme novamente quando estiverem prontos.",
+            "ambiguous_form": "Não foi possível identificar um único formulário seguro de login. Faça o login pelo próprio site e depois continue.",
+            "ambiguous_username": "Não foi possível identificar o campo de usuário com segurança. Faça o login pelo próprio site.",
+            "additional_required_fields": "O login exige outros campos. Complete a entrada pelo próprio site e depois continue.",
+            "unobserved_controls": "Os controles de login não puderam ser confirmados. Faça o login pelo próprio site.",
+        }
+        status = attempt.status if attempt.status in {"success", "rejected", "manual_required"} else "manual_required"
+        reason = attempt.reason if attempt.reason in messages else "ambiguous_form"
+        return {"status": status, "reason": reason, "reason_label": messages[reason]}
 
     @classmethod
     def _automatic_login_message(cls, reason: str) -> str:
@@ -2587,6 +2610,7 @@ class ExplorationManager:
             scenario_number = 0
             consecutive_model_errors = 0
             login_retried = False
+            login_feedback_message = ""
             automatic_login_attempted = False
             authentication_boundary_crossed = False
             actions_executed = 0
@@ -2705,10 +2729,8 @@ class ExplorationManager:
                         break
                     if login_retried:
                         panel_message = (
-                            "Login ainda não detectado! Você preencheu mas "
-                            "não clicou no Login do site? Clique no botão Login "
-                            "da página e aguarde entrar — ao entrar, a exploração "
-                            "retoma sozinha."
+                            (login_feedback_message or "A entrada ainda não foi confirmada. Confira a resposta do site e ajuste os campos.") + " "
+                            + self.LOGIN_PANEL_MESSAGE
                         )
                     if self._needs_login(observation):
                         outcome = await self._wait_for_user_input(
@@ -2744,13 +2766,40 @@ class ExplorationManager:
                             executor.observe("after-user-input"),
                             timeout=self._operation_timeout(deadline),
                         )
+                        if outcome == "manual" and self._needs_login(observation):
+                            # One explicit Continue click authorizes one local
+                            # submission of the user's already-filled form. It
+                            # never authorizes a background credential retry.
+                            await executor.update_live_panel("Entrando no site", "Tentativa solicitada por você · sem chamadas à IA")
+                            self.repository.add_event(exploration_id, "info", "confirmed_login_started",
+                                                      "Tentando entrar com os campos preenchidos após confirmação do usuário")
+                            try:
+                                login = await asyncio.wait_for(executor.attempt_filled_login(observation),
+                                    timeout=min(25, self._operation_timeout(deadline)))
+                            except asyncio.TimeoutError:
+                                login = LoginAttempt("manual_required", "login_not_confirmed")
+                            feedback = self._filled_login_feedback(login)
+                            login_feedback_message = feedback["reason_label"]
+                            self.repository.add_event(exploration_id, "info" if feedback["status"] == "success" else "warning",
+                                                      "confirmed_login_result", feedback["reason_label"], feedback)
+                            observation = await asyncio.wait_for(executor.observe("after-confirmed-login"),
+                                timeout=self._operation_timeout(deadline))
+                        if self.repository.is_cancel_requested(exploration_id):
+                            terminal = ExplorationStatus.CANCELLED
+                            break
+                        if deadline is not None and time.monotonic() >= deadline:
+                            terminal = ExplorationStatus.PARTIAL
+                            self.repository.add_event(exploration_id, "warning", "coverage_partial",
+                                "Maximum exploration duration reached while confirming login; coverage is partial",
+                                {"reason": "duration_limit", **coverage.context(observation)})
+                            break
                         self._record_screenshot(exploration_id, observation, "After login")
                         self.repository.update_exploration(
                             exploration_id, current_url=observation.url
                         )
                         if self._needs_login(observation):
-                            # User resumed before actually signing in: keep the
-                            # manual gate, without another automatic attempt.
+                            # A failed explicit submission returns to the gate;
+                            # no automatic retry or original action follows it.
                             login_retried = True
                             self.repository.add_event(
                                 exploration_id,
@@ -2760,12 +2809,12 @@ class ExplorationManager:
                                 {"url": observation.url},
                             )
                             await executor.show_intervention_panel(
-                                "Login ainda não detectado! Clique no botão Login "
-                                "do próprio site, aguarde a próxima página carregar "
-                                "e só então clique em Continuar exploração."
+                                (feedback["reason_label"] + " " if outcome == "manual" else "")
+                                + self.LOGIN_PANEL_MESSAGE
                             )
                             continue
                     login_retried = False
+                    login_feedback_message = ""
                     executor.protect_authenticated_history()
                     if not authentication_boundary_crossed:
                         # The login document is an entry gate, not the parent

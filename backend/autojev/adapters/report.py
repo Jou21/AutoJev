@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from autojev.services.scenario_timeline import prepare_scenario_timelines
+from autojev.services.scenario_step_order import presentation_scenario_steps
 from autojev.services.rerun_projection import without_rerun_recipes
 from autojev.services.coverage_ledger import coverage_restriction_ledger
 from autojev.services.execution_summary import formatted_execution_duration, report_snapshot_key
@@ -87,16 +88,16 @@ class StandaloneHtmlReport:
         candidate = self._image_path(exploration_id, relative_path)
         if candidate is None:
             return None
-        mime = "image/png" if candidate.suffix.lower() == ".png" else "image/jpeg"
+        mime = {".png": "image/png", ".webp": "image/webp"}.get(candidate.suffix.lower(), "image/jpeg")
         return f"data:{mime};base64,{base64.b64encode(candidate.read_bytes()).decode('ascii')}"
 
-    def _screenshots(self, exploration_id: str, paths: list[str]) -> str:
+    def _screenshots(self, exploration_id: str, paths: list[str], *, image_label: str = "Captura de evidência") -> str:
         images: list[str] = []
         for path in paths:
             data = self._image_data(exploration_id, path)
             if data:
                 images.append(
-                    f'<figure><img loading="lazy" src="{data}" alt="Captura de evidência"><figcaption>{_h(Path(path).name)}</figcaption></figure>'
+                    f'<figure><img loading="lazy" src="{data}" alt="{_h(image_label)}"><figcaption>{_h(Path(path).name)}</figcaption></figure>'
                 )
         return "".join(images) or '<p class="muted">Nenhuma captura associada.</p>'
 
@@ -294,7 +295,7 @@ class StandaloneHtmlReport:
         if not isinstance(step, int) or isinstance(step, bool) or step < 1:
             return None
         for scenario in scenarios:
-            for index, entry in enumerate((scenario.get("evidence") or {}).get("timeline") or []):
+            for index, entry in enumerate(presentation_scenario_steps(scenario.get("evidence") or {})):
                 if (entry.get("kind") == "action"
                         and entry.get("step_number", entry.get("action_step")) == step):
                     return self._timeline_entry_id(scenario, index)
@@ -1240,6 +1241,10 @@ class StandaloneHtmlReport:
         if kind == "signal":
             return "warning", "Ocorrência registrada", "Ocorrência técnica; sozinha, não reprova o teste."
         if capture_exists:
+            if entry.get("image_source") == "user_upload":
+                return "recorded", "Imagem anexada", "Imagem escolhida por você; não foi capturada pelo teste e não aprova nem reprova o resultado."
+            if entry.get("capture_phase") in {"before_action", "after_action"} and entry.get("checkpoint_id"):
+                return "recorded", "Print manual registrado", "Você confirmou a captura durante a pausa; o print não aprova nem reprova o teste."
             return "recorded", "Captura registrada", "Captura salva; não é uma conferência do teste."
         return "info", "Registro disponível", "Observação salva; não é uma conferência do teste."
 
@@ -1247,7 +1252,13 @@ class StandaloneHtmlReport:
         self, exploration_id: str, scenario: dict[str, Any], *, observation: bool = False,
     ) -> str:
         evidence = scenario.get("evidence") or {}
-        entries = list(evidence.get("timeline") or [])
+        # A planned attachment belongs at its selected script boundary, even
+        # when submitted later. Keep the chronological evidence itself intact.
+        entries = list(evidence.get("timeline") or []) if observation else presentation_scenario_steps(evidence)
+        planned_order = any(
+            (entry.get("presentation_position") or {}).get("status") == "planned"
+            for entry in entries
+        )
         used_shots = {
             Path(str(item["screenshot"])).name for item in entries if item.get("screenshot")
         }
@@ -1311,7 +1322,15 @@ class StandaloneHtmlReport:
                 detail += self._assertion_detail(
                     entry["assertion"], selection=self._selection_for_assertion(entries, index),
                 )
-            timestamp = entry.get("occurred_at")
+            user_image = entry.get("image_source") == "user_upload"
+            timestamp = (entry.get("attached_at") or entry.get("occurred_at")) if user_image else entry.get("occurred_at")
+            placement = entry.get("presentation_position") or {}
+            placement_note = ""
+            if placement.get("status") == "planned":
+                boundary = "antes da primeira etapa" if placement.get("gap") == 0 else f'após a etapa {placement.get("gap")} do roteiro de origem'
+                placement_note = f'<p class="muted attachment-position-note">Posição escolhida: {_h(boundary)}. O horário exibido é o horário real do anexo.</p>'
+            elif placement.get("status") == "unresolved":
+                placement_note = '<p class="muted attachment-position-note">Não foi possível vincular com segurança a posição planejada deste anexo. Ele aparece separado dos passos, sem posição atribuída e com seu horário real.</p>'
             title = (
                 provenance.get("summary") if observation else None
             ) or entry.get("title") or labels[kind]
@@ -1356,11 +1375,14 @@ class StandaloneHtmlReport:
             rendered.append(
                 f'<li id="{self._timeline_entry_id(scenario, index)}" class="timeline-entry {kind}" '
                 f'data-step-state="{step_state}" data-step-outcome="{_h(step_outcome)}" '
-                f'data-step-description="{_h(step_description)}"><div class="timeline-marker" aria-hidden="true"></div>'
+                f'data-step-description="{_h(step_description)}"'
+                + (' data-image-source="user_upload"' if user_image else '')
+                + '><div class="timeline-marker" aria-hidden="true"></div>'
                 '<div class="timeline-content"><div class="event-meta">'
-                f'<span class="event-kind">{labels[kind]}</span>'
-                f'<time datetime="{_h(timestamp)}">{_h(self._timeline_time(timestamp))}</time></div>'
+                f'<span class="event-kind">{"Imagem do usuário" if user_image else labels[kind]}</span>'
+                f'<time datetime="{_h(timestamp)}">{"Anexado em " if user_image else ""}{_h(self._timeline_time(timestamp))}</time></div>'
                 f'<h3>{_h(title)}</h3>'
+                + placement_note
                 + action_meta
                 + observation_meta
                 + (f'<p>{_h(entry.get("message"))}</p>' if entry.get("message") else "")
@@ -1369,10 +1391,11 @@ class StandaloneHtmlReport:
                 + (self._action_preview(
                     exploration_id, entry, preceding=entries[:index], canonical_shots=canonical_shots,
                 ) if kind == "action" else "")
-                + (f'<div class="shots">{self._screenshots(exploration_id, [screenshot])}</div>' if screenshot else "")
+                + (f'<div class="shots">{self._screenshots(exploration_id, [screenshot], image_label="Imagem anexada pelo usuário" if entry.get("image_source") == "user_upload" else "Captura de evidência")}</div>' if screenshot else "")
                 + '</div></li>'
             )
-        return '<ol class="evidence-timeline">' + "".join(rendered) + '</ol>' if rendered else (
+        order_attribute = ' data-step-order="planned"' if planned_order else ''
+        return f'<ol class="evidence-timeline"{order_attribute}>' + "".join(rendered) + '</ol>' if rendered else (
             '<p class="muted">Não há evidência temporal registrada para este caso.</p>'
         )
 

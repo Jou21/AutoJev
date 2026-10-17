@@ -6,11 +6,13 @@ sites are involved. The page's login form is operated like a user's browser.
 """
 
 import asyncio
+import base64
 import copy
 import hashlib
 import threading
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
@@ -58,6 +60,8 @@ document.getElementById('sort').addEventListener('change', event => {
 
 @pytest.fixture
 def protected_inventory():
+    login_submissions = []
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
             pass
@@ -93,7 +97,9 @@ def protected_inventory():
 
         def do_POST(self):
             # These constants belong solely to this public test fixture. The
-            # service itself receives no credentials and performs no login.
+            # service receives no credentials. An explicit Continue may submit
+            # the fields already filled in the browser, without forwarding them.
+            login_submissions.append(self.path)
             fields = parse_qs(self.rfile.read(int(self.headers["Content-Length"])).decode())
             if self.path == "/login" and fields == {"username": ["fixture-user"], "password": ["fixture-password"]}:
                 self._redirect("/inventory.html", signed_in=True)
@@ -104,7 +110,12 @@ def protected_inventory():
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        yield f"http://127.0.0.1:{server.server_port}/inventory.html"
+        class FixtureInventoryUrl(str):
+            pass
+
+        fixture_url = FixtureInventoryUrl(f"http://127.0.0.1:{server.server_port}/inventory.html")
+        fixture_url.login_submissions = login_submissions
+        yield fixture_url
     finally:
         server.shutdown()
         server.server_close()
@@ -131,9 +142,22 @@ async def wait_preparation(service, exploration_id, version):
             await asyncio.sleep(0.01)
 
 
+async def wait_capture(service, exploration_id):
+    async with asyncio.timeout(20):
+        while True:
+            state = service.state_for(exploration_id)
+            if state.get("phase") == "waiting_capture":
+                return copy.deepcopy(state["capture_checkpoint"])
+            if state.get("phase") == "finished":
+                raise AssertionError(f"Capture finished prematurely: {state}")
+            await asyncio.sleep(0.01)
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize("print_gap", [None, 0, 3])
+@pytest.mark.parametrize("login_via_continue", [False, True], ids=["site-login", "continue-login"])
 async def test_login_redirect_and_premature_resume_keep_browser_open_until_explicit_retry(
-    tmp_path, monkeypatch, protected_inventory,
+    tmp_path, monkeypatch, protected_inventory, user_print_image, print_gap, login_via_continue,
 ):
     settings = Settings(
         data_dir=tmp_path, database_path=tmp_path / "db.sqlite3",
@@ -174,6 +198,12 @@ async def test_login_redirect_and_premature_resume_keep_browser_open_until_expli
         scenario = ExplorationManager._scenario_from_evidence(after, decision, result, 1)
         assert str(scenario.status) == "PASS"
         assert [assertion.kind for assertion in result.assertions] == ["selection_matches", "no_new_browser_errors"]
+        # An optional auxiliary review is metadata, not an additional original
+        # assertion. The local replay must neither borrow it nor invent a
+        # missing visual_model check when all saved local checks are repeated.
+        scenario.evidence["visual_assessment"] = {
+            "requested": True, "status": "assessed", "summary": "Original-only auxiliary review",
+        }
         saved_result = result.to_dict()
         saved_result["evidence"]["rerun_recipe"] = recipe
         repository.add_action(source_id, 1, asdict(decision), saved_result)
@@ -190,6 +220,7 @@ async def test_login_redirect_and_premature_resume_keep_browser_open_until_expli
 
     original = repository.get_exploration(source_id)
     original_report_digest = hashlib.sha256(source_report.read_bytes()).hexdigest()
+    assert protected_inventory.login_submissions == ["/login"]
     browsers = []
 
     class HeadlessFixtureExecutor(PlaywrightExecutor):
@@ -201,14 +232,32 @@ async def test_login_redirect_and_premature_resume_keep_browser_open_until_expli
             self.dispatched = []
             self.fixture_changes = None
             self.was_closed = False
+            self.confirmed_login_calls = 0
             browsers.append(self)
 
+        async def start(self, url):
+            observation = await super().start(url)
+            if print_gap is not None or login_via_continue:
+                # CI launches without a desktop, then enables the exact headed
+                # intervention-panel path. This leaves the real Chromium
+                # process headless while exercising its passive browser panel.
+                # Capture authority remains in AutoJev, outside the tested DOM.
+                self.headless = False
+            return observation
+
+        async def attempt_filled_login(self, observation=None):
+            self.confirmed_login_calls += 1
+            return await super().attempt_filled_login(observation)
+
         async def execute(self, replay_decision, credentials):
-            assert credentials == {}, "The replay service must not log in or forward credentials"
+            assert credentials == {}, "The CT action must not receive or forward login credentials"
             self.dispatched.append(copy.deepcopy(replay_decision))
             replay_result, replay_after = await super().execute(replay_decision, credentials)
             self.fixture_changes = await self._page.locator("#change-count").inner_text()
             return replay_result, replay_after
+
+        async def capture_print(self, _label):
+            raise AssertionError("Attaching an arbitrary image must not capture the tested browser")
 
         async def close(self):
             await super().close()
@@ -225,21 +274,30 @@ async def test_login_redirect_and_premature_resume_keep_browser_open_until_expli
     service = ScenarioRerunService(manager, settings)
     service.intervention_timeout_seconds = 40
     try:
-        new_id = service.submit(source_id, "CT001")
+        capture_plan = None if print_gap is None else {
+            "version": 1, "checkpoints": [{"id": "db-1", "gap": print_gap, "order": 0}],
+        }
+        new_id = service.submit(source_id, "CT001", capture_plan=capture_plan)
         task = service.tasks[new_id]
         first = await wait_preparation(service, new_id, 1)
         browser = browsers[0]
         assert first["preparation"]["expected_url"] == protected_inventory
         assert first["preparation"]["current_url"].endswith("/login")
         assert browser._page.url.endswith("/login")
+        assert browser.confirmed_login_calls == 0
+        assert protected_inventory.login_submissions == ["/login"]
 
-        # Reproduce the reported mistake: confirmation before logging in must
-        # show an actionable preparation warning, not terminate the attempt.
+        # An empty login cannot submit. Confirmation must instead show an
+        # actionable preparation warning, without terminating the attempt.
         service.resume(new_id)
         second = await wait_preparation(service, new_id, 2)
         assert second["preparation"]["attempts"] == 1
         assert second["preparation"]["reason_code"] == "before_url_changed"
         assert second["preparation"]["reason_label"]
+        assert second["preparation"]["login_attempt"]["status"] == "manual_required"
+        assert second["preparation"]["login_attempt"]["reason"] == "incomplete_credentials"
+        assert browser.confirmed_login_calls == 1
+        assert protected_inventory.login_submissions == ["/login"]
         waiting = repository.get_exploration(new_id)
         assert waiting["status"] == "waiting_input"
         assert waiting["steps_completed"] == 0
@@ -249,21 +307,74 @@ async def test_login_redirect_and_premature_resume_keep_browser_open_until_expli
         assert browser.dispatched == [] and not browser.was_closed
         assert not browser._page.is_closed() and not task.done()
 
-        await login_through_fixture_ui(browser, protected_inventory)
-        # Navigating to the correct page is preparation, never authorization to
-        # dispatch. Yield to the service so any automatic bypass is observable.
+        if login_via_continue:
+            # Reproduce the original yellow-button workflow: only fill the
+            # fields; never click the fixture site's Entrar button.
+            await browser._page.get_by_label("Usuário").fill("fixture-user")
+            await browser._page.get_by_label("Senha").fill("fixture-password")
+            assert browser._page.url.endswith("/login")
+            assert protected_inventory.login_submissions == ["/login"]
+        else:
+            await login_through_fixture_ui(browser, protected_inventory)
+        # Filling or manually navigating is preparation, never authorization to
+        # dispatch. Yield so any automatic submission/bypass is observable.
         await asyncio.sleep(0.1)
+        assert browser.confirmed_login_calls == 1
+        assert len(protected_inventory.login_submissions) == (1 if login_via_continue else 2)
         assert browser.dispatched == [] and not task.done()
         assert service.states[new_id]["phase"] == "waiting_preparation"
         assert repository.get_exploration(new_id)["steps_completed"] == 0
 
         service.resume(new_id)
+        if print_gap is not None:
+            checkpoint = await wait_capture(service, new_id)
+            assert checkpoint["id"] == "db-1" and checkpoint["gap"] == print_gap
+            expected_actions = 0 if print_gap == 0 else 1
+            assert len(browser.dispatched) == expected_actions
+            assert repository.get_exploration(new_id)["status"] == "waiting_input"
+            assert not browser.was_closed and not task.done()
+            passive_button = browser._page.get_by_role("button", name="Anexe na aplicação AutoJev", exact=True)
+            await passive_button.wait_for()
+            assert await passive_button.is_disabled()
+            assert await browser._page.evaluate("typeof window.__autojev_capture_print") == "undefined"
+            # Both a normal Continue request and elapsed time leave this real
+            # Chromium session waiting. The tested page cannot authorize its
+            # own attachment through a DOM event or an exposed host binding.
+            service.resume(new_id)
+            await passive_button.dispatch_event("click")
+            await browser._page.evaluate("window.__autojev_resume?.()")
+            await asyncio.sleep(0.2)
+            assert service.state_for(new_id)["phase"] == "waiting_capture"
+            assert service.state_for(new_id)["captures_completed"] == 0
+            assert len(browser.dispatched) == expected_actions and not task.done()
+            # A full page navigation must restore only the passive guidance,
+            # never make the old generic Continue binding a capture shortcut.
+            await browser._page.reload()
+            await passive_button.wait_for()
+            assert await passive_button.is_disabled()
+            assert await browser._page.evaluate("typeof window.__autojev_capture_print") == "undefined"
+            await browser._page.evaluate("window.__autojev_resume?.()")
+            await asyncio.sleep(0.1)
+            assert service.state_for(new_id)["phase"] == "waiting_capture"
+            assert not task.done() and len(browser.dispatched) == expected_actions
+            # This is the service method behind the strict, origin-checked
+            # application API, not an in-page callback in the untrusted site.
+            with pytest.raises(ValueError):
+                service.capture_print(new_id, checkpoint["id"], checkpoint["version"], "")
+            await asyncio.sleep(0.1)
+            assert service.state_for(new_id)["phase"] == "waiting_capture"
+            assert not task.done() and len(browser.dispatched) == expected_actions
+            service.capture_print(new_id, checkpoint["id"], checkpoint["version"], user_print_image["data_url"])
         await asyncio.wait_for(task, timeout=30)
         replay = repository.get_exploration(new_id)
         assert replay["status"] == "completed"
         assert replay["steps_completed"] == 1
         assert len(replay["actions"]) == len(replay["scenarios"]) == len(browser.dispatched) == 1
         assert browser.fixture_changes == "Alterações: 1"
+        assert protected_inventory.login_submissions == ["/login", "/login"]
+        assert browser.confirmed_login_calls == (2 if login_via_continue else 1)
+        confirmed_logins = [event for event in replay["events"] if event["type"] == "confirmed_login_result"]
+        assert sum(event["payload"]["status"] == "success" for event in confirmed_logins) == int(login_via_continue)
         assert browser.was_closed
         assert replay["scenarios"][0]["status"] == "PASS"
         replay_assertions = replay["scenarios"][0]["evidence"]["assertions"]
@@ -273,9 +384,40 @@ async def test_login_redirect_and_premature_resume_keep_browser_open_until_expli
         ]
         assert all(item["passed"] is True for item in replay_assertions)
         assert replay["scenarios"][0]["evidence"]["missing_original_checks"] == []
+        assert replay["scenarios"][0]["evidence"]["visual_assessment"] == {
+            "requested": False, "status": "disabled", "reason": "single_ct_rerun_local_only",
+        }
+        assert not replay.get("error")
+        replay_scope = replay["scenarios"][0]["evidence"]["rerun_scope"]
+        assert replay_scope["missing_visual_checks"] is False
+        assert replay_scope["visual_review_omitted"] is True and replay_scope["visual_review"] is False
         assert replay["usage"]["total_tokens"] == 0
         assert replay["report_available"] is True
         assert (settings.artifact_dir / new_id / "report.html").is_file()
+        if print_gap is not None:
+            manual = replay["scenarios"][0]["evidence"]["manual_captures"]
+            assert len(manual) == 1
+            captured = manual[0]
+            assert captured["checkpoint_id"] == "db-1" and captured["planned_gap"] == print_gap
+            assert captured["kind"] == "observation" and "passed" not in captured
+            assert captured["source"] == captured["image_source"] == "user_upload"
+            assert "url" not in captured and "page_url" not in captured
+            assert captured["attachment"]["sha256"] == user_print_image["sha256"]
+            assert (captured["attachment"]["width"], captured["attachment"]["height"]) == (240, 120)
+            screenshot = next(shot for shot in replay["screenshots"] if shot["path"] == captured["screenshot"])
+            assert screenshot["scenario_id"] == "CT001"
+            path = Path(captured["screenshot"])
+            if not path.is_absolute():
+                path = settings.artifact_dir / new_id / "screenshots" / path
+            assert path.is_file() and path.read_bytes() == user_print_image["bytes"]
+            html = (settings.artifact_dir / new_id / "report.html").read_text()
+            assert "Imagem anexada pelo usuário" in html
+            assert user_print_image["data_url"] in html
+            assert base64.b64encode(user_print_image["bytes"]).decode("ascii") in html
+            assert 'data-step-outcome="Imagem anexada"' in html
+            assert 'alt="Imagem anexada pelo usuário"' in html
+            assert "não aprova nem reprova" in html
+            assert service.state_for(new_id)["captures_completed"] == 1
         assert repository.get_exploration(source_id) == original
         assert hashlib.sha256(source_report.read_bytes()).hexdigest() == original_report_digest
     finally:

@@ -190,8 +190,18 @@ async function timelineComponents() {
     compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX, target: ScriptTarget.ES2022 },
   });
   const componentModule = { exports: {} };
+  const boardSource = await readFile(new URL("../app/components/RerunLiveBoard.tsx", import.meta.url), "utf8");
+  const boardCompiled = transpileModule(boardSource, {
+    fileName: "RerunLiveBoard.tsx",
+    compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX, target: ScriptTarget.ES2022 },
+  });
+  const boardModule = { exports: {} };
+  const nativeRequire = createRequire(import.meta.url);
+  new Function("require", "module", "exports", boardCompiled.outputText)(
+    (name) => name.endsWith(".css") ? {} : nativeRequire(name), boardModule, boardModule.exports,
+  );
   new Function("require", "module", "exports", compiled.outputText)(
-    createRequire(import.meta.url), componentModule, componentModule.exports,
+    (name) => name === "./components/RerunLiveBoard" ? boardModule.exports : nativeRequire(name), componentModule, componentModule.exports,
   );
   return componentModule.exports;
 }
@@ -229,8 +239,14 @@ test("real CT rerun consent explains data effects, manual preparation and unavai
   const blocked = renderToStaticMarkup(createElement(ScenarioRerunConsent, { preflight: available, loading: false, error: "", busy: false, consent: false, ...handlers }));
   assert.match(blocked, /ação original será repetida uma única vez e pode alterar dados/);
   assert.match(blocked, /sem chamadas à LLM/);
-  assert.match(blocked, /cartões de banco do rascunho não serão executados/);
-  assert.match(blocked, /recrie as pré-condições/);
+  assert.match(blocked, /Nenhuma pausa para print foi incluída\. SWS e SQL não serão executados/);
+  assert.match(blocked, /Nem todas as conferências originais poderão ser repetidas/);
+  assert.match(blocked, /a conferência visual da LLM ficará pendente/);
+  assert.match(blocked, /Recrie as pré-condições/);
+  assert.match(blocked, /preencha usuário e senha no novo navegador/);
+  assert.match(blocked, /tentará enviar um formulário de login preenchido e seguro/);
+  assert.match(blocked, /Se já estiver conectado, apenas conferirá a preparação/);
+  assert.match(blocked, /pode tentar entrar com o login que eu preencher/);
   assert.match(blocked, /Continuar reexecução/);
   assert.match(blocked, /type="button"[^>]*disabled=""[^>]*>.*Confirmar reexecução real/);
   const ready = renderToStaticMarkup(createElement(ScenarioRerunConsent, { preflight: available, loading: false, error: "", busy: false, consent: true, ...handlers }));
@@ -238,6 +254,178 @@ test("real CT rerun consent explains data effects, manual preparation and unavai
   const historical = renderToStaticMarkup(createElement(ScenarioRerunConsent, { preflight: { available: false, reason: "Receita não registrada nesta execução histórica." }, loading: false, error: "", busy: false, consent: false, ...handlers }));
   assert.match(historical, /Reexecução indisponível.*Receita não registrada/);
   assert.doesNotMatch(historical, /type="checkbox"/);
+});
+
+test("CT rerun consent distinguishes omitted auxiliary review from an unreplayed original visual check", async () => {
+  const { ScenarioRerunConsent } = await timelineComponents();
+  const handlers = { onConsent() {}, onConfirm() { throw new Error("Rendering must never execute a CT"); }, onClose() {} };
+  const markup = (scope, consent = true) => renderToStaticMarkup(createElement(ScenarioRerunConsent, {
+    preflight: { available: true, scenario_id: "CT001", scope }, loading: false, error: "", busy: false, consent, ...handlers,
+  }));
+  const auxiliaryOnly = markup({ local_checks: true, visual_review: false, missing_visual_checks: false, visual_review_omitted: true });
+  assert.match(auxiliaryOnly, /A revisão visual auxiliar não será repetida/);
+  assert.match(auxiliaryOnly, /As verificações locais podem ser concluídas normalmente/);
+  assert.match(auxiliaryOnly, /isso não equivale a uma aprovação visual/);
+  assert.doesNotMatch(auxiliaryOnly, /Nem todas as conferências|conferência visual da LLM ficará pendente/);
+  assert.doesNotMatch(auxiliaryOnly, /class="button primary"[^>]*disabled/);
+  assert.match(markup({ visual_review_omitted: true }, false), /class="button primary"[^>]*disabled/);
+
+  const originalVisualCheck = markup({ missing_visual_checks: true, visual_review_omitted: true });
+  assert.match(originalVisualCheck, /Nem todas as conferências originais poderão ser repetidas/);
+  assert.match(originalVisualCheck, /A reexecução não confirmará essa parte do teste/);
+  assert.doesNotMatch(originalVisualCheck, /As verificações locais podem ser concluídas normalmente/);
+
+  const localOnly = markup({ local_checks: true, visual_review: false, visual_review_omitted: false });
+  assert.doesNotMatch(localOnly, /revisão visual auxiliar não será repetida|conferência visual da LLM ficará pendente/);
+  assert.match(localOnly, /sem chamadas à LLM/);
+});
+
+test("capture plans cross only the explicit rerun handoff and malformed plans block consent", async () => {
+  const { parseAppHash, validateScenarioCapturePlan, validateCapturePlanForPreflight, confirmScenarioRerun } = await timelineComponents();
+  const plan = { version: 1, checkpoints: [{ id: "db-3", gap: 3, order: 0 }, { id: "db-8", gap: 3, order: 1 }] };
+  const hash = (value) => `#/reexecutar/source/CT001?capture_plan=${encodeURIComponent(JSON.stringify(value))}`;
+  assert.deepEqual(parseAppHash(hash(plan)), { view: "detail", explorationId: "source", rerunScenarioId: "CT001", capturePlan: plan });
+  const unknown = [null, [], {}, { ...plan, sql: "SELECT secret" }, { ...plan, version: true }, { ...plan, version: 2 },
+    { ...plan, checkpoints: [{ ...plan.checkpoints[0], query: "SELECT secret" }] },
+    { ...plan, checkpoints: [{ ...plan.checkpoints[0], gap: "3" }] },
+    { ...plan, checkpoints: [{ ...plan.checkpoints[0], gap: -1 }] },
+    { ...plan, checkpoints: [{ ...plan.checkpoints[0], order: 1.1 }] },
+    { ...plan, checkpoints: [{ ...plan.checkpoints[0], id: "db-١" }] },
+    { ...plan, checkpoints: [plan.checkpoints[0], plan.checkpoints[0]] },
+    { ...plan, checkpoints: [plan.checkpoints[0], { ...plan.checkpoints[0], id: "db-99" }] },
+    { ...plan, checkpoints: Array.from({ length: 101 }, (_, index) => ({ id: `db-${index}`, gap: 3, order: index })) }];
+  for (const value of unknown) {
+    assert.throws(() => validateScenarioCapturePlan(value));
+    const route = parseAppHash(hash(value));
+    assert.equal(route.capturePlan, undefined);
+    assert.ok(route.capturePlanError, JSON.stringify(value));
+    assert.equal(route.rerunScenarioId, "CT001", "keep confirmation screen visible with a blocking error");
+  }
+  for (const query of ["capture_plan=%7Bbad", "unknown=true", `capture_plan=${encodeURIComponent(JSON.stringify(plan))}&sql=SELECT`, `capture_plan=${encodeURIComponent(JSON.stringify(plan))}&capture_plan={}`]) {
+    assert.ok(parseAppHash(`#/reexecutar/source/CT001?${query}`).capturePlanError);
+  }
+  assert.equal(validateCapturePlanForPreflight(plan, { available: true, timeline_count: 6 }), "");
+  assert.match(validateCapturePlanForPreflight(plan, { available: true, timeline_count: 2 }), /fora dos passos/);
+  assert.match(validateCapturePlanForPreflight(plan, { available: true }), /conferir a posição/);
+  const calls = [];
+  const request = async (...values) => { calls.push(values); return { id: "child" }; };
+  await assert.rejects(confirmScenarioRerun(request, "source", "CT001", false, true, plan), /Confirme/);
+  await assert.rejects(confirmScenarioRerun(request, "source", "CT001", true, true, unknown[3]), /plano de prints/);
+  assert.equal(calls.length, 0);
+  await confirmScenarioRerun(request, "source", "CT001", true, true, plan);
+  assert.deepEqual(JSON.parse(calls[0][1].body), { confirm: true, capture_plan: plan });
+});
+
+test("manual capture consent makes pauses and their positions explicit without executing SWS or SQL", async () => {
+  const { ScenarioRerunConsent } = await timelineComponents();
+  const handlers = { onConsent() {}, onConfirm() { throw new Error("Rendering cannot submit a rerun"); }, onClose() {} };
+  const properties = { preflight: { available: true, scenario_id: "CT001" }, loading: false, error: "", busy: false, consent: true, ...handlers,
+    capturePlan: { version: 1, checkpoints: [{ id: "db-8", gap: 3, order: 0 }, { id: "db-3", gap: 0, order: 0 }] } };
+  const html = renderToStaticMarkup(createElement(ScenarioRerunConsent, properties));
+  assert.match(html, /2 pausas para print nesta reexecução/);
+  assert.match(html, /Posição planejada: antes da primeira etapa/);
+  assert.match(html, /Posição planejada: após a etapa 3/);
+  assert.match(html, /as demais acontecem após a ação e suas conferências locais/);
+  assert.match(html, /Anexar print e continuar/);
+  assert.match(html, /cole com Ctrl \+ V, arraste um arquivo ou escolha uma imagem/);
+  assert.match(html, /Pode ser de qualquer tela ou aplicativo; não há captura automática do navegador/);
+  assert.match(html, /A confirmação ocorre somente na aplicação AutoJev, nunca pela página testada/);
+  assert.match(html, /SWS e SQL continuam bloqueados e não serão executados/);
+  assert.match(html, /O print não aprova nem reprova/);
+  assert.doesNotMatch(html, /class="button primary"[^>]*disabled/);
+  const invalid = renderToStaticMarkup(createElement(ScenarioRerunConsent, { ...properties, error: "Plano de prints inválido" }));
+  assert.match(invalid, /role="alert">Plano de prints inválido/);
+  assert.match(invalid, /class="button primary"[^>]*disabled/);
+  assert.doesNotMatch(invalid, /type="checkbox"/);
+});
+
+test("capture confirmation is scoped to the current paused checkpoint and never uses generic resume", async () => {
+  const { captureScenarioRerunPrint, scenarioRerunCaptureKey, scenarioRerunPreparationConsent, scenarioRerunPhaseStepState } = await timelineComponents();
+  const checkpoint = { id: "db-3", gap: 3, order: 0, version: 1 };
+  const paused = { id: "child/run", app_url: "http://local.test", status: "waiting_input", steps_completed: 1, rerun: { phase: "waiting_capture", capture_checkpoint: checkpoint, capture_count: 2, captures_completed: 0 } };
+  const image = "data:image/png;base64,iVBORw0KGgo=";
+  const calls = [];
+  const request = async (...values) => { calls.push(values); return { id: paused.id }; };
+  assert.equal(scenarioRerunCaptureKey(paused), "child/run:db-3:1");
+  assert.equal(scenarioRerunPreparationConsent(paused, { key: "child/run:0", confirmed: true }), false);
+  assert.equal(scenarioRerunPhaseStepState(paused, "capture"), "active");
+  assert.equal(scenarioRerunPhaseStepState(paused, "reporting"), "pending");
+  for (const [run, point] of [[paused, { ...checkpoint, id: "db-4" }], [paused, { ...checkpoint, version: 2 }], [{ ...paused, rerun: { ...paused.rerun, phase: "capturing_print" } }, checkpoint], [{ ...paused, rerun: undefined }, checkpoint]]) {
+    await assert.rejects(captureScenarioRerunPrint(request, run, point, image), /Esta pausa já mudou/);
+  }
+  assert.equal(calls.length, 0);
+  for (const invalid of [undefined, "", "https://remote.test/print.png", "data:image/svg+xml;base64,PHN2Zz4=", "data:image/png;base64,not valid"]) {
+    await assert.rejects(captureScenarioRerunPrint(request, paused, checkpoint, invalid), /imagem/);
+  }
+  assert.equal(calls.length, 0, "a print must be deliberately attached, never captured automatically");
+  await captureScenarioRerunPrint(request, paused, checkpoint, image);
+  assert.deepEqual(calls, [["/explorations/child%2Frun/capture-print", { method: "POST", body: JSON.stringify({ confirm: true, checkpoint_id: "db-3", checkpoint_version: 1, image_data_url: image }) }]]);
+  const capturing = { ...paused, status: "running", rerun: { ...paused.rerun, phase: "capturing_print" } };
+  assert.equal(scenarioRerunPhaseStepState(capturing, "capture"), "active");
+  assert.equal(scenarioRerunPhaseStepState({ ...paused, status: "completed", rerun: { ...paused.rerun, phase: "finished", captures_completed: 2 } }, "capture"), "done");
+});
+
+test("paused capture UI offers paste, drop and file selection, and cannot continue without an image", async () => {
+  const { ScenarioRerunCapture } = await timelineComponents();
+  const properties = { checkpoint: { id: "db-3", gap: 3, order: 0, version: 1 }, total: 2, completed: 0, onCapture() { throw new Error("Rendering cannot capture"); } };
+  const waiting = renderToStaticMarkup(createElement(ScenarioRerunCapture, properties));
+  assert.match(waiting, /Adicione o print que você quiser/);
+  assert.match(waiting, /Print 1 de 2/);
+  assert.match(waiting, /Posição planejada: após a etapa 3/);
+  assert.match(waiting, /Até 15 minutos para confirmar/);
+  assert.match(waiting, /Sem confirmação, a execução não avança automaticamente/);
+  assert.match(waiting, /Anexar print e continuar/);
+  assert.match(waiting, /Cole ou arraste seu print aqui/);
+  assert.match(waiting, /Escolher imagem/);
+  assert.match(waiting, /type="file" accept="image\/png,image\/jpeg,image\/webp"/);
+  assert.match(waiting, /O print não precisa ser da página testada/);
+  assert.match(waiting, /Ou use Ctrl \+ V nesta tela/);
+  assert.match(waiting, /ela não aprova nem reprova o teste/);
+  assert.match(waiting, /class="button primary"[^>]*disabled/);
+  assert.doesNotMatch(waiting, /Continuar reexecução|type="checkbox"/);
+  const saving = renderToStaticMarkup(createElement(ScenarioRerunCapture, { ...properties, busy: true }));
+  assert.match(saving, /Salvando print/);
+  assert.match(saving, /class="button primary"[^>]*disabled/);
+  const failed = renderToStaticMarkup(createElement(ScenarioRerunCapture, { ...properties, error: "A captura não pôde ser salva" }));
+  assert.match(failed, /role="alert">A captura não pôde ser salva/);
+});
+
+test("print validation accepts only bounded image attachments and recognizes raster file signatures", async () => {
+  const { RERUN_PRINT_MAX_BYTES, rerunPrintFileError, rerunPrintImageType, rerunPrintDataUrlError } = await timelineComponents();
+  assert.equal(RERUN_PRINT_MAX_BYTES, 10 * 1024 * 1024);
+  for (const type of ["image/png", "image/jpeg", "image/webp", ""]) assert.equal(rerunPrintFileError({ size: 10, type }), "");
+  assert.match(rerunPrintFileError({ size: 0, type: "image/png" }), /vazia/);
+  assert.match(rerunPrintFileError({ size: RERUN_PRINT_MAX_BYTES + 1, type: "image/png" }), /10 MB/);
+  for (const type of ["image/svg+xml", "image/gif", "text/html", "application/pdf"]) assert.match(rerunPrintFileError({ size: 10, type }), /PNG, JPG ou WEBP/);
+  assert.equal(rerunPrintImageType(Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10])), "image/png");
+  assert.equal(rerunPrintImageType(Uint8Array.from([255, 216, 255, 224])), "image/jpeg");
+  assert.equal(rerunPrintImageType(Uint8Array.from([82, 73, 70, 70, 32, 0, 0, 0, 87, 69, 66, 80])), "image/webp");
+  assert.equal(rerunPrintImageType(new TextEncoder().encode("<svg></svg>")), "");
+  for (const mime of ["png", "jpeg", "webp"]) assert.equal(rerunPrintDataUrlError(`data:image/${mime};base64,aGVsbG8=`), "");
+  for (const value of [undefined, "", "https://remote.test/a.png", "data:image/gif;base64,aGVsbG8=", "data:image/png;base64,", "data:image/png;base64,a==", "data:image/png;base64,a===", "data:image/png;base64,a GVs", "data:image/png;base64,aGVs\nbG8="]) assert.ok(rerunPrintDataUrlError(value), String(value));
+  assert.equal(rerunPrintDataUrlError(`data:image/png;base64,${Buffer.alloc(RERUN_PRINT_MAX_BYTES).toString("base64")}`), "");
+  assert.match(rerunPrintDataUrlError(`data:image/png;base64,${Buffer.alloc(RERUN_PRINT_MAX_BYTES + 1).toString("base64")}`), /10 MB/);
+});
+
+test("pasting print images leaves text inputs and unrelated dialogs alone", async () => {
+  const { rerunPrintPasteIsBlocked } = await timelineComponents();
+  const plain = { closest() { return null; } };
+  const input = { closest(selector) { assert.match(selector, /input.*textarea.*contenteditable/); return {}; } };
+  assert.equal(rerunPrintPasteIsBlocked(plain, plain, false), false);
+  assert.equal(rerunPrintPasteIsBlocked(input, plain, false), true);
+  assert.equal(rerunPrintPasteIsBlocked(plain, input, false), true);
+  assert.equal(rerunPrintPasteIsBlocked(plain, plain, true), true);
+  assert.equal(rerunPrintPasteIsBlocked(null, null, false), false);
+});
+
+test("the attachment panel appears near the top of a paused execution, ahead of its progress dashboard", async () => {
+  const source = await readFile(new URL("../app/AutoJevApp.tsx", import.meta.url), "utf8");
+  const capture = source.indexOf("{capturePhase && <ScenarioRerunCapture");
+  assert.ok(capture > source.indexOf('aria-label="Origem da reexecução"'));
+  assert.ok(capture < source.indexOf('<section className={`execution-command'));
+  assert.match(source, /ScenarioRerunCapture key=\{captureKey \|\| exploration.id\}/);
+  assert.match(source, /window.addEventListener\("paste", paste\)/);
+  assert.doesNotMatch(source, /navigator.clipboard.read|clipboard.readText/);
 });
 
 test("terminal CT reruns keep polling for their new report and stop on ready, renderer failure or bounded expiry", async () => {
@@ -321,8 +509,34 @@ test("rerun preparation compares the expected and open pages with readable corre
   assert.match(html, /Faça login e abra a lista de produtos/);
   assert.doesNotMatch(html, /before_url_changed|"version"/);
   const validating = renderToStaticMarkup(createElement(ScenarioRerunPreparation, { validating: true }));
-  assert.match(validating, /Conferindo a página e os pré-requisitos/);
+  assert.match(validating, /Entrando e conferindo preparação/);
+  assert.match(validating, /formulário de login preenchido e seguro/);
+  assert.match(validating, /Depois conferirá a página e os pré-requisitos/);
   assert.match(validating, /Aguarde o resultado antes de confirmar novamente/);
+  const fallback = renderToStaticMarkup(createElement(ScenarioRerunPreparation, {}));
+  assert.match(fallback, /preencha usuário e senha/);
+  assert.match(fallback, /Continuar reexecução/);
+  assert.match(fallback, /tentará enviar o formulário de login/);
+  assert.match(fallback, /Se já estiver conectado, apenas conferirá a preparação/);
+});
+
+test("rerun preparation reports the login attempt without exposing technical codes or claiming the CT passed", async () => {
+  const { ScenarioRerunPreparation } = await timelineComponents();
+  const markup = (login_attempt) => renderToStaticMarkup(createElement(ScenarioRerunPreparation, { preparation: { login_attempt } }));
+  const success = markup({ status: "success", reason: "login_succeeded", reason_label: "O formulário foi enviado e o login foi confirmado." });
+  assert.match(success, /Login realizado/);
+  assert.match(success, /O formulário foi enviado e o login foi confirmado/);
+  assert.doesNotMatch(success, /login_succeeded|CT aprovado|Teste aprovado/);
+  const rejected = markup({ status: "rejected", reason: "login_rejected", reason_label: "O site recusou o login. Confira usuário e senha." });
+  assert.match(rejected, /Login não realizado/);
+  assert.match(rejected, /O site recusou o login/);
+  assert.doesNotMatch(rejected, /login_rejected|Login realizado/);
+  const manual = markup({ status: "manual_required", reason: "ambiguous_login", reason_label: "Conclua o login no navegador e tente continuar novamente." });
+  assert.match(manual, /Ajuste o login/);
+  assert.match(manual, /Conclua o login no navegador/);
+  assert.doesNotMatch(manual, /ambiguous_login/);
+  assert.match(markup({ status: "success" }), /os pré-requisitos do teste ainda serão conferidos/);
+  assert.match(markup({ status: "manual_required" }), /Confira o login no navegador antes de tentar novamente/);
 });
 
 test("blocked historical reruns explain that the action did not start without hiding real errors or unknown effects", async () => {
@@ -469,6 +683,69 @@ test("renders each CT timeline with its captures, assertions and technical signa
   assert.ok(html.indexOf('class="execution-observations"') > html.indexOf('class="scenario-case-list"'));
   assert.doesNotMatch(html, /Contexto · não é um teste|Contexto \/ navegação de apoio|Evidência de contexto|context-startup/);
   assert.doesNotMatch(html, /Sinais técnicos observados \(/);
+});
+
+test("user-uploaded images are plainly labeled as attachments, not browser captures or test approval", async () => {
+  const { ScenarioTimelinePanel } = await timelineComponents();
+  const html = renderToStaticMarkup(createElement(ScenarioTimelinePanel, {
+    explorationId: "run", apiBase: "http://localhost:8000/api", contexts: [], scenarios: [{
+      id: "CT001", title: "Testar ação", status: "PASS", evidence: { timeline: [{
+        kind: "observation", title: "Print fornecido pelo usuário", image_source: "user_upload", screenshot: "user-print.png",
+        occurred_at: "2026-10-16T15:00:00Z", url: "https://should-not-imply-browser-page.test/",
+      }] },
+    }],
+  }));
+  assert.match(html, /Imagem enviada por você/);
+  assert.match(html, /Não é uma captura automática do navegador nem uma verificação do teste/);
+  assert.match(html, /\/run\/screenshots\/user-print\.png/);
+  assert.doesNotMatch(html, /https:\/\/should-not-imply-browser-page.test/);
+  assert.doesNotMatch(html, /class="scenario-assertion-result/);
+});
+
+test("CT attachments use their planned step position without pretending their real upload time changed", async () => {
+  const { ScenarioTimelinePanel } = await timelineComponents();
+  const before = { id: "before", kind: "observation", title: "Antes da ação", screenshot: "before.png", occurred_at: "2026-10-16T15:00:00Z" };
+  const action = { id: "action", kind: "action", title: "Selecionar opção", occurred_at: "2026-10-16T15:00:01Z" };
+  const after = { id: "after", kind: "observation", title: "Depois da ação", screenshot: "after.png", occurred_at: "2026-10-16T15:00:02Z" };
+  const attachment = { id: "capture-db-1", kind: "observation", title: "Imagem anexada pelo usuário", image_source: "user_upload", screenshot: "user-print.png", occurred_at: "2026-10-16T15:05:00Z", attached_at: "2026-10-16T15:05:00Z" };
+  const scenario = {
+    id: "CT001", title: "Testar opção", status: "PASS", evidence: {
+      timeline: [before, action, after, attachment],
+      presentation_steps: [before, action, { ...attachment, presentation_position: { status: "planned", gap: 2, order: 0 } }, after],
+    },
+  };
+  const unchanged = JSON.stringify(scenario);
+  const html = renderToStaticMarkup(createElement(ScenarioTimelinePanel, {
+    explorationId: "run", apiBase: "http://localhost:8000/api", scenarios: [scenario], contexts: [],
+  }));
+  assert.match(html, /Passos e evidências do CT/);
+  assert.match(html, /Ordem dos passos planejada · horários reais preservados/);
+  assert.match(html, /não altera quando a imagem foi anexada nem quando as verificações aconteceram/);
+  assert.ok(html.indexOf("Selecionar opção") < html.indexOf("Imagem anexada pelo usuário"));
+  assert.ok(html.indexOf("Imagem anexada pelo usuário") < html.indexOf("Depois da ação"));
+  assert.match(html, /dateTime="2026-10-16T15:05:00Z">Anexado em /);
+  assert.match(html, /Posição escolhida: após a etapa 2 do roteiro de origem/);
+  assert.equal((html.match(/alt="CT001 · Imagem anexada pelo usuário"/g) || []).length, 1);
+  assert.equal(JSON.stringify(scenario), unchanged);
+});
+
+test("an attachment with ambiguous placement is explicitly unresolved and remains in recorded order", async () => {
+  const { ScenarioTimelinePanel } = await timelineComponents();
+  const html = renderToStaticMarkup(createElement(ScenarioTimelinePanel, {
+    explorationId: "run", apiBase: "http://localhost:8000/api", contexts: [], scenarios: [{
+      id: "CT001", title: "Testar opção", status: "PASS", evidence: {
+        timeline: [], presentation_steps: [
+          { id: "after", kind: "observation", title: "Depois da ação" },
+          { id: "capture-db-1", kind: "observation", title: "Imagem anexada pelo usuário", image_source: "user_upload", attached_at: "2026-10-16T15:05:00Z", presentation_position: { status: "unresolved", reason: "invalid_gap" } },
+        ],
+      },
+    }],
+  }));
+  assert.ok(html.indexOf("Depois da ação") < html.indexOf("Imagem anexada pelo usuário"));
+  assert.match(html, /Não foi possível vincular com segurança a posição planejada deste anexo/);
+  assert.match(html, /Ele aparece separado dos passos, sem posição atribuída e com seu horário real/);
+  assert.match(html, /dateTime="2026-10-16T15:05:00Z">Anexado em /);
+  assert.doesNotMatch(html, /Ordem dos passos planejada/);
 });
 
 test("shows orphan occurrences as execution observations with page provenance and request facts", async () => {

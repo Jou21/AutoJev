@@ -223,6 +223,7 @@ class FixtureElement {
     return event;
   }
   click() {
+    if (this.disabled) return;
     if (this.tagName === "A" && this.download) this.ownerDocument.downloads?.push({ filename: this.download, href: this.href });
     this.dispatch("click");
   }
@@ -464,6 +465,27 @@ function fixture(options = {}) {
         }
         originals.push(entry);
       });
+      if (options.projectedUpload && caseIndex === 0) {
+        timeline.dataset.stepOrder = "planned";
+        const entry = make("li", "timeline-entry observation", timeline);
+        entry.id = "timeline-case0-user-upload";
+        entry.dataset.imageSource = "user_upload";
+        entry.dataset.stepState = "recorded";
+        entry.dataset.stepOutcome = "Imagem anexada";
+        const content = make("div", "timeline-content", entry);
+        const meta = make("div", "event-meta", content);
+        make("span", "event-kind", meta, "Observação");
+        make("time", "", meta, "12:05:00");
+        make("h3", "", content, "Imagem anexada pelo usuário");
+        make("p", "", content, "Imagem fornecida por você; não aprova nem reprova o teste.");
+        const figure = make("figure", "", make("div", "shots", content));
+        const image = make("img", "", figure);
+        image.src = "data:image/png;base64,dXNlci1pbWFnZQ==";
+        make("figcaption", "", figure, "user-upload.png");
+        const assertion = timeline.querySelector(".assertion");
+        timeline.insertBefore(entry, assertion);
+        originals.splice(originals.indexOf(assertion), 0, entry);
+      }
     } else make("p", "muted", body, "Não há evidência temporal registrada para este caso.");
     cards.push(card);
   }
@@ -485,6 +507,17 @@ function fixture(options = {}) {
       element.naturalWidth = naturalImageSize.width;
       element.naturalHeight = naturalImageSize.height;
     }
+  }
+  const picker = make("dialog", "step-picker-dialog", document.body);
+  picker.id = "step-picker";
+  picker.setAttribute("aria-labelledby", "step-picker-title");
+  picker.showModal = () => picker.setAttribute("open", "");
+  picker.close = () => { picker.removeAttribute("open"); picker.dispatch("close"); };
+  for (const [tag, id] of [["h2", "step-picker-title"], ["p", "step-picker-position"], ["button", "step-picker-close"]]) {
+    make(tag, "", picker).id = id;
+  }
+  for (const [type, title] of [["sws", "Executar SWS"], ["sql", "Executar SQL"], ["wait_print", "Aguardar print"]]) {
+    make("button", "step-picker-choice", picker, title).dataset.stepChoice = type;
   }
   if (visualEditor) {
     const editor = make("dialog", "case-editor-dialog", document.body);
@@ -528,6 +561,14 @@ function fixture(options = {}) {
   }
   vm.runInNewContext(script, { document, window, Element: FixtureElement, Blob, URL: FixtureURL, fetch: window.fetch, Map, Set, console }, { filename: "premium.js" });
   return { document, window, cards, originals, originalImages, actionFigures, actionImages, toolbar, topbar, blobs, downloads: document.downloads, journeyList, journeyRoute, journeyCanvas, canvasCalls };
+}
+
+function insertStep(document, gap, type = "sql") {
+  gap.click();
+  const picker = document.getElementById("step-picker");
+  assert.equal(picker.hasAttribute("open"), true, "insertion opens the type chooser before creating a draft");
+  picker.querySelector(`[data-step-choice="${type}"]`).click();
+  assert.equal(picker.hasAttribute("open"), false);
 }
 
 test("golden journey keeps chronological DOM while laying out responsive serpentine rows", () => {
@@ -729,7 +770,7 @@ test("database placeholders support drag/drop, accessible insertion and reorder 
   prototype.dispatch("dragstart", { dataTransfer: transfer });
   list.querySelector(".case-editor-gap").dispatch("drop", { dataTransfer: transfer });
   assert.equal(list.querySelectorAll("[data-editor-step]")[0].dataset.editorStep, "database");
-  list.querySelectorAll(".case-editor-insert").at(-1).click();
+  insertStep(document, list.querySelectorAll(".case-editor-insert").at(-1));
   assert.equal(list.querySelectorAll(".case-editor-prototype").length, 2);
   list.querySelector(".case-editor-prototype").querySelectorAll("button").at(-1).click();
   assert.equal(list.querySelectorAll(".case-editor-prototype").length, 1);
@@ -741,21 +782,21 @@ test("saved visual drafts are per CT, export as bounded JSON only, and reopen of
   const { document, blobs, originals } = fixture({ visualEditor: true, journey: true });
   const originalSource = document.getElementById("report-data").textContent;
   document.querySelector("[data-edit-current]").click();
-  document.getElementById("case-editor-steps").querySelectorAll(".case-editor-insert")[1].click();
+  insertStep(document, document.getElementById("case-editor-steps").querySelectorAll(".case-editor-insert")[1]);
   document.getElementById("case-editor-save").click();
   assert.match(document.getElementById("case-editor-feedback").textContent, /Baixe o relatório para conservar/);
   document.getElementById("case-editor-close").click();
   const second = document.getElementById("journey-cases-0").querySelectorAll("[data-edit-case]")[1];
   second.click();
   assert.equal(document.getElementById("case-editor-steps").querySelectorAll(".case-editor-prototype").length, 0);
-  document.getElementById("case-editor-steps").querySelectorAll(".case-editor-insert").at(-1).click();
+  insertStep(document, document.getElementById("case-editor-steps").querySelectorAll(".case-editor-insert").at(-1));
   document.getElementById("case-editor-save").click();
   document.getElementById("download-report").click();
   const exported = await blobs.at(-1).text();
   const payload = JSON.parse(exported.match(/<script[^>]*id="report-drafts"[^>]*>([\s\S]*?)<\/script>/)[1]);
   assert.deepEqual(Object.keys(payload.cases), ["0", "1"]);
-  assert.deepEqual(payload.cases["0"].map(({ type, gap }) => ({ type, gap })), [{ type: "database", gap: 1 }]);
-  assert.deepEqual(payload.cases["1"].map(({ type, gap }) => ({ type, gap })), [{ type: "database", gap: 3 }]);
+  assert.deepEqual(payload.cases["0"].map(({ type, gap }) => ({ type, gap })), [{ type: "sql", gap: 1 }]);
+  assert.deepEqual(payload.cases["1"].map(({ type, gap }) => ({ type, gap })), [{ type: "sql", gap: 3 }]);
   assert.doesNotMatch(exported, /<li[^>]*class="case-editor-step/);
   assert.doesNotMatch(exported, /<dialog[^>]*id="case-editor"[^>]*\bopen=/);
   assert.equal((exported.match(/data:image\/png;base64,cHJlc2VydmVk/g) || []).length, 2);
@@ -792,7 +833,7 @@ test("visual drafts discard invalid imported fields and bound placeholders to 10
   assert.ok(bounded.document.querySelectorAll(".case-editor-insert").every((control) => control.disabled));
   bounded.document.querySelector(".case-editor-insert").click();
   assert.equal(bounded.document.querySelectorAll(".case-editor-prototype").length, 100);
-  assert.match(bounded.document.getElementById("case-editor-feedback").textContent, /Limite de 100/);
+  assert.equal(bounded.document.getElementById("step-picker").hasAttribute("open"), false, "a disabled insertion control cannot open the picker at the limit");
 });
 
 test("empty and malformed draft reports retain an honest visual-only editor and rerun feedback", () => {
@@ -801,7 +842,7 @@ test("empty and malformed draft reports retain an honest visual-only editor and 
     document.querySelector("[data-edit-current]").click();
     assert.match(document.querySelector(".case-editor-empty").textContent, /não tem passos registrados/);
     assert.equal(document.querySelectorAll(".case-editor-recorded").length, 0);
-    document.getElementById("case-editor-steps").querySelector(".case-editor-insert").click();
+    insertStep(document, document.getElementById("case-editor-steps").querySelector(".case-editor-insert"));
     assert.equal(document.querySelectorAll(".case-editor-prototype").length, 1);
     document.getElementById("case-editor-rerun").click();
     assert.match(document.getElementById("case-editor-feedback").textContent, /Reexecução não iniciada.*Abra o relatório pela aplicação/);
@@ -819,13 +860,13 @@ test("a connected blob report hands off only to same-origin app confirmation and
   });
   document.querySelector("[data-edit-current]").click();
   assert.equal(document.getElementById("case-editor-rerun").textContent, "Reexecutar este teste");
-  document.getElementById("case-editor-steps").querySelector(".case-editor-insert").click();
+  insertStep(document, document.getElementById("case-editor-steps").querySelector(".case-editor-insert"));
   document.getElementById("case-editor-save").click();
   document.getElementById("case-editor-rerun").click();
   assert.deepEqual(window.openedTabs, [["http://localhost:5173/#/reexecutar/source-123/CT001", "_blank", "noopener,noreferrer"]]);
   assert.equal(window.networkCalls, 0);
   assert.equal(cards[0].dataset.status, "PASS");
-  assert.match(document.getElementById("case-editor-feedback").textContent, /Nenhuma ação foi iniciada.*cartões de banco.*não serão executados/);
+  assert.match(document.getElementById("case-editor-feedback").textContent, /Nenhuma ação foi iniciada.*passos extras.*não serão executados/);
   document.getElementById("download-report").click();
   const exported = await blobs.at(-1).text();
   assert.doesNotMatch(exported, /<script[^>]*id="report-app-runtime"/);
@@ -863,14 +904,14 @@ test("the result toolbar reruns only the selected CT through app confirmation, n
     appRuntime: { app_url: "http://localhost:5173", source_exploration_id: "source-123" },
   });
   const first = cards[0];
-  first.querySelectorAll(".case-inline-insert")[1].click();
+  insertStep(document, first.querySelectorAll(".case-inline-insert")[1]);
   document.getElementById("case-rerun").click();
   assert.deepEqual(window.openedTabs, [["http://localhost:5173/#/reexecutar/source-123/CT001", "_blank", "noopener,noreferrer"]]);
   const feedback = document.getElementById("case-rerun-feedback");
   assert.equal(feedback.hidden, false);
   assert.equal(feedback.getAttribute("role"), "status");
   assert.equal(feedback.getAttribute("aria-live"), "polite");
-  assert.match(feedback.textContent, /Nenhuma ação foi iniciada.*cartões de banco.*não serão executados/);
+  assert.match(feedback.textContent, /Nenhuma ação foi iniciada.*passos extras.*não serão executados/);
   assert.equal(document.getElementById("case-editor").hasAttribute("open"), false, "toolbar action does not require the step editor");
   document.getElementById("case-next").click();
   document.getElementById("case-rerun").click();
@@ -897,7 +938,7 @@ test("the visible rerun button explains offline or untrusted reports without con
   }
 });
 
-test("insertion controls appear directly between steps without a toggle or modal and preserve original evidence", () => {
+test("insertion controls appear directly between steps and preserve original evidence through the type picker", () => {
   const { document, window, cards, originals, originalImages } = fixture();
   const card = cards[0];
   const unchangedEvidence = originals.map((entry) => entry.outerHTML.replace(/ hidden=""/g, ""));
@@ -909,14 +950,14 @@ test("insertion controls appear directly between steps without a toggle or modal
   assert.equal(card.querySelectorAll(".case-inline-gap").length, 4);
   assert.ok(card.querySelectorAll(".case-inline-gap").every((gap) => !gap.hidden));
   assert.ok(card.querySelectorAll(".case-inline-insert").every((control) => !control.hidden && control.textContent === "+ Adicionar aqui"));
-  card.querySelectorAll(".case-inline-insert")[1].click();
+  insertStep(document, card.querySelectorAll(".case-inline-insert")[1]);
   const draft = card.querySelector(".case-inline-draft");
   assert.ok(draft);
-  assert.match(draft.textContent, /Consulta em banco de dados.*Não executado/);
+  assert.match(draft.textContent, /Executar SQL.*Não executado/);
   draft.querySelector(".case-inline-draft-button").click();
   const panel = card.querySelector(".case-draft-panel");
   assert.equal(panel.hidden, false);
-  assert.match(panel.textContent, /Consulta em banco de dados/);
+  assert.match(panel.textContent, /Executar SQL/);
   assert.match(panel.textContent, /[Nn]ão executado/);
   assert.equal(panel.closest(".evidence-timeline"), null, "drafts are not historical evidence entries");
   assert.equal(card.querySelectorAll(".timeline-entry").filter((entry) => !entry.hidden).length, 0);
@@ -930,7 +971,7 @@ test("insertion controls appear directly between steps without a toggle or modal
   assert.equal(card.dataset.status, "PASS");
   assert.equal(window.networkCalls, 0);
   const saved = JSON.parse(document.getElementById("report-drafts").textContent);
-  assert.deepEqual(saved.cases["0"], [{ id: draft.dataset.draftId, type: "database", gap: 1, order: 0 }]);
+  assert.deepEqual(saved.cases["0"], [{ id: draft.dataset.draftId, type: "sql", gap: 1, order: 0, wait_for_print: false }]);
   assert.equal(card.querySelectorAll(".case-inline-draft").length, 1);
   assert.equal(card.querySelector(".case-inline-draft").dataset.draftId, draft.dataset.draftId);
   assert.equal(draft.getAttribute("draggable"), "true", "saved visual cards remain movable without entering an editing mode");
@@ -942,13 +983,401 @@ test("insertion controls appear directly between steps without a toggle or modal
   assert.equal(card.querySelector(".case-draft-panel").hidden, true);
 });
 
-test("inline database cards support trusted drag/drop, keyboard reorder, move buttons and removal", () => {
+test("the step picker offers exactly SWS, SQL and wait-print without inserting on open or cancellation", () => {
+  const { document, cards, window, originals } = fixture();
+  const card = cards[0];
+  const picker = document.getElementById("step-picker");
+  const trigger = card.querySelectorAll(".case-inline-insert")[1];
+  const originalHtml = originals.map((entry) => entry.outerHTML);
+  const untouchedDrafts = document.getElementById("report-drafts").textContent;
+  assert.equal(picker.tagName, "DIALOG");
+  assert.equal(picker.getAttribute("aria-labelledby"), "step-picker-title");
+  assert.deepEqual(picker.querySelectorAll("[data-step-choice]").map((button) => button.dataset.stepChoice), ["sws", "sql", "wait_print"]);
+  assert.deepEqual(picker.querySelectorAll("[data-step-choice]").map((button) => button.textContent), ["Executar SWS", "Executar SQL", "Aguardar print"]);
+  trigger.focus();
+  trigger.click();
+  assert.equal(picker.hasAttribute("open"), true);
+  assert.equal(card.querySelectorAll(".case-inline-draft").length, 0);
+  assert.equal(document.getElementById("report-drafts").textContent, untouchedDrafts);
+  assert.match(document.getElementById("step-picker-position").textContent, /CT001/);
+  document.getElementById("step-picker-close").click();
+  assert.equal(picker.hasAttribute("open"), false);
+  assert.equal(document.activeElement, trigger);
+  trigger.click();
+  picker.dispatch("cancel");
+  assert.equal(picker.hasAttribute("open"), false);
+  assert.equal(document.activeElement, trigger);
+  trigger.click();
+  picker.dispatch("keydown", { key: "Escape" });
+  assert.equal(picker.hasAttribute("open"), false);
+  assert.equal(document.activeElement, trigger);
+  picker.querySelector('[data-step-choice="sql"]').click();
+  assert.equal(card.querySelectorAll(".case-inline-draft").length, 0, "a stale choice cannot insert after the picker has closed");
+  assert.deepEqual(originals.map((entry) => entry.outerHTML), originalHtml);
+  assert.equal(window.networkCalls, 0);
+  assert.equal(window.openedTabs.length, 0);
+});
+
+test("SWS and SQL visual steps expose wait-print configuration and disabled future execution actions", () => {
+  for (const [type, title, blocked] of [["sws", "Executar SWS", "Escolher SWS"], ["sql", "Executar SQL", "Executar SQL"]]) {
+    const { document, cards, window, originalImages } = fixture();
+    const card = cards[0];
+    insertStep(document, card.querySelectorAll(".case-inline-insert")[2], type);
+    const draft = card.querySelector(".case-inline-draft");
+    assert.match(draft.textContent, new RegExp(title));
+    draft.querySelector(".case-inline-draft-button").click();
+    const panel = card.querySelector(".case-draft-panel");
+    assert.equal(panel.hidden, false);
+    const wait = panel.querySelector(".case-draft-wait-print");
+    const disabled = panel.querySelector(".case-draft-disabled-action");
+    assert.ok(wait, "wait-print is a configurable option rather than a claimed capture");
+    assert.equal(wait.disabled, false);
+    assert.equal(wait.checked, false);
+    assert.equal(wait.dataset.draftId, draft.dataset.draftId);
+    assert.equal(disabled.disabled, true);
+    assert.match(disabled.textContent, new RegExp(blocked));
+    assert.match(panel.textContent, /Aguardar print/);
+    assert.match(panel.textContent, /[Nn]ão executado/);
+    const source = () => JSON.parse(document.getElementById("report-drafts").textContent).cases["0"][0];
+    assert.deepEqual(source(), { id: draft.dataset.draftId, type, gap: 2, order: 0, wait_for_print: false });
+    wait.checked = true;
+    wait.dispatch("change");
+    assert.equal(source().wait_for_print, true);
+    disabled.click();
+    assert.equal(window.networkCalls, 0);
+    assert.equal(window.openedTabs.length, 0);
+    assert.deepEqual(document.querySelectorAll("img[src]"), originalImages, "configuring wait-print does not fabricate a new screenshot");
+    assert.deepEqual(cards.map((item) => item.dataset.status), ["PASS", "FAIL"]);
+  }
+});
+
+test("canceling a nested step picker preserves the editor, discards no original evidence and restores focus", () => {
+  const { document, originals, window } = fixture({ visualEditor: true });
+  const edit = document.querySelector("[data-edit-current]");
+  const editor = document.getElementById("case-editor");
+  const picker = document.getElementById("step-picker");
+  const saved = document.getElementById("report-drafts").textContent;
+  const canonical = originals.map((entry) => entry.outerHTML);
+  edit.click();
+  const gap = document.getElementById("case-editor-steps").querySelectorAll(".case-editor-insert")[1];
+  for (const cancel of [
+    () => document.getElementById("step-picker-close").click(),
+    () => picker.dispatch("cancel"),
+    () => document.dispatch("keydown", { key: "Escape" }),
+    () => picker.close(),
+  ]) {
+    gap.click();
+    assert.equal(picker.hasAttribute("open"), true);
+    assert.equal(document.activeElement, picker.querySelector('[data-step-choice="sws"]'));
+    cancel();
+    assert.equal(picker.hasAttribute("open"), false);
+    assert.equal(editor.hasAttribute("open"), true, "closing the topmost picker must not close the underlying editor");
+    assert.equal(document.activeElement, gap);
+    picker.querySelector('[data-step-choice="sql"]').click();
+    assert.equal(document.querySelectorAll(".case-editor-prototype").length, 0, "a stale choice cannot invoke a closed picker request");
+    assert.equal(document.getElementById("report-drafts").textContent, saved);
+  }
+  document.dispatch("keydown", { key: "Escape" });
+  assert.equal(editor.hasAttribute("open"), false);
+  assert.equal(document.activeElement, edit);
+  assert.deepEqual(originals.map((entry) => entry.outerHTML), canonical);
+  assert.equal(window.networkCalls, 0);
+});
+
+test("closing the editor or navigating away invalidates pending picker choices without inserting a stale step", () => {
+  const { document, cards, window } = fixture({ visualEditor: true });
+  const editor = document.getElementById("case-editor");
+  const picker = document.getElementById("step-picker");
+  const source = document.getElementById("report-drafts").textContent;
+  document.querySelector("[data-edit-current]").click();
+  document.getElementById("case-editor-steps").querySelector(".case-editor-insert").click();
+  document.getElementById("case-editor-close").click();
+  assert.equal(editor.hasAttribute("open"), false);
+  assert.equal(picker.hasAttribute("open"), false);
+  picker.querySelector('[data-step-choice="sws"]').click();
+  assert.equal(document.querySelectorAll(".case-editor-prototype").length, 0);
+  cards[0].querySelectorAll(".case-inline-insert")[1].click();
+  document.getElementById("case-next").click();
+  assert.equal(picker.hasAttribute("open"), false);
+  assert.equal(window.location.hash, "#view/results/CT002");
+  picker.querySelector('[data-step-choice="sql"]').click();
+  assert.ok(cards.every((card) => card.querySelectorAll(".case-inline-draft").length === 0));
+  assert.equal(document.getElementById("report-drafts").textContent, source);
+  assert.equal(window.networkCalls, 0);
+});
+
+test("standalone wait-print plans a manual capture in the chosen gap without starting execution", () => {
+  const { document, cards, window } = fixture();
+  insertStep(document, cards[0].querySelectorAll(".case-inline-insert")[1], "wait_print");
+  const draft = cards[0].querySelector(".case-inline-draft");
+  draft.querySelector(".case-inline-draft-button").click();
+  const panel = cards[0].querySelector(".case-draft-panel");
+  assert.match(panel.textContent, /Aguardar print/);
+  assert.match(panel.textContent, /[Nn]ão executado/);
+  assert.match(panel.textContent, /Ctrl\+V.*arrastar.*qualquer conteúdo.*Anexar print e continuar/);
+  assert.equal(panel.querySelector(".case-draft-wait-print"), null);
+  assert.equal(panel.querySelector(".case-draft-disabled-action"), null);
+  assert.deepEqual(JSON.parse(document.getElementById("report-drafts").textContent).cases["0"], [
+    { id: draft.dataset.draftId, type: "wait_print", gap: 1, order: 0 },
+  ]);
+  assert.equal(cards[0].querySelectorAll(".timeline-entry").length, 3);
+  assert.equal(window.networkCalls, 0);
+  assert.equal(window.openedTabs.length, 0);
+});
+
+test("connected rerun hands off only saved manual capture checkpoints, never SWS SQL or credentials", () => {
+  const { document, window, cards, originals } = fixture({ runId: "source-123", locationProtocol: "blob:",
+    locationOrigin: "http://localhost:5173", appRuntime: { app_url: "http://localhost:5173", source_exploration_id: "source-123" },
+    drafts: { version: 1, cases: { "0": [
+      { id: "db-1", type: "wait_print", gap: 1, order: 0, sql: "DROP TABLE users", token: "never-send" },
+      { id: "db-2", type: "sws", gap: 2, order: 1, wait_for_print: true, endpoint: "https://secret.example" },
+      { id: "db-3", type: "sql", gap: 2, order: 2, wait_for_print: true, query: "DELETE FROM users" },
+      { id: "db-4", type: "sql", gap: 3, order: 3, wait_for_print: false },
+      { id: "db-5", type: "database", gap: 3, order: 4, wait_for_print: true },
+    ] } },
+  });
+  const canonical = originals.map((entry) => entry.outerHTML);
+  document.getElementById("case-rerun").click();
+  const [target, context, features] = window.openedTabs.at(-1);
+  const [route, query] = target.split("?");
+  assert.equal(route, "http://localhost:5173/#/reexecutar/source-123/CT001");
+  assert.deepEqual(JSON.parse(new URLSearchParams(query).get("capture_plan")), { version: 1, checkpoints: [
+    { id: "db-1", gap: 1, order: 0 }, { id: "db-2", gap: 2, order: 1 }, { id: "db-3", gap: 2, order: 2 },
+  ] });
+  assert.equal(context, "_blank");
+  assert.equal(features, "noopener,noreferrer");
+  assert.doesNotMatch(target, /secret|DROP|DELETE|token|sql|sws|credentials/);
+  assert.match(document.getElementById("case-rerun-feedback").textContent, /3 pausa\(s\).*confirmação.*SWS e SQL não serão executados/);
+  assert.deepEqual(originals.map((entry) => entry.outerHTML), canonical);
+  assert.deepEqual(cards.map((card) => card.dataset.status), ["PASS", "FAIL"]);
+  assert.equal(window.networkCalls, 0);
+  document.getElementById("case-next").click();
+  document.getElementById("case-rerun").click();
+  assert.equal(window.openedTabs.at(-1)[0], "http://localhost:5173/#/reexecutar/source-123/CT002", "capture plan belongs only to the selected CT");
+});
+
+test("each visible insertion boundary survives rerun handoff and export without counting the case summary", async () => {
+  const connection = { runId: "source-123", locationProtocol: "blob:", locationOrigin: "http://localhost:5173",
+    appRuntime: { app_url: "http://localhost:5173", source_exploration_id: "source-123" } };
+  for (const gap of [0, 1, 2, 3]) {
+    const { document, window, cards, blobs, originals } = fixture(connection);
+    const card = cards[0];
+    const canonical = originals.map((entry) => entry.outerHTML.replace(/ hidden=""/g, ""));
+    insertStep(document, card.querySelectorAll(".case-inline-insert")[gap], "wait_print");
+    const draft = card.querySelector(".case-inline-draft");
+    const list = card.querySelector(".case-step-list");
+    const visibleCards = list.children.filter((entry) => entry.classList.contains("case-inline-draft")
+      || entry.classList.contains("case-step-button"));
+    assert.equal(visibleCards.indexOf(draft), gap + 1, "the non-executable case summary must not consume a capture gap");
+    document.getElementById("case-rerun").click();
+    const plan = JSON.parse(new URLSearchParams(window.openedTabs.at(-1)[0].split("?")[1]).get("capture_plan"));
+    assert.deepEqual(plan, { version: 1, checkpoints: [{ id: draft.dataset.draftId, gap, order: 0 }] });
+    document.getElementById("download-report").click();
+    const html = await blobs.at(-1).text();
+    const saved = JSON.parse(html.match(/<script[^>]*id="report-drafts"[^>]*>([\s\S]*?)<\/script>/)[1]);
+    assert.equal(saved.cases["0"][0].gap, gap);
+    const reopened = fixture({ ...connection, drafts: saved });
+    reopened.document.getElementById("case-rerun").click();
+    const reopenedPlan = JSON.parse(new URLSearchParams(reopened.window.openedTabs.at(-1)[0].split("?")[1]).get("capture_plan"));
+    assert.deepEqual(reopenedPlan, plan, "reopening the same recorded evidence cannot move a capture to the end");
+    assert.deepEqual(originals.map((entry) => entry.outerHTML.replace(/ hidden=""/g, "")), canonical);
+    assert.equal(window.networkCalls + reopened.window.networkCalls, 0);
+  }
+});
+
+test("adjacent manual print drafts share their canonical gap and retain local order in the rerun plan", () => {
+  const { document, window, cards } = fixture({ runId: "source-123", locationProtocol: "blob:",
+    locationOrigin: "http://localhost:5173", appRuntime: { app_url: "http://localhost:5173", source_exploration_id: "source-123" } });
+  const card = cards[0];
+  insertStep(document, card.querySelectorAll(".case-inline-insert")[2], "wait_print");
+  const firstId = card.querySelector(".case-inline-draft").dataset.draftId;
+  insertStep(document, card.querySelectorAll(".case-inline-insert")[3], "wait_print");
+  const secondId = card.querySelectorAll(".case-inline-draft")[1].dataset.draftId;
+  document.getElementById("case-rerun").click();
+  const plan = JSON.parse(new URLSearchParams(window.openedTabs.at(-1)[0].split("?")[1]).get("capture_plan"));
+  assert.deepEqual(plan.checkpoints, [{ id: firstId, gap: 2, order: 0 }, { id: secondId, gap: 2, order: 1 }]);
+  assert.equal(card.querySelectorAll(".timeline-entry").length, 3);
+  assert.equal(window.networkCalls, 0);
+});
+
+test("native planned steps retain an uploaded image between the chosen neighbors and reopen without duplicating evidence", async () => {
+  const { document, window, cards, blobs } = fixture({ projectedUpload: true });
+  const card = cards[0];
+  const titles = ["Antes da ação", "Selecionar ordenação", "Imagem anexada pelo usuário", "Conferir resultado"];
+  const timeline = card.querySelector(".evidence-timeline");
+  assert.equal(timeline.dataset.stepOrder, "planned");
+  assert.deepEqual(timeline.children.map((entry) => entry.querySelector("h3").textContent), titles);
+  assert.equal(card.querySelector(".case-step-order-note").textContent, "Ordem dos passos planejada · horários reais preservados");
+  const imageControl = card.querySelectorAll(".case-step-button[data-recorded-index]")[3];
+  assert.equal(imageControl.querySelector(".step-kind").textContent, "Imagem do usuário");
+  imageControl.click();
+  assert.equal(card.querySelector(".case-step-position").textContent, "Etapa 3 de 4 · Imagem do usuário");
+  assert.equal(card.querySelector('[data-image-source="user_upload"] time').textContent, "12:05:00", "the later attachment time remains real, not rewritten to fit the planned order");
+  document.getElementById("download-report").click();
+  const html = await blobs.at(-1).text();
+  assert.match(html, /<ol[^>]*data-step-order="planned"/);
+  const positions = ["timeline-case0-0", "timeline-case0-1", "timeline-case0-user-upload", "timeline-case0-2"].map((id) => html.indexOf('id="' + id + '"'));
+  assert.ok(positions.every((position, index) => position >= 0 && (!index || position > positions[index - 1])));
+  assert.equal((html.match(/data:image\/png;base64,dXNlci1pbWFnZQ==/g) || []).length, 1);
+  assert.doesNotMatch(html, /class="case-step-order-note"|class="step-preview-button"/, "export keeps canonical data, not live enhancements");
+  const reopened = fixture({ projectedUpload: true, exported: true });
+  assert.deepEqual(reopened.cards[0].querySelectorAll(".timeline-entry").map((entry) => entry.querySelector("h3").textContent), titles);
+  assert.equal(reopened.cards[0].querySelectorAll(".case-step-order-note").length, 1);
+  assert.equal(reopened.cards[0].querySelectorAll('[data-image-source="user_upload"]').length, 1);
+  assert.equal(reopened.cards[0].querySelectorAll(".case-step-button[data-recorded-index]")[3].querySelector(".step-kind").textContent, "Imagem do usuário");
+  assert.equal(card.dataset.status, "PASS");
+  assert.equal(window.networkCalls + reopened.window.networkCalls, 0);
+});
+
+test("modal edits must be saved before capture checkpoints can be handed to the app", () => {
+  const { document, window } = fixture({ visualEditor: true, runId: "source-123", locationProtocol: "blob:",
+    locationOrigin: "http://localhost:5173", appRuntime: { app_url: "http://localhost:5173", source_exploration_id: "source-123" },
+  });
+  document.querySelector("[data-edit-current]").click();
+  insertStep(document, document.getElementById("case-editor-steps").querySelectorAll(".case-editor-insert")[1], "wait_print");
+  document.getElementById("case-editor-rerun").click();
+  assert.equal(window.openedTabs.length, 0, "unsaved modal changes must not be silently omitted from reexecution");
+  assert.match(document.getElementById("case-editor-feedback").textContent, /Guarde o rascunho antes/);
+  document.getElementById("case-editor-save").click();
+  document.getElementById("case-rerun").click();
+  assert.equal(window.openedTabs.at(-1)[0].includes("capture_plan="), true);
+  assert.equal(window.networkCalls, 0);
+});
+
+test("manual capture plans stay bounded, reject forged positions, and cannot run from offline reports", () => {
+  const drafts = { version: 1, cases: { "0": [
+    { id: "db-1", type: "wait_print", gap: 99, order: 0 },
+    ...Array.from({ length: 110 }, (_, i) => ({ id: "db-" + (i + 2), type: "wait_print", gap: 1, order: i })),
+  ] } };
+  const connected = fixture({ drafts, runId: "source-123", locationProtocol: "blob:", locationOrigin: "http://localhost:5173",
+    appRuntime: { app_url: "http://localhost:5173", source_exploration_id: "source-123" } });
+  connected.document.getElementById("case-rerun").click();
+  const target = connected.window.openedTabs.at(-1)[0];
+  const plan = JSON.parse(new URLSearchParams(target.split("?")[1]).get("capture_plan"));
+  assert.ok(plan.checkpoints.length <= 100);
+  assert.ok(plan.checkpoints.every((checkpoint) => checkpoint.gap === 1 && checkpoint.id !== "db-1"));
+  const offline = fixture({ drafts, runId: "source-123", locationProtocol: "file:", locationOrigin: "null" });
+  offline.document.getElementById("case-rerun").click();
+  assert.equal(offline.window.openedTabs.length, 0);
+  assert.equal(offline.window.networkCalls, 0);
+});
+
+test("discarding modal wait-print changes leaves the saved inline draft untouched until an explicit save", () => {
+  const { document, cards, window } = fixture({ visualEditor: true });
+  const card = cards[0];
+  insertStep(document, card.querySelectorAll(".case-inline-insert")[1], "sql");
+  const inline = card.querySelector(".case-draft-wait-print");
+  inline.checked = true;
+  inline.dispatch("change");
+  const saved = document.getElementById("report-drafts").textContent;
+  const edit = document.querySelector("[data-edit-current]");
+  edit.click();
+  let modal = document.querySelector(".case-editor-wait-print");
+  assert.equal(modal.checked, true);
+  modal.checked = false;
+  modal.dispatch("change");
+  insertStep(document, document.getElementById("case-editor-steps").querySelectorAll(".case-editor-insert").at(-1), "wait_print");
+  document.getElementById("case-editor-close").click();
+  assert.equal(document.getElementById("report-drafts").textContent, saved);
+  assert.equal(card.querySelectorAll(".case-inline-draft").length, 1);
+  assert.equal(card.querySelector(".case-draft-wait-print").checked, true);
+  edit.click();
+  assert.equal(document.querySelectorAll(".case-editor-prototype").length, 1);
+  modal = document.querySelector(".case-editor-wait-print");
+  assert.equal(modal.checked, true, "reopening must read the saved draft, not the previously discarded object");
+  modal.checked = false;
+  modal.dispatch("change");
+  document.getElementById("case-editor-save").click();
+  document.getElementById("case-editor-close").click();
+  assert.equal(card.querySelector(".case-draft-wait-print").checked, false);
+  assert.equal(JSON.parse(document.getElementById("report-drafts").textContent).cases["0"][0].wait_for_print, false);
+  assert.deepEqual(cards.map((item) => item.dataset.status), ["PASS", "FAIL"]);
+  assert.equal(window.networkCalls, 0);
+});
+
+test("wait-print preferences synchronize with saved modal edits and survive offline export per CT", async () => {
+  const { document, cards, blobs } = fixture({ visualEditor: true });
+  insertStep(document, cards[0].querySelectorAll(".case-inline-insert")[1], "sws");
+  let inlineWait = cards[0].querySelector(".case-draft-wait-print");
+  inlineWait.checked = true;
+  inlineWait.dispatch("change");
+  document.querySelector("[data-edit-current]").click();
+  const editor = document.getElementById("case-editor-steps");
+  const modalWait = editor.querySelector(".case-editor-wait-print");
+  assert.equal(modalWait.checked, true);
+  modalWait.checked = false;
+  modalWait.dispatch("change");
+  assert.equal(JSON.parse(document.getElementById("report-drafts").textContent).cases["0"][0].wait_for_print, true, "modal changes are not applied until explicitly saved");
+  document.getElementById("case-editor-save").click();
+  document.getElementById("case-editor-close").click();
+  assert.equal(cards[0].querySelector(".case-draft-wait-print").checked, false);
+  inlineWait = cards[0].querySelector(".case-draft-wait-print");
+  inlineWait.checked = true;
+  inlineWait.dispatch("change");
+  document.getElementById("case-next").click();
+  insertStep(document, cards[1].querySelectorAll(".case-inline-insert").at(-1), "wait_print");
+  document.getElementById("download-report").click();
+  const exported = await blobs.at(-1).text();
+  const payload = JSON.parse(exported.match(/<script[^>]*id="report-drafts"[^>]*>([\s\S]*?)<\/script>/)[1]);
+  assert.equal(payload.cases["0"][0].type, "sws");
+  assert.equal(payload.cases["0"][0].gap, 1);
+  assert.equal(payload.cases["0"][0].wait_for_print, true);
+  assert.deepEqual(Object.keys(payload.cases["0"][0]).sort(), ["gap", "id", "order", "type", "wait_for_print"]);
+  assert.equal(payload.cases["1"][0].type, "wait_print");
+  assert.equal(payload.cases["1"][0].gap, 3);
+  assert.deepEqual(Object.keys(payload.cases["1"][0]), ["id", "type", "gap", "order"]);
+  assert.doesNotMatch(exported, /<dialog[^>]*id="step-picker"[^>]*\bopen=/);
+  assert.equal((exported.match(/data:image\/png;base64,cHJlc2VydmVk/g) || []).length, 2);
+  const reopened = fixture({ visualEditor: true, exported: true, drafts: payload });
+  assert.equal(reopened.cards[0].querySelector(".case-draft-wait-print").checked, true);
+  reopened.document.getElementById("case-next").click();
+  assert.equal(reopened.cards[1].querySelectorAll(".case-inline-draft").length, 1);
+  assert.match(reopened.cards[1].querySelector(".case-inline-draft").textContent, /Aguardar print/);
+  assert.equal(reopened.cards[1].querySelector(".case-draft-wait-print"), null);
+  assert.equal(reopened.window.networkCalls, 0);
+  assert.deepEqual(reopened.cards.map((item) => item.dataset.status), ["PASS", "FAIL"]);
+});
+
+test("draft imports allow only known visual types and literal wait-print booleans while preserving legacy schema", () => {
+  const entries = [
+    { id: "db-1", type: "database", gap: 0, order: 0, wait_for_print: true, sql: "DELETE", status: "PASS" },
+    { id: "db-2", type: "sws", gap: 1, order: 1, wait_for_print: true, endpoint: "https://private.example", token: "secret" },
+    { id: "db-3", type: "sql", gap: 2, order: 2, wait_for_print: false, query: "DROP TABLE users", credentials: "secret" },
+    { id: "db-4", type: "wait_print", gap: 3, order: 3, wait_for_print: true, screenshot: "data:forged", status: "PASS" },
+    { id: "db-5", type: "sql", gap: 0, order: 4, wait_for_print: "true" },
+    { id: "db-6", type: "sws", gap: 0, order: 5, wait_for_print: { execute: true } },
+    { id: "db-7", type: "execute", gap: 0, order: 6 },
+    { id: "db-8", type: "SQL", gap: 0, order: 7 },
+    { id: "db-9", type: ["sql"], gap: 0, order: 8 },
+    { id: "db-10", type: { name: "sws" }, gap: 0, order: 9 },
+  ];
+  const { document, cards, window } = fixture({ visualEditor: true, drafts: { version: 1, cases: { "0": entries } } });
+  assert.equal(cards[0].querySelectorAll(".case-inline-draft").length, 6);
+  document.querySelector("[data-edit-current]").click();
+  document.getElementById("case-editor-save").click();
+  const payload = JSON.parse(document.getElementById("report-drafts").textContent).cases["0"];
+  const byId = Object.fromEntries(payload.map((entry) => [entry.id, entry]));
+  assert.deepEqual(byId["db-1"], { id: "db-1", type: "database", gap: 0, order: 0 });
+  assert.equal(byId["db-2"].wait_for_print, true);
+  assert.equal(byId["db-3"].wait_for_print, false);
+  assert.deepEqual(Object.keys(byId["db-4"]), ["id", "type", "gap", "order"]);
+  assert.equal(byId["db-5"].wait_for_print, false, "a string cannot enable waiting for a print");
+  assert.equal(byId["db-6"].wait_for_print, false, "objects cannot enable waiting for a print");
+  assert.equal(byId["db-7"], undefined);
+  assert.equal(byId["db-8"], undefined);
+  assert.equal(byId["db-9"], undefined, "a coercible array is not a literal draft type");
+  assert.equal(byId["db-10"], undefined);
+  assert.doesNotMatch(JSON.stringify(payload), /DELETE|DROP TABLE|secret|private\.example|forged|credentials|status|endpoint/);
+  assert.equal(window.networkCalls, 0);
+});
+
+test("inline extra-step cards support trusted drag/drop, keyboard reorder, move buttons and removal", () => {
   const { document, cards } = fixture();
   const card = cards[0];
   const transfer = { setData() {} };
   card.querySelectorAll(".case-inline-gap")[1].dispatch("drop", { dataTransfer: transfer });
   assert.equal(card.querySelectorAll(".case-inline-draft").length, 0, "arbitrary external drops do not create steps");
-  card.querySelectorAll(".case-inline-insert")[0].click();
+  insertStep(document, card.querySelectorAll(".case-inline-insert")[0]);
   card.querySelector(".case-inline-draft").dispatch("dragstart", { dataTransfer: transfer });
   const gap = card.querySelectorAll(".case-inline-gap")[2];
   assert.equal(gap.dispatch("dragover", { dataTransfer: transfer }).defaultPrevented, true);
@@ -978,11 +1407,11 @@ test("inline database cards support trusted drag/drop, keyboard reorder, move bu
 test("inline drafts remain isolated by CT and synchronize with explicitly saved modal edits", () => {
   const { document, cards } = fixture({ visualEditor: true });
   const first = cards[0];
-  first.querySelectorAll(".case-inline-insert")[1].click();
+  insertStep(document, first.querySelectorAll(".case-inline-insert")[1]);
   document.querySelector("[data-edit-current]").click();
   const editor = document.getElementById("case-editor-steps");
   assert.equal(editor.querySelectorAll(".case-editor-prototype").length, 1);
-  editor.querySelectorAll(".case-editor-insert").at(-1).click();
+  insertStep(document, editor.querySelectorAll(".case-editor-insert").at(-1));
   assert.equal(first.querySelectorAll(".case-inline-draft").length, 1, "unsaved modal changes are not applied to the report");
   document.getElementById("case-editor-save").click();
   assert.equal(first.querySelectorAll(".case-inline-draft").length, 2);
@@ -995,7 +1424,7 @@ test("inline drafts remain isolated by CT and synchronize with explicitly saved 
   assert.equal(cards[1].querySelectorAll(".case-inline-draft").length, 0);
   assert.equal(cards[1].querySelector(".case-inline-add-toggle"), null);
   assert.ok(cards[1].querySelectorAll(".case-inline-gap").every((gap) => !gap.hidden));
-  cards[1].querySelectorAll(".case-inline-insert").at(-1).click();
+  insertStep(document, cards[1].querySelectorAll(".case-inline-insert").at(-1));
   const saved = JSON.parse(document.getElementById("report-drafts").textContent);
   assert.deepEqual(Object.keys(saved.cases), ["0", "1"]);
   assert.equal(saved.cases["0"][0].gap, 3);
@@ -1008,14 +1437,16 @@ test("inline drafts remain isolated by CT and synchronize with explicitly saved 
 test("inline autosaves export only bounded visual draft data and rebuild offline without duplicated evidence", async () => {
   const { document, blobs, cards, window } = fixture();
   const source = document.getElementById("report-data").textContent;
-  cards[0].querySelectorAll(".case-inline-insert")[2].click();
+  insertStep(document, cards[0].querySelectorAll(".case-inline-insert")[2]);
   cards[0].querySelector(".case-inline-draft-button").click();
   document.getElementById("download-report").click();
   const exported = await blobs.at(-1).text();
   const payload = JSON.parse(exported.match(/<script[^>]*id="report-drafts"[^>]*>([\s\S]*?)<\/script>/)[1]);
   assert.deepEqual(Object.keys(payload), ["version", "cases"]);
   assert.equal(payload.version, 1);
-  assert.deepEqual(Object.keys(payload.cases["0"][0]), ["id", "type", "gap", "order"]);
+  assert.deepEqual(Object.keys(payload.cases["0"][0]).sort(), ["gap", "id", "order", "type", "wait_for_print"]);
+  assert.equal(payload.cases["0"][0].type, "sql");
+  assert.equal(payload.cases["0"][0].wait_for_print, false);
   assert.equal(payload.cases["0"][0].gap, 2);
   assert.doesNotMatch(exported, /class="[^"]*case-inline-draft|class="[^"]*case-draft-panel/);
   assert.doesNotMatch(exported, /<button[^>]*id="download-report"/);
@@ -1025,7 +1456,7 @@ test("inline autosaves export only bounded visual draft data and rebuild offline
   const reopened = fixture({ exported: true, drafts: payload });
   assert.equal(reopened.cards[0].querySelectorAll(".case-inline-draft").length, 1);
   assert.equal(reopened.cards[0].querySelector(".case-inline-add-toggle"), null);
-  reopened.cards[0].querySelectorAll(".case-inline-insert").at(-1).click();
+  insertStep(reopened.document, reopened.cards[0].querySelectorAll(".case-inline-insert").at(-1));
   assert.equal(reopened.cards[0].querySelectorAll(".case-inline-draft").length, 2);
   const offlineFeedback = reopened.cards[0].querySelector(".case-inline-feedback").textContent;
   assert.match(offlineFeedback, /somente nesta aba.*arquivo original não será alterado/);
@@ -1036,7 +1467,7 @@ test("inline autosaves export only bounded visual draft data and rebuild offline
   reopened.cards[0].querySelector(".case-inline-remove").click();
   assert.equal(reopened.cards[0].querySelectorAll(".case-inline-draft").length, 1);
   const removalFeedback = reopened.cards[0].querySelector(".case-inline-feedback").textContent;
-  assert.match(removalFeedback, /removida.*somente nesta aba.*arquivo original não será alterado/);
+  assert.match(removalFeedback, /removid[ao].*somente nesta aba.*arquivo original não será alterado/);
   assert.doesNotMatch(removalFeedback, /baixe o relatório/);
   assert.equal(reopened.cards[0].querySelectorAll(".timeline-entry").length, 3);
   assert.equal(reopened.window.networkCalls, 0);
@@ -1055,7 +1486,7 @@ test("inline insertion enforces the same 100-card bound and cannot import execut
   assert.ok(card.querySelectorAll(".case-inline-insert").every((button) => button.disabled));
   card.querySelector(".case-inline-insert").click();
   assert.equal(card.querySelectorAll(".case-inline-draft").length, 100);
-  assert.match(card.querySelector(".case-inline-feedback").textContent, /Limite de 100/);
+  assert.equal(document.getElementById("step-picker").hasAttribute("open"), false, "a disabled insertion control cannot open the picker at the limit");
   card.querySelector(".case-inline-draft").dispatch("dragstart", { dataTransfer: { setData() {} } });
   card.querySelectorAll(".case-inline-gap").at(-1).dispatch("drop", { dataTransfer: { setData() {} } });
   assert.equal(card.querySelectorAll(".case-inline-draft").length, 100, "existing cards can still be moved without increasing the bound");
@@ -1067,10 +1498,49 @@ test("inline insertion enforces the same 100-card bound and cannot import execut
   assert.equal(card.dataset.status, "PASS");
 });
 
+test("mixed legacy and typed drafts share one 100-card limit and preserve only allowlisted offline data", async () => {
+  const types = ["database", "sws", "sql", "wait_print"];
+  const entries = Array.from({ length: 120 }, (_, index) => ({
+    id: "db-" + (index + 1), type: types[index % types.length], gap: index % 4, order: index % 100,
+    wait_for_print: true, executable: true, sql: "DROP TABLE accounts", credentials: "never-export",
+  }));
+  const { document, cards, blobs, window } = fixture({ visualEditor: true, drafts: { version: 1, cases: { "0": entries } } });
+  const card = cards[0];
+  assert.equal(card.querySelectorAll(".case-inline-draft").length, 100);
+  assert.ok(card.querySelectorAll(".case-inline-insert").every((button) => button.disabled));
+  card.querySelector(".case-inline-remove").click();
+  insertStep(document, card.querySelectorAll(".case-inline-insert").at(-1), "wait_print");
+  assert.equal(card.querySelectorAll(".case-inline-draft").length, 100);
+  assert.ok(card.querySelectorAll(".case-inline-insert").every((button) => button.disabled));
+  document.querySelector("[data-edit-current]").click();
+  assert.equal(document.querySelectorAll(".case-editor-prototype").length, 100);
+  assert.ok(document.querySelectorAll(".case-editor-insert").every((button) => button.disabled));
+  document.getElementById("case-editor-save").click();
+  document.getElementById("download-report").click();
+  const exported = await blobs.at(-1).text();
+  const payload = JSON.parse(exported.match(/<script[^>]*id="report-drafts"[^>]*>([\s\S]*?)<\/script>/)[1]);
+  assert.equal(payload.cases["0"].length, 100);
+  assert.deepEqual([...new Set(payload.cases["0"].map((item) => item.type))].sort(), types.toSorted());
+  payload.cases["0"].forEach((item) => {
+    const withOptions = ["sws", "sql"].includes(item.type);
+    assert.deepEqual(Object.keys(item).sort(), withOptions
+      ? ["gap", "id", "order", "type", "wait_for_print"] : ["gap", "id", "order", "type"]);
+    if (withOptions) assert.equal(item.wait_for_print, true);
+  });
+  assert.doesNotMatch(JSON.stringify(payload), /DROP TABLE|never-export|credentials|executable/);
+  const offline = fixture({ exported: true, visualEditor: true, drafts: payload });
+  assert.equal(offline.cards[0].querySelectorAll(".case-inline-draft").length, 100);
+  assert.ok(offline.cards[0].querySelectorAll(".case-inline-insert").every((button) => button.disabled));
+  assert.equal(offline.cards[0].querySelectorAll(".timeline-entry").length, 3);
+  assert.equal(card.dataset.status, "PASS");
+  assert.equal(window.networkCalls, 0);
+  assert.equal(offline.window.networkCalls, 0);
+});
+
 test("inline drafts do not interfere with technical filters or original keyboard navigation", () => {
   const { document, cards } = fixture({ withSignal: true });
   const card = cards[0];
-  card.querySelectorAll(".case-inline-insert").at(-1).click();
+  insertStep(document, card.querySelectorAll(".case-inline-insert").at(-1));
   document.getElementById("show-technical").checked = false;
   document.getElementById("settings-form").dispatch("submit");
   const original = card.querySelectorAll(".case-step-button[data-recorded-index]");

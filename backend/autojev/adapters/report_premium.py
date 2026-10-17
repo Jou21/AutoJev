@@ -111,6 +111,11 @@ def render_premium_report(renderer: Any, exploration: dict[str, Any], scenarios:
     actions = {item.get("step_number"): item.get("result") or {} for item in exploration.get("actions") or []}
     case_html, evidence_cards, execution_events = [], [], []
     evidence_seen: set[str] = set()
+    uploaded_shots = {
+        Path(entry["screenshot"]).name for scenario in scenarios
+        for entry in (scenario.get("evidence") or {}).get("timeline") or []
+        if entry.get("image_source") == "user_upload" and entry.get("screenshot")
+    }
     shot_owners: dict[str, list[tuple[int, str]]] = {}
     for owner_index, owner in enumerate(scenarios):
         owner_evidence = owner.get("evidence") or {}
@@ -173,7 +178,8 @@ def render_premium_report(renderer: Any, exploration: dict[str, Any], scenarios:
             owners = shot_owners[name]
             owner_ids = ", ".join(owner_id for _, owner_id in owners)
             links = "".join(f'<button class="button button-ghost" data-open-case="{owner_index}">{_h(owner_id)} →</button>' for owner_index, owner_id in owners)
-            evidence_cards.append(f'<article class="evidence-card" data-evidence-kind="screenshot" data-case-index="{index}" data-filename="{_h(name)}" data-search="{_h(owner_ids)}"><button data-preview-evidence aria-label="Ampliar captura {_h(name)}"><img loading="lazy" data-source-case="{index}" data-source-shot="{_h(name)}" alt="{_h(owner_ids)} · {_h(name)}"></button><div class="evidence-meta"><strong>{_h(case["id"])}</strong><p>{_h(name)}</p><small>{_h(page)} · {len(owners)} CT(s) associado(s)</small><div>{links}</div></div></article>')
+            image_context = "Imagem anexada pelo usuário" if name in uploaded_shots else page
+            evidence_cards.append(f'<article class="evidence-card" data-evidence-kind="screenshot" data-case-index="{index}" data-filename="{_h(name)}" data-search="{_h(owner_ids)}"><button data-preview-evidence aria-label="Ampliar imagem {_h(name)}"><img loading="lazy" data-source-case="{index}" data-source-shot="{_h(name)}" alt="{_h(owner_ids)} · {_h(name)}"></button><div class="evidence-meta"><strong>{_h(case["id"])}</strong><p>{_h(name)}</p><small>{_h(image_context)} · {len(owners)} CT(s) associado(s)</small><div>{links}</div></div></article>')
         if signals:
             evidence_cards.append(f'<article class="evidence-card" data-evidence-kind="log" data-case-index="{index}"><div class="evidence-meta"><span class="event-chip">Console e rede</span><h3>{_h(case["id"])} · {len(signals)} sinais técnicos</h3><p>{_h(str(signals[0].get("message") or "Sinal técnico registrado")[:300])}</p><small>Um sinal técnico não confirma sozinho um defeito funcional.</small><button class="button button-ghost" data-open-case="{index}">Ver na linha do tempo do CT</button></div></article>')
         if evidence.get("assertions"):
@@ -210,7 +216,7 @@ def render_premium_report(renderer: Any, exploration: dict[str, Any], scenarios:
             '<div class="reading-guide rerun-provenance"><strong>Reexecução individual de '
             + _h(rerun_source.get("source_scenario_id")) + '.</strong> '
             'Este é um novo resultado; o relatório original permanece inalterado. '
-            'Foram previstas somente a ação original e as conferências locais. '
+            'Foram previstas a ação original, as conferências locais e, quando confirmadas, pausas para anexar imagens escolhidas pelo usuário. '
             'Análises por modelo e cartões de consulta ao banco não são executados. '
             '<br>Execução de origem: <span class="url">'
             + _h(rerun_source.get("source_exploration_id")) + '</span></div>' + overview
@@ -260,7 +266,7 @@ def render_premium_report(renderer: Any, exploration: dict[str, Any], scenarios:
     head = head.replace('<html lang="pt-BR"', f'<html data-report-layout="{REPORT_LAYOUT_VERSION}" lang="pt-BR"', 1)
     css = (ASSETS / "premium.css").read_text() + '\n' + (ASSETS / "journey.css").read_text()
     js = (ASSETS / "premium.js").read_text()
-    data = _case_editor() + data + '<script id="report-drafts" type="application/json">{"version":1,"cases":{}}</script>'
+    data = _case_editor() + _step_picker() + data + '<script id="report-drafts" type="application/json">{"version":1,"cases":{}}</script>'
     return head + f'<style>{css}</style></head><body class="report-premium" data-view="overview" data-theme="dark" data-density="comfortable" data-report-schema="ct-timeline-v1"><aside class="report-sidebar"><div class="report-brand"><span class="brand-mark">{_icon("robot")}</span><div><strong class="brand-name">AUTOJEV</strong><span class="brand-caption">Relatório exploratório</span></div></div><nav aria-label="Seções do relatório">{nav}</nav><div class="sidebar-footer"><span class="legend-dot"></span>Relatório local e independente<small>Dados preservados · sem chamadas de IA</small></div></aside><main class="report-main"><header class="report-topbar"><div><span class="page-kicker">{_h(app_name)} / RELATÓRIO</span><h1 id="view-title" tabindex="-1">Visão geral</h1><p id="view-subtitle">Uma visão clara dos testes, resultados e evidências da execução.</p></div><div class="toolbar"><button id="print-report" class="button button-ghost">Imprimir</button><button id="download-report" class="button button-primary">{_icon("download")}Baixar relatório</button></div></header>{views}<noscript><style>.report-view[hidden],#scenarios .scenario[hidden]{{display:block!important}}.report-sidebar,.report-tools,.result-navigation,.toolbar{{display:none!important}}</style><p>JavaScript está desativado. Todas as seções são exibidas para leitura; abra os casos para ver suas evidências.</p></noscript></main><dialog id="evidence-dialog" class="evidence-dialog"><div class="dialog-toolbar"><strong id="evidence-caption">Captura registrada</strong><a id="download-evidence" class="button button-ghost" download>Baixar captura</a><button id="close-evidence" class="button button-ghost" aria-label="Fechar captura">Fechar ✕</button></div><div class="dialog-content"><img id="evidence-preview" alt="Captura de evidência ampliada"></div></dialog>{data}<script>{js}</script></body></html>'
 
 
@@ -406,18 +412,46 @@ def _case_editor() -> str:
         '<h2 id="case-editor-title">Editar passos do teste</h2></div>'
         '<button id="case-editor-close" class="button button-ghost" aria-label="Fechar editor de passos">Fechar ✕</button></header>'
         '<div class="case-editor-notice">Rascunho visual · não executado · não altera este resultado. '
-        'As etapas registradas ficam preservadas; os cards extras não executam consultas nem acessam bancos de dados.</div>'
+        'As etapas registradas ficam preservadas. “Aguardar print” pode pausar uma nova reexecução confirmada na aplicação; '
+        'adicionar cards aqui não inicia ações, integrações ou capturas.</div>'
         '<div class="case-editor-layout"><aside id="case-editor-palette" class="case-editor-palette">'
         '<span class="ct-summary-eyebrow">Adicionar ao roteiro</span>'
         f'<button id="database-step-card" class="database-step-card" draggable="true">{_icon("database")}'
         '<strong>Consulta em banco de dados</strong><small>Somente visual · sem conexão ou execução</small></button>'
-        '<p class="muted">Arraste o card para um espaço entre as etapas ou use “Adicionar aqui”.</p></aside>'
+        '<p class="muted">Arraste a consulta de exemplo ou use “Adicionar aqui” para escolher SWS, SQL ou Aguardar print.</p></aside>'
         '<section class="case-editor-canvas" aria-label="Etapas do roteiro"><h3>Passos do teste</h3>'
         '<p class="muted">Etapas originais são somente leitura. Posicione seus novos cards entre elas.</p>'
         '<ol id="case-editor-steps"></ol></section></div>'
         '<footer class="case-editor-footer"><p id="case-editor-feedback" role="status" aria-live="polite"></p>'
         '<div><button id="case-editor-rerun" class="button button-ghost">Ver disponibilidade de reexecução</button>'
         '<button id="case-editor-save" class="button button-primary">Guardar rascunho neste relatório</button></div></footer></dialog>'
+    )
+
+
+def _step_picker() -> str:
+    choices = (
+        ("sws", "route", "Executar SWS", "Prepare uma etapa de SWS e defina se ela deve aguardar um print.", "Escolher SWS · em breve"),
+        ("sql", "database", "Executar SQL", "Prepare uma etapa de banco de dados e defina se ela deve aguardar um print.", "Executar SQL · em breve"),
+        ("wait_print", "image", "Aguardar print", "Cole com Ctrl+V, arraste ou escolha uma imagem de qualquer conteúdo na aplicação AutoJev. Confira a prévia e clique em “Anexar print e continuar”.", "Sua imagem no relatório"),
+    )
+    cards = "".join(
+        f'<button type="button" class="step-picker-choice" data-step-choice="{kind}">'
+        f'<span class="step-picker-icon" aria-hidden="true">{_icon(icon)}</span>'
+        f'<strong>{title}</strong><span class="step-picker-description">{description}</span>'
+        f'<span class="step-picker-tag">{caption}</span>'
+        '<span class="step-picker-arrow" aria-hidden="true">→</span></button>'
+        for kind, icon, title, description, caption in choices
+    )
+    return (
+        '<dialog id="step-picker" class="step-picker-dialog" aria-labelledby="step-picker-title" aria-describedby="step-picker-note">'
+        '<header class="step-picker-header"><div><span class="page-kicker">Construa seu roteiro</span>'
+        '<h2 id="step-picker-title">Qual passo você quer adicionar?</h2>'
+        '<p id="step-picker-position" aria-live="polite"></p></div>'
+        '<button type="button" id="step-picker-close" class="button button-ghost" aria-label="Fechar opções de passo">Fechar ✕</button></header>'
+        '<div class="step-picker-choices">' + cards + '</div>'
+        '<p id="step-picker-note" class="step-picker-note">Adicionar um passo não inicia a execução. '
+        'As pausas para print serão confirmadas na aplicação ao reexecutar o teste. '
+        'SWS e SQL permanecem indisponíveis, e o resultado original do teste não muda.</p></dialog>'
     )
 
 

@@ -89,6 +89,74 @@ def test_case_time_sums_distinct_actions_and_starts_at_first_attempt_not_documen
     assert projected["status"] == "PASS"
 
 
+def test_step_picker_offers_three_named_choices_without_executable_configuration(tmp_path):
+    run = fixture()
+    before = deepcopy(run)
+    document = render(tmp_path, run)
+    picker = document.split('<dialog id="step-picker"', 1)[1].split('</dialog>', 1)[0]
+    assert document.count('id="step-picker"') == 1
+    assert 'aria-labelledby="step-picker-title"' in picker
+    assert 'aria-describedby="step-picker-note"' in picker
+    assert 'id="step-picker-close"' in picker
+    assert re.findall(r'data-step-choice="([^"]+)"', picker) == ["sws", "sql", "wait_print"]
+    for title in ("Executar SWS", "Executar SQL", "Aguardar print"):
+        assert f'<strong>{title}</strong>' in picker
+    assert 'Escolher SWS · em breve' in picker
+    assert 'Executar SQL · em breve' in picker
+    assert 'Anexar print e continuar' in picker
+    assert 'Ctrl+V' in picker and 'qualquer conteúdo' in picker
+    assert 'As pausas para print serão confirmadas na aplicação' in picker
+    assert 'SWS e SQL permanecem indisponíveis' in picker
+    assert '<input' not in picker and '<form' not in picker
+    assert run == before
+
+
+def test_manual_print_is_presented_as_evidence_not_a_passed_check():
+    entry = {"kind": "observation", "capture_phase": "after_action", "checkpoint_id": "db-1"}
+    state, outcome, description = StandaloneHtmlReport._step_presentation(entry, "observation", capture_exists=True)
+    assert state == "recorded"
+    assert outcome == "Print manual registrado"
+    assert "não aprova nem reprova" in description
+    assert StandaloneHtmlReport._step_presentation(entry, "observation", capture_exists=False)[0] == "info"
+
+
+def test_uploaded_image_is_not_presented_as_browser_capture_or_pass():
+    entry = {"kind": "observation", "image_source": "user_upload", "capture_phase": "after_action", "checkpoint_id": "db-1"}
+    state, outcome, description = StandaloneHtmlReport._step_presentation(entry, "observation", capture_exists=True)
+    assert state == "recorded"
+    assert outcome == "Imagem anexada"
+    assert "não foi capturada pelo teste" in description
+    assert "não aprova nem reprova" in description
+
+
+def test_uploaded_external_image_is_embedded_and_identified_without_claiming_a_browser_page(tmp_path):
+    from io import BytesIO
+    from PIL import Image
+
+    run = fixture()
+    filename = "uploaded-external-evidence.webp"
+    directory = tmp_path / run["id"] / "screenshots"
+    directory.mkdir(parents=True)
+    image = BytesIO()
+    Image.new("RGB", (24, 18), "#9747ff").save(image, format="WEBP")
+    (directory / filename).write_bytes(image.getvalue())
+    entry = {"kind": "observation", "title": "Imagem anexada pelo usuário", "image_source": "user_upload",
+             "screenshot": filename, "attached_at": "2026-10-16T12:00:00Z", "occurred_at": "2026-10-16T12:00:00Z",
+             "checkpoint_id": "db-1", "capture_phase": "after_action"}
+    run["scenarios"][0]["evidence"]["timeline"] = [entry]
+    run["scenarios"][0]["screenshots"] = [filename]
+    before = deepcopy(run)
+    document = render(tmp_path, run)
+    assert 'data:image/webp;base64,' in document
+    assert 'alt="Imagem anexada pelo usuário"' in document
+    assert 'data-step-outcome="Imagem anexada"' in document
+    gallery = re.search(r'<article class="evidence-card"[^>]*data-filename="uploaded-external-evidence.webp".*?</article>', document).group()
+    assert 'Imagem anexada pelo usuário' in gallery
+    assert '/cart' not in gallery and 'shop.test' not in gallery
+    assert run == before
+    assert data(document)["cases"][0]["status"] == "PASS"
+
+
 def test_unknown_timing_is_not_invented_as_zero(tmp_path):
     run = fixture()
     run["actions"] = []

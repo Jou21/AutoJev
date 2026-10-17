@@ -18,6 +18,7 @@ import {
   ChevronRight,
   CircleStop,
   Clock3,
+  ClipboardPaste,
   CloudCog,
   Code2,
   Copy,
@@ -30,6 +31,7 @@ import {
   Globe2,
   Hash,
   History,
+  ImagePlus,
   KeyRound,
   LayoutDashboard,
   LoaderCircle,
@@ -52,6 +54,7 @@ import {
   TerminalSquare,
   Trash2,
   Unplug,
+  Upload,
   WandSparkles,
   X,
   Zap,
@@ -66,6 +69,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { RerunLiveBoard, type RerunLiveProgress, type RerunLiveStep } from "./components/RerunLiveBoard";
 
 const DEFAULT_API_URL =
   process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
@@ -78,7 +82,9 @@ type View =
   | "settings"
   | "detail";
 
-type AppRoute = { view: View; explorationId?: string; rerunScenarioId?: string };
+type ScenarioCapturePlan = { version: 1; checkpoints: { id: string; gap: number; order: number }[] };
+type RerunCaptureCheckpoint = { id: string; gap: number; order: number; version: number };
+type AppRoute = { view: View; explorationId?: string; rerunScenarioId?: string; capturePlan?: ScenarioCapturePlan; capturePlanError?: string; liveRerun?: boolean };
 
 type ScenarioRerunPreflight = {
   available: boolean;
@@ -91,7 +97,9 @@ type ScenarioRerunPreflight = {
   checks?: string[];
   effects?: string[];
   manual_preparation_required?: boolean;
-  scope?: { local_checks?: boolean; visual_review?: boolean; database_steps?: boolean; missing_visual_checks?: boolean };
+  timeline_count?: number;
+  action_index?: number;
+  scope?: { local_checks?: boolean; visual_review?: boolean; database_steps?: boolean; missing_visual_checks?: boolean; visual_review_omitted?: boolean };
 };
 
 type Model = {
@@ -180,6 +188,9 @@ type ScenarioTimelineEntry = {
     status_code?: number | null;
   };
   screenshot?: string | null;
+  image_source?: "user_upload" | string;
+  attached_at?: string;
+  presentation_position?: { status: "planned" | "unresolved"; gap?: number; order?: number; reason?: string };
   signal?: ScenarioTechnicalSignal;
   assertion?: ScenarioAssertion;
   step_number?: number;
@@ -203,6 +214,7 @@ type ScenarioCase = {
     rerun_blocked_reason?: string;
     rerun_blocked_explanation?: string;
     timeline?: ScenarioTimelineEntry[];
+    presentation_steps?: ScenarioTimelineEntry[];
     technical_signals?: ScenarioTechnicalSignal[];
     assertions?: ScenarioAssertion[];
     visual_assessment?: { requested?: boolean; status?: string; reason?: string; accepted_count?: number; uncertain_count?: number; limitations?: string[]; context_limited?: boolean; review_scope?: string };
@@ -255,6 +267,11 @@ type RerunPreparation = {
   reason_code?: string | null;
   reason_label?: string | null;
   instruction?: string;
+  login_attempt?: {
+    status: "success" | "rejected" | "manual_required";
+    reason?: string;
+    reason_label?: string;
+  };
 };
 
 type Exploration = {
@@ -263,7 +280,7 @@ type Exploration = {
   status: string;
   rerun?: {
     running?: boolean;
-    phase?: "queued" | "preparing" | "waiting_preparation" | "validating_preparation" | "executing" | "generating_report" | "finished";
+    phase?: "queued" | "preparing" | "waiting_preparation" | "validating_preparation" | "executing" | "waiting_capture" | "capturing_print" | "generating_report" | "finished";
     source_exploration_id?: string;
     source_scenario_id?: string;
     exploration_id?: string;
@@ -271,8 +288,13 @@ type Exploration = {
     reason_label?: string;
     action_dispatched?: boolean;
     preparation?: RerunPreparation;
+    capture_checkpoint?: RerunCaptureCheckpoint;
+    capture_count?: number;
+    captures_completed?: number;
+    capture_timeout_seconds?: number;
     outcome?: string;
     finished_at?: string;
+    step_progress?: RerunLiveProgress;
   };
   created_at?: string;
   updated_at?: string;
@@ -763,12 +785,16 @@ export function scenarioRerunPhaseStepState(exploration: Exploration, stepKey: s
     || (exploration.actions || []).some((action) => typeof action.result?.success === "boolean");
   const live = isLive(exploration.status);
   if (stepKey === "preparing") {
-    if (rerun.phase === "executing" || actionCompleted) return "done";
+    if (["executing", "waiting_capture", "capturing_print"].includes(rerun.phase || "") || actionCompleted) return "done";
     return live && ["queued", "preparing", "waiting_preparation", "validating_preparation"].includes(rerun.phase || "") ? "active" : "pending";
   }
   if (stepKey === "executing") {
     if (actionCompleted) return "done";
     return live && rerun.phase === "executing" ? "active" : "pending";
+  }
+  if (stepKey === "capture") {
+    if ((rerun.capture_count || 0) > 0 && (rerun.captures_completed || 0) >= (rerun.capture_count || 0)) return "done";
+    return live && ["waiting_capture", "capturing_print"].includes(rerun.phase || "") ? "active" : "pending";
   }
   if (stepKey === "reporting") {
     if (exploration.report_available === true) return "done";
@@ -818,14 +844,18 @@ export function scenarioRerunFeedback(exploration: Exploration) {
 }
 
 export function ScenarioRerunPreparation({ preparation, validating = false }: { preparation?: RerunPreparation; validating?: boolean }) {
+  const loginAttempt = preparation?.login_attempt;
+  const loginAttemptLabel = loginAttempt?.status === "success" ? "Login realizado"
+    : loginAttempt?.status === "rejected" ? "Login não realizado" : "Ajuste o login";
   return <div className="rerun-preparation-guide">
+    {loginAttempt && <p className="rerun-preparation-reason" role="status">{loginAttempt.status === "success" ? <CheckCircle2 size={17} /> : <AlertCircle size={17} />}<span><strong>{loginAttemptLabel}.</strong> {loginAttempt.reason_label || (loginAttempt.status === "success" ? "O login foi concluído; os pré-requisitos do teste ainda serão conferidos." : "Confira o login no navegador antes de tentar novamente.")}</span></p>}
     {preparation?.reason_label && <p className="rerun-preparation-reason" role="status"><AlertCircle size={17} /><span>{preparation.reason_label} <strong>Nenhuma ação do CT foi executada.</strong></span></p>}
     <div className="rerun-page-comparison" aria-label="Comparação da página para reexecução">
       <div><span>Página esperada pelo teste</span><strong>{preparation?.expected_url || "Consulte a página inicial do CT original"}</strong></div>
       <ArrowRight size={18} aria-hidden="true" />
       <div><span>Página aberta no navegador</span><strong>{preparation?.current_url || "Aguardando leitura do navegador"}</strong></div>
     </div>
-    <p>{validating ? "Conferindo a página e os pré-requisitos. Aguarde o resultado antes de confirmar novamente." : preparation?.instruction || "No navegador da reexecução, faça login se necessário, abra a página esperada e recrie os dados e opções iniciais do CT. Depois confirme abaixo para conferir a preparação."}</p>
+    <p>{validating ? "Entrando e conferindo preparação… Se houver um formulário de login preenchido e seguro, o AutoJev tentará enviá-lo. Depois conferirá a página e os pré-requisitos. Aguarde o resultado antes de confirmar novamente." : preparation?.instruction || "Se estiver na tela de login, preencha usuário e senha no navegador da reexecução e clique em «Continuar reexecução»: o AutoJev tentará enviar o formulário de login. Se já estiver conectado, apenas conferirá a preparação. Recrie também os dados e opções iniciais do CT; a ação original só será executada depois de conferir os pré-requisitos."}</p>
   </div>;
 }
 
@@ -867,14 +897,48 @@ function errorMessage(error: unknown) {
   return "Não foi possível concluir a solicitação.";
 }
 
+export function validateScenarioCapturePlan(value: unknown): ScenarioCapturePlan {
+  const record = (item: unknown): item is Record<string, unknown> => !!item && typeof item === "object" && !Array.isArray(item);
+  const exactKeys = (item: Record<string, unknown>, keys: string[]) => Object.keys(item).length === keys.length && keys.every((key) => Object.hasOwn(item, key));
+  if (!record(value) || !exactKeys(value, ["version", "checkpoints"]) || value.version !== 1 || !Array.isArray(value.checkpoints) || value.checkpoints.length > 100) throw new Error("O plano de prints é inválido. Reabra o relatório pela aplicação e tente novamente.");
+  const ids = new Set<string>(), positions = new Set<string>();
+  const checkpoints = value.checkpoints.map((item) => {
+    if (!record(item) || !exactKeys(item, ["id", "gap", "order"]) || typeof item.id !== "string" || !/^db-[0-9]{1,9}$/.test(item.id)
+      || typeof item.gap !== "number" || !Number.isInteger(item.gap) || item.gap < 0 || item.gap > 10000
+      || typeof item.order !== "number" || !Number.isInteger(item.order) || item.order < 0 || item.order > 10000
+      || ids.has(item.id) || positions.has(`${item.gap}:${item.order}`)) throw new Error("O plano de prints contém uma pausa inválida ou repetida. Reabra o relatório pela aplicação.");
+    ids.add(item.id); positions.add(`${item.gap}:${item.order}`);
+    return { id: item.id, gap: item.gap, order: item.order };
+  });
+  return { version: 1, checkpoints };
+}
+
+export function validateCapturePlanForPreflight(plan: ScenarioCapturePlan | undefined, preflight: ScenarioRerunPreflight | null) {
+  if (!plan?.checkpoints.length) return "";
+  if (!preflight || !Number.isInteger(preflight.timeline_count) || (preflight.timeline_count || 0) < 0) return "Não foi possível conferir a posição dos prints neste CT. Atualize a aplicação e reabra o relatório.";
+  if (plan.checkpoints.some((item) => item.gap > preflight.timeline_count!)) return "Uma pausa para print está fora dos passos deste CT. Reabra o relatório e confira as posições.";
+  return "";
+}
+
 export function parseAppHash(hash: string): AppRoute {
-  const rerun = hash.match(/^#\/reexecutar\/([^/]+)\/([^/]+)$/);
+  const rerun = hash.match(/^#\/reexecutar\/([^/?]+)\/([^/?]+)(?:\?(.*))?$/);
   try {
-    if (rerun) return { view: "detail", explorationId: decodeURIComponent(rerun[1]), rerunScenarioId: decodeURIComponent(rerun[2]) };
+    if (rerun) {
+      const route: AppRoute = { view: "detail", explorationId: decodeURIComponent(rerun[1]), rerunScenarioId: decodeURIComponent(rerun[2]) };
+      if (rerun[3] !== undefined) {
+        try {
+          if (rerun[3].length > 30000) throw new Error("O plano de prints excedeu o limite permitido.");
+          const parameters = new URLSearchParams(rerun[3]);
+          if ([...parameters].length !== 1 || !parameters.has("capture_plan")) throw new Error("A solicitação contém parâmetros de reexecução desconhecidos. Reabra o relatório pela aplicação.");
+          route.capturePlan = validateScenarioCapturePlan(JSON.parse(parameters.get("capture_plan")!));
+        } catch (caught) { route.capturePlanError = caught instanceof SyntaxError ? "O plano de prints não pôde ser lido. Reabra o relatório pela aplicação." : errorMessage(caught); }
+      }
+      return route;
+    }
   } catch { return { view: "dashboard" }; }
-  const detail = hash.match(/^#\/exploracoes\/([^/]+)$/);
+  const detail = hash.match(/^#\/exploracoes\/([^/]+)(\/acompanhar)?$/);
   try {
-    if (detail) return { view: "detail", explorationId: decodeURIComponent(detail[1]) };
+    if (detail) return { view: "detail", explorationId: decodeURIComponent(detail[1]), ...(detail[2] ? { liveRerun: true } : {}) };
   } catch { return { view: "dashboard" }; }
   const route = NAV_ITEMS.find((item) => item.hash === hash);
   return { view: route?.view || "dashboard" };
@@ -892,11 +956,140 @@ export function connectReportToApplication(html: string, sourceExplorationId: st
   return clean.replace(/<head\b[^>]*>/i, (head) => head + '<script id="report-app-runtime" type="application/json">' + runtime + "</script>");
 }
 
-export async function confirmScenarioRerun(request: ApiRequest, sourceId: string, scenarioId: string, consent: boolean, available: boolean) {
+export async function confirmScenarioRerun(request: ApiRequest, sourceId: string, scenarioId: string, consent: boolean, available: boolean, capturePlan?: ScenarioCapturePlan) {
   if (!consent || !available) throw new Error("Confirme os efeitos da reexecução antes de iniciar.");
+  const plan = capturePlan === undefined ? undefined : validateScenarioCapturePlan(capturePlan);
   return request<Exploration>(`/explorations/${encodeURIComponent(sourceId)}/scenarios/${encodeURIComponent(scenarioId)}/rerun`, {
-    method: "POST", body: JSON.stringify({ confirm: true }),
+    method: "POST", body: JSON.stringify({ confirm: true, ...(plan ? { capture_plan: plan } : {}) }),
   });
+}
+
+export function scenarioRerunCaptureKey(exploration: Exploration | null) {
+  const checkpoint = exploration?.rerun?.capture_checkpoint;
+  return checkpoint ? `${exploration?.id || ""}:${checkpoint.id}:${checkpoint.version}` : "";
+}
+
+export const RERUN_PRINT_MAX_BYTES = 10 * 1024 * 1024;
+
+export function rerunPrintFileError(file: { size: number; type: string }) {
+  if (!file.size) return "Esta imagem está vazia. Escolha outro arquivo.";
+  if (file.size > RERUN_PRINT_MAX_BYTES) return "A imagem deve ter no máximo 10 MB. Escolha uma imagem menor.";
+  if (file.type && !["image/png", "image/jpeg", "image/webp"].includes(file.type)) return "Use uma imagem PNG, JPG ou WEBP. Outros arquivos não podem ser anexados.";
+  return "";
+}
+
+export function rerunPrintImageType(bytes: Uint8Array) {
+  if (bytes.length >= 8 && [137, 80, 78, 71, 13, 10, 26, 10].every((value, index) => bytes[index] === value)) return "image/png";
+  if (bytes.length >= 3 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255) return "image/jpeg";
+  if (bytes.length >= 12 && [82, 73, 70, 70].every((value, index) => bytes[index] === value) && [87, 69, 66, 80].every((value, index) => bytes[index + 8] === value)) return "image/webp";
+  return "";
+}
+
+export function rerunPrintDataUrlError(value: unknown) {
+  if (typeof value !== "string") return "Adicione uma imagem antes de continuar.";
+  const header = value.match(/^data:image\/(?:png|jpeg|webp);base64,/);
+  if (!header) return "Não foi possível ler a imagem. Adicione um arquivo PNG, JPG ou WEBP novamente.";
+  const encoded = value.slice(header[0].length);
+  if (encoded.length > Math.ceil(RERUN_PRINT_MAX_BYTES / 3) * 4) return "A imagem deve ter no máximo 10 MB. Escolha uma imagem menor.";
+  if (!encoded || encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) return "Não foi possível ler a imagem. Adicione um arquivo PNG, JPG ou WEBP novamente.";
+  const size = encoded.length / 4 * 3 - (encoded.endsWith("==") ? 2 : encoded.endsWith("=") ? 1 : 0);
+  if (size > RERUN_PRINT_MAX_BYTES) return "A imagem deve ter no máximo 10 MB. Escolha uma imagem menor.";
+  return "";
+}
+
+export function rerunPrintPasteIsBlocked(target: Element | null, activeElement: Element | null, modalOpen: boolean) {
+  const selector = "input, textarea, select, [contenteditable]:not([contenteditable='false']), [role='textbox'], dialog, [role='dialog']";
+  return modalOpen || !!target?.closest(selector) || !!activeElement?.closest(selector);
+}
+
+async function readRerunPrintImage(file: File) {
+  const invalid = rerunPrintFileError(file);
+  if (invalid) throw new Error(invalid);
+  const type = rerunPrintImageType(new Uint8Array(await file.slice(0, 12).arrayBuffer()));
+  if (!type || file.type && file.type !== type) throw new Error("Este arquivo não é uma imagem PNG, JPG ou WEBP válida. Escolha outra imagem.");
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => typeof reader.result === "string" ? resolve(reader.result.replace(/^data:[^;]*;/, `data:${type};`)) : reject(new Error("Não foi possível ler a imagem."));
+    reader.onerror = () => reject(new Error("Não foi possível ler a imagem. Tente escolher o arquivo novamente."));
+    reader.onabort = () => reject(new Error("A leitura da imagem foi interrompida. Tente novamente."));
+    reader.readAsDataURL(file);
+  });
+  const invalidData = rerunPrintDataUrlError(dataUrl);
+  if (invalidData) throw new Error(invalidData);
+  return { dataUrl, name: file.name || "Print colado", size: file.size };
+}
+
+export async function captureScenarioRerunPrint(request: ApiRequest, exploration: Exploration, checkpoint: RerunCaptureCheckpoint, imageDataUrl: string) {
+  const current = exploration.rerun?.capture_checkpoint;
+  if (exploration.rerun?.phase !== "waiting_capture" || !current || current.id !== checkpoint.id || current.version !== checkpoint.version
+    || !/^db-[0-9]{1,9}$/.test(checkpoint.id) || !Number.isInteger(checkpoint.version) || checkpoint.version < 1) throw new Error("Esta pausa já mudou. Atualize a execução antes de capturar.");
+  const invalidImage = rerunPrintDataUrlError(imageDataUrl);
+  if (invalidImage) throw new Error(invalidImage);
+  return request<Exploration>(`/explorations/${encodeURIComponent(exploration.id)}/capture-print`, {
+    method: "POST", body: JSON.stringify({ confirm: true, checkpoint_id: checkpoint.id, checkpoint_version: checkpoint.version, image_data_url: imageDataUrl }),
+  });
+}
+
+export function ScenarioRerunCapture({ checkpoint, completed = 0, total = 0, busy = false, error = "", timeoutSeconds = 900, onCapture }: {
+  checkpoint?: RerunCaptureCheckpoint;
+  completed?: number;
+  total?: number;
+  busy?: boolean;
+  error?: string;
+  timeoutSeconds?: number;
+  onCapture: (imageDataUrl: string) => void;
+}) {
+  const [image, setImage] = useState<{ dataUrl: string; name: string; size: number } | null>(null);
+  const [selectionError, setSelectionError] = useState("");
+  const [selecting, setSelecting] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const selectionVersion = useRef(0);
+  const dragDepth = useRef(0);
+  const chooserId = useId();
+  const selectImage = useCallback(async (files: File[]) => {
+    if (busy || !checkpoint) return;
+    const version = ++selectionVersion.current;
+    setSelectionError("");
+    setImage(null);
+    if (files.length !== 1) { setSelecting(false); setSelectionError("Adicione uma imagem por pausa. Escolha apenas um arquivo."); return; }
+    setSelecting(true);
+    try {
+      const selected = await readRerunPrintImage(files[0]);
+      if (version === selectionVersion.current) setImage(selected);
+    } catch (caught) {
+      if (version === selectionVersion.current) setSelectionError(errorMessage(caught));
+    } finally { if (version === selectionVersion.current) setSelecting(false); }
+  }, [busy, checkpoint]);
+  useEffect(() => {
+    const paste = (event: ClipboardEvent) => {
+      if (busy || !checkpoint || rerunPrintPasteIsBlocked(event.target instanceof Element ? event.target : null, document.activeElement, !!document.querySelector("dialog[open], [role='dialog'][aria-modal='true']"))) return;
+      const files = Array.from(event.clipboardData?.files || []);
+      if (!files.length) return;
+      event.preventDefault();
+      void selectImage(files);
+    };
+    window.addEventListener("paste", paste);
+    return () => window.removeEventListener("paste", paste);
+  }, [busy, checkpoint, selectImage]);
+  useEffect(() => {
+    setImage(null); setSelectionError(""); setSelecting(false); setDragging(false);
+    selectionVersion.current += 1;
+    return () => { selectionVersion.current += 1; };
+  }, [checkpoint?.id, checkpoint?.version]);
+  const removeImage = () => { selectionVersion.current += 1; setSelecting(false); setImage(null); setSelectionError(""); if (fileInput.current) fileInput.current.value = ""; };
+  const captureLimit = Number.isFinite(timeoutSeconds) && timeoutSeconds > 0 ? timeoutSeconds : 900;
+  const captureLimitLabel = captureLimit >= 60 ? `${Math.ceil(captureLimit / 60)} minutos` : `${Math.ceil(captureLimit)} segundos`;
+  return <section className="panel rerun-capture" aria-label="Aguardar print">
+    <div className="rerun-capture-heading"><span className="rerun-capture-symbol"><ImagePlus size={25} /></span><div><span className="section-kicker"><span className="live-pulse" />{busy ? "Salvando sua imagem" : "O teste espera por você"}</span><h2>{busy ? "Anexando seu print ao relatório…" : "Adicione o print que você quiser"}</h2><p>Vale uma imagem de qualquer tela ou aplicativo. Cole com <kbd>Ctrl</kbd> + <kbd>V</kbd>, arraste um arquivo ou escolha uma imagem abaixo.</p></div></div>
+      <div className="rerun-capture-meta"><span><MonitorPlay size={15} />Print {Math.min(completed + 1, total || completed + 1)} de {total || completed + 1}</span>{checkpoint && <span>Posição planejada: {checkpoint.gap === 0 ? "antes da primeira etapa" : `após a etapa ${checkpoint.gap}`}</span>}<span><Clock3 size={14} />Até {captureLimitLabel} para confirmar</span></div>
+    <input ref={fileInput} id={chooserId} className="rerun-print-input" type="file" accept="image/png,image/jpeg,image/webp" disabled={busy || !checkpoint} onChange={(event) => { const files = Array.from(event.target.files || []); event.target.value = ""; if (files.length) void selectImage(files); }} />
+    <div className={`rerun-print-dropzone ${dragging ? "is-dragging" : ""} ${image ? "has-image" : ""} ${busy ? "is-busy" : ""}`} onDragEnter={(event) => { event.preventDefault(); if (!busy) { dragDepth.current += 1; setDragging(true); } }} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = busy ? "none" : "copy"; }} onDragLeave={(event) => { event.preventDefault(); dragDepth.current = Math.max(0, dragDepth.current - 1); if (!dragDepth.current) setDragging(false); }} onDrop={(event) => { event.preventDefault(); dragDepth.current = 0; setDragging(false); if (!busy) void selectImage(Array.from(event.dataTransfer.files)); }}>
+      {image ? <><div className="rerun-print-preview"><img src={image.dataUrl} alt="Prévia do print escolhido para anexar" onError={() => { removeImage(); setSelectionError("Não foi possível abrir esta imagem. Cole ou escolha outro arquivo PNG, JPG ou WEBP."); }} /></div><div className="rerun-print-file"><span className="rerun-print-ready"><CheckCircle2 size={18} /></span><div><strong title={image.name}>{image.name}</strong><small>{image.size < 1024 * 1024 ? `${Math.max(1, Math.round(image.size / 1024))} KB` : `${(image.size / 1024 / 1024).toFixed(1)} MB`} · Pronta para anexar</small></div><button type="button" className="button secondary small" disabled={busy || selecting} onClick={() => fileInput.current?.click()}><RefreshCcw size={14} />Trocar</button><button type="button" className="icon-button" aria-label="Remover imagem escolhida" disabled={busy || selecting} onClick={removeImage}><Trash2 size={17} /></button></div></> : <div className="rerun-print-empty"><span className="rerun-print-empty-icon">{selecting ? <Spinner size={27} /> : dragging ? <Upload size={29} /> : <ClipboardPaste size={29} />}</span><h3>{selecting ? "Preparando sua imagem…" : dragging ? "Solte a imagem aqui" : "Cole ou arraste seu print aqui"}</h3><p>O print não precisa ser da página testada.<br />PNG, JPG ou WEBP · Até 10 MB · Uma imagem por pausa</p><button type="button" className="button secondary" onClick={() => fileInput.current?.click()} disabled={busy || selecting || !checkpoint}><Upload size={16} />Escolher imagem</button><small>Ou use Ctrl + V nesta tela</small></div>}
+    </div>
+    {(selectionError || error) && <p className="rerun-error" role="alert">{selectionError || error}</p>}
+    <div className="rerun-capture-footer"><p className="rerun-capture-note"><ShieldCheck size={16} /><span>Você escolhe o que compartilhar. A imagem será identificada como enviada por você; ela não aprova nem reprova o teste. Sem confirmação, a execução não avança automaticamente.</span></p><button type="button" className="button primary" onClick={() => { if (image && !selecting) onCapture(image.dataUrl); }} disabled={busy || selecting || !image || !checkpoint}>{busy || selecting ? <Spinner /> : <ArrowRight size={17} />}{busy ? "Salvando print…" : "Anexar print e continuar"}</button></div>
+  </section>;
 }
 
 function resolveAssetUrl(value?: string | null) {
@@ -1352,6 +1545,7 @@ export default function AutoJevApp() {
         return (
           <ExplorationDetailView
             key={route.explorationId}
+            liveRerun={route.liveRerun}
             exploration={explorationDetailState(route.explorationId, selectedExploration, detailLoading, settledExplorationId).exploration}
             loading={explorationDetailState(route.explorationId, selectedExploration, detailLoading, settledExplorationId).loading}
             providers={providers}
@@ -1498,31 +1692,35 @@ export default function AutoJevApp() {
         </Modal>
       )}
       {route.explorationId && route.rerunScenarioId && <ScenarioRerunDialog
-        key={`${route.explorationId}/${route.rerunScenarioId}`}
+        key={`${route.explorationId}/${route.rerunScenarioId}/${JSON.stringify(route.capturePlan)}/${route.capturePlanError || ""}`}
         sourceId={route.explorationId}
         scenarioId={route.rerunScenarioId}
+        capturePlan={route.capturePlan}
+        capturePlanError={route.capturePlanError}
         request={request}
         onClose={() => navigate(`#/exploracoes/${encodeURIComponent(route.explorationId!)}`)}
         onCreated={(created) => {
           setExplorations((current) => [created, ...current.filter((item) => item.id !== created.id)]);
           toast("Nova execução criada. Prepare o navegador e confirme a continuação para repetir o CT.", "success");
-          navigate(`#/exploracoes/${encodeURIComponent(created.id)}`);
+          navigate(`#/exploracoes/${encodeURIComponent(created.id)}/acompanhar`);
         }}
       />}
     </div>
   );
 }
 
-export function ScenarioRerunConsent({ preflight, loading, error, busy, consent, onConsent, onConfirm, onClose }: {
+export function ScenarioRerunConsent({ preflight, loading, error, busy, consent, capturePlan, onConsent, onConfirm, onClose }: {
   preflight: ScenarioRerunPreflight | null;
   loading: boolean;
   error: string;
   busy: boolean;
   consent: boolean;
+  capturePlan?: ScenarioCapturePlan;
   onConsent: (value: boolean) => void;
   onConfirm: () => void;
   onClose: () => void;
 }) {
+  const checkpointCount = capturePlan?.checkpoints.length || 0;
   return <div className="modal-form rerun-confirmation">
     {loading ? <p className="rerun-loading" role="status"><Spinner />Verificando se o CT pode ser reexecutado…</p> : error ? <p className="rerun-error" role="alert">{error}</p> : preflight && <>
       <div className="rerun-case"><span className="section-kicker">{preflight.scenario_id || "Caso de teste original"}</span><strong>{preflight.title || "Reexecução de um CT"}</strong>{preflight.url && <span>{preflight.url}</span>}</div>
@@ -1530,19 +1728,22 @@ export function ScenarioRerunConsent({ preflight, loading, error, busy, consent,
         <div className="rerun-effects"><strong>Antes de confirmar</strong><p>A ação original será repetida uma única vez e pode alterar dados na aplicação testada. Não é uma simulação.</p>
           <ul>{(preflight.effects?.length ? preflight.effects : ["Um novo navegador será aberto para preparar o teste.", "Somente a ação original deste CT será repetida.", "Um novo resultado e novas evidências serão registrados, preservando a execução original."]).map((effect, index) => <li key={index}>{effect}</li>)}</ul>
         </div>
-        <p className="rerun-local-note"><ShieldCheck size={17} />As verificações locais salvas serão repetidas, sem chamadas à LLM. Revisões visuais e cartões de banco do rascunho não serão executados.</p>
-        {preflight.scope?.missing_visual_checks && <p className="rerun-local-note">Este CT também tinha análise visual; ela não será repetida nem apresentada como validada.</p>}
-        <div className="rerun-preparation"><strong>Você prepara o navegador antes da ação</strong><p>Faça login, recrie as pré-condições do CT e abra a página esperada. A execução aguardará sua confirmação em «Continuar reexecução» antes de realizar a ação.</p></div>
-        <label className="rerun-consent"><input type="checkbox" checked={consent} disabled={busy} onChange={(event) => onConsent(event.target.checked)} /><span>Entendo que esta reexecução é real, pode modificar dados da aplicação e não executará os cartões de banco do rascunho.</span></label>
+        <p className="rerun-local-note"><ShieldCheck size={17} />As verificações locais salvas serão repetidas, sem chamadas à LLM. {checkpointCount ? "Somente as pausas para print serão aplicadas. SWS e SQL continuam bloqueados e não serão executados." : "Nenhuma pausa para print foi incluída. SWS e SQL não serão executados."}</p>
+        {checkpointCount > 0 && <div className="rerun-capture-plan"><span className="rerun-capture-plan-icon"><ImagePlus size={22} /></span><div><strong>{checkpointCount} {checkpointCount === 1 ? "pausa para print" : "pausas para print"} nesta reexecução</strong><p>Em cada pausa, adicione a imagem que você quiser na aplicação AutoJev: cole com Ctrl + V, arraste um arquivo ou escolha uma imagem PNG, JPG ou WEBP de até 10 MB. Pode ser de qualquer tela ou aplicativo; não há captura automática do navegador. Confira a prévia e clique em «Anexar print e continuar». A confirmação ocorre somente na aplicação AutoJev, nunca pela página testada. O print não aprova nem reprova o teste.</p><p>As pausas planejadas antes da ação ocorrem antes dela; as demais acontecem após a ação e suas conferências locais. A posição no rascunho fica registrada, sem interromper cada conferência individual.</p><p>Prazo de confirmação: até 15 minutos por pausa, com limite de 1 hora somando todas as pausas. Ao esgotar o prazo, a execução termina sem anexar ou continuar automaticamente.</p><ol>{[...capturePlan!.checkpoints].sort((left, right) => left.gap - right.gap || left.order - right.order).map((item) => <li key={item.id}><span>Aguardar print</span><small>Posição planejada: {item.gap === 0 ? "antes da primeira etapa" : `após a etapa ${item.gap}`}</small></li>)}</ol></div></div>}
+        {preflight.scope?.missing_visual_checks ? <p className="rerun-local-note">Nem todas as conferências originais poderão ser repetidas: a conferência visual da LLM ficará pendente. A reexecução não confirmará essa parte do teste.</p> : preflight.scope?.visual_review_omitted && <p className="rerun-local-note">A revisão visual auxiliar não será repetida. As verificações locais podem ser concluídas normalmente; isso não equivale a uma aprovação visual.</p>}
+        <div className="rerun-preparation"><strong>Preencha o login e continue pelo AutoJev</strong><p>Se precisar entrar, preencha usuário e senha no novo navegador. Ao clicar em «Continuar reexecução», o AutoJev tentará enviar um formulário de login preenchido e seguro. Se já estiver conectado, apenas conferirá a preparação. Recrie as pré-condições do CT e abra a página esperada; a ação original só será executada após essa conferência.</p></div>
+        <label className="rerun-consent"><input type="checkbox" checked={consent} disabled={busy} onChange={(event) => onConsent(event.target.checked)} /><span>Entendo que esta reexecução é real, pode tentar entrar com o login que eu preencher e pode modificar dados da aplicação{checkpointCount ? " e aguardará minha confirmação para cada print; SWS e SQL não serão executados." : " e não executará SWS ou SQL."}</span></label>
       </>}
     </>}
     <div className="modal-actions"><button type="button" className="button ghost" disabled={busy} onClick={onClose}>Voltar sem reexecutar</button><button type="button" className="button primary" disabled={loading || busy || !!error || !preflight?.available || !consent} onClick={onConfirm}>{busy ? <Spinner /> : <Play size={16} />}{busy ? "Criando execução…" : "Confirmar reexecução real"}</button></div>
   </div>;
 }
 
-function ScenarioRerunDialog({ sourceId, scenarioId, request, onClose, onCreated }: {
+function ScenarioRerunDialog({ sourceId, scenarioId, capturePlan, capturePlanError, request, onClose, onCreated }: {
   sourceId: string;
   scenarioId: string;
+  capturePlan?: ScenarioCapturePlan;
+  capturePlanError?: string;
   request: ApiRequest;
   onClose: () => void;
   onCreated: (exploration: Exploration) => void;
@@ -1553,6 +1754,7 @@ function ScenarioRerunDialog({ sourceId, scenarioId, request, onClose, onCreated
   const [consent, setConsent] = useState(false);
   const [busy, setBusy] = useState(false);
   const confirming = useRef(false);
+  const planError = capturePlanError || (!loading && preflight ? validateCapturePlanForPreflight(capturePlan, preflight) : "");
   useEffect(() => {
     const controller = new AbortController();
     void request<ScenarioRerunPreflight>(`/explorations/${encodeURIComponent(sourceId)}/scenarios/${encodeURIComponent(scenarioId)}/rerun`, { signal: controller.signal })
@@ -1562,19 +1764,19 @@ function ScenarioRerunDialog({ sourceId, scenarioId, request, onClose, onCreated
     return () => controller.abort();
   }, [request, sourceId, scenarioId]);
   const confirm = async () => {
-    if (confirming.current || !consent || !preflight?.available || loading) return;
+    if (confirming.current || !consent || !preflight?.available || loading || error || planError) return;
     confirming.current = true;
     setBusy(true);
     setError("");
     try {
-      const created = await confirmScenarioRerun(request, sourceId, scenarioId, consent, preflight.available);
+      const created = await confirmScenarioRerun(request, sourceId, scenarioId, consent, preflight.available, capturePlan);
       if (!created || typeof created.id !== "string" || !created.id) throw new Error("A API não informou a nova execução. Atualize o histórico antes de tentar novamente.");
       onCreated(created);
     } catch (caught) { setError(errorMessage(caught)); }
     finally { confirming.current = false; setBusy(false); }
   };
   return <Modal title="Reexecutar um caso de teste" description="Nova execução isolada; o resultado original não será alterado." onClose={() => { if (!confirming.current) onClose(); }}>
-    <ScenarioRerunConsent preflight={preflight} loading={loading} error={error} busy={busy} consent={consent} onConsent={setConsent} onConfirm={() => void confirm()} onClose={onClose} />
+    <ScenarioRerunConsent preflight={preflight} loading={loading} error={planError || error} busy={busy} consent={consent} capturePlan={capturePlan} onConsent={setConsent} onConfirm={() => void confirm()} onClose={onClose} />
   </Modal>;
 }
 
@@ -2487,7 +2689,7 @@ function AddProviderModal({ request, onClose, onSaved, toast }: { request: ApiRe
   );
 }
 
-function ExplorationDetailView({
+export function ExplorationDetailView({
   exploration,
   loading,
   providers,
@@ -2499,6 +2701,7 @@ function ExplorationDetailView({
   onReport,
   apiBase,
   pollInterval,
+  liveRerun = false,
 }: {
   exploration: Exploration | null;
   loading: boolean;
@@ -2511,12 +2714,18 @@ function ExplorationDetailView({
   onReport: (data: unknown) => void;
   apiBase: string;
   pollInterval: number;
+  liveRerun?: boolean;
 }) {
   const [cancelling, setCancelling] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [openingReport, setOpeningReport] = useState(false);
   const [rerunPreparationConfirmation, setRerunPreparationConfirmation] = useState({ key: "", confirmed: false });
+  const [capturePendingKey, setCapturePendingKey] = useState("");
+  const [captureSubmittedKey, setCaptureSubmittedKey] = useState("");
+  const [captureError, setCaptureError] = useState({ key: "", message: "" });
+  const captureRequests = useRef(new Set<string>());
   const [detailTab, setDetailTab] = useState<"overview" | "scenarios" | "coverage" | "activity" | "evidence" | "config">("overview");
+  const [selectedRerunStepId, setSelectedRerunStepId] = useState<string | null>(null);
   if (loading && !exploration) return <div className="detail-loading"><Spinner size={24} /><span>Carregando exploração…</span></div>;
   if (!exploration) {
     return <section className="panel"><EmptyState icon={AlertCircle} title="Exploração não encontrada" description="O registro pode ter sido removido ou ainda não está disponível." action={<button className="button secondary" onClick={() => navigate("#/exploracoes")}><ArrowLeft size={16} />Voltar ao histórico</button>} /></section>;
@@ -2527,6 +2736,9 @@ function ExplorationDetailView({
   const rerunFeedback = scenarioRerunFeedback(exploration);
   const rerunPreparationConfirmed = scenarioRerunPreparationConsent(exploration, rerunPreparationConfirmation);
   const validatingRerunPreparation = rerun?.phase === "validating_preparation";
+  const capturePhase = rerun?.phase === "waiting_capture" || rerun?.phase === "capturing_print";
+  const captureKey = scenarioRerunCaptureKey(exploration);
+  const captureBusy = rerun?.phase === "capturing_print" || !!captureKey && (capturePendingKey === captureKey || captureSubmittedKey === captureKey);
   const phase = exploration.phase || (isLive(exploration.status) ? "exploring" : "complete");
   const configuredStepLimit = typeof exploration.options?.max_steps === "number" ? exploration.options.max_steps : null;
   const phaseProgress = exploration.phase_progress || {
@@ -2534,7 +2746,8 @@ function ExplorationDetailView({
     total: configuredStepLimit,
     percentage: exploration.progress,
   };
-  const overallProgress = exploration.overall_progress ?? exploration.progress ?? (["completed", "success", "partial"].includes(status.value) ? 100 : undefined);
+  const recordedProgress = exploration.overall_progress ?? exploration.progress ?? (["completed", "success", "partial"].includes(status.value) ? 100 : undefined);
+  const overallProgress = capturePhase && typeof recordedProgress === "number" ? Math.min(recordedProgress, 95) : recordedProgress;
   const determinateProgress = typeof overallProgress === "number";
   const overallProgressValue = typeof overallProgress === "number" ? overallProgress : 0;
   const events = exploration.events || exploration.activity || exploration.logs || [];
@@ -2563,6 +2776,7 @@ function ExplorationDetailView({
   const phaseSteps = rerun ? [
     { key: "preparing", label: "Preparar navegador", detail: "pré-condições manuais" },
     { key: "executing", label: "Reexecutar o CT", detail: "uma ação original" },
+    ...((rerun.capture_count || 0) > 0 ? [{ key: "capture", label: "Capturas manuais", detail: `${rerun.captures_completed || 0} de ${rerun.capture_count} salvas` }] : []),
     { key: "reporting", label: "Novo relatório", detail: exploration.report_available ? "pronto" : "pendente" },
   ] : [
     { key: "exploring", label: "Explorar", detail: `${exploration.browser_progress?.current ?? counters.actions} ações` },
@@ -2591,7 +2805,9 @@ function ExplorationDetailView({
   const phaseHeadline = rerun
     ? rerunFeedback?.notStarted ? "Reexecução não iniciada"
       : rerun.phase === "generating_report" ? "Montando o relatório da reexecução"
-      : validatingRerunPreparation ? "Conferindo a preparação do CT"
+      : validatingRerunPreparation ? "Entrando e conferindo preparação…"
+      : rerun.phase === "waiting_capture" ? "Aguardando seu print para continuar"
+      : rerun.phase === "capturing_print" ? "Salvando a captura solicitada"
       : rerun.phase === "waiting_preparation" ? "Prepare o CT antes de continuar"
       : rerun.phase === "executing" ? "Reexecutando a ação original do CT"
         : rerun.phase === "finished" ? `Reexecução ${status.label.toLocaleLowerCase("pt-BR")}` : "Preparando a reexecução do CT"
@@ -2604,10 +2820,12 @@ function ExplorationDetailView({
         : exploration.phase_label || status.label;
   const phaseDescription = rerun
     ? rerunFeedback?.notStarted ? `${rerunFeedback.detail} O resultado original não foi alterado.`
-      : validatingRerunPreparation ? "O AutoJev está conferindo a página, os controles e as condições iniciais antes de executar a ação salva."
-      : rerun.phase === "waiting_preparation" ? "Faça login e recrie as pré-condições no novo navegador. A ação só será executada se a página e os pré-requisitos corresponderem ao CT original."
+      : validatingRerunPreparation ? "Se houver um formulário de login preenchido e seguro, o AutoJev tentará enviá-lo. Depois conferirá a página, os controles e as condições iniciais antes de executar a ação salva."
+      : rerun.phase === "waiting_capture" ? "O CT está pausado. Cole, arraste ou escolha sua imagem no painel acima e confirme em «Anexar print e continuar». Pode ser um print de qualquer tela ou aplicativo."
+      : rerun.phase === "capturing_print" ? "Sua imagem será anexada ao novo relatório como evidência enviada por você. Aguarde o salvamento; a ação original não será repetida."
+      : rerun.phase === "waiting_preparation" ? "Preencha usuário e senha no novo navegador, se necessário, e clique em «Continuar reexecução» para tentar entrar e conferir a preparação. Se já estiver conectado, apenas os pré-requisitos serão conferidos antes da ação original."
       : rerun.phase === "executing" ? "Somente a ação salva e suas verificações locais serão repetidas. Não há exploração autônoma nem chamadas à LLM."
-        : "Esta é uma execução separada. O resultado e as evidências originais permanecem preservados; os cartões de banco do rascunho não são executados."
+        : `Esta é uma execução separada. O resultado e as evidências originais permanecem preservados. ${(rerun.capture_count || 0) > 0 ? `${rerun.captures_completed || 0} de ${rerun.capture_count} prints manuais registrados; SWS e SQL não foram executados.` : "SWS e SQL não são executados."}`
     : terminalOutcomeVisible && actionLimitReached
     ? "A automação não falhou na ação 67: ela concluiu o limite configurado e preservou tudo o que encontrou. A cobertura ficou parcial porque ainda havia opções a explorar."
     : terminalOutcomeVisible && completedWithRestrictions
@@ -2635,13 +2853,31 @@ function ExplorationDetailView({
     if (rerun) setRerunPreparationConfirmation({ key: scenarioRerunPreparationKey(exploration), confirmed: false });
     try {
       await request(`/explorations/${encodeURIComponent(exploration.id)}/resume`, { method: "POST" });
-      toast(rerun ? "Preparação enviada para conferência. A ação só será executada se os pré-requisitos corresponderem." : "Exploração retomada.", rerun ? "info" : "success");
+      toast(rerun ? "Tentando entrar, se houver login preenchido, e conferindo a preparação. A ação original só será executada se os pré-requisitos corresponderem." : "Exploração retomada.", rerun ? "info" : "success");
       onRefresh();
     } catch (error) {
       toast(errorMessage(error), "error");
     } finally {
       setResuming(false);
     }
+  };
+
+  const capturePrint = async (imageDataUrl: string) => {
+    const checkpoint = rerun?.capture_checkpoint;
+    if (!checkpoint || rerun?.phase !== "waiting_capture" || !captureKey || captureRequests.current.has(captureKey)) return;
+    captureRequests.current.add(captureKey);
+    setCapturePendingKey(captureKey);
+    setCaptureError({ key: captureKey, message: "" });
+    try {
+      await captureScenarioRerunPrint(request, exploration, checkpoint, imageDataUrl);
+      setCaptureSubmittedKey(captureKey);
+      toast("Print enviado. O CT continua após salvar sua imagem, sem repetir a ação original.", "info");
+      onRefresh();
+    } catch (caught) {
+      captureRequests.current.delete(captureKey);
+      setCaptureError({ key: captureKey, message: errorMessage(caught) });
+      onRefresh();
+    } finally { setCapturePendingKey(""); }
   };
 
   const resumeVisualReviews = async (options: { max_requests: number; max_attempts: number }) => {
@@ -2691,11 +2927,20 @@ function ExplorationDetailView({
     }
   };
 
+  const preparationPanel = waitingForInput && !capturePhase ? (
+    <section className={`panel intervention-card intervention-wide ${rerun ? "rerun-intervention" : ""}`}>
+      <span className="section-kicker"><span className="live-pulse" />Ação necessária</span>
+      <div><h2>{rerun ? validatingRerunPreparation ? "Entrando e conferindo preparação…" : rerun.preparation?.reason_code ? "Ajuste a página e tente novamente" : "Prepare o CT no navegador" : "Faça login no navegador"}</h2>{rerun ? <ScenarioRerunPreparation preparation={rerun.preparation} validating={validatingRerunPreparation} /> : <p>{waitingEvent?.message || "Preencha usuário e senha no navegador. Ao continuar, o AutoJev tentará enviar um formulário de login preenchido e seguro."}</p>}{rerun && <label className="rerun-consent"><input type="checkbox" checked={rerunPreparationConfirmed} disabled={resuming || validatingRerunPreparation} onChange={(event) => setRerunPreparationConfirmation({ key: scenarioRerunPreparationKey(exploration), confirmed: event.target.checked })} /><span>Autorizo tentar entrar com o login preenchido e executar a ação original somente se a conferência dos pré-requisitos passar.</span></label>}</div>
+      <button className="button primary" onClick={() => void resume()} disabled={resuming || (!!rerun && !rerunPreparationConfirmed)}>{resuming || validatingRerunPreparation ? <Spinner /> : <Play size={16} />}{validatingRerunPreparation ? "Entrando e conferindo preparação…" : rerun ? "Continuar reexecução" : "Continuar exploração"}</button>
+    </section>
+  ) : null;
+  const showLiveRerun = !!rerun && liveRerun;
+
   return (
-    <div className="view-stack detail-view">
+    <div className={`view-stack detail-view ${showLiveRerun ? "rerun-live-detail" : ""}`}>
       <div className="detail-breadcrumb"><button onClick={() => navigate("#/exploracoes")}><ArrowLeft size={15} />Explorações</button><ChevronRight size={14} /><span>{hostFromUrl(exploration.app_url)}</span></div>
       <header className="detail-header">
-        <div className="detail-title"><span className="app-avatar large"><Globe2 size={22} /></span><div><div className="detail-title-line"><h1>{hostFromUrl(exploration.app_url)}</h1>{terminalOutcomeVisible && actionLimitReached ? <span className="status-badge status-warning"><span className="status-dot" />Limite anterior atingido</span> : terminalOutcomeVisible && completedWithRestrictions ? <span className="status-badge status-warning"><span className="status-dot" />Concluída com restrições</span> : <StatusBadge status={exploration.status} completionType={completion.type} />}</div><a href={exploration.app_url} target="_blank" rel="noreferrer">{exploration.app_url}<SquareArrowOutUpRight size={13} /></a></div></div>
+        <div className="detail-title"><span className="app-avatar large"><Globe2 size={22} /></span><div><div className="detail-title-line"><h1>{showLiveRerun ? `Reexecução de ${rerun?.source_scenario_id || "um CT"}` : hostFromUrl(exploration.app_url)}</h1>{terminalOutcomeVisible && actionLimitReached ? <span className="status-badge status-warning"><span className="status-dot" />Limite anterior atingido</span> : terminalOutcomeVisible && completedWithRestrictions ? <span className="status-badge status-warning"><span className="status-dot" />Concluída com restrições</span> : <StatusBadge status={exploration.status} completionType={completion.type} />}</div><a href={exploration.app_url} target="_blank" rel="noreferrer">{exploration.app_url}<SquareArrowOutUpRight size={13} /></a></div></div>
         <div className="page-actions">
           <button className="button secondary" onClick={onRefresh}><RefreshCcw size={16} />Atualizar</button>
           {isLive(exploration.status) ? (
@@ -2708,10 +2953,23 @@ function ExplorationDetailView({
         </div>
       </header>
 
-      {rerun && <section className="panel rerun-provenance" aria-label="Origem da reexecução"><RefreshCcw size={20} /><div><strong>Reexecução de {rerun.source_scenario_id || "um CT"}</strong><p>Nova execução com evidências próprias. O relatório original não é alterado. Verificações locais apenas; cartões de banco e análises da LLM não são executados.</p>{rerun.source_exploration_id && <button type="button" className="text-button" onClick={() => navigate(`#/exploracoes/${encodeURIComponent(rerun.source_exploration_id!)}`)}>Abrir execução original <ArrowRight size={14} /></button>}</div></section>}
+      {rerun && <section className="panel rerun-provenance" aria-label="Origem da reexecução"><RefreshCcw size={20} /><div><strong>Reexecução de {rerun.source_scenario_id || "um CT"}</strong><p>Nova execução com evidências próprias. O relatório original não é alterado. Verificações locais{(rerun.capture_count || 0) > 0 ? ` e ${rerun.capture_count} pausa(s) para print com confirmação manual` : " apenas"}; SWS, SQL e análises da LLM não são executados.</p>{rerun.source_exploration_id && <button type="button" className="text-button" onClick={() => navigate(`#/exploracoes/${encodeURIComponent(rerun.source_exploration_id!)}`)}>Abrir execução original <ArrowRight size={14} /></button>}</div></section>}
+
+      {rerun && <nav className="rerun-view-switch" aria-label="Telas da reexecução">
+        <button type="button" className={showLiveRerun ? "active" : ""} aria-current={showLiveRerun ? "page" : undefined} onClick={() => navigate(`#/exploracoes/${encodeURIComponent(exploration.id)}/acompanhar`)}><MonitorPlay size={16} />Acompanhar reexecução</button>
+        <button type="button" className={!showLiveRerun ? "active" : ""} aria-current={!showLiveRerun ? "page" : undefined} onClick={() => navigate(`#/exploracoes/${encodeURIComponent(exploration.id)}`)}><Gauge size={16} />Visão geral e resultados</button>
+      </nav>}
+
+      {showLiveRerun && <ScenarioRerunLiveView rerun={rerun} active={isLive(exploration.status)} selectedStepId={selectedRerunStepId} onSelectStep={(step) => setSelectedRerunStepId(step.id)} pollInterval={pollInterval} phaseHeadline={phaseHeadline} />}
+
+      <div id="rerun-live-controls" className={showLiveRerun ? "rerun-live-controls" : "rerun-standard-controls"}>
+        {capturePhase && <ScenarioRerunCapture key={captureKey || exploration.id} checkpoint={rerun?.capture_checkpoint} completed={rerun?.captures_completed} total={rerun?.capture_count} busy={captureBusy} error={captureError.key === captureKey ? captureError.message : ""} timeoutSeconds={rerun?.capture_timeout_seconds} onCapture={(imageDataUrl) => void capturePrint(imageDataUrl)} />}
+        {showLiveRerun && preparationPanel}
+      </div>
 
       {(rerunFeedback || exploration.error) && <div className={`callout ${rerunFeedback?.notStarted ? "warning-callout" : "error-callout"}`} role="status"><AlertCircle size={19} /><div><strong>{rerunFeedback?.title || "A execução encontrou um erro"}</strong><span>{rerunFeedback?.detail || exploration.error}</span>{rerunFeedback?.nextStep && <span>{rerunFeedback.nextStep}</span>}</div></div>}
 
+      {!showLiveRerun && <>
       <section className={`execution-command panel phase-${phase} ${rerunFeedback?.notStarted ? "execution-not-started" : ""}`} aria-live="polite">
         <div className="execution-command-head">
           <span className={`phase-symbol ${isLive(exploration.status) ? "live" : rerunFeedback?.notStarted ? "warning" : status.value === "failed" ? "error" : ""}`}>
@@ -2741,7 +2999,7 @@ function ExplorationDetailView({
         </div>
         {(phase === "documenting" || scenariosRunningInParallel) && (postprocessing.pending || 0) > 0 && <p className="ct-queue-copy">{postprocessing.pending} revisões auxiliares pendentes · {postprocessing.requests || 0} chamadas realizadas{(postprocessing.deferred || 0) > 0 ? ` · ${postprocessing.deferred} aguardando nova tentativa` : ""}. Os CTs locais já podem ser consultados.</p>}
         <div className={`large-progress ${determinateProgress ? "" : "indeterminate"}`}><span style={determinateProgress ? { width: `${Math.min(100, Math.max(0, overallProgressValue))}%` } : undefined} /></div>
-        <div className="phase-track" aria-label="Fases da execução">
+        <div className={`phase-track ${rerun && (rerun.capture_count || 0) > 0 ? "with-manual-captures" : ""}`} aria-label="Fases da execução">
           {phaseSteps.map((step, index) => {
             const stepState = phaseStepState(step.key);
             return (
@@ -2767,13 +3025,7 @@ function ExplorationDetailView({
         onCancel={cancelVisualReviews}
       />}
 
-      {waitingForInput && (
-        <section className={`panel intervention-card intervention-wide ${rerun ? "rerun-intervention" : ""}`}>
-          <span className="section-kicker"><span className="live-pulse" />Ação necessária</span>
-          <div><h2>{rerun ? validatingRerunPreparation ? "Conferindo a preparação do CT" : rerun.preparation?.reason_code ? "Ajuste a página e tente novamente" : "Prepare o CT no navegador" : "Faça login no navegador"}</h2>{rerun ? <ScenarioRerunPreparation preparation={rerun.preparation} validating={validatingRerunPreparation} /> : <p>{waitingEvent?.message || "O navegador está aguardando sua intervenção para continuar."}</p>}{rerun && <label className="rerun-consent"><input type="checkbox" checked={rerunPreparationConfirmed} disabled={resuming || validatingRerunPreparation} onChange={(event) => setRerunPreparationConfirmation({ key: scenarioRerunPreparationKey(exploration), confirmed: event.target.checked })} /><span>Preparei a página e autorizo a ação original, se a conferência dos pré-requisitos passar.</span></label>}</div>
-          <button className="button primary" onClick={() => void resume()} disabled={resuming || (!!rerun && !rerunPreparationConfirmed)}>{resuming || validatingRerunPreparation ? <Spinner /> : <Play size={16} />}{validatingRerunPreparation ? "Conferindo preparação…" : rerun ? "Continuar reexecução" : "Continuar exploração"}</button>
-        </section>
-      )}
+      {preparationPanel}
 
       <section className="detail-workspace panel">
         <div className="detail-tabs" role="tablist" aria-label="Detalhes da exploração">
@@ -2867,8 +3119,32 @@ function ExplorationDetailView({
           )}
         </div>
       </section>
+      </>}
+      {showLiveRerun && !isLive(exploration.status) && <div className="rerun-live-end"><ShieldCheck size={17} /><p>Esta reexecução terminou. Os cards mostram apenas os registros desta tentativa; o relatório original permanece preservado.</p><button type="button" className="text-button" onClick={() => navigate(`#/exploracoes/${encodeURIComponent(exploration.id)}`)}>Ver resultados completos <ArrowRight size={15} /></button></div>}
     </div>
   );
+}
+
+export function ScenarioRerunLiveView({ rerun, active = false, selectedStepId, onSelectStep, pollInterval = 3000, phaseHeadline }: {
+  rerun: NonNullable<Exploration["rerun"]>;
+  active?: boolean;
+  selectedStepId?: string | null;
+  onSelectStep?: (step: RerunLiveStep) => void;
+  pollInterval?: number;
+  phaseHeadline?: string;
+}) {
+  const progress = rerun.step_progress?.version === 1 ? rerun.step_progress : undefined;
+  const selected = progress?.steps.find((step) => step.id === selectedStepId)
+    || progress?.steps.find((step) => step.id === progress.current_id) || progress?.steps[0];
+  return <section className="rerun-live-page" aria-label="Acompanhamento dos passos da reexecução">
+    <div className="rerun-live-page-heading"><div><span className="section-kicker"><MonitorPlay size={14} />{active ? "Reexecução ao vivo" : "Passos da reexecução"}</span><h2>Seu teste, <span>passo a passo</span></h2><p>{phaseHeadline || "Acompanhe a ação, as conferências e os prints desta tentativa."}</p></div><span className={`rerun-live-sync ${active ? "is-live" : ""}`}>{active && <span className="live-pulse" />}{active ? `Atualização a cada ${pollInterval / 1000}s` : "Evidências preservadas"}</span></div>
+    {active && ["waiting_capture", "waiting_preparation"].includes(rerun.phase || "") && <button type="button" className="rerun-live-attention" aria-controls="rerun-live-controls" onClick={() => document.getElementById("rerun-live-controls")?.scrollIntoView({ block: "start", behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" })}>{rerun.phase === "waiting_capture" ? <ImagePlus size={18} /> : <KeyRound size={18} />}<span>{rerun.phase === "waiting_capture" ? "Aguardando seu print" : "Sua preparação é necessária"}<small>{rerun.phase === "waiting_capture" ? "Cole, arraste ou escolha uma imagem para continuar" : "Preencha o login e confirme quando estiver pronto"}</small></span><ArrowRight size={18} /></button>}
+    <RerunLiveBoard progress={progress} scenarioId={rerun.source_scenario_id} active={active} selectedStepId={selected?.id} onSelectStep={onSelectStep} />
+    {selected && <div className="rerun-live-step-detail" data-step-state={selected.state}>
+      <span className="rerun-live-detail-icon">{selected.state === "done" ? <CheckCircle2 size={22} /> : selected.state === "failed" || selected.state === "blocked" ? <AlertCircle size={22} /> : selected.state === "waiting" ? <ImagePlus size={22} /> : <Focus size={22} />}</span>
+      <div><span className="section-kicker">{selected.id === progress?.current_id ? "Etapa atual" : "Etapa selecionada"} · {selected.label}</span><h3>{selected.title}</h3><p>{selected.description}</p>{selected.occurred_at && <time dateTime={selected.occurred_at}>{formatDate(selected.occurred_at)}</time>}</div>
+    </div>}
+  </section>;
 }
 
 export function scenarioScreenshotUrl(apiBase: string, explorationId: string, screenshot?: string | null) {
@@ -3011,7 +3287,8 @@ function technicalSignalImpact(signal: ScenarioTechnicalSignal) {
 function ScenarioTimelineCard({ scenario, explorationId, apiBase }: { scenario: ScenarioCase; explorationId: string; apiBase: string }) {
   const verdict = scenarioVerdict(scenario);
   const signals = scenarioSignals(scenario);
-  const entries = scenarioTimeline(scenario);
+  const entries = scenario.evidence?.presentation_steps?.length ? scenario.evidence.presentation_steps : scenarioTimeline(scenario);
+  const plannedOrder = entries.some((entry) => entry.presentation_position?.status === "planned");
   const visual = scenario.evidence?.visual_assessment;
   const contextLimited = visual?.context_limited === true || visual?.review_scope === "saved_capture_only_legacy";
   const visualLabel = visual?.status === "pending" ? "Análise visual em andamento"
@@ -3029,34 +3306,39 @@ function ScenarioTimelineCard({ scenario, explorationId, apiBase }: { scenario: 
     <details className={`scenario-case-card verdict-${verdict.tone}`}>
       <summary className="scenario-case-summary">
         <ChevronRight className="scenario-expand-icon" size={17} />
-        <div className="scenario-case-heading"><span>{scenario.id}</span><h3>{scenario.title}</h3><div className="scenario-case-meta"><span>{timeline.length} registros na linha do tempo</span>{uniqueScreenshots.size > 0 && <span><Eye size={12} />{uniqueScreenshots.size} capturas</span>}{signals.length > 0 && <span className="scenario-signal-count"><Network size={12} />{signals.length} sinais técnicos</span>}{visual?.requested && <span>Visual: {visual.status === "pending" ? "em análise" : visual.status !== "assessed" ? "indisponível" : visual.accepted_count ? "indício a revisar" : "analisado"}</span>}</div></div>
+        <div className="scenario-case-heading"><span>{scenario.id}</span><h3>{scenario.title}</h3><div className="scenario-case-meta"><span>{timeline.length} registros {plannedOrder ? "nos passos do CT" : "na linha do tempo"}</span>{uniqueScreenshots.size > 0 && <span><Eye size={12} />{uniqueScreenshots.size} capturas</span>}{signals.length > 0 && <span className="scenario-signal-count"><Network size={12} />{signals.length} sinais técnicos</span>}{visual?.requested && <span>Visual: {visual.status === "pending" ? "em análise" : visual.status !== "assessed" ? "indisponível" : visual.accepted_count ? "indício a revisar" : "analisado"}</span>}</div></div>
         <span className={`scenario-verdict verdict-${verdict.tone}`}>{verdict.label}</span>
       </summary>
       <div className="scenario-case-body">
         {scenario.evidence?.verdict?.explanation && <p className={`scenario-verdict-explanation verdict-${verdict.tone}`}>{scenario.evidence.verdict.explanation}{scenario.evidence.verdict.historical && <small>O resultado histórico foi preservado; a classificação técnica explica a evidência, sem afirmar um defeito funcional.</small>}</p>}
         {visual?.requested && <div className="scenario-context-note"><strong>{visualLabel}</strong>{visual.reason && visual.status === "unavailable" && <small>Motivo: {visual.reason.startsWith("auxiliary_rate_limit") ? "O provedor limitou as chamadas. As verificações locais foram preservadas." : visual.reason === "auxiliary_request_budget_exhausted" ? "O orçamento de chamadas auxiliares desta execução foi esgotado." : visual.reason === "screenshot_not_available" ? "Não havia captura disponível para enviar ao modelo." : ["visual_assessment_not_returned", "visual_assessment_schema_invalid"].includes(visual.reason) ? "O modelo não devolveu uma análise visual no formato obrigatório. A documentação recebida não é uma validação visual." : `${visualUnavailabilityLabel(visual.reason)}. As verificações locais foram preservadas.`} Código: {visual.reason}</small>}{visual.status === "assessed" && <small>A confiança é declarada pelo modelo; um indício visual não confirma sozinho um bug funcional.</small>}{contextLimited && <small>Contexto textual limitado: esta revisão usa as capturas salvas. O DOM e o texto visível originais não foram preservados; não equivale a uma análise com contexto semântico completo.</small>}</div>}
         {(scenario.expected_result || scenario.actual_result) && <div className="scenario-outcome-grid">{scenario.expected_result && <div><small>Resultado esperado</small><p>{scenario.expected_result}</p></div>}{scenario.actual_result && <div><small>Resultado observado</small><p>{scenario.actual_result}</p></div>}</div>}
-        <h4 className="scenario-timeline-title"><History size={15} />Linha do tempo do CT</h4>
+        <h4 className="scenario-timeline-title"><History size={15} />{plannedOrder ? "Passos e evidências do CT" : "Linha do tempo do CT"}</h4>
+        {plannedOrder && <div className="scenario-context-note"><strong>Ordem dos passos planejada · horários reais preservados</strong><small>Os prints anexados aparecem no ponto escolhido por você. Essa posição organiza o roteiro, não altera quando a imagem foi anexada nem quando as verificações aconteceram.</small></div>}
         {timeline.length === 0 ? <p className="scenario-context-note">Nenhum evento detalhado foi preservado para este caso.</p> : <ol className="scenario-timeline">{timeline.map(({ entry, image }, index) => {
           const signal = entry.signal;
           const assertion = entry.assertion;
           const kind = entry.kind;
+          const userImage = entry.image_source === "user_upload";
           const failedAssertion = kind === "assertion" && assertion?.passed === false;
           const technicalAssertion = ["no_new_browser_errors", "no_new_application_errors"].includes(assertion?.kind || "");
           const visualAssertion = assertion?.kind === "visual_model";
-          const link = safeScenarioPageUrl(entry.url || signal?.url);
+          const link = userImage ? null : safeScenarioPageUrl(entry.url || signal?.url);
           const entryTone = signal ? "technical" : failedAssertion ? (technicalAssertion ? "technical" : "error") : kind === "assertion" && assertion?.passed ? "success" : "info";
-          const Icon = kind === "signal" ? Network : kind === "observation" ? Eye : kind === "assertion" ? (failedAssertion ? AlertCircle : ShieldCheck) : Play;
+          const Icon = userImage ? ImagePlus : kind === "signal" ? Network : kind === "observation" ? Eye : kind === "assertion" ? (failedAssertion ? AlertCircle : ShieldCheck) : Play;
           const association = signal?.association?.kind;
           return <li className={`scenario-timeline-event event-${entryTone}`} key={entry.id || `${kind}-${entry.occurred_at || "record"}-${index}`}>
             <span className="scenario-timeline-marker"><Icon size={14} /></span>
             <div className="scenario-timeline-event-body">
-              <div className="scenario-timeline-event-head"><strong>{signal?.label || entry.title || ({ observation: "Observação", action: "Ação executada", assertion: "Verificação", signal: "Sinal técnico" })[kind]}</strong>{entry.occurred_at && <time dateTime={entry.occurred_at}>{formatDate(entry.occurred_at)}</time>}</div>
+              <div className="scenario-timeline-event-head"><strong>{signal?.label || entry.title || ({ observation: "Observação", action: "Ação executada", assertion: "Verificação", signal: "Sinal técnico" })[kind]}</strong>{(entry.attached_at || entry.occurred_at) && <time dateTime={userImage ? entry.attached_at || entry.occurred_at : entry.occurred_at}>{userImage ? "Anexado em " : ""}{formatDate(userImage ? entry.attached_at || entry.occurred_at : entry.occurred_at)}</time>}</div>
               {(entry.message || signal?.message || assertion?.message) && <p>{entry.message || signal?.message || assertion?.message}</p>}
+              {userImage && <div className="scenario-context-note"><strong>Imagem enviada por você</strong><small>Anexo fornecido pelo usuário. Não é uma captura automática do navegador nem uma verificação do teste.</small></div>}
+              {userImage && entry.presentation_position?.status === "planned" && <small>Posição escolhida: {entry.presentation_position.gap === 0 ? "antes da primeira etapa" : `após a etapa ${entry.presentation_position.gap}`} do roteiro de origem.</small>}
+              {userImage && entry.presentation_position?.status === "unresolved" && <div className="scenario-context-note"><small>Não foi possível vincular com segurança a posição planejada deste anexo. Ele aparece separado dos passos, sem posição atribuída e com seu horário real.</small></div>}
               {kind === "action" && (entry.step_number !== undefined || entry.target) && <div className="scenario-case-meta">{entry.step_number !== undefined && <span>Etapa {entry.step_number}</span>}{entry.target && <span>Alvo observado: {entry.target}</span>}</div>}
               {assertion && <div className={`scenario-assertion-result ${assertion.passed === false ? "not-passed" : ""}`}><span>{assertion.passed === true ? "Aprovada" : assertion.passed === false ? "Falhou" : "Sem resultado"}{technicalAssertion ? " · verificação técnica" : visualAssertion ? " · indício visual da LLM" : ""}</span>{visualAssertion && <small>Reprovação baseada na análise da imagem; confira a captura e a região antes de confirmar o defeito. O diagnóstico original do modelo é preservado no idioma em que foi recebido.</small>}{assertion.expected !== undefined && <small>Esperado: {assertion.expected_display ?? JSON.stringify(assertion.expected)}</small>}{assertion.actual !== undefined && <small>Observado: {JSON.stringify(assertion.actual)}</small>}</div>}
               {signal && <div className="scenario-signal-detail">{signal.status_code && <span className="scenario-http-code">HTTP {signal.status_code}</span>}<p>{technicalSignalImpact(signal)}</p>{signal.classification_reason && <small>{signal.classification_reason}</small>}<small>{association === "before_action" ? "Observado antes da ação; sem atribuição causal." : association === "after_action" ? "Observado após a ação; associação temporal, não causalidade comprovada." : association === "during_action" ? "Registrado durante a ação; associação temporal, não causalidade comprovada." : "Registrado durante a execução; relação causal não comprovada."}</small>{signal.affects_verdict === false && <small>Não reprova automaticamente o CT.</small>}</div>}
-              {(entry.url || signal?.url) && <div className="scenario-event-url">{link ? <a href={link} target="_blank" rel="noreferrer">{entry.url || signal?.url}<SquareArrowOutUpRight size={12} /></a> : <span>{entry.url || signal?.url}</span>}</div>}
+              {!userImage && (entry.url || signal?.url) && <div className="scenario-event-url">{link ? <a href={link} target="_blank" rel="noreferrer">{entry.url || signal?.url}<SquareArrowOutUpRight size={12} /></a> : <span>{entry.url || signal?.url}</span>}</div>}
               {image && <figure className="scenario-timeline-screenshot"><a href={image} target="_blank" rel="noreferrer"><img src={image} loading="lazy" alt={`${scenario.id} · ${entry.title || "evidência"}`} /></a><figcaption><span>{entry.screenshot?.replace(/\\/g, "/").split("/").pop()}</span><a href={image} target="_blank" rel="noreferrer">Ampliar <SquareArrowOutUpRight size={12} /></a></figcaption></figure>}
             </div>
           </li>;

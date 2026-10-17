@@ -1,21 +1,27 @@
 """One explicitly authorized, deterministic CT replay in a fresh browser.
 
-This is deliberately not another exploration. No planner/provider is created,
-no draft custom step is interpreted, and an absent historical recipe is never
-replaced with a guessed action. The original run is read-only.
+This is deliberately not another exploration. No planner/provider is created;
+only an allowlisted manual screenshot checkpoint plan is admitted. Captures
+require confirmation through the trusted AutoJev application, never a binding
+exposed to the tested page. Integration drafts are never executed and an absent
+historical recipe is never replaced with a guessed action. The original run is
+read-only.
 """
 from __future__ import annotations
 
 import asyncio
 import copy
 import json
+import re
 import time
+import uuid
 from collections import Counter
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from autojev.adapters.playwright_executor import BrowserUnavailableError, PlaywrightExecutor
+from autojev.adapters.playwright_executor import BrowserUnavailableError, LoginAttempt, PlaywrightExecutor
 from autojev.adapters.repository import NotFoundError
 from autojev.adapters.secrets import redact
 from autojev.domain.models import (
@@ -25,6 +31,10 @@ from autojev.domain.models import (
 from autojev.services.business_checks import check_business_outcomes
 from autojev.services.exploration import ExplorationManager
 from autojev.services.report_localization import check_label
+from autojev.services.scenario_timeline import prepare_scenario_timelines
+from autojev.services.scenario_step_order import capture_position_anchor, presentation_scenario_steps
+from autojev.services.rerun_step_progress import build_step_plan, progress_check_bindings
+from autojev.services.user_image_upload import ValidatedUserImage, validate_user_image
 from autojev.services.rerun_recipe import (
     RerunRecipeBlocked, recipe_effect_digest, resolve_rerun_decision, validate_rerun_recipe,
 )
@@ -65,6 +75,8 @@ def rerun_block_reason(reason: str) -> str:
         "unverifiable_selection_state": "Não foi possível confirmar a opção selecionada no controle original.",
         "unbound_state_reference": "Um controle ligado aos pré-requisitos originais não pôde ser identificado nesta página.",
         "preparation_timeout": "O prazo para preparar a página terminou sem uma confirmação para continuar.",
+        "capture_timeout": "O prazo para anexar a imagem terminou. Nenhuma imagem foi adicionada nem houve continuação automática.",
+        "capture_failed": "Não foi possível concluir a inclusão da imagem. A reexecução não continuou automaticamente.",
         "browser_closed": "O navegador foi fechado antes de concluir a reexecução.",
         "cancelled": "A reexecução foi cancelada pelo usuário.",
         "backend_shutdown": "O backend foi encerrado durante a reexecução.",
@@ -111,9 +123,14 @@ class ScenarioRerunService:
         self.manager, self.repository, self.settings = manager, manager.repository, settings
         self.tasks: dict[str, asyncio.Task[None]] = {}
         self.input_events: dict[str, asyncio.Event] = {}
+        self.capture_events: dict[str, asyncio.Event] = {}
+        self.capture_records: dict[str, list[dict[str, Any]]] = {}
+        self.pending_images: dict[str, dict[str, Any]] = {}
         self.states: dict[str, dict[str, Any]] = {}
         self.intervention_timeout_seconds = 300.0
         self.operation_timeout_seconds = 120.0
+        self.capture_timeout_seconds = 900.0
+        self.capture_total_timeout_seconds = 3600.0
         # A restart cannot reconnect to the old browser or safely redispatch.
         # Reconcile recent unfinished reruns at startup, and all others on read.
         for item in self.repository.list_explorations(limit=10000):
@@ -144,15 +161,21 @@ class ScenarioRerunService:
             for a in assertions)
         local = [a for a in assertions if isinstance(a, dict) and a.get("kind") and a["kind"] != "visual_model"]
         visual = any(isinstance(a, dict) and a.get("kind") == "visual_model" for a in assertions)
-        visual = visual or bool((evidence.get("visual_assessment") or {}).get("requested"))
+        # Auxiliary screenshot interpretation is not itself an assertion.
+        # Omit it honestly in a local-only replay, without inventing a missing
+        # mandatory check. Explicit visual_model assertions still remain due.
+        visual_review_omitted = visual or bool((evidence.get("visual_assessment") or {}).get("requested"))
         result = {
             "available": False, "code": None, "reason": None,
             "title": str(scenario.get("title") or scenario_id),
             "url": str(evidence.get("before_url") or scenario.get("url") or ""),
             "checks": [str(a["kind"]) for a in local],
             "scope": {"local_checks": True, "visual_review": False, "database_steps": False,
-                      "missing_visual_checks": visual},
+                      "missing_visual_checks": visual, "visual_review_omitted": visual_review_omitted},
         }
+        timeline = self._source_timeline(item, scenario_id)
+        action_positions = [index for index, entry in enumerate(timeline) if entry.get("kind") == "action"]
+        result.update(timeline_count=len(timeline), action_index=action_positions[0] if len(action_positions) == 1 else None)
         code, reason = None, None
         action_entries = [e for e in evidence.get("timeline", []) if isinstance(e, dict) and e.get("kind") == "action"]
         if str(item.get("status")) not in TERMINAL_STATUSES:
@@ -166,7 +189,7 @@ class ScenarioRerunService:
         elif invalid_checks:
             code, reason = "invalid_checks", "As conferências originais deste CT estão incompletas e não podem ser comparadas com segurança."
         elif not local:
-            code, reason = ("visual_only" if visual else "missing_checks"), "Este CT não possui conferências locais salvas que possam ser repetidas sem uma nova análise por modelo."
+            code, reason = ("visual_only" if visual_review_omitted else "missing_checks"), "Este CT não possui conferências locais salvas que possam ser repetidas sem uma nova análise por modelo."
         elif (_origin(item.get("app_url")) is None or _origin(recipe.get("before_url")) != _origin(item.get("app_url"))
               or (evidence.get("before_url") and recipe.get("before_url") != evidence["before_url"])):
             code, reason = "unsafe_origin", "A página inicial da receita não corresponde à origem e ao estado autorizados."
@@ -182,32 +205,79 @@ class ScenarioRerunService:
                 return result
             result.update(available=True, url=recipe["before_url"], code="ready",
                           reason="Prepare a página e o estado original no navegador antes de continuar."
-                          + (" A análise visual anterior não será repetida; o novo CT ficará bloqueado nessa conferência." if visual else ""))
+                          + (" A conferência visual original não será repetida; o novo CT ficará bloqueado nessa conferência." if visual else
+                             " A revisão visual auxiliar não será repetida. O resultado será das conferências locais executadas, sem aprovação visual." if visual_review_omitted else ""))
         return result
 
+    @staticmethod
+    def _source_timeline(item: dict[str, Any], scenario_id: str) -> list[dict[str, Any]]:
+        prepared = prepare_scenario_timelines(item)
+        scenario = next((entry for entry in prepared.get("scenarios", []) if entry.get("id") == scenario_id), {})
+        # A rerun of a rerun uses the very same roteiro order as its report
+        # editor. Its uploaded images must not shift the next numeric gap just
+        # because their real attachment timestamps appear later in the log.
+        return presentation_scenario_steps(scenario.get("evidence") or {})
+
+    @staticmethod
+    def _capture_plan(plan: Any, timeline_count: int, action_index: int | None) -> dict[str, Any]:
+        if plan is None:
+            return {"version": 1, "checkpoints": []}
+        if (not isinstance(plan, dict) or set(plan) != {"version", "checkpoints"}
+                or type(plan["version"]) is not int or plan["version"] != 1
+                or not isinstance(plan["checkpoints"], list) or len(plan["checkpoints"]) > 100):
+            raise ValueError("O plano de capturas não é válido.")
+        checkpoints, ids, positions = [], set(), set()
+        for checkpoint in plan["checkpoints"]:
+            if not isinstance(checkpoint, dict) or set(checkpoint) != {"id", "gap", "order"}:
+                raise ValueError("O plano de capturas contém um passo não autorizado.")
+            identity, gap, order = checkpoint["id"], checkpoint["gap"], checkpoint["order"]
+            if (not isinstance(identity, str) or not re.fullmatch(r"db-[0-9]{1,9}", identity)
+                    or type(gap) is not int or not 0 <= gap <= min(10000, timeline_count)
+                    or type(order) is not int or not 0 <= order <= 10000
+                    or identity in ids or (gap, order) in positions or action_index is None):
+                raise ValueError("A posição de uma captura não corresponde aos passos do teste original.")
+            ids.add(identity)
+            positions.add((gap, order))
+            checkpoints.append({"id": identity, "gap": gap, "order": order})
+        return {"version": 1, "checkpoints": sorted(checkpoints, key=lambda checkpoint: (checkpoint["gap"], checkpoint["order"]))}
+
     def submit(self, exploration_id: str, scenario_id: str,
-               credentials: dict[str, str] | None = None) -> str:
+               credentials: dict[str, str] | None = None, capture_plan: dict[str, Any] | None = None) -> str:
         preflight = self.preflight(exploration_id, scenario_id)
         if not preflight["available"]:
             raise ValueError(preflight["reason"])
         item, scenario, action, recipe = self._source(exploration_id, scenario_id)
+        capture_plan = self._capture_plan(capture_plan, preflight["timeline_count"], preflight["action_index"])
+        source_steps = self._source_timeline(item, scenario_id)
+        position_anchors = {
+            checkpoint["id"]: capture_position_anchor(source_steps, checkpoint["gap"], scenario.get("evidence") or {})
+            for checkpoint in capture_plan["checkpoints"]
+        }
         options_data = {key: value for key, value in (item.get("options") or {}).items()
                         if key in ExplorationOptions.__dataclass_fields__}
         options_data.update(mode="single_ct_rerun", max_steps=1, max_duration_seconds=420,
                             auxiliary_evidence_mode="text", auxiliary_max_requests=0,
                             generate_test_cases=True, generate_html_report=True)
+        if capture_plan["checkpoints"]:
+            options_data["capture_screenshots"] = True
         request = ExplorationRequest(item["app_url"], ModelSelection(**item["agent"]),
                                      ModelSelection(**item["auxiliary_llm"]), ExplorationOptions(**options_data))
         new_id = self.repository.create_exploration(request)
         self.manager.credential_vault.put(new_id, credentials or {})
         source = {"source_exploration_id": exploration_id, "source_scenario_id": scenario_id,
                   "scope": preflight["scope"], "manual_preparation_required": True,
-                  "custom_steps_executed": False, "model_calls": False}
+                  "custom_steps_executed": False, "model_calls": False,
+                  "capture_plan": capture_plan, "capture_count": len(capture_plan["checkpoints"]),
+                  "captures_completed": 0, "capture_action_index": preflight["action_index"],
+                  "capture_position_anchors": position_anchors,
+                  "step_plan": build_step_plan(source_steps, capture_plan, scenario.get("evidence") or {})}
         self.repository.add_event(new_id, "info", SOURCE_EVENT,
                                   "Reexecução individual autorizada; a execução original permanece inalterada", source)
         self.states[new_id] = {**source, "exploration_id": new_id, "running": True, "phase": "queued"}
         self._persist(new_id)
         self.input_events[new_id] = asyncio.Event()
+        self.capture_events[new_id] = asyncio.Event()
+        self.capture_records[new_id] = []
         task = asyncio.create_task(self._guarded_run(new_id, item, scenario, action, recipe))
         self.tasks[new_id] = task
         task.add_done_callback(lambda _task: self._forget(new_id))
@@ -216,6 +286,13 @@ class ScenarioRerunService:
     def _forget(self, exploration_id: str) -> None:
         self.tasks.pop(exploration_id, None)
         self.input_events.pop(exploration_id, None)
+        self.capture_events.pop(exploration_id, None)
+        self.capture_records.pop(exploration_id, None)
+        pending_image = self.pending_images.pop(exploration_id, None)
+        if pending_image is not None:
+            # Only this generated, never committed file is eligible for
+            # cleanup; never touch a user-supplied path or existing evidence.
+            self._uploaded_image_path(exploration_id, pending_image["screenshot"]).unlink(missing_ok=True)
         self.manager.credential_vault.discard(exploration_id)
 
     def _persist(self, exploration_id: str, **changes: Any) -> None:
@@ -246,6 +323,95 @@ class ScenarioRerunService:
         event = self.input_events.get(exploration_id)
         if event is not None and self.states.get(exploration_id, {}).get("phase") == "waiting_preparation":
             event.set()
+
+    def _store_uploaded_image(self, exploration_id: str, image: ValidatedUserImage) -> dict[str, Any]:
+        """Write only a generated filename in this new run's artifact directory."""
+        artifact_root = self.settings.artifact_dir.resolve()
+        expected_directory = artifact_root / exploration_id / "screenshots"
+        directory = expected_directory.resolve()
+        if directory != expected_directory or directory.parent.parent != artifact_root:
+            raise ValueError("O destino desta imagem não é válido.")
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"user-upload-{uuid.uuid4().hex}{image.extension}"
+        created = False
+        try:
+            # Exclusive creation prevents replacement of any existing evidence.
+            with path.open("xb") as destination:
+                created = True
+                destination.write(image.content)
+                destination.flush()
+        except Exception:
+            if created:
+                path.unlink(missing_ok=True)
+            raise
+        return {"screenshot": path.name, "attachment": {
+            "mime_type": image.mime_type, "size_bytes": len(image.content),
+            "width": image.width, "height": image.height, "sha256": image.sha256,
+        }}
+
+    def _uploaded_image_path(self, exploration_id: str, filename: str) -> Path:
+        if not isinstance(filename, str) or not re.fullmatch(r"user-upload-[0-9a-f]{32}\.(?:png|jpg|webp)", filename):
+            raise ValueError("O nome da imagem anexada não é válido.")
+        artifact_root = self.settings.artifact_dir.resolve()
+        path = artifact_root / exploration_id / "screenshots" / filename
+        if path.resolve() != path or path.parent.parent.parent != artifact_root:
+            raise ValueError("O destino desta imagem não é válido.")
+        return path
+
+    def capture_print(self, exploration_id: str, checkpoint_id: str, checkpoint_version: int,
+                      image_data_url: str | ValidatedUserImage) -> dict[str, Any]:
+        """Accept one user attachment; neither a page binding nor an empty confirmation can continue."""
+        self.repository.get_exploration(exploration_id, include_details=False)
+        state = self.states.get(exploration_id) or {}
+        checkpoint = state.get("capture_checkpoint") or {}
+        event = self.capture_events.get(exploration_id)
+        if (event is None or not state.get("running") or state.get("phase") != "waiting_capture"
+                or checkpoint.get("id") != checkpoint_id or type(checkpoint_version) is not int
+                or checkpoint.get("version") != checkpoint_version
+                or self.repository.is_cancel_requested(exploration_id)):
+            raise ValueError("Esta captura não está aguardando confirmação ou já foi solicitada. Atualize a execução.")
+        # The HTTP route validates/decompresses in a worker thread, then returns
+        # here on the event loop. Direct service clients are validated too.
+        image = image_data_url if isinstance(image_data_url, ValidatedUserImage) else validate_user_image(image_data_url)
+        upload = self._store_uploaded_image(exploration_id, image)
+        attached_at = utc_now()
+        entry = {
+            "id": f"capture-{checkpoint_id}", "kind": "observation", "title": "Imagem anexada pelo usuário",
+            "message": "Imagem fornecida por você neste passo. Pode mostrar qualquer conteúdo; não é uma captura automática da página nem uma aprovação do teste.",
+            "occurred_at": attached_at, "attached_at": attached_at,
+            "image_source": "user_upload", "source": "user_upload", **upload,
+            "checkpoint_id": checkpoint_id, "planned_gap": checkpoint["gap"], "planned_order": checkpoint["order"],
+            "capture_phase": "before_action" if checkpoint["gap"] <= state["capture_action_index"] else "after_action",
+        }
+        anchor = (state.get("capture_position_anchors") or {}).get(checkpoint_id)
+        if anchor is not None:
+            entry["position_anchor"] = copy.deepcopy(anchor)
+        original_state = copy.deepcopy(state)
+        try:
+            # Synchronous phase change precedes the event: concurrent/double
+            # clicks cannot overwrite this image or consume the next checkpoint.
+            self.pending_images[exploration_id] = entry
+            self._persist(exploration_id, phase="capturing_print")
+        except Exception:
+            self.pending_images.pop(exploration_id, None)
+            self.states[exploration_id] = original_state
+            self._uploaded_image_path(exploration_id, upload["screenshot"]).unlink(missing_ok=True)
+            raise
+        event.set()
+        return copy.deepcopy(self.states[exploration_id])
+
+    def _commit_uploaded_image(self, exploration_id: str) -> dict[str, Any] | None:
+        """Attach an accepted image even if cancellation races its wake-up event."""
+        entry = self.pending_images.get(exploration_id)
+        if entry is None:
+            return None
+        records = self.capture_records[exploration_id]
+        if not any(item.get("id") == entry["id"] for item in records):
+            self.repository.add_user_image_evidence(exploration_id, entry, "CT001")
+            records.append(entry)
+        self.states[exploration_id]["captures_completed"] = len(records)
+        self.pending_images.pop(exploration_id, None)
+        return entry
 
     def cancel(self, exploration_id: str) -> None:
         self.repository.request_cancel(exploration_id)
@@ -278,10 +444,14 @@ class ScenarioRerunService:
         event.clear()
         self.repository.update_exploration(exploration_id, status=ExplorationStatus.WAITING_INPUT)
         expected_url, current_url = preparation["expected_url"], preparation["current_url"]
-        message = ((preparation.get("reason_label") + " " if preparation.get("reason_label") else "")
-                   + "Prepare a página original e recrie os pré-requisitos do CT (incluindo login, carrinho ou formulário). "
+        login_feedback = preparation.get("login_attempt") or {}
+        message = ((login_feedback.get("reason_label") + " " if login_feedback else "")
+                   + (preparation.get("reason_label") + " " if preparation.get("reason_label") else "")
+                   + "Se estiver na tela de login, preencha usuário e senha e clique em Continuar exploração: "
+                   + "o AutoJev tentará entrar com esses campos. Se já entrou, apenas conferirá a preparação. "
+                   + "Prepare também os demais pré-requisitos do CT (carrinho, opções ou formulário). "
                    + f"Página esperada: {expected_url}. Página aberta: {current_url}. "
-                   + "Nenhuma ação foi executada. Depois de corrigir a preparação, confirme novamente para continuar.")
+                   + "Nenhuma ação do CT foi executada. Depois de corrigir a preparação, confirme novamente para continuar.")
         preparation = {**preparation, "instruction": message}
         self._persist(exploration_id, phase="waiting_preparation", preparation=preparation)
         self.repository.add_event(exploration_id, "warning", "waiting_input", message,
@@ -313,6 +483,80 @@ class ScenarioRerunService:
                     task.cancel()
             await asyncio.gather(*pending_tasks, return_exceptions=True)
 
+    async def _wait_for_capture(self, exploration_id: str, executor: Any,
+                                checkpoint: dict[str, Any], remaining: float,
+                                capture_phase: str) -> str:
+        event = self.capture_events[exploration_id]
+        event.clear()
+        version = self.states[exploration_id].get("captures_completed", 0) + 1
+        active = {**checkpoint, "version": version}
+        timeout = min(self.capture_timeout_seconds, remaining)
+        message = ("A reexecução está pausada neste passo. Volte à aplicação AutoJev para colar uma imagem com Ctrl+V, "
+                   "arrastar um arquivo ou escolhê-lo no computador. A imagem pode mostrar qualquer conteúdo. "
+                   "Depois, clique em Anexar print e continuar. Não há captura automática da página e nenhuma ação do teste será repetida. "
+                   f"Prazo restante para anexar: {max(0, int(timeout))} segundos.")
+        self.repository.update_exploration(exploration_id, status=ExplorationStatus.WAITING_INPUT)
+        self._persist(exploration_id, phase="waiting_capture", capture_checkpoint=active,
+                      capture_timeout_seconds=max(0, timeout), capture_wait_started_at=utc_now(),
+                      capture_instruction=message)
+        self.repository.add_event(exploration_id, "info", "waiting_capture", message, active)
+
+        app_capture = asyncio.create_task(event.wait())
+        passive_panel = asyncio.create_task(executor.wait_for_capture_confirmation(message))
+        browser_closed = asyncio.create_task(executor.wait_until_inactive())
+        pending_tasks = {app_capture, passive_panel, browser_closed}
+        try:
+            done, _ = await asyncio.wait(pending_tasks, timeout=max(0, timeout), return_when=asyncio.FIRST_COMPLETED)
+            if self.repository.is_cancel_requested(exploration_id):
+                return "cancelled"
+            if not done:
+                return "capture_timeout"
+            if browser_closed in done:
+                return "browser_closed"
+            for task in done:
+                task.result()
+            # The tested page has no capture binding/callback. Its generic
+            # preparation resume channel can never authorize this checkpoint.
+            if app_capture not in done or self.states[exploration_id].get("phase") != "capturing_print" or not event.is_set():
+                return "capture_failed"
+            # Stop passive panel restoration. The image comes from the user,
+            # never from the browser under test or its exposed page bindings.
+            if not passive_panel.done():
+                passive_panel.cancel()
+            await asyncio.gather(passive_panel, return_exceptions=True)
+            await executor.hide_intervention_panel()
+            entry = self._commit_uploaded_image(exploration_id)
+            if entry is None or not entry.get("screenshot"):
+                return "capture_failed"
+            self.repository.update_exploration(exploration_id, status=ExplorationStatus.RUNNING)
+            self._persist(exploration_id, phase="preparing" if capture_phase == "before_action" else "executing",
+                          captures_completed=version, capture_checkpoint=None)
+            return "ready"
+        finally:
+            for task in pending_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+    def _apply_captures(self, exploration_id: str, scenario: TestScenario) -> None:
+        captures = copy.deepcopy(self.capture_records.get(exploration_id) or [])
+        scenario.evidence["capture_plan"] = copy.deepcopy(self.states[exploration_id].get("capture_plan"))
+        scenario.evidence["manual_captures"] = captures
+        original_entries = [entry for entry in scenario.evidence.get("timeline", [])
+                            if not str(entry.get("id", "")).startswith("capture-db-")]
+        # Actual capture times still establish the evidence log's chronology.
+        # presentation_scenario_steps separately projects the selected roteiro
+        # slot for report/editor/API consumers. Checks remain the one read-only
+        # post-action batch, never rerun following a manual print.
+        scenario.evidence["timeline"] = sorted([*original_entries, *captures], key=lambda entry: str(entry.get("occurred_at") or ""))
+        scenario.screenshots = list(dict.fromkeys([*scenario.screenshots, *(entry["screenshot"] for entry in captures)]))
+
+    def _save_capture_scenario(self, exploration_id: str, scenario: TestScenario, secrets: list[str]) -> None:
+        self._apply_captures(exploration_id, scenario)
+        safe_scenario = redact(asdict(scenario), secrets)
+        safe_scenario["status"] = ScenarioStatus(safe_scenario["status"])
+        self.repository.add_scenario(exploration_id, 1, TestScenario(**safe_scenario))
+
     @staticmethod
     def _missing_checks(original: dict[str, Any], action: dict[str, Any] | None,
                         decision: AgentDecision, result: ActionResult) -> list[str]:
@@ -338,9 +582,6 @@ class ScenarioRerunService:
                 missing.append(str(kind))
             else:
                 available[identity] -= 1
-        if ((original.get("evidence") or {}).get("visual_assessment") or {}).get("requested"):
-            if "visual_model" not in missing:
-                missing.append("visual_model")
         return missing
 
     def _blocked_scenario(self, exploration_id: str, original: dict[str, Any],
@@ -366,6 +607,7 @@ class ScenarioRerunService:
                       "assertions": [], "timeline": [{"kind": "observation", "title": "Reexecução bloqueada",
                           "message": actual, "occurred_at": utc_now()}]},
         )
+        self._apply_captures(exploration_id, scenario)
         self.repository.add_scenario(exploration_id, 1, scenario)
 
     async def _guarded_run(self, exploration_id: str, source: dict[str, Any],
@@ -388,10 +630,16 @@ class ScenarioRerunService:
         observation = None
         dispatched = False
         scenario_saved = False
+        scenario = None
+        capture_wait_total = 0.0
         terminal, reason = ExplorationStatus.PARTIAL, None
         secrets = list(self.manager.credential_vault.get(exploration_id).values())
         try:
-            async with asyncio.timeout(420):
+            # Manual print waits have their own finite budget. They must not
+            # consume the original operation/preparation budget, nor make the
+            # browser immortal if requests never arrive.
+            manual_budget = self.capture_total_timeout_seconds if self.states[exploration_id].get("capture_count") else 0
+            async with asyncio.timeout(420 + manual_budget):
                 if self.repository.is_cancel_requested(exploration_id):
                     terminal, reason = ExplorationStatus.CANCELLED, "cancelled"
                     return
@@ -408,6 +656,7 @@ class ScenarioRerunService:
                 self.repository.update_exploration(exploration_id, current_url=observation.url)
                 preparation_deadline = min(deadline, time.monotonic() + self.intervention_timeout_seconds)
                 attempts, version = 0, 0
+                login_feedback = None
                 preparation_reason = "before_url_changed" if observation.url != recipe["before_url"] else None
                 decision = None
                 while decision is None:
@@ -417,6 +666,7 @@ class ScenarioRerunService:
                         "expected_url": recipe["before_url"], "current_url": observation.url,
                         "reason_code": preparation_reason,
                         "reason_label": rerun_block_reason(preparation_reason) if preparation_reason else None,
+                        **({"login_attempt": login_feedback} if login_feedback else {}),
                     }
                     reason = await self._wait_for_preparation(exploration_id, executor, preparation_deadline, preparation)
                     if reason != "ready":
@@ -432,6 +682,30 @@ class ScenarioRerunService:
                         break
                     try:
                         observation = await asyncio.wait_for(executor.observe("rerun_before"), min(operation_timeout(), remaining))
+                        if ExplorationManager._needs_login(observation):
+                            await executor.show_intervention_panel(
+                                "Tentando entrar com os campos que você preencheu. Aguarde; nenhuma ação do CT foi executada.",
+                                title="Entrando e conferindo a preparação", button_label="Conferindo…", button_disabled=True)
+                            self.repository.add_event(exploration_id, "info", "confirmed_login_started",
+                                "Tentando entrar com os campos preenchidos após confirmação do usuário")
+                            try:
+                                login = await asyncio.wait_for(executor.attempt_filled_login(observation),
+                                    min(operation_timeout(), max(0.1, preparation_deadline - time.monotonic())))
+                            except asyncio.TimeoutError:
+                                login = LoginAttempt("manual_required", "login_not_confirmed")
+                            login_feedback = ExplorationManager._filled_login_feedback(login)
+                            self._persist(exploration_id, preparation={
+                                **self.states[exploration_id]["preparation"], "login_attempt": login_feedback})
+                            self.repository.add_event(exploration_id,
+                                "info" if login_feedback["status"] == "success" else "warning", "confirmed_login_result",
+                                login_feedback["reason_label"], login_feedback)
+                            await executor.hide_intervention_panel()
+                            remaining = preparation_deadline - time.monotonic()
+                            if remaining <= 0:
+                                reason = "preparation_timeout"
+                                break
+                            observation = await asyncio.wait_for(executor.observe("rerun_after_confirmed_login"),
+                                min(operation_timeout(), remaining))
                     except asyncio.TimeoutError:
                         if time.monotonic() >= preparation_deadline:
                             reason = "preparation_timeout"
@@ -458,8 +732,29 @@ class ScenarioRerunService:
                     else:
                         self._blocked_scenario(exploration_id, original, recipe, reason, observation)
                     return
+                checkpoints = self.states[exploration_id]["capture_plan"]["checkpoints"]
+                action_index = self.states[exploration_id]["capture_action_index"]
+                for checkpoint in (entry for entry in checkpoints if entry["gap"] <= action_index):
+                    wait_started = time.monotonic()
+                    reason = await self._wait_for_capture(exploration_id, executor, checkpoint,
+                        self.capture_total_timeout_seconds - capture_wait_total, "before_action")
+                    waited = time.monotonic() - wait_started
+                    capture_wait_total += waited
+                    deadline += waited
+                    if reason != "ready":
+                        terminal = ExplorationStatus.CANCELLED if reason in {"cancelled", "browser_closed"} else ExplorationStatus.PARTIAL
+                        self._blocked_scenario(exploration_id, original, recipe, reason, observation)
+                        return
+                    # Manual preparation may change the page while paused.
+                    # Bind fresh handles and enforce every original guard
+                    # again before the one and only action dispatch.
+                    observation = await asyncio.wait_for(executor.observe("rerun_before_manual_print"), operation_timeout())
+                    decision = resolve_rerun_decision(recipe, observation, source["app_url"])
+                if time.monotonic() >= deadline:
+                    raise asyncio.TimeoutError("Original operation budget expired before action dispatch")
                 self.repository.update_exploration(exploration_id, status=ExplorationStatus.RUNNING, current_url=observation.url)
-                self._persist(exploration_id, phase="executing")
+                self._persist(exploration_id, phase="executing",
+                              step_check_bindings=progress_check_bindings(action, decision.assertions))
                 dispatched = True
                 result, after = await asyncio.wait_for(executor.execute(decision, {}), operation_timeout())
                 result.assertions.extend(check_business_outcomes(observation, decision, result, after))
@@ -480,6 +775,8 @@ class ScenarioRerunService:
                     visual_assessment={"requested": False, "status": "disabled", "reason": "single_ct_rerun_local_only"})
                 scenario = ExplorationManager._scenario_from_evidence(after, decision, result, 1)
                 scenario.title = str(original.get("title") or scenario.title)
+                if self.states[exploration_id]["scope"].get("visual_review_omitted"):
+                    scenario.actual_result += "\nA revisão visual da execução original não foi repetida. Este resultado não representa aprovação visual."
                 if missing:
                     # Missing evidence limits completeness, but cannot erase a
                     # concrete failed local check or failed browser execution.
@@ -495,31 +792,47 @@ class ScenarioRerunService:
                 # substring that happens to equal a supplied credential.
                 safe_result["evidence"]["rerun_recipe"] = copy.deepcopy(recipe)
                 self.repository.add_action(exploration_id, 1, redact(asdict(decision), secrets), safe_result)
-                safe_scenario = redact(asdict(scenario), secrets)
-                safe_scenario["status"] = ScenarioStatus(safe_scenario["status"])
-                self.repository.add_scenario(exploration_id, 1, TestScenario(**safe_scenario))
+                self._save_capture_scenario(exploration_id, scenario, secrets)
                 scenario_saved = True
                 for shot, label in [(observation.screenshot, "Antes da reexecução"), (after.screenshot, "Depois da reexecução")]:
                     if shot:
                         self.repository.add_screenshot(exploration_id, shot, label, scenario.id)
                 self.repository.update_exploration(exploration_id, current_url=after.url, steps_completed=1)
                 terminal = ExplorationStatus.PARTIAL if missing or scenario.status in {ScenarioStatus.BLOCKED, ScenarioStatus.SKIPPED} else ExplorationStatus.COMPLETED
+                # The action and its local assertions are already durable.
+                # A cancelled/timed-out manual print cannot erase or redispatch
+                # that observed result. It only limits capture completeness.
+                checks_reason = reason
+                for checkpoint in (entry for entry in checkpoints if entry["gap"] > action_index):
+                    wait_started = time.monotonic()
+                    reason = await self._wait_for_capture(exploration_id, executor, checkpoint,
+                        self.capture_total_timeout_seconds - capture_wait_total, "after_action")
+                    waited = time.monotonic() - wait_started
+                    capture_wait_total += waited
+                    deadline += waited
+                    self._save_capture_scenario(exploration_id, scenario, secrets)
+                    if reason != "ready":
+                        terminal = ExplorationStatus.CANCELLED if reason in {"cancelled", "browser_closed"} else ExplorationStatus.PARTIAL
+                        return
+                reason = checks_reason
         except RerunRecipeBlocked as exc:
             reason = str(exc)
-            self._blocked_scenario(exploration_id, original, recipe, reason, observation, dispatched=dispatched)
+            if not scenario_saved:
+                self._blocked_scenario(exploration_id, original, recipe, reason, observation, dispatched=dispatched)
         except asyncio.CancelledError:
             terminal = ExplorationStatus.CANCELLED
             reason = self.states[exploration_id].get("reason") or "cancelled"
-            if dispatched and not scenario_saved:
-                self._blocked_scenario(exploration_id, original, recipe, reason, observation, dispatched=True)
+            if not scenario_saved and (dispatched or self.capture_records.get(exploration_id)):
+                self._blocked_scenario(exploration_id, original, recipe, reason, observation, dispatched=dispatched)
         except BrowserUnavailableError:
             terminal, reason = ExplorationStatus.CANCELLED, "browser_closed"
-            if dispatched and not scenario_saved:
-                self._blocked_scenario(exploration_id, original, recipe, reason, observation, dispatched=True)
+            if not scenario_saved and (dispatched or self.capture_records.get(exploration_id)):
+                self._blocked_scenario(exploration_id, original, recipe, reason, observation, dispatched=dispatched)
         except Exception as exc:
             reason = str(redact(f"{type(exc).__name__}: {exc}", secrets))[:1000]
             terminal = ExplorationStatus.PARTIAL
-            self._blocked_scenario(exploration_id, original, recipe, reason, observation, dispatched=dispatched)
+            if not scenario_saved:
+                self._blocked_scenario(exploration_id, original, recipe, reason, observation, dispatched=dispatched)
             self.repository.add_event(exploration_id, "error", "scenario_rerun_failed", reason)
         finally:
             if executor is not None:
@@ -527,10 +840,20 @@ class ScenarioRerunService:
                     await asyncio.wait_for(executor.close(), 15)
                 except Exception:
                     pass
+            # A trusted upload accepted just before cancellation/browser close
+            # remains evidence. Its provenance never changes into page capture.
+            accepted_image = self._commit_uploaded_image(exploration_id)
+            if accepted_image is not None and not scenario_saved:
+                self._blocked_scenario(exploration_id, original, recipe, reason or "capture_failed", observation, dispatched=dispatched)
             if self.repository.is_cancel_requested(exploration_id):
                 terminal, reason = ExplorationStatus.CANCELLED, "cancelled"
+            if scenario_saved and scenario is not None:
+                if self.states[exploration_id].get("captures_completed", 0) < self.states[exploration_id].get("capture_count", 0):
+                    scenario.evidence["capture_interruption"] = {"reason": reason, "reason_label": rerun_block_reason(reason or "capture_failed")}
+                    scenario.actual_result += "\nA coleta dos prints planejados não foi concluída. As ações e conferências já registradas foram preservadas."
+                self._save_capture_scenario(exploration_id, scenario, secrets)
             self.repository.update_exploration(exploration_id, status=terminal, finished_at=utc_now(), error=reason)
-            self._persist(exploration_id, running=False, phase="finished", reason=reason,
+            self._persist(exploration_id, running=False, phase="finished", reason=reason, capture_checkpoint=None,
                           outcome=str(terminal), finished_at=utc_now())
             self.manager.credential_vault.discard(exploration_id)
             try:

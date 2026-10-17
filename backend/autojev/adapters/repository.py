@@ -122,6 +122,7 @@ class SQLiteRepository:
             scenario_id TEXT,
             relative_path TEXT NOT NULL,
             label TEXT NOT NULL,
+            image_source TEXT NOT NULL DEFAULT 'browser_capture',
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_exploration_events ON exploration_events(exploration_id, id);
@@ -130,6 +131,11 @@ class SQLiteRepository:
         """
         with self._lock, self._connect() as connection:
             connection.executescript(schema)
+            try:
+                connection.execute("ALTER TABLE screenshots ADD COLUMN image_source TEXT NOT NULL DEFAULT 'browser_capture'")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
             for column, definition in (
                 ("prompt_tokens", "INTEGER NOT NULL DEFAULT 0"),
                 ("completion_tokens", "INTEGER NOT NULL DEFAULT 0"),
@@ -560,13 +566,36 @@ class SQLiteRepository:
         relative_path: str,
         label: str,
         scenario_id: str | None = None,
+        *,
+        image_source: str = "browser_capture",
     ) -> None:
+        if image_source not in {"browser_capture", "user_upload"}:
+            raise ValueError("Unknown screenshot provenance")
         with self._lock, self._connect() as connection:
             connection.execute(
                 """INSERT INTO screenshots
-                   (exploration_id, scenario_id, relative_path, label, created_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (exploration_id, scenario_id, relative_path, label, utc_now()),
+                   (exploration_id, scenario_id, relative_path, label, image_source, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (exploration_id, scenario_id, relative_path, label, image_source, utc_now()),
+            )
+
+    def add_user_image_evidence(self, exploration_id: str, entry: dict[str, Any], scenario_id: str) -> None:
+        """The gallery row and its provenance event are one database commit."""
+        if entry.get("image_source") != "user_upload" or not entry.get("screenshot"):
+            raise ValueError("Invalid user image evidence")
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """INSERT INTO screenshots
+                   (exploration_id, scenario_id, relative_path, label, image_source, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (exploration_id, scenario_id, entry["screenshot"], "Imagem anexada pelo usuário", "user_upload", entry["attached_at"]),
+            )
+            connection.execute(
+                """INSERT INTO exploration_events
+                   (exploration_id, level, type, message, payload_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (exploration_id, "info", "manual_print_attached", "Imagem anexada pelo usuário após confirmação explícita",
+                 json.dumps(entry, ensure_ascii=False), entry["attached_at"]),
             )
 
     @staticmethod
@@ -666,6 +695,7 @@ class SQLiteRepository:
                     "scenario_id": item["scenario_id"],
                     "path": item["relative_path"],
                     "label": item["label"],
+                    "image_source": item["image_source"],
                     "created_at": item["created_at"],
                 }
                 for item in connection.execute(
@@ -702,9 +732,9 @@ class SQLiteRepository:
                     (SELECT COUNT(DISTINCT json_extract(a.result_json, '$.after_url'))
                        FROM actions a WHERE a.exploration_id = e.id) AS visited_count,
                     (SELECT relative_path FROM screenshots ss
-                       WHERE ss.exploration_id = e.id ORDER BY ss.id DESC LIMIT 1) AS latest_screenshot_path,
+                       WHERE ss.exploration_id = e.id AND ss.image_source != 'user_upload' ORDER BY ss.id DESC LIMIT 1) AS latest_screenshot_path,
                     (SELECT label FROM screenshots ss
-                       WHERE ss.exploration_id = e.id ORDER BY ss.id DESC LIMIT 1) AS latest_screenshot_label,
+                       WHERE ss.exploration_id = e.id AND ss.image_source != 'user_upload' ORDER BY ss.id DESC LIMIT 1) AS latest_screenshot_label,
                     (SELECT created_at FROM exploration_events ev
                        WHERE ev.exploration_id = e.id ORDER BY ev.id DESC LIMIT 1) AS latest_event_at,
                     (SELECT type FROM exploration_events ev
@@ -788,6 +818,7 @@ class SQLiteRepository:
                         "scenario_id": None,
                         "path": row["latest_screenshot_path"],
                         "label": row["latest_screenshot_label"] or "Latest screenshot",
+                        "image_source": "browser_capture",
                         "created_at": item["updated_at"],
                     }
                 ]
