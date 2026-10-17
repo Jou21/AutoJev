@@ -420,9 +420,9 @@ test("pasting print images leaves text inputs and unrelated dialogs alone", asyn
 
 test("the attachment panel appears near the top of a paused execution, ahead of its progress dashboard", async () => {
   const source = await readFile(new URL("../app/AutoJevApp.tsx", import.meta.url), "utf8");
-  const capture = source.indexOf("{capturePhase && <ScenarioRerunCapture");
-  assert.ok(capture > source.indexOf('aria-label="Origem da reexecução"'));
-  assert.ok(capture < source.indexOf('<section className={`execution-command'));
+  assert.match(source, /const capturePanel = capturePhase && <ScenarioRerunCapture/);
+  assert.match(source, /controls=\{rerunControls\} \/> : rerunControls/);
+  assert.ok(source.indexOf("{controls}") < source.indexOf("<RerunLiveBoard compact progress="));
   assert.match(source, /ScenarioRerunCapture key=\{captureKey \|\| exploration.id\}/);
   assert.match(source, /window.addEventListener\("paste", paste\)/);
   assert.doesNotMatch(source, /navigator.clipboard.read|clipboard.readText/);

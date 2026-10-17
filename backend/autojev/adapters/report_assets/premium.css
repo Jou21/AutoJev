@@ -154,6 +154,9 @@ code { font-size: .9em; overflow-wrap: anywhere; }
 .report-table th { padding: 12px 14px; color: #a9bdcf; font-size: 10px; font-weight: 650; white-space: nowrap; }
 .report-table td { padding: 12px 14px; border-top: 1px solid var(--line-soft); vertical-align: middle; }
 .report-table tbody tr:hover { background: #112132; }
+.report-table tbody tr[data-open-case-row] { cursor: pointer; }
+.report-table tbody tr[data-open-case-row]:focus-within { background: #112132; }
+.report-table tbody tr[data-open-case-row]:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .report-table td:first-child { font-variant-numeric: tabular-nums; }
 .report-table .badge { font-size: 9px; padding: 4px 7px; }
 .report-table .page-url { max-width: 220px; font-size: 10px; }
@@ -629,7 +632,7 @@ body[data-theme="light"] .button-rerun { border-color: color-mix(in srgb, var(--
 body[data-theme="light"] .report-sidebar button[data-report-nav], body[data-theme="light"] .meta strong, body[data-theme="light"] .setting-field > span, body[data-theme="light"] .setting-field > label { color: #425e77; }
 body[data-theme="light"] .report-sidebar button[data-report-nav].active { color: var(--accent); background: var(--accent-soft); }
 body[data-theme="light"] button, body[data-theme="light"] .button, body[data-theme="light"] input, body[data-theme="light"] select, body[data-theme="light"] textarea, body[data-theme="light"] .timeline-content, body[data-theme="light"] .result > div, body[data-theme="light"] pre { background: #f5f8fb; color: var(--text); }
-body[data-theme="light"] button:hover, body[data-theme="light"] .button:hover, body[data-theme="light"] .report-table tbody tr:hover { background: #e8f0f7; }
+body[data-theme="light"] button:hover, body[data-theme="light"] .button:hover, body[data-theme="light"] .report-table tbody tr:hover, body[data-theme="light"] .report-table tbody tr[data-open-case-row]:focus-within { background: #e8f0f7; }
 body[data-theme="light"] .button-primary { background: #ffbf47; color: #332205; border-color: #e1a534; }
 body[data-theme="light"] .button-primary:hover { background: #ffd173; }
 body[data-theme="light"] .case-title-button { background: transparent; }

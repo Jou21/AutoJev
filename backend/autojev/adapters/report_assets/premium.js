@@ -23,6 +23,16 @@
     const byId = new Map(cases.map((item) => [String(item.id), item]));
     const $ = (id) => document.getElementById(id);
     const all = (selector, scope = document) => Array.from(scope.querySelectorAll(selector));
+    // A running backend may still hold the previous Python row template while
+    // reading this updated runtime from disk. Upgrade its canonical rows too;
+    // never require a backend restart just to expand the clickable area.
+    all("#case-rows tr[data-case-index]").forEach((row) => {
+      const item = byIndex.get(row.dataset.caseIndex);
+      if (!item) return;
+      row.dataset.openCaseRow = String(item.index);
+      row.setAttribute("tabindex", "0");
+      row.setAttribute("aria-label", "Abrir resultado de " + String(item.id) + ": " + String(item.title || ""));
+    });
     const reportConnection = (() => {
       const runtime = $("report-app-runtime");
       // Only a report explicitly opened by the app in its same-origin blob can
@@ -1230,11 +1240,32 @@
       event.preventDefault();
       navigate(nav.dataset.reportNav);
     }));
+    document.addEventListener("keydown", (event) => {
+      const row = event.target instanceof Element ? event.target : null;
+      if (!row || !row.matches("#case-rows tr[data-case-index]")
+        || event.defaultPrevented || event.repeat || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey
+        || (event.key !== "Enter" && event.key !== " ")) return;
+      event.preventDefault();
+      openCase(row.dataset.caseIndex);
+    });
     document.addEventListener("click", (event) => {
       const target = event.target instanceof Element ? event.target : null;
       if (!target) return;
       const open = target.closest("[data-open-case]");
       if (open) { event.preventDefault(); openCase(open.dataset.openCase); return; }
+      const caseRow = target.closest("#case-rows tr[data-case-index]");
+      if (caseRow) {
+        // Keep native controls and copying table text usable. A plain click
+        // anywhere else in the row opens its result exactly once.
+        if (event.defaultPrevented || (event.button != null && event.button !== 0)
+          || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey
+          || target.closest('a,button,input,select,textarea,summary,[role="button"],[contenteditable="true"]')) return;
+        const selection = window.getSelection && window.getSelection();
+        if (selection && !selection.isCollapsed && String(selection).trim()) return;
+        event.preventDefault();
+        openCase(caseRow.dataset.caseIndex);
+        return;
+      }
       const edit = target.closest("[data-edit-case], [data-edit-current]");
       if (edit) {
         event.preventDefault();

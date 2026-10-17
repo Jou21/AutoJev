@@ -271,7 +271,7 @@ def render_premium_report(renderer: Any, exploration: dict[str, Any], scenarios:
 
 
 def _case_row(case: dict[str, Any]) -> str:
-    return f'<tr data-case-index="{case["index"]}"><td><span class="case-id">{_h(case["id"])}</span></td><td><button class="case-title-button" data-open-case="{case["index"]}">{_h(case["title"])}</button></td><td><span class="badge {case["status"].lower()}">{STATUS_LABELS[case["status"]]}</span></td><td>{CATEGORIES[case["category"]]}</td><td class="page-url" title="{_h(case["url"])}">{_h(case["page"])}</td><td>{_time(case["duration_seconds"])}</td><td>{case["signals"]}</td><td><button class="button button-ghost" data-open-case="{case["index"]}" aria-label="Abrir {_h(case["id"])}">Ver →</button></td></tr>'
+    return f'<tr data-case-index="{case["index"]}" data-open-case-row="{case["index"]}" tabindex="0" aria-label="Abrir resultado de {_h(case["id"])}: {_h(case["title"])}"><td><span class="case-id">{_h(case["id"])}</span></td><td><button class="case-title-button" data-open-case="{case["index"]}">{_h(case["title"])}</button></td><td><span class="badge {case["status"].lower()}">{STATUS_LABELS[case["status"]]}</span></td><td>{CATEGORIES[case["category"]]}</td><td class="page-url" title="{_h(case["url"])}">{_h(case["page"])}</td><td>{_time(case["duration_seconds"])}</td><td>{case["signals"]}</td><td><button class="button button-ghost" data-open-case="{case["index"]}" aria-label="Abrir {_h(case["id"])}">Ver →</button></td></tr>'
 
 
 def _pages_table(pages: list[dict[str, Any]], compact: bool = False) -> str:

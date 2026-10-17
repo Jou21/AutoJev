@@ -2,16 +2,17 @@
 
 This is deliberately not another exploration. No planner/provider is created;
 only an allowlisted manual screenshot checkpoint plan is admitted. Captures
-require confirmation through the trusted AutoJev application, never a binding
-exposed to the tested page. Integration drafts are never executed and an absent
-historical recipe is never replaced with a guessed action. The original run is
-read-only.
+require confirmation through the trusted AutoJev application or its isolated
+browser panel, never an authority exposed to the tested page. Integration drafts
+are never executed and an absent historical recipe is never replaced with a
+guessed action. The original run is read-only.
 """
 from __future__ import annotations
 
 import asyncio
 import copy
 import json
+import math
 import re
 import time
 import uuid
@@ -33,7 +34,7 @@ from autojev.services.exploration import ExplorationManager
 from autojev.services.report_localization import check_label
 from autojev.services.scenario_timeline import prepare_scenario_timelines
 from autojev.services.scenario_step_order import capture_position_anchor, presentation_scenario_steps
-from autojev.services.rerun_step_progress import build_step_plan, progress_check_bindings
+from autojev.services.rerun_step_progress import build_step_plan, project_step_progress, progress_check_bindings
 from autojev.services.user_image_upload import ValidatedUserImage, validate_user_image
 from autojev.services.rerun_recipe import (
     RerunRecipeBlocked, recipe_effect_digest, resolve_rerun_decision, validate_rerun_recipe,
@@ -324,6 +325,113 @@ class ScenarioRerunService:
         if event is not None and self.states.get(exploration_id, {}).get("phase") == "waiting_preparation":
             event.set()
 
+    async def _resume_from_browser_panel(self, exploration_id: str, preparation_version: int) -> dict[str, Any]:
+        """Confirm only the current preparation, using the durable app gate.
+
+        A panel snapshot can be half a second behind the service. It must not
+        resume a newer retry or lose an early click when a browser-side waiter
+        later clears its generic event. This check and the app event set have
+        no await between them and therefore form one event-loop transaction.
+        """
+        state = self.states.get(exploration_id) or {}
+        preparation = state.get("preparation") or {}
+        event = self.input_events.get(exploration_id)
+        if (event is None or event.is_set() or state.get("running") is not True
+                or state.get("phase") != "waiting_preparation"
+                or type(preparation_version) is not int or preparation.get("version") != preparation_version
+                or self.repository.is_cancel_requested(exploration_id)):
+            raise ValueError("Esta preparação não está aguardando confirmação ou foi atualizada. Confira o painel e tente novamente.")
+        self.resume(exploration_id)
+        return {"accepted": True, "preparation_version": preparation_version}
+
+    def _browser_panel_payload(self, exploration_id: str, secrets: list[str]) -> dict[str, Any]:
+        """Only the live roteiro and fixed presentation text cross into the panel.
+
+        Do not forward a saved state/event wholesale: it contains the private
+        source recipe and can grow to include browser evidence or attachments.
+        Verdicts come only from evidence of this replay, never the original CT.
+        """
+        item = self.repository.get_exploration(exploration_id)
+        state = self.states.get(exploration_id) or {}
+        projected = project_step_progress(item, state, state.get("step_plan"))
+
+        def text(value: Any, limit: int = 1000) -> str:
+            return str(redact(str(value or ""), secrets))[:limit]
+
+        def number(value: Any, *, maximum: int = 10000) -> int:
+            return min(maximum, max(0, value)) if type(value) is int else 0
+
+        steps = []
+        for row in projected.get("steps", [])[:10000]:
+            if not isinstance(row, dict):
+                continue
+            steps.append({
+                "id": str(row.get("id") or "")[:120],
+                "title": text(row.get("title"), 240),
+                "kind": row.get("kind") if row.get("kind") in {"observation", "action", "assertion", "signal", "capture_wait"} else "observation",
+                "state": row.get("state") if row.get("state") in {"pending", "active", "waiting", "done", "failed", "blocked", "skipped", "unavailable"} else "pending",
+                "label": text(row.get("label"), 120),
+                "description": text(row.get("description")),
+                **({"checkpoint_id": str(row["checkpoint_id"])[:120]} if isinstance(row.get("checkpoint_id"), str) else {}),
+                **({"source_index": number(row["source_index"])} if type(row.get("source_index")) is int else {}),
+            })
+        checkpoint = state.get("capture_checkpoint") or {}
+        active_checkpoint = None
+        if (isinstance(checkpoint, dict) and isinstance(checkpoint.get("id"), str)
+                and all(type(checkpoint.get(key)) is int for key in ("gap", "order", "version"))):
+            active_checkpoint = {"id": checkpoint["id"][:120], **{
+                key: number(checkpoint[key]) for key in ("gap", "order", "version")}}
+        preparation = state.get("preparation") or {}
+        login = preparation.get("login_attempt") or {}
+        safe_preparation = {"version": number(preparation.get("version")),
+                            **{key: text(preparation.get(key), 2000) for key in (
+                                "reason_label", "expected_url", "current_url", "instruction")}}
+        if isinstance(login, dict) and login:
+            safe_preparation["login_attempt"] = {
+                "status": login.get("status") if login.get("status") in {"success", "rejected", "manual_required"} else "manual_required",
+                "reason_label": text(login.get("reason_label")),
+            }
+        usage = item.get("usage") or {}
+        cost = usage.get("cost")
+        cost = float(cost) if type(cost) in {int, float} and math.isfinite(cost) and cost >= 0 else None
+        timeout = state.get("capture_timeout_seconds")
+        timeout = float(timeout) if type(timeout) in {int, float} and math.isfinite(timeout) and timeout >= 0 else 0
+        return {
+            "version": 1, "scenario_id": "CT001",
+            "phase": state.get("phase") if state.get("phase") in {
+                "queued", "preparing", "waiting_preparation", "validating_preparation", "executing", "waiting_capture", "capturing_print", "finished"} else "queued",
+            "running": state.get("running") is True,
+            "progress": {"steps": steps, "completed": number(projected.get("completed")), "total": len(steps),
+                         "current_id": str(projected.get("current_id") or "")[:120], "notice": text(projected.get("notice"))},
+            "checkpoint": active_checkpoint, "preparation": safe_preparation,
+            "capture_count": number(state.get("capture_count"), maximum=100),
+            "captures_completed": number(state.get("captures_completed"), maximum=100),
+            "capture_timeout_seconds": min(timeout, self.capture_total_timeout_seconds),
+            "usage": {"total_tokens": number(usage.get("total_tokens"), maximum=1_000_000_000),
+                      "cost": cost, "cost_known": usage.get("cost_known") is True},
+        }
+
+    async def _stream_browser_panel(self, exploration_id: str, executor: Any, secrets: list[str]) -> None:
+        """Refresh safely after page navigation without changing saved evidence.
+
+        The executor owns frame-identity/payload deduplication: it must still be
+        called on unchanged data to restore its isolated frame after a reload.
+        A presentation failure cannot dispatch, accept a print, or abort a CT.
+        """
+        update = getattr(executor, "update_rerun_panel", None)
+        if not callable(update):
+            return
+        while True:
+            try:
+                await update(self._browser_panel_payload(exploration_id, secrets))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The application upload remains available if the browser
+                # closes or a page prevents this optional embedded surface.
+                pass
+            await asyncio.sleep(0.5)
+
     def _store_uploaded_image(self, exploration_id: str, image: ValidatedUserImage) -> dict[str, Any]:
         """Write only a generated filename in this new run's artifact directory."""
         artifact_root = self.settings.artifact_dir.resolve()
@@ -360,7 +468,7 @@ class ScenarioRerunService:
 
     def capture_print(self, exploration_id: str, checkpoint_id: str, checkpoint_version: int,
                       image_data_url: str | ValidatedUserImage) -> dict[str, Any]:
-        """Accept one user attachment; neither a page binding nor an empty confirmation can continue."""
+        """Accept one explicit attachment; untrusted page code cannot confirm it."""
         self.repository.get_exploration(exploration_id, include_details=False)
         state = self.states.get(exploration_id) or {}
         checkpoint = state.get("capture_checkpoint") or {}
@@ -370,8 +478,9 @@ class ScenarioRerunService:
                 or checkpoint.get("version") != checkpoint_version
                 or self.repository.is_cancel_requested(exploration_id)):
             raise ValueError("Esta captura não está aguardando confirmação ou já foi solicitada. Atualize a execução.")
-        # The HTTP route validates/decompresses in a worker thread, then returns
-        # here on the event loop. Direct service clients are validated too.
+        # Both the HTTP route and the isolated browser-panel callback validate
+        # in a worker thread, then return here to recheck the live checkpoint.
+        # Direct service clients are validated too.
         image = image_data_url if isinstance(image_data_url, ValidatedUserImage) else validate_user_image(image_data_url)
         upload = self._store_uploaded_image(exploration_id, image)
         attached_at = utc_now()
@@ -399,6 +508,19 @@ class ScenarioRerunService:
             raise
         event.set()
         return copy.deepcopy(self.states[exploration_id])
+
+    async def _capture_from_browser_panel(self, exploration_id: str, checkpoint_id: str,
+                                          checkpoint_version: int, image_data_url: str) -> dict[str, Any]:
+        """Use the same upload transaction after a trusted-frame confirmation.
+
+        The executor checks isolated frame identity, a private rotating token
+        and a real user confirmation. Rechecking state in capture_print after
+        decoding also rejects cancellation, duplicates, or a stale checkpoint
+        that raced image validation. No image bytes are logged or sent to AI.
+        """
+        image = await asyncio.to_thread(validate_user_image, image_data_url)
+        self.capture_print(exploration_id, checkpoint_id, checkpoint_version, image)
+        return {"accepted": True, "checkpoint_id": checkpoint_id, "checkpoint_version": checkpoint_version}
 
     def _commit_uploaded_image(self, exploration_id: str) -> dict[str, Any] | None:
         """Attach an accepted image even if cancellation races its wake-up event."""
@@ -491,7 +613,10 @@ class ScenarioRerunService:
         version = self.states[exploration_id].get("captures_completed", 0) + 1
         active = {**checkpoint, "version": version}
         timeout = min(self.capture_timeout_seconds, remaining)
-        message = ("A reexecução está pausada neste passo. Volte à aplicação AutoJev para colar uma imagem com Ctrl+V, "
+        upload_surface = ("Use o painel AutoJev deste navegador ou a aplicação AutoJev para colar uma imagem com Ctrl+V, "
+                          if callable(getattr(executor, "update_rerun_panel", None)) else
+                          "Volte à aplicação AutoJev para colar uma imagem com Ctrl+V, ")
+        message = ("A reexecução está pausada neste passo. " + upload_surface +
                    "arrastar um arquivo ou escolhê-lo no computador. A imagem pode mostrar qualquer conteúdo. "
                    "Depois, clique em Anexar print e continuar. Não há captura automática da página e nenhuma ação do teste será repetida. "
                    f"Prazo restante para anexar: {max(0, int(timeout))} segundos.")
@@ -515,12 +640,12 @@ class ScenarioRerunService:
                 return "browser_closed"
             for task in done:
                 task.result()
-            # The tested page has no capture binding/callback. Its generic
+            # Untrusted tested-page code has no capture authority. The generic
             # preparation resume channel can never authorize this checkpoint.
             if app_capture not in done or self.states[exploration_id].get("phase") != "capturing_print" or not event.is_set():
                 return "capture_failed"
-            # Stop passive panel restoration. The image comes from the user,
-            # never from the browser under test or its exposed page bindings.
+            # Stop wait-panel restoration. The image comes from the user,
+            # never an automatic screenshot of the browser under test.
             if not passive_panel.done():
                 passive_panel.cancel()
             await asyncio.gather(passive_panel, return_exceptions=True)
@@ -627,6 +752,7 @@ class ScenarioRerunService:
     async def _run(self, exploration_id: str, source: dict[str, Any],
                    original: dict[str, Any], action: dict[str, Any] | None, recipe: dict[str, Any]) -> None:
         executor = None
+        browser_panel_task = None
         observation = None
         dispatched = False
         scenario_saved = False
@@ -650,9 +776,23 @@ class ScenarioRerunService:
                     return min(self.operation_timeout_seconds, max(0.1, deadline - time.monotonic()))
                 executor = PlaywrightExecutor(self.settings.artifact_dir / exploration_id / "screenshots", options,
                                                headless=False, browser_name=self.settings.browser, secret_values=secrets)
+                configure_panel = getattr(executor, "configure_rerun_panel", None)
+                if callable(configure_panel):
+                    async def capture_handler(checkpoint_id: str, checkpoint_version: int,
+                                              image_data_url: str) -> dict[str, Any]:
+                        return await self._capture_from_browser_panel(
+                            exploration_id, checkpoint_id, checkpoint_version, image_data_url)
+                    configure_panel(capture_handler)
+                configure_resume = getattr(executor, "configure_rerun_resume", None)
+                if callable(configure_resume):
+                    async def resume_handler(preparation_version: int) -> dict[str, Any]:
+                        return await self._resume_from_browser_panel(exploration_id, preparation_version)
+                    configure_resume(resume_handler)
                 self.repository.update_exploration(exploration_id, status=ExplorationStatus.RUNNING, started_at=utc_now())
                 self._persist(exploration_id, phase="preparing")
                 observation = await asyncio.wait_for(executor.start(recipe["before_url"]), operation_timeout())
+                if callable(getattr(executor, "update_rerun_panel", None)):
+                    browser_panel_task = asyncio.create_task(self._stream_browser_panel(exploration_id, executor, secrets))
                 self.repository.update_exploration(exploration_id, current_url=observation.url)
                 preparation_deadline = min(deadline, time.monotonic() + self.intervention_timeout_seconds)
                 attempts, version = 0, 0
@@ -835,6 +975,9 @@ class ScenarioRerunService:
                 self._blocked_scenario(exploration_id, original, recipe, reason, observation, dispatched=dispatched)
             self.repository.add_event(exploration_id, "error", "scenario_rerun_failed", reason)
         finally:
+            if browser_panel_task is not None:
+                browser_panel_task.cancel()
+                await asyncio.gather(browser_panel_task, return_exceptions=True)
             if executor is not None:
                 try:
                     await asyncio.wait_for(executor.close(), 15)

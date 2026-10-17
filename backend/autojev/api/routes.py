@@ -1066,7 +1066,8 @@ async def get_report(exploration_id: str, request: Request) -> FileResponse:
     # Encoding many local captures should not block the exploration's async
     # browser/CT pipeline while the user opens a historical report.
     path = await run_in_threadpool(current_report)
-    return FileResponse(path, media_type="text/html; charset=utf-8", filename="report.html")
+    return FileResponse(path, media_type="text/html; charset=utf-8", filename="report.html",
+                        headers={"Cache-Control": "private, no-store", "Pragma": "no-cache"})
 
 
 @router.get("/explorations/{exploration_id}/screenshots/{filename:path}")

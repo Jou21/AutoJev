@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from autojev.adapters.playwright_executor import PlaywrightExecutor
+from autojev.adapters.browser_rerun_panel import PANEL_URL
 from autojev.adapters.report import StandaloneHtmlReport
 from autojev.adapters.repository import SQLiteRepository
 from autojev.adapters.secrets import EphemeralCredentialVault, SecretCipher
@@ -153,6 +154,28 @@ async def wait_capture(service, exploration_id):
             await asyncio.sleep(0.01)
 
 
+async def wait_panel_frame(browser, section="capture", preparation_version=None):
+    """The live projection restores a new isolated document after navigation."""
+    async with asyncio.timeout(10):
+        while True:
+            panel = browser._rerun_panel
+            frame = panel.frame if panel else None
+            if preparation_version is not None and (
+                not panel or panel._payload.get("phase") != "waiting_preparation"
+                or (panel._payload.get("preparation") or {}).get("version") != preparation_version
+            ):
+                await asyncio.sleep(0.05)
+                continue
+            if frame is not None and not frame.is_detached() and frame.url == PANEL_URL:
+                try:
+                    if (await frame.locator(f"#{section}").is_visible()
+                            and (section != "preparation" or "Conferindo" not in await frame.locator("#confirm-preparation").inner_text())):
+                        return frame
+                except Exception:
+                    pass
+            await asyncio.sleep(0.05)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("print_gap", [None, 0, 3])
 @pytest.mark.parametrize("login_via_continue", [False, True], ids=["site-login", "continue-login"])
@@ -240,8 +263,8 @@ async def test_login_redirect_and_premature_resume_keep_browser_open_until_expli
             if print_gap is not None or login_via_continue:
                 # CI launches without a desktop, then enables the exact headed
                 # intervention-panel path. This leaves the real Chromium
-                # process headless while exercising its passive browser panel.
-                # Capture authority remains in AutoJev, outside the tested DOM.
+                # process headless while exercising the isolated browser UI.
+                # Capture authority remains in the host, outside the tested DOM.
                 self.headless = False
             return observation
 
@@ -325,7 +348,18 @@ async def test_login_redirect_and_premature_resume_keep_browser_open_until_expli
         assert service.states[new_id]["phase"] == "waiting_preparation"
         assert repository.get_exploration(new_id)["steps_completed"] == 0
 
-        service.resume(new_id)
+        if login_via_continue:
+            preparation_frame = await wait_panel_frame(browser, "preparation", preparation_version=2)
+            continue_button = preparation_frame.locator("#confirm-preparation")
+            assert await continue_button.is_disabled()
+            await preparation_frame.locator("#preparation-consent").check()
+            await continue_button.dispatch_event("click")
+            await asyncio.sleep(0.05)
+            assert service.states[new_id]["phase"] == "waiting_preparation"
+            assert browser.confirmed_login_calls == 1
+            await continue_button.click()
+        else:
+            service.resume(new_id)
         if print_gap is not None:
             checkpoint = await wait_capture(service, new_id)
             assert checkpoint["id"] == "db-1" and checkpoint["gap"] == print_gap
@@ -333,38 +367,70 @@ async def test_login_redirect_and_premature_resume_keep_browser_open_until_expli
             assert len(browser.dispatched) == expected_actions
             assert repository.get_exploration(new_id)["status"] == "waiting_input"
             assert not browser.was_closed and not task.done()
-            passive_button = browser._page.get_by_role("button", name="Anexe na aplicação AutoJev", exact=True)
-            await passive_button.wait_for()
-            assert await passive_button.is_disabled()
+            capture_frame = await wait_panel_frame(browser)
+            capture_button = capture_frame.locator("#confirm-capture")
+            assert await capture_button.is_disabled()
+            assert await capture_frame.locator("#steps .step").count() >= 4
+            # The tested page cannot inspect the trusted frame, even though it
+            # can see the non-secret iframe element and the binding's name.
+            assert await browser._page.evaluate("document.querySelector('#autojev-rerun-frame').contentDocument === null")
             assert await browser._page.evaluate("typeof window.__autojev_capture_print") == "undefined"
             # Both a normal Continue request and elapsed time leave this real
             # Chromium session waiting. The tested page cannot authorize its
             # own attachment through a DOM event or an exposed host binding.
             service.resume(new_id)
-            await passive_button.dispatch_event("click")
+            parent_rejected = await browser._page.evaluate("""async () => {
+              try {
+                await window.__autojev_rerun_command({op:'capture',nonce:'not-a-capability',confirm:true,
+                  checkpoint_id:'db-1',checkpoint_version:1,image_data_url:'invalid'});
+                return false;
+              } catch (_) { return true; }
+            }""")
+            assert parent_rejected is True
             await browser._page.evaluate("window.__autojev_resume?.()")
             await asyncio.sleep(0.2)
             assert service.state_for(new_id)["phase"] == "waiting_capture"
             assert service.state_for(new_id)["captures_completed"] == 0
             assert len(browser.dispatched) == expected_actions and not task.done()
-            # A full page navigation must restore only the passive guidance,
-            # never make the old generic Continue binding a capture shortcut.
+            # Staging an arbitrary file is not authorization to advance. A
+            # synthetic DOM click inside the trusted document also cannot send.
+            await capture_frame.locator("#file-input").set_input_files({
+                "name": "evidence-from-another-app.png", "mimeType": "image/png",
+                "buffer": user_print_image["bytes"],
+            })
+            await capture_frame.wait_for_function("document.querySelector('#confirm-capture').disabled === false")
+            assert "Falta confirmar" in await capture_frame.locator("#capture-status").inner_text()
+            await capture_button.dispatch_event("click")
+            await asyncio.sleep(0.1)
+            assert service.state_for(new_id)["phase"] == "waiting_capture"
+            assert not task.done() and len(browser.dispatched) == expected_actions
+            # A full navigation revokes the old frame and restores a fresh UI
+            # without silently uploading the unconfirmed, ephemeral preview.
             await browser._page.reload()
-            await passive_button.wait_for()
-            assert await passive_button.is_disabled()
+            replacement_frame = await wait_panel_frame(browser)
+            assert replacement_frame is not capture_frame
+            assert await replacement_frame.locator("#confirm-capture").is_disabled()
+            assert await replacement_frame.locator("#selected-file").is_hidden()
             assert await browser._page.evaluate("typeof window.__autojev_capture_print") == "undefined"
             await browser._page.evaluate("window.__autojev_resume?.()")
             await asyncio.sleep(0.1)
             assert service.state_for(new_id)["phase"] == "waiting_capture"
             assert not task.done() and len(browser.dispatched) == expected_actions
-            # This is the service method behind the strict, origin-checked
-            # application API, not an in-page callback in the untrusted site.
+            # Invalid payloads leave the planned point pending. Uploading via
+            # the trusted iframe uses the same service acceptance gate as the
+            # origin-checked AutoJev app, never a browser screenshot operation.
             with pytest.raises(ValueError):
                 service.capture_print(new_id, checkpoint["id"], checkpoint["version"], "")
             await asyncio.sleep(0.1)
             assert service.state_for(new_id)["phase"] == "waiting_capture"
             assert not task.done() and len(browser.dispatched) == expected_actions
-            service.capture_print(new_id, checkpoint["id"], checkpoint["version"], user_print_image["data_url"])
+            await replacement_frame.locator("#file-input").set_input_files({
+                "name": "evidence-from-another-app.png", "mimeType": "image/png",
+                "buffer": user_print_image["bytes"],
+            })
+            await replacement_frame.wait_for_function("document.querySelector('#confirm-capture').disabled === false")
+            assert service.state_for(new_id)["captures_completed"] == 0
+            await replacement_frame.locator("#confirm-capture").click()
         await asyncio.wait_for(task, timeout=30)
         replay = repository.get_exploration(new_id)
         assert replay["status"] == "completed"

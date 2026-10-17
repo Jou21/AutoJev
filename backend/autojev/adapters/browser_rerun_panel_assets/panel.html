@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>AutoJev · Reexecução</title>
+  <style>
+    :root{color-scheme:dark;--bg:#10191b;--surface:#182326;--line:#344347;--text:#eef4f3;--muted:#9fb0b3;--amber:#ffd15a;--green:#6fd5aa;--blue:#84bfff;--red:#ff9d9a}
+    *{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;min-width:0;background:var(--bg);color:var(--text);font:13px/1.4 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    body{display:flex;flex-direction:column;overflow:hidden}button,input{font:inherit}button{cursor:pointer}button:disabled{cursor:default;opacity:.55}button:focus-visible,input:focus-visible,[tabindex]:focus-visible,summary:focus-visible{outline:2px solid var(--amber);outline-offset:3px}[hidden]{display:none!important}
+    .header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 14px 10px;border-bottom:1px solid var(--line);flex:none}.brand{font-size:10px;font-weight:800;letter-spacing:.13em;color:var(--amber)}h1{font-size:18px;margin:3px 0 0;line-height:1.2}.counter{text-align:right;flex:none}.counter strong{font-size:21px}.counter span{color:var(--muted);font-size:11px}.counter small{display:block;color:var(--muted);font-size:10px}
+    .body{padding:12px 14px;display:flex;flex-direction:column;gap:12px;min-height:0;overflow:auto;scrollbar-width:thin;scrollbar-color:var(--line) transparent}.map{flex:none}.section-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 8px}.section-heading h2{font-size:12px;margin:0}.live{display:flex;align-items:center;gap:5px;font-size:10px;color:var(--muted)}.live:before{content:"";width:6px;height:6px;border-radius:50%;background:var(--green)}
+    .steps{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;list-style:none;padding:0;margin:0;max-height:35vh;overflow:auto;scrollbar-width:thin;scrollbar-color:var(--line) transparent}.step{min-width:0;border:1px solid var(--line);background:#192226;border-radius:9px;padding:7px;position:relative;min-height:78px}.step-top{display:flex;justify-content:space-between;align-items:center;gap:4px}.step-number{color:var(--muted);font-size:10px;font-weight:800}.step-icon{font-size:13px;color:var(--muted);font-weight:700;line-height:1}.step-title{margin:6px 0 5px;font-size:11px;font-weight:650;line-height:1.3;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}.step-label{display:block;color:var(--muted);font-size:9px;line-height:1.3;overflow-wrap:anywhere}.step[data-state="done"]{border-color:#3b7a62;background:#172d25}.step[data-state="done"] .step-icon,.step[data-state="done"] .step-label,.step[data-state="done"] .step-number{color:var(--green)}.step[data-state="waiting"]{border:2px solid var(--amber);background:#352b15;padding:6px;box-shadow:0 0 0 2px #ffd15a20}.step[data-state="waiting"] .step-icon,.step[data-state="waiting"] .step-label,.step[data-state="waiting"] .step-number{color:var(--amber)}.step[data-state="active"]{border-color:var(--blue);background:#192b3c}.step[data-state="active"] .step-icon,.step[data-state="active"] .step-label{color:var(--blue)}.step[data-state="failed"]{border-color:#9a5555;background:#362222}.step[data-state="failed"] .step-icon,.step[data-state="failed"] .step-label{color:var(--red)}.step[data-state="blocked"],.step[data-state="skipped"],.step[data-state="unavailable"]{border-style:dashed;opacity:.8}.empty{margin:4px 0;color:var(--muted);font-size:12px}
+    .action{border:1px solid #8d7334;border-radius:11px;padding:12px;background:#28271c;flex:none;min-width:0}.action h2{font-size:17px;line-height:1.2;margin:4px 0 5px}.eyebrow{font-size:9px;letter-spacing:.1em;font-weight:800;color:var(--amber)}.hint{font-size:11px;line-height:1.5;color:var(--muted);margin:0 0 9px}.position{font-size:10px;color:var(--muted);margin:0 0 8px}.dropzone{border:1px dashed #7e887e;background:#121d1d;border-radius:9px;padding:12px;text-align:center;transition:border-color .15s,background .15s;min-height:92px;display:flex;flex-direction:column;justify-content:center;align-items:center;gap:6px}.dropzone.dragging{border-color:var(--amber);background:#353021}.dropzone b{font-size:12px}.dropzone small{font-size:10px;color:var(--muted)}kbd{font:10px system-ui;border:1px solid #52605e;border-bottom-width:2px;border-radius:3px;padding:0 3px;color:var(--text)}.secondary{display:inline-flex;align-items:center;justify-content:center;gap:5px;border:1px solid #52615d;border-radius:6px;background:#1d2929;color:var(--text);padding:6px 9px;font-size:11px}.preview{display:block;width:100%;height:112px;object-fit:contain;border-radius:6px;background:repeating-conic-gradient(#172425 0 25%,#233233 0 50%) 0/16px 16px}.file-row{display:flex;align-items:center;gap:8px;justify-content:space-between;margin-top:7px}.file-info{min-width:0;display:flex;flex-direction:column}.file-name{font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.file-size{font-size:9px;color:var(--muted)}.file-tools{display:flex;gap:4px;flex:none}.file-tools button{font-size:10px;padding:5px 7px}.status{font-size:11px;margin:9px 0 7px;min-height:16px;color:var(--amber);overflow-wrap:anywhere}.status[data-tone="error"]{color:var(--red)}.status[data-tone="success"]{color:var(--green)}.primary{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;border:0;border-radius:7px;padding:11px 9px;background:var(--amber);color:#241d09;font-size:12px;font-weight:800;line-height:1.3}.privacy{font-size:9px;line-height:1.45;color:var(--muted);margin:7px 0 0}.consent{display:flex;align-items:flex-start;gap:8px;font-size:11px;line-height:1.45;margin:10px 0}.consent input{margin:2px 0 0;accent-color:var(--amber);flex:none}.prep-details{font-size:11px;color:var(--muted);margin:9px 0}.prep-details summary{cursor:pointer;color:var(--text);font-size:11px}.prep-details p{white-space:pre-wrap;overflow-wrap:anywhere;margin:8px 0}.url-row{margin-top:8px;font-size:10px;min-width:0}.url-row span{display:block;color:var(--muted)}.url-row b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text);font-size:10px}
+    .phase-note{border:1px solid var(--line);background:var(--surface);border-radius:9px;padding:12px}.phase-note h2{font-size:14px;margin:0 0 4px}.phase-note p{font-size:11px;color:var(--muted);margin:0}.details{border-top:1px solid var(--line);padding-top:9px;font-size:10px;color:var(--muted);flex:none}.details summary{cursor:pointer;font-size:10px}.details p{margin:7px 0;line-height:1.5}.usage{display:flex;gap:12px;flex-wrap:wrap}.usage b{color:var(--text);font-weight:600}.legend{display:flex;gap:9px;flex-wrap:wrap;margin:8px 0 0;font-size:9px}.legend span:before{content:"●";margin-right:4px;color:var(--muted)}.legend .done:before{color:var(--green)}.legend .active:before{color:var(--blue)}.legend .waiting:before{color:var(--amber)}
+    @media(max-height:760px){.header{padding:10px 12px 8px}.header h1{font-size:16px}.brand{font-size:9px}.counter strong{font-size:19px}.counter small{font-size:9px}.body{padding:10px 12px;gap:9px}.section-heading{margin-bottom:6px}.steps{max-height:260px;gap:5px}.step{min-height:58px;padding:6px}.step[data-state="waiting"]{padding:5px}.step-title{font-size:10px;line-height:1.2;margin:3px 0}.step-label{font-size:8px;line-height:1.2}.step-number{font-size:9px}.step-icon{font-size:11px}.legend{margin-top:5px;font-size:8px}.action{padding:10px}.action h2{font-size:16px;margin:3px 0 4px}.eyebrow{font-size:8px}.hint{font-size:10px;margin-bottom:6px}.position{font-size:9px;margin-bottom:6px}.dropzone{min-height:78px;padding:8px;gap:4px}.dropzone b{font-size:11px}.dropzone small{font-size:9px}.preview{height:90px}.file-row{margin-top:5px}.file-tools button{padding:4px 6px}.status{margin:7px 0 6px;font-size:10px;min-height:14px}.primary{padding:9px;font-size:11px}.privacy{font-size:8px;margin-top:6px}.details{padding-top:7px;font-size:9px}.details summary{font-size:9px}}
+    @media(max-width:380px){.steps{grid-template-columns:repeat(2,minmax(0,1fr));max-height:300px}.header{padding:10px}.body{padding:10px;gap:9px}.action{padding:10px}.step{min-height:58px}.step-title{margin:3px 0}.preview{height:85px}.header h1{font-size:16px}}
+    @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
+  </style>
+</head>
+<body>
+  <header class="header">
+    <div><div class="brand">AUTOJEV · AO VIVO</div><h1 id="panel-title">Sua reexecução</h1></div>
+    <div class="counter" aria-label="Progresso da reexecução"><strong id="completed">0</strong><span id="total"> / 0</span><small>etapas concluídas</small></div>
+  </header>
+  <main class="body">
+    <section class="map" aria-labelledby="map-heading">
+      <div class="section-heading"><h2 id="map-heading">Passos e evidências</h2><span class="live" id="live-label">Atualização ao vivo</span></div>
+      <ol class="steps" id="steps" aria-label="Etapas da reexecução"></ol>
+      <p class="empty" id="empty-map">Carregando o roteiro…</p>
+      <div class="legend"><span class="done">Concluída</span><span class="active">Em execução</span><span class="waiting">Sua vez</span></div>
+    </section>
+
+    <section class="action" id="capture" aria-labelledby="capture-heading" hidden>
+      <div class="eyebrow" id="capture-eyebrow">SUA VEZ · AGUARDANDO PRINT</div>
+      <h2 id="capture-heading">Cole seu print aqui</h2>
+      <p class="hint">Pode ser uma imagem de qualquer tela ou aplicativo.</p>
+      <p class="position" id="capture-position"></p>
+      <input id="file-input" type="file" accept="image/png,image/jpeg,image/webp" hidden aria-label="Escolher seu print">
+      <div id="dropzone" class="dropzone" tabindex="0" aria-label="Clique aqui e cole seu print com Ctrl mais V, ou arraste uma imagem">
+        <b>Clique aqui e cole <kbd>Ctrl</kbd> + <kbd>V</kbd></b>
+        <small>Ou arraste uma imagem para esta área</small>
+        <button class="secondary" id="choose-file" type="button">Escolher imagem</button>
+        <small>PNG, JPG ou WEBP · Até 10 MB</small>
+      </div>
+      <div id="selected-file" hidden>
+        <img id="preview" class="preview" alt="Prévia do print selecionado">
+        <div class="file-row"><div class="file-info"><b class="file-name" id="file-name"></b><span class="file-size" id="file-size"></span></div><div class="file-tools"><button class="secondary" id="replace-file" type="button">Trocar</button><button class="secondary" id="remove-file" type="button" aria-label="Remover imagem selecionada">Remover</button></div></div>
+      </div>
+      <p id="capture-status" class="status" role="status" aria-live="polite">Primeiro, cole, arraste ou escolha uma imagem.</p>
+      <button class="primary" id="confirm-capture" type="button" disabled>Anexar print e continuar →</button>
+      <p class="privacy">A imagem só é enviada ao confirmar. Ela não aprova nem reprova o teste.</p>
+    </section>
+
+    <section class="action" id="preparation" aria-labelledby="preparation-heading" hidden>
+      <div class="eyebrow">PREPARE A PÁGINA</div>
+      <h2 id="preparation-heading">Faça login para continuar</h2>
+      <p class="hint">Se estiver no login, preencha os campos na página. Ao continuar, o AutoJev tentará entrar. Se já entrou, confira os demais pré-requisitos.</p>
+      <details class="prep-details"><summary>Conferir a preparação da página</summary><div class="url-row"><span>Página esperada</span><b id="expected-url"></b></div><div class="url-row"><span>Página aberta</span><b id="current-url"></b></div><p id="preparation-instruction"></p></details>
+      <label class="consent"><input id="preparation-consent" type="checkbox"><span>Preparei a página e autorizo continuar a reexecução.</span></label>
+      <p id="preparation-status" class="status" role="status" aria-live="polite"></p>
+      <button class="primary" id="confirm-preparation" type="button" disabled>Continuar exploração →</button>
+      <p class="privacy">Nenhuma ação do teste é repetida antes desta confirmação.</p>
+    </section>
+
+    <section class="phase-note" id="phase-note" aria-live="polite"><h2 id="phase-heading">Preparando a reexecução</h2><p id="phase-description">As etapas vão mudar de cor conforme os resultados forem registrados.</p></section>
+
+    <details class="details"><summary>Como ler este mapa e uso da execução</summary><p id="notice">Os cards mostram apenas os resultados desta reexecução.</p><p>Uma captura registrada ou uma ação concluída não significa, sozinha, aprovação do teste.</p><div class="usage"><span>Tokens: <b id="usage-tokens">0</b></span><span>Custo: <b id="usage-cost">—</b></span></div></details>
+  </main>
+  <script>
+    (() => {
+      'use strict';
+      const $ = id => document.getElementById(id);
+      const MAX_BYTES = 10 * 1024 * 1024;
+      const states = new Set(['pending', 'active', 'waiting', 'done', 'failed', 'blocked', 'skipped', 'unavailable']);
+      let current = null;
+      let checkpointKey = '';
+      let preparationKey = '';
+      let staged = null;
+      let reading = false;
+      let busy = false;
+      let accepted = false;
+      let preparationBusy = false;
+      let readVersion = 0;
+      let lastMap = '';
+      let lastCurrentStep = '';
+
+      const short = (value, limit = 500) => typeof value === 'string' ? value.slice(0, limit) : '';
+      const integer = value => Number.isInteger(value) && value >= 0 ? value : 0;
+      const checkpoint = () => current && current.checkpoint;
+      const canCapture = () => !!(current && current.running && current.phase === 'waiting_capture' && checkpoint() && !busy && !accepted);
+      const status = (message, tone = '') => { $('capture-status').textContent = message; $('capture-status').dataset.tone = tone; };
+
+      function refreshCaptureControls() {
+        const ready = canCapture();
+        $('confirm-capture').disabled = !ready || !staged || reading;
+        $('confirm-capture').textContent = accepted ? 'Enviado. Salvando imagem…' : busy ? 'Anexando print…' : 'Anexar print e continuar →';
+        for (const id of ['choose-file', 'replace-file', 'remove-file', 'file-input']) $(id).disabled = !ready;
+        $('dropzone').setAttribute('aria-disabled', String(!ready));
+      }
+
+      function clearImage() {
+        readVersion += 1;
+        staged = null;
+        reading = false;
+        $('preview').removeAttribute('src');
+        $('file-name').textContent = '';
+        $('file-size').textContent = '';
+        $('file-input').value = '';
+        $('selected-file').hidden = true;
+        $('dropzone').hidden = false;
+        status('Primeiro, cole, arraste ou escolha uma imagem.');
+        refreshCaptureControls();
+      }
+
+      async function stageFile(file) {
+        if (!canCapture()) return;
+        clearImage();
+        const version = ++readVersion;
+        const key = checkpointKey;
+        if (!file || !(file instanceof Blob) || !file.size || file.size > MAX_BYTES) {
+          status('Escolha uma imagem de até 10 MB.', 'error');
+          return;
+        }
+        reading = true;
+        refreshCaptureControls();
+        status('Conferindo sua imagem…');
+        try {
+          const bytes = new Uint8Array(await file.slice(0, 16).arrayBuffer());
+          const png = bytes.length >= 8 && [137,80,78,71,13,10,26,10].every((byte, index) => bytes[index] === byte);
+          const jpeg = bytes.length >= 3 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255;
+          const webp = bytes.length >= 12 && String.fromCharCode(...bytes.slice(0, 4)) === 'RIFF' && String.fromCharCode(...bytes.slice(8, 12)) === 'WEBP';
+          const mime = png ? 'image/png' : jpeg ? 'image/jpeg' : webp ? 'image/webp' : '';
+          if (!mime || (file.type && !['image/png', 'image/jpeg', 'image/webp'].includes(file.type))) throw new Error('format');
+          const imageData = await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onerror = reject;
+            reader.onload = () => resolve(reader.result);
+            reader.readAsDataURL(file.slice(0, file.size, mime));
+          });
+          if (typeof imageData !== 'string' || !imageData.startsWith('data:' + mime + ';base64,')) throw new Error('format');
+          await new Promise((resolve, reject) => {
+            const image = new Image();
+            image.onload = () => image.naturalWidth > 0 && image.naturalHeight > 0 && image.naturalWidth <= 16384 && image.naturalHeight <= 16384 && image.naturalWidth * image.naturalHeight <= 30000000 ? resolve() : reject(new Error('format'));
+            image.onerror = () => reject(new Error('format'));
+            image.src = imageData;
+          });
+          if (version !== readVersion || key !== checkpointKey || !canCapture()) return;
+          staged = { data: imageData, name: short(file.name || 'Print colado', 200), size: file.size };
+          $('preview').src = imageData;
+          $('file-name').textContent = staged.name;
+          $('file-size').textContent = (file.size < 1024 * 1024 ? Math.max(1, Math.round(file.size / 1024)) + ' KB' : (file.size / (1024 * 1024)).toFixed(1) + ' MB') + ' · Pronto para enviar';
+          $('selected-file').hidden = false;
+          $('dropzone').hidden = true;
+          status('Print selecionado. Falta confirmar o envio.', 'success');
+          refreshCaptureControls();
+        } catch (_) {
+          if (version === readVersion && key === checkpointKey) status('Não foi possível abrir essa imagem. Use um arquivo PNG, JPG ou WEBP válido.', 'error');
+        } finally {
+          if (version === readVersion) { reading = false; refreshCaptureControls(); if (staged) $('confirm-capture').focus({ preventScroll: true }); }
+        }
+      }
+
+      function pick() { if (canCapture()) $('file-input').click(); }
+      $('choose-file').addEventListener('click', pick);
+      $('replace-file').addEventListener('click', pick);
+      $('remove-file').addEventListener('click', () => { if (canCapture()) { clearImage(); $('dropzone').focus({ preventScroll: true }); } });
+      $('file-input').addEventListener('change', event => { const files = event.target.files; if (files && files.length === 1) stageFile(files[0]); else if (files && files.length > 1) status('Adicione uma imagem por pausa.', 'error'); event.target.value = ''; });
+      document.addEventListener('paste', event => {
+        if (!canCapture()) return;
+        const files = Array.from(event.clipboardData && event.clipboardData.items || []).filter(item => item.kind === 'file').map(item => item.getAsFile()).filter(Boolean);
+        if (!files.length) return;
+        event.preventDefault();
+        if (files.length !== 1) { status('Cole uma imagem por pausa.', 'error'); return; }
+        stageFile(files[0]);
+      });
+      document.addEventListener('dragover', event => { if (event.dataTransfer && Array.from(event.dataTransfer.types || []).includes('Files')) { event.preventDefault(); event.dataTransfer.dropEffect = canCapture() ? 'copy' : 'none'; if (canCapture()) $('dropzone').classList.add('dragging'); } });
+      document.addEventListener('dragleave', event => { if (!event.relatedTarget) $('dropzone').classList.remove('dragging'); });
+      document.addEventListener('drop', event => {
+        $('dropzone').classList.remove('dragging');
+        event.preventDefault();
+        if (!canCapture()) return;
+        const files = Array.from(event.dataTransfer && event.dataTransfer.files || []);
+        if (files.length !== 1) { status('Arraste uma imagem por pausa.', 'error'); return; }
+        stageFile(files[0]);
+      });
+
+      $('confirm-capture').addEventListener('click', async event => {
+        if (!event.isTrusted || !canCapture() || !staged || reading) return;
+        if (typeof window.__autojev_rerun_command !== 'function') { status('A conexão com o AutoJev não está disponível. Aguarde e tente novamente.', 'error'); return; }
+        const key = checkpointKey;
+        const cp = checkpoint();
+        busy = true;
+        refreshCaptureControls();
+        status('Enviando sua imagem…');
+        try {
+          const result = await window.__autojev_rerun_command({op: 'capture', nonce: current.nonce, checkpoint_id: cp.id, checkpoint_version: cp.version, image_data_url: staged.data, confirm: true});
+          if (key !== checkpointKey) return;
+          if (!result || result.accepted !== true) throw new Error('not-accepted');
+          accepted = true;
+          status('Envio confirmado. Aguardando a imagem ser salva.', 'success');
+        } catch (_) {
+          if (key === checkpointKey) status('O print não foi enviado. Confira se esta etapa ainda aguarda sua imagem e tente novamente.', 'error');
+        } finally {
+          if (key === checkpointKey) { busy = false; refreshCaptureControls(); }
+        }
+      });
+
+      $('preparation-consent').addEventListener('change', () => { $('confirm-preparation').disabled = preparationBusy || !$('preparation-consent').checked || !current || current.phase !== 'waiting_preparation'; });
+      $('confirm-preparation').addEventListener('click', async event => {
+        if (!event.isTrusted || preparationBusy || !$('preparation-consent').checked || !current || current.phase !== 'waiting_preparation' || !current.preparation) return;
+        if (typeof window.__autojev_rerun_command !== 'function') { $('preparation-status').textContent = 'A conexão com o AutoJev não está disponível. Aguarde e tente novamente.'; return; }
+        const key = preparationKey;
+        preparationBusy = true;
+        $('confirm-preparation').disabled = true;
+        $('confirm-preparation').textContent = 'Conferindo a página…';
+        $('preparation-status').textContent = 'A confirmação foi enviada. Aguarde a conferência da página.';
+        try {
+          const result = await window.__autojev_rerun_command({op: 'resume', nonce: current.nonce, preparation_version: current.preparation.version, confirm: true});
+          if (!result || result.accepted !== true) throw new Error('not-accepted');
+        } catch (_) {
+          if (key === preparationKey) {
+            preparationBusy = false;
+            $('preparation-status').textContent = 'Não foi possível continuar. Confira a etapa e tente novamente.';
+            $('confirm-preparation').textContent = 'Continuar exploração →';
+            $('confirm-preparation').disabled = !$('preparation-consent').checked;
+          }
+        }
+      });
+
+      function renderMap(progress) {
+        const steps = Array.isArray(progress.steps) ? progress.steps.slice(0, 10000) : [];
+        $('completed').textContent = String(integer(progress.completed));
+        $('total').textContent = ' / ' + String(integer(progress.total));
+        $('empty-map').hidden = steps.length > 0;
+        const mapKey = JSON.stringify([steps, progress.current_id]);
+        if (mapKey === lastMap) return;
+        lastMap = mapKey;
+        const fragment = document.createDocumentFragment();
+        let currentCard = null;
+        steps.forEach((step, index) => {
+          const state = states.has(step.state) ? step.state : 'pending';
+          const card = document.createElement('li');
+          card.className = 'step'; card.dataset.state = state;
+          card.dataset.stepId = short(step.id, 180);
+          if (progress.current_id === step.id) { card.setAttribute('aria-current', 'step'); currentCard = card; }
+          card.title = short(step.description, 700);
+          const top = document.createElement('div'); top.className = 'step-top';
+          const number = document.createElement('span'); number.className = 'step-number'; number.textContent = String(index + 1).padStart(2, '0');
+          const icon = document.createElement('span'); icon.className = 'step-icon'; icon.setAttribute('aria-hidden', 'true'); icon.textContent = ({done:'✓', waiting:'Ⅱ', active:'↻', failed:'×', blocked:'–', skipped:'–', unavailable:'–'})[state] || '○';
+          const title = document.createElement('p'); title.className = 'step-title'; title.textContent = short(step.title, 180) || 'Etapa do teste';
+          const label = document.createElement('span'); label.className = 'step-label'; label.textContent = short(step.label, 100) || 'Aguardando';
+          top.append(number, icon); card.append(top, title, label); fragment.append(card);
+        });
+        $('steps').replaceChildren(fragment);
+        if (currentCard && progress.current_id !== lastCurrentStep) $('steps').scrollTop = Math.max(0, currentCard.offsetTop - $('steps').offsetTop - 8);
+        lastCurrentStep = progress.current_id || '';
+      }
+
+      function update(payload) {
+        if (!payload || typeof payload !== 'object') return;
+        current = payload;
+        const phase = short(payload.phase, 80);
+        const cp = payload.checkpoint;
+        const newKey = cp && typeof cp.id === 'string' && Number.isInteger(cp.version) ? cp.id + ':' + cp.version : '';
+        const terminal = ['finished', 'completed', 'partial', 'failed', 'cancelled'].includes(phase);
+        const newCapture = !!newKey && newKey !== checkpointKey;
+        if (newCapture || terminal) {
+          checkpointKey = newKey;
+          busy = false; accepted = false; clearImage();
+        }
+        const prep = payload.preparation || {};
+        const newPrepKey = Number.isInteger(prep.version) ? String(prep.version) : '';
+        if (newPrepKey !== preparationKey || phase !== 'waiting_preparation') {
+          preparationKey = newPrepKey; preparationBusy = false;
+          $('preparation-consent').checked = false;
+          $('preparation-status').textContent = '';
+        }
+        $('confirm-preparation').textContent = preparationBusy || phase === 'validating_preparation' ? 'Conferindo a página…' : 'Continuar exploração →';
+        $('confirm-preparation').disabled = preparationBusy || phase !== 'waiting_preparation' || !$('preparation-consent').checked;
+        renderMap(payload.progress || {});
+        $('notice').textContent = short((payload.progress || {}).notice, 1500) || 'Os cards mostram apenas os resultados desta reexecução.';
+        $('live-label').textContent = terminal ? 'Execução encerrada' : 'Atualização ao vivo';
+        $('capture').hidden = !['waiting_capture', 'capturing_print'].includes(phase) || !cp;
+        $('preparation').hidden = !['waiting_preparation', 'validating_preparation'].includes(phase);
+        $('phase-note').hidden = !$('capture').hidden || !$('preparation').hidden;
+        $('capture-eyebrow').textContent = phase === 'capturing_print' ? 'SALVANDO SUA IMAGEM' : 'SUA VEZ · AGUARDANDO PRINT';
+        $('capture-position').textContent = 'Print ' + Math.min(integer(payload.captures_completed) + 1, integer(payload.capture_count) || 1) + ' de ' + (integer(payload.capture_count) || 1) + (cp && Number.isInteger(cp.gap) ? ' · ' + (cp.gap ? 'Após a etapa ' + cp.gap : 'Antes da primeira etapa') : '');
+        if (phase === 'capturing_print') { accepted = true; status('Envio confirmado. Aguardando a imagem ser salva.', 'success'); }
+        $('preparation-heading').textContent = short(prep.reason_label, 120) || 'Prepare a página para continuar';
+        $('preparation-instruction').textContent = short(prep.instruction, 2200);
+        for (const [id, value] of [['expected-url', prep.expected_url], ['current-url', prep.current_url]]) { $(id).textContent = short(value, 1500) || 'Não informada'; $(id).title = short(value, 1500); }
+        const phaseTitles = {queued:'Preparando a reexecução', preparing:'Preparando a página', executing:'Executando o teste', saving:'Salvando as evidências', finished:'Reexecução encerrada', completed:'Reexecução concluída', cancelled:'Reexecução cancelada', failed:'Reexecução encerrada com falha'};
+        $('phase-heading').textContent = phaseTitles[phase] || 'Acompanhando a reexecução';
+        $('phase-description').textContent = terminal ? 'As cores mostram somente as etapas com resultado confirmado. As evidências já registradas foram preservadas.' : 'Os cards mudam de cor conforme os resultados desta execução são registrados.';
+        const usage = payload.usage || {};
+        $('usage-tokens').textContent = String(integer(usage.total_tokens));
+        $('usage-cost').textContent = usage.cost_known && typeof usage.cost === 'number' && Number.isFinite(usage.cost) && usage.cost >= 0 ? '$' + usage.cost.toFixed(6) : '—';
+        refreshCaptureControls();
+        if (newCapture && phase === 'waiting_capture') $('dropzone').focus({ preventScroll: true });
+      }
+      window.__autojevRerunPanel = Object.freeze({update});
+    })();
+  </script>
+</body>
+</html>

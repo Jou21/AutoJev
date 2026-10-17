@@ -27,6 +27,7 @@ from autojev.domain.models import (
 from autojev.domain.product_identity import (
     declared_product_id, matching_product_indexes, product_ledger_key,
 )
+from autojev.adapters.browser_rerun_panel import BrowserRerunPanel, is_panel_url
 
 
 class BrowserUnavailableError(RuntimeError):
@@ -160,6 +161,7 @@ class PlaywrightExecutor:
         self._authenticated_history_root_url: str | None = None
         self._inactive_event = asyncio.Event()
         self._sidepanel_init_installed = False
+        self._rerun_panel: BrowserRerunPanel | None = None
         self._automatic_login_attempted = False
         # Per-run opaque tokens compare field contents without storing PII.
         self._field_token_key = secrets.token_bytes(32)
@@ -265,6 +267,8 @@ class PlaywrightExecutor:
         except Exception:
             # The binding may already exist after a same-document transition.
             pass
+        if self._rerun_panel is not None:
+            await self._rerun_panel.bind_page(page)
         page.on("console", lambda message: self._on_console(message, page=page))
         page.on("pageerror", lambda error: self._on_page_error(error, page=page))
         page.on("response", lambda response: self._on_response(response, page=page))
@@ -441,6 +445,12 @@ class PlaywrightExecutor:
         "#autojev-sidepanel[data-automation='true'] .autojev-panel-rail,"
         "#autojev-sidepanel[data-automation='true'] .autojev-panel-surface,"
         "#autojev-sidepanel[data-automation='true'] .autojev-panel-surface *{pointer-events:none !important;}"
+        "#autojev-sidepanel[data-rerun='true']{width:min(526px,calc(100vw - 28px)) !important;}"
+        "#autojev-sidepanel[data-rerun='true'] .autojev-panel-surface{padding:0;overflow:hidden;}"
+        "#autojev-sidepanel[data-rerun='true'] .autojev-panel-surface > :not(iframe){display:none !important;}"
+        "#autojev-rerun-frame{display:none;width:100%;border:0;background:#10191d;}"
+        "#autojev-sidepanel[data-rerun='true'] #autojev-rerun-frame{display:block;"
+        "height:min(760px,calc(100dvh - 36px));min-height:0;color-scheme:dark;}"
         "@media(max-width:620px){#autojev-sidepanel{top:10px !important;right:10px !important;"
         "width:calc(100vw - 20px) !important;max-height:calc(100vh - 20px) !important;"
         "grid-template-columns:52px minmax(0,1fr) !important;transform:translate3d(calc(100% - 52px),0,0);}"
@@ -602,6 +612,26 @@ class PlaywrightExecutor:
     async def show_live_panel(self) -> None:
         await self._ensure_sidepanel()
 
+    def configure_rerun_panel(self, capture_handler: Any) -> None:
+        """Enable the isolated map/upload UI for this one rerun only."""
+        if self._rerun_panel is not None:
+            self._rerun_panel.close()
+        self._rerun_panel = BrowserRerunPanel(self, capture_handler)
+
+    def configure_rerun_resume(self, resume_handler: Any) -> None:
+        if self._rerun_panel is not None:
+            self._rerun_panel.resume_handler = resume_handler
+
+    async def update_rerun_panel(self, payload: dict[str, Any]) -> bool:
+        if self._rerun_panel is None or not await self._ensure_sidepanel():
+            return False
+        try:
+            return await self._rerun_panel.update(payload)
+        except Exception:
+            # Some sites forbid embedded frames. Keep their CSP intact and
+            # retain the main AutoJev application as a confirmation fallback.
+            return False
+
     async def _set_sidepanel_automation(self, active: bool) -> None:
         """Mantém o overlay fora do hit testing enquanto o Playwright atua."""
 
@@ -751,6 +781,7 @@ class PlaywrightExecutor:
                   const hint = document.getElementById('autojev-panel-hint');
                   let savedPinned = false;
                   try { savedPinned = sessionStorage.getItem('autojev-panel-open') === 'true'; } catch (error) {}
+                  if (panel?.dataset.rerun === 'true') savedPinned = panel.dataset.pinned === 'true';
                   if (hint) hint.textContent = savedPinned ? 'Clique no J para recolher' : 'Clique no J para abrir';
                   if (panel) {
                     panel.dataset.mode = 'exploring';
@@ -772,14 +803,16 @@ class PlaywrightExecutor:
         self._user_input_event.set()
 
     async def wait_for_capture_confirmation(self, message: str) -> None:
-        """Passive guidance only: the tested page has no capture capability.
+        """Restore guidance; uploads use the isolated frame or trusted app.
 
-        Exposed page bindings are callable by the tested site's JavaScript.
-        The capture endpoint in the trusted AutoJev application is therefore
-        the only confirmation channel; this waiter is cancelled by its caller.
+        The generic parent-page resume binding can never consume a print.
+        This waiter is cancelled only after the service accepts an image.
         """
         while True:
-            await self.show_intervention_panel(message, title="Aguardando seu print",
+            guidance = ("Este site restringe o painel integrado. Volte à aplicação AutoJev "
+                        "para acompanhar o mapa, colar ou escolher seu print e confirmar o envio."
+                        if self._rerun_panel is not None and self._rerun_panel.unavailable else message)
+            await self.show_intervention_panel(guidance, title="Aguardando seu print",
                 button_label="Anexe na aplicação AutoJev", button_disabled=True)
             # Restore passive guidance after a full navigation, even when the
             # bootstrap has already recreated a hidden default panel.
@@ -1221,6 +1254,8 @@ class PlaywrightExecutor:
         return (parsed.scheme.lower(), (parsed.hostname or "").lower(), parsed.port or default_port)
 
     async def _guard_navigation(self, route: Any, request: Any) -> None:
+        if self._rerun_panel is not None and await self._rerun_panel.route(route, request):
+            return
         try:
             is_top_level = True
             if request.is_navigation_request():
@@ -1559,6 +1594,13 @@ class PlaywrightExecutor:
         }
 
     def _on_console(self, message: Any, *, page: Any = None) -> None:
+        text = str(getattr(message, "text", ""))
+        panel_csp_diagnostic = (self._rerun_panel is not None
+            and "https://autojev-panel.invalid" in text and "Content Security Policy" in text
+            and text.startswith(("Refused to frame", "Refused to load", "Framing '")))
+        if (is_panel_url((getattr(message, "location", {}) or {}).get("url", ""))
+                or panel_csp_diagnostic):
+            return
         if self.options.capture_console_errors and message.type == "error":
             page_context = self._event_page_context(page)
             self._console_buffer.append(
@@ -1572,6 +1614,9 @@ class PlaywrightExecutor:
             )
 
     def _on_page_error(self, error: Exception, *, page: Any = None) -> None:
+        if any("https://autojev-panel.invalid/" in line
+               for line in str(getattr(error, "stack", "")).splitlines()[1:]):
+            return
         if self.options.capture_console_errors:
             page_context = self._event_page_context(page)
             self._console_buffer.append(
@@ -1585,6 +1630,8 @@ class PlaywrightExecutor:
             )
 
     def _on_response(self, response: Any, *, page: Any = None) -> None:
+        if is_panel_url(getattr(response, "url", "")):
+            return
         # Remember the main document independently from error capture. A SPA
         # may hydrate after a 404 response; the planner still needs to know
         # that replaying the URL with GET is not equivalent to its UI route.
@@ -1607,6 +1654,8 @@ class PlaywrightExecutor:
             )
 
     def _on_request_failed(self, request: Any, *, page: Any = None) -> None:
+        if is_panel_url(getattr(request, "url", "")):
+            return
         if self.options.capture_network_errors:
             failure = request.failure or "Request failed"
             self._network_buffer.append(
@@ -3005,6 +3054,8 @@ class PlaywrightExecutor:
         return results
 
     async def close(self) -> None:
+        if self._rerun_panel is not None:
+            self._rerun_panel.close()
         await self._release_observed_element_handles()
         for resource in (self._context, self._browser):
             if resource:

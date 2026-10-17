@@ -280,3 +280,53 @@ test("completed and executing card descriptions and labels meet 4.5:1 with actua
     }
   }
 });
+
+test("compact board preserves all planned cards, live colors and accessible descriptions without changing the normal board", async () => {
+  const progress = completedStepsAndWaitingPrint();
+  const normal = await render({ progress, active: true, onSelectStep: () => {} });
+  const compact = await render({ progress, active: true, compact: true, onSelectStep: () => {} });
+  assert.match(normal, /<section class="rerun-live-board"/);
+  assert.doesNotMatch(normal, /is-compact|rerun-board-compact-notice|aria-describedby=/);
+  assert.match(compact, /<section class="rerun-live-board is-compact"/);
+  assert.deepEqual(renderedCards(compact).map((card) => card.id), renderedCards(normal).map((card) => card.id));
+  assert.deepEqual(renderedCards(compact).map((card) => card.html.match(/data-step-state="([^"]+)"/)[1]), ["done", "done", "done", "done", "done", "done", "waiting"]);
+  assert.equal((compact.match(/class="rerun-board-waiting-badge">SUA VEZ/g) || []).length, 1);
+  assert.match(compact, /Aguardando você/);
+  assert.match(compact, /6<span> \/ 7<\/span>/);
+  const descriptionReferences = [...compact.matchAll(/aria-describedby="([^"]+)"/g)].map((match) => match[1]);
+  assert.equal(descriptionReferences.length, progress.steps.length);
+  assert.equal(new Set(descriptionReferences).size, progress.steps.length);
+  descriptionReferences.forEach((id) => assert.ok(compact.includes(`id="${id}" class="rerun-board-description"`)));
+  progress.steps.forEach((entry) => assert.ok(compact.includes(entry.description)));
+});
+
+test("compact board retains the real batch-order notice in a keyboard-accessible disclosure", async () => {
+  const notice = "Os cards seguem o roteiro planejado. As conferências locais são registradas juntas após a ação e podem estar concluídas antes de um print posicionado entre elas. Os horários reais são preservados.";
+  const html = await render({ compact: true, progress: { ...completedStepsAndWaitingPrint(), notice } });
+  assert.match(html, /<details class="rerun-board-compact-notice"><summary>Ordem planejada · conferências em bloco<\/summary>/);
+  assert.ok(html.includes(`<p>${notice}</p></details>`));
+  assert.doesNotMatch(html, /<details[^>]*aria-hidden|<summary[^>]*tabindex="-1"/);
+  const fallback = await render({ compact: true, progress: completedStepsAndWaitingPrint() });
+  assert.match(fallback, /<summary>Como ler os resultados<\/summary>/);
+  assert.match(fallback, /Concluir uma etapa não significa aprovar o teste/);
+});
+
+test("compact CSS uses separate dense S-layout breakpoints while keeping normal card sizes and legible status labels", async () => {
+  const css = await readFile(new URL("../app/components/RerunLiveBoard.css", import.meta.url), "utf8");
+  const compactPrefix = ".rerun-live-board.is-compact ";
+  assert.equal(cssDeclarations(css, ".rerun-board-grid")["grid-auto-rows"], "auto", "The existing normal print fallback must remain intact.");
+  assert.match(css, /\.rerun-board-grid \{[^}]*grid-auto-rows: 180px/);
+  assert.match(css, /\.rerun-live-board\.is-compact \.rerun-board-grid \{ grid-template-columns: minmax\(0, 1fr\); grid-auto-rows: 108px;/);
+  assert.match(css, /\.rerun-live-board\.is-compact \.rerun-board-canvas \{ --board-row-gap: 16px; --board-column-gap: 16px;/);
+  assert.match(css, /@container rerun-board \(min-width: 600px\) and \(max-width: 849px\)/);
+  assert.match(css, /@container rerun-board \(min-width: 850px\)/);
+  assert.match(css, /@container rerun-board \(min-width: 330px\) and \(max-width: 599px\)/);
+  assert.match(css, /grid-row: var\(--board-row-3\); grid-column: var\(--board-column-3\)/);
+  assert.equal(cssDeclarations(css, `${compactPrefix}.rerun-board-state-label`)["font-size"], "11px");
+  assert.equal(cssDeclarations(css, `${compactPrefix}.rerun-board-waiting-badge`)["font-size"], "11px");
+  assert.equal(cssDeclarations(css, `${compactPrefix}.rerun-board-number`)["font-size"], "11px");
+  assert.match(css, /\.rerun-live-board\.is-compact \.rerun-board-description[^}]*clip-path: inset\(50%\)/);
+  assert.equal(cssDeclarations(css, ".rerun-board-compact-notice > summary:focus-visible").outline, "2px solid #c5e7ff");
+  assert.doesNotMatch(css, /\.rerun-board-compact-notice[^}]*display:\s*none/);
+  assert.doesNotMatch(css, /\.rerun-live-board\.is-compact \.rerun-board-state-label[^}]*display:\s*none/);
+});

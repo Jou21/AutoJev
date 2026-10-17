@@ -30,6 +30,7 @@ export type RerunLiveBoardProps = {
   active?: boolean;
   selectedStepId?: string | null;
   onSelectStep?: (step: RerunLiveStep) => void;
+  compact?: boolean;
 };
 
 const stepStates = {
@@ -62,7 +63,7 @@ function gridPosition(index: number): CSSProperties {
   return properties as CSSProperties;
 }
 
-export function RerunLiveBoard({ progress, scenarioId, active = false, selectedStepId, onSelectStep }: RerunLiveBoardProps) {
+export function RerunLiveBoard({ progress, scenarioId, active = false, selectedStepId, onSelectStep, compact = false }: RerunLiveBoardProps) {
   const headingId = useId();
   const steps = progress?.steps ?? [];
   const total = progress?.total ?? steps.length;
@@ -71,7 +72,7 @@ export function RerunLiveBoard({ progress, scenarioId, active = false, selectedS
     ?? steps.find((step) => step.state === "active" || step.state === "waiting");
 
   return (
-    <section className="rerun-live-board" aria-labelledby={headingId}>
+    <section className={`rerun-live-board${compact ? " is-compact" : ""}`} aria-labelledby={headingId}>
       <header className="rerun-board-heading">
         <div className="rerun-board-heading-copy">
           <span className="rerun-board-eyebrow"><Route size={15} aria-hidden="true" /> PASSOS E EVIDÊNCIAS {scenarioId && <span>· {scenarioId}</span>}</span>
@@ -108,15 +109,15 @@ export function RerunLiveBoard({ progress, scenarioId, active = false, selectedS
                   <span className={`rerun-board-state-symbol ${stateName === "active" ? "is-spinning" : ""}`} aria-hidden="true"><StateIcon size={17} /></span>
                 </div>
                 <h3>{step.title}</h3>
-                <p className="rerun-board-description">{step.description || "Acompanhe o resultado desta etapa durante a reexecução."}</p>
+                <p id={compact ? `${headingId}-description-${index}` : undefined} className="rerun-board-description">{step.description || "Acompanhe o resultado desta etapa durante a reexecução."}</p>
                 <div className="rerun-board-card-bottom">
                   <span className="rerun-board-state-label"><StateIcon size={13} aria-hidden="true" />{step.label || state.label}</span>
                   {onSelectStep && <span className="rerun-board-details-hint">Ver detalhes <span aria-hidden="true">↗</span></span>}
                 </div>
               </>;
               return <li key={step.id} className={`rerun-board-cell state-${stateName}`} style={gridPosition(index)} data-step-id={step.id} data-step-state={stateName}>
-                {onSelectStep ? <button type="button" className={`rerun-board-card${isSelected ? " is-selected" : ""}`} aria-current={isCurrent ? "step" : undefined} aria-pressed={isSelected} aria-label={`Etapa ${index + 1}: ${step.title}. ${step.label || state.label}. Ver detalhes.`} onClick={() => onSelectStep(step)}>{content}</button>
-                  : <div className={`rerun-board-card${isSelected ? " is-selected" : ""}`} aria-current={isCurrent ? "step" : undefined} aria-label={`Etapa ${index + 1}: ${step.title}. ${step.label || state.label}.`}>{content}</div>}
+                {onSelectStep ? <button type="button" className={`rerun-board-card${isSelected ? " is-selected" : ""}`} aria-current={isCurrent ? "step" : undefined} aria-pressed={isSelected} aria-describedby={compact ? `${headingId}-description-${index}` : undefined} aria-label={`Etapa ${index + 1}: ${step.title}. ${step.label || state.label}. Ver detalhes.`} onClick={() => onSelectStep(step)}>{content}</button>
+                  : <div className={`rerun-board-card${isSelected ? " is-selected" : ""}`} aria-current={isCurrent ? "step" : undefined} aria-describedby={compact ? `${headingId}-description-${index}` : undefined} aria-label={`Etapa ${index + 1}: ${step.title}. ${step.label || state.label}.`}>{content}</div>}
               </li>;
             })}
           </ol>
@@ -129,7 +130,8 @@ export function RerunLiveBoard({ progress, scenarioId, active = false, selectedS
           <span><LoaderCircle size={14} aria-hidden="true" />Em execução</span>
           <span><Pause size={14} aria-hidden="true" />Aguardando você</span>
         </div>
-        <p>{progress?.notice || "Concluir uma etapa não significa aprovar o teste. As conferências mostram o resultado observado nesta reexecução."}</p>
+        {compact ? <details className="rerun-board-compact-notice"><summary>{progress?.notice?.includes("conferências locais") ? "Ordem planejada · conferências em bloco" : "Como ler os resultados"}</summary><p>{progress?.notice || "Concluir uma etapa não significa aprovar o teste. As conferências mostram o resultado observado nesta reexecução."}</p></details>
+          : <p>{progress?.notice || "Concluir uma etapa não significa aprovar o teste. As conferências mostram o resultado observado nesta reexecução."}</p>}
       </footer>
     </section>
   );
