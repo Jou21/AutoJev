@@ -529,9 +529,7 @@ body[data-theme="light"] .step-picker-choice[data-step-choice="wait_print"], bod
 .ct-summary-details > summary:hover { color: var(--text); }
 .ct-summary-details > p, .ct-summary-details li { font-size: 12px; }
 @media print {
-  .case-execution-history, #case-compare, .step-selected-tag { display: none !important; }
-  .case-execution-summary { margin: 12px 0; padding: 8px; border: 1px solid #aaa; font-size: 10px; }
-  .case-execution-metadata { display: flex; flex-wrap: wrap; gap: 7px; }
+  .case-execution-history, .step-selected-tag { display: none !important; }
   .case-selected-execution > .scenario > summary { display: flex; }
   .ct-overview { max-width: none; break-inside: avoid; print-color-adjust: exact; -webkit-print-color-adjust: exact; }
   .ct-overview-result, .ct-summary-check, .ct-summary-visual { break-inside: avoid; }
@@ -981,15 +979,8 @@ body[data-theme="light"] .dialog-toolbar, body[data-theme="light"] dialog.eviden
   [data-status='BLOCKED'] > .execution-outcome-icon { background: var(--blocked); color: var(--bg); }
   .execution-card-outcome[data-status='FAIL'] { color: var(--fail); }
   .execution-card-duration::before { margin-right: 6px; content: "·"; }
-  .execution-latest-tag, .execution-historical-tag, .execution-current-tag { display: inline-flex; align-items: center; flex: 0 0 auto; width: max-content; padding: 2px 9px; border-radius: 20px; background: var(--accent); color: #241b0a; font-size: 9px; font-weight: 750; line-height: 1.5; text-transform: uppercase; white-space: nowrap; }
+  .execution-latest-tag { display: inline-flex; align-items: center; flex: 0 0 auto; width: max-content; padding: 2px 9px; border-radius: 20px; background: var(--accent); color: #241b0a; font-size: 9px; font-weight: 750; line-height: 1.5; text-transform: uppercase; white-space: nowrap; }
   .execution-card > .execution-latest-tag { position: absolute; top: -10px; right: 10px; }
-  .execution-historical-tag { border: 1px solid var(--line); background: var(--panel); color: var(--muted); }
-  .execution-current-tag { background: color-mix(in srgb, var(--info) 15%, var(--surface)); color: var(--info); }
-  .case-execution-summary { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 14px; min-height: 52px; margin-bottom: 14px; padding: 11px 14px; border: 1px solid var(--line); border-left: 5px solid var(--accent); border-radius: 7px; background: linear-gradient(100deg, var(--panel), var(--surface)); }
-  .case-execution-metadata { display: flex; flex: 1; align-items: center; flex-wrap: wrap; gap: 9px 12px; min-width: 0; }
-  .execution-summary-title { font-size: 15px; white-space: nowrap; }
-  .execution-summary-item { padding-left: 12px; border-left: 1px solid var(--line); color: var(--text); font-size: 10px; line-height: 1.8; white-space: nowrap; }
-  #case-compare { flex: 0 0 auto; min-height: 33px; font-size: 11px; }
   body[data-view="results"] #scenarios > .step-explorer > summary, .case-selected-execution > .step-explorer > summary { display: none; }
   body[data-view="results"] #scenarios > .scenario, .case-selected-execution > .scenario { margin: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
   body[data-view="results"] .step-explorer > .scenario-body { border-top: 0; }
@@ -1087,9 +1078,6 @@ body[data-theme="light"] .dialog-toolbar, body[data-theme="light"] dialog.eviden
   #case-execution-list { gap: 20px; }
   .execution-history-item { flex: 0 0 190px; }
   .execution-history-item:not(:last-child)::after { width: 20px; }
-  .case-execution-summary { flex-wrap: wrap; padding: 11px; }
-  .case-execution-metadata { gap: 7px; }
-  .execution-summary-item { padding-left: 7px; font-size: 10px; }
   body[data-view="results"] .case-workspace { grid-template-columns: minmax(0, 1fr); gap: 12px; }
   body[data-view="results"] .case-step-sidebar { max-height: 310px; }
   body[data-view="results"] .case-step-stage { min-height: 470px; }
@@ -1100,5 +1088,4 @@ body[data-theme="light"] .dialog-toolbar, body[data-theme="light"] dialog.eviden
   .case-execution-history { padding-top: 10px; padding-bottom: 9px; margin-bottom: 9px; }
   .execution-history-heading h2 { font-size: 14px; }
   .execution-card { min-height: 78px; padding-top: 9px; padding-bottom: 9px; gap: 4px; }
-  .case-execution-summary { margin-bottom: 10px; min-height: 46px; padding-top: 8px; padding-bottom: 8px; }
 }

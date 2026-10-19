@@ -179,9 +179,9 @@ def test_history_dom_ids_and_internal_accessibility_references_are_namespaced():
 def test_history_modal_controls_exist_exactly_once(tmp_path):
     _, _, markup = render(tmp_path, fixture())
     ids = [attrs["id"] for _, attrs in markup.tags if "id" in attrs]
-    for identifier in ("case-compare", "case-history-dialog", "case-history-title", "case-history-list", "case-history-detail", "case-history-note", "case-history-close"):
+    for identifier in ("case-history-dialog", "case-history-title", "case-history-list", "case-history-detail", "case-history-note", "case-history-close"):
         assert ids.count(identifier) == 1
-    assert "case-history" not in ids and "case-history-count" not in ids
+    assert not {"case-history", "case-history-count", "case-execution-summary", "case-execution-metadata", "case-compare"}.intersection(ids)
 
 
 def test_original_coverage_never_links_to_foreign_action_with_same_step_number(tmp_path):

@@ -66,28 +66,23 @@ async def test_offline_current_history_owner_images_and_download_remain_complete
             current_image = current.locator('figure img[src^="data:"]')
             await expect(current_image).to_have_attribute("src", images["latest-rerun"])
             await expect(current_image).to_have_js_property("naturalWidth", 64)
-            await page.locator("#case-compare").click()
-            dialog = page.locator("#case-history-dialog")
-            await expect(dialog).to_be_visible()
-            await expect(page.locator("#case-history-title")).to_have_text("Histórico de CT147")
-            await expect(page.locator("#case-history-list button")).to_have_count(4)
-            await page.get_by_role("button", name="Execução #1", exact=False).click()
-            detail = page.locator("#case-history-detail")
+            await expect(page.locator("#case-execution-summary, #case-compare")).to_have_count(0)
+            await expect(page.locator("#case-execution-list button")).to_have_count(4)
+            await page.locator('#case-execution-list [data-execution-version="0"]').click()
+            detail = page.locator("#case-selected-execution")
             await expect(detail).to_contain_text("Primeira execução")
             await expect(detail.locator('figure img[src^="data:"]')).to_have_attribute("src", images["root"])
             await expect(detail.locator('figure img[src^="data:"]')).to_have_js_property("naturalWidth", 64)
             await no_duplicate_ids(page)
-            await page.get_by_role("button", name="Execução #2", exact=False).click()
+            await page.locator('#case-execution-list [data-execution-version="1"]').click()
             await expect(detail).to_contain_text("Tentativa anterior")
             await expect(detail.locator('figure img[src^="data:"]')).to_have_attribute("src", images["old-rerun"])
             await no_duplicate_ids(page)
-            await page.get_by_role("button", name="Execução #4", exact=False).click()
-            await expect(detail).to_contain_text("não tem um resultado de teste registrado")
+            await page.locator('#case-execution-list [data-execution-version="3"]').click()
+            await expect(detail).to_contain_text("não tem passos ou evidências de um resultado concluído")
             await expect(detail.locator(".scenario")).to_have_count(0)
-            await page.get_by_role("button", name="Execução #3 · Último resultado", exact=False).click()
-            await expect(detail).to_contain_text("versão mostrada na lista de testes")
-            await page.get_by_role("button", name="Ver resultado atual", exact=True).click()
-            await expect(dialog).not_to_be_visible()
+            await page.locator('#case-execution-list [data-execution-version="2"]').click()
+            await expect(detail).not_to_be_visible()
             await expect(page.locator("#case-title")).to_have_text("Resultado mais recente")
             await expect(current_image).to_have_attribute("src", images["latest-rerun"])
             await expect(page.locator("#scenarios details.scenario[data-case-index]")).to_have_count(2)
@@ -107,9 +102,8 @@ async def test_offline_current_history_owner_images_and_download_remain_complete
             saved = await context.new_page()
             await saved.goto(exported_path.as_uri() + "#view/results/CT147")
             await expect(saved.locator("#case-title")).to_have_text("Resultado mais recente")
-            await saved.locator("#case-compare").click()
-            await saved.get_by_role("button", name="Execução #1", exact=False).click()
-            await expect(saved.locator('#case-history-detail figure img[src^="data:"]')).to_have_attribute("src", images["root"])
+            await saved.locator('#case-execution-list [data-execution-version="0"]').click()
+            await expect(saved.locator('#case-selected-execution figure img[src^="data:"]')).to_have_attribute("src", images["root"])
             await no_duplicate_ids(saved)
             assert not [url for url in requests if urlsplit(url).scheme in {"http", "https"}]
             assert not errors
@@ -184,6 +178,11 @@ async def test_result_header_has_only_primary_actions_and_a_status_tag_next_to_t
                 assert tag_box["y"] >= heading_box["y"] + heading_box["height"]
                 assert abs(tag_box["x"] - heading_box["x"]) <= 1
             await page.locator(".result-navigation").screenshot(path=str(tmp_path / f"result-header-{width}.png"))
+            await expect(page.locator("#case-execution-summary, #case-execution-metadata, #case-compare")).to_have_count(0)
+            history_box = await page.locator("#case-execution-history").bounding_box()
+            workspace_box = await page.locator("#scenarios .case-workspace").first.bounding_box()
+            assert 0 <= workspace_box["y"] - history_box["y"] - history_box["height"] <= 16
+            await page.screenshot(path=str(tmp_path / f"results-without-summary-{width}.png"))
             await page.locator('#case-execution-list [data-execution-version="1"]').click()
             await expect(tag).to_have_text("Reprovado")
             await expect(tag).to_have_class("badge fail")
@@ -204,6 +203,9 @@ async def test_execution_timeline_switches_owned_evidence_without_changing_lates
     markup = markup.replace('<div id="result-report-actions"',
                             '<button id="case-history">Histórico</button><button id="case-edit">Editar passos</button>'
                             '<details id="result-more"><summary>Mais</summary></details><div id="result-report-actions"', 1)
+    markup = markup.replace('<section id="scenarios">',
+                            '<section id="case-execution-summary"><div id="case-execution-metadata"></div>'
+                            '<button id="case-compare">Comparar execução</button></section><section id="scenarios">', 1)
     requests = []
     state = {"key": "revisions-v2", "markup": markup}
     async with async_playwright() as driver:
@@ -216,7 +218,7 @@ async def test_execution_timeline_switches_owned_evidence_without_changing_lates
             await expect(page.locator("#case-executions-all")).to_have_count(0)
             await expect(page.locator("#case-history, #case-edit, #result-more")).to_have_count(0)
             await expect(page.locator('#case-execution-list [aria-pressed="true"]')).to_have_attribute("data-execution-version", "2")
-            await expect(page.locator("#case-execution-metadata")).to_contain_text("Último resultado")
+            await expect(page.locator("#case-execution-summary, #case-execution-metadata, #case-compare")).to_have_count(0)
             await expect(page.locator('#case-execution-list [data-execution-version="3"]')).to_contain_text("Mais recente")
             await page.locator('#case-execution-list [data-execution-version="0"]').click()
             await expect(page.locator("#case-title")).to_have_text("Primeira execução")
@@ -244,7 +246,7 @@ async def test_execution_timeline_switches_owned_evidence_without_changing_lates
                 await page.locator("#download-report").click()
             exported_path = tmp_path / "timeline-offline.html"
             await (await pending.value).save_as(exported_path)
-            for identifier in ("case-executions-all", "case-history", "case-edit", "result-more"):
+            for identifier in ("case-executions-all", "case-history", "case-edit", "result-more", "case-execution-summary", "case-execution-metadata", "case-compare"):
                 assert f'id="{identifier}"' not in exported_path.read_text()
             offline = await browser.new_context()
             offline_requests = []
@@ -264,11 +266,6 @@ async def test_execution_timeline_switches_owned_evidence_without_changing_lates
             await page.locator("#case-editor-rerun").click()
             assert await page.evaluate("window.__opened") == [[ORIGIN + "/#/reexecutar/old-rerun/CT001", "_blank", "noopener,noreferrer"]]
             await page.locator("#case-editor-close").click()
-            await page.locator("#case-compare").click()
-            await expect(page.locator(".execution-comparison")).to_contain_text("Último resultado")
-            await no_duplicate_ids(page)
-            await page.locator("#case-history-close").click()
-            await expect(page.locator("#case-compare")).to_be_focused()
             await page.locator('#case-execution-list [data-execution-version="3"]').click()
             await expect(page.locator("#case-selected-execution")).to_contain_text("Cancelada")
             await expect(page.locator("#case-rerun")).to_be_disabled()
@@ -515,20 +512,18 @@ async def test_connected_open_history_keeps_snapshot_until_explicit_refresh(tmp_
         browser = await driver.chromium.launch(headless=True)
         context, page = await connected_page(browser, original, state, requests)
         try:
+            await page.locator('#case-execution-list [data-execution-version="0"]').click()
             location = page.url
-            await page.locator("#case-compare").click()
-            await page.get_by_role("button", name="Execução #1", exact=False).click()
             state["key"] = "revisions-v3"
             await page.evaluate("window.dispatchEvent(new Event('focus'))")
             await expect(page.get_by_role("button", name="Atualizar resultados", exact=True)).to_be_attached()
-            await expect(page.locator("#case-history-dialog")).to_be_visible()
-            await expect(page.locator("#case-history-detail")).to_contain_text("Primeira execução")
-            await expect(page.locator("#case-title")).to_have_text("Resultado mais recente")
+            await expect(page.locator("#case-selected-execution")).to_be_visible()
+            await expect(page.locator("#case-title")).to_have_text("Primeira execução")
             assert ("GET", "/api/explorations/root/report") not in requests
             # The existing version stays fully readable before the user agrees.
-            await page.locator("#case-history-close").click()
             await page.get_by_role("button", name="Atualizar resultados", exact=True).click()
-            await expect(page.locator("#case-title")).to_have_text("Mais novo resultado após reexecução")
+            await expect(page.locator("#case-title")).to_have_text("Primeira execução")
+            await expect(page.locator('#case-rows tr[data-case-index="0"]')).to_contain_text("Mais novo resultado após reexecução")
             assert page.url == location
             await no_duplicate_ids(page)
         finally:
@@ -538,27 +533,25 @@ async def test_connected_open_history_keeps_snapshot_until_explicit_refresh(tmp_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("viewport", [{"width": 1440, "height": 900}, {"width": 390, "height": 844}], ids=["desktop", "mobile"])
-async def test_history_dialog_layout_stays_inside_viewport(tmp_path, viewport):
+async def test_selected_history_layout_stays_inside_viewport(tmp_path, viewport):
     source, _, _ = rendered_report(tmp_path)
     async with async_playwright() as driver:
         browser = await driver.chromium.launch(headless=True)
         page = await browser.new_page(viewport=viewport)
         try:
             await page.goto(source.as_uri() + "#view/results/CT147")
-            await page.locator("#case-compare").click()
-            dialog = page.locator("#case-history-dialog")
-            await expect(dialog).to_be_visible()
-            for version in ("Execução #1", "Execução #2"):
-                await page.get_by_role("button", name=version, exact=False).click()
-                box = await dialog.bounding_box()
-                assert box and box["x"] >= 0 and box["y"] >= 0
+            for version in (0, 1):
+                await page.locator(f'#case-execution-list [data-execution-version="{version}"]').click()
+                workspace = page.locator("#case-selected-execution .case-workspace")
+                await expect(workspace).to_be_visible()
+                box = await workspace.bounding_box()
+                assert box and box["x"] >= 0
                 assert box["x"] + box["width"] <= viewport["width"] + 1
-                assert box["y"] + box["height"] <= viewport["height"] + 1
                 assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")
-                assert await dialog.evaluate("el => el.scrollWidth <= el.clientWidth + 1")
-                assert await page.locator("#case-history-detail").evaluate("el => el.scrollWidth <= el.clientWidth + 1")
+                assert await workspace.evaluate("el => el.scrollWidth <= el.clientWidth + 1")
+                await expect(page.locator("#case-execution-summary, #case-compare")).to_have_count(0)
                 await no_duplicate_ids(page)
-                version_id = "original" if version == "Execução #1" else "rerun-1"
+                version_id = "original" if version == 0 else "rerun-1"
                 await page.screenshot(path=str(tmp_path / f"history-{viewport['width']}-{version_id}.png"))
         finally:
             await browser.close()
@@ -616,18 +609,16 @@ async def test_history_opened_during_report_fetch_is_not_discarded(tmp_path):
         browser = await driver.chromium.launch(headless=True)
         context, page = await connected_page(browser, original, state, requests)
         try:
-            location = page.url
             state["key"] = "revisions-v3"
             await page.evaluate("window.dispatchEvent(new Event('focus'))")
             async with asyncio.timeout(5):
                 await requested.wait()
-            await page.locator("#case-compare").click()
-            await page.get_by_role("button", name="Execução #1", exact=False).click()
+            await page.locator('#case-execution-list [data-execution-version="0"]').click()
+            location = page.url
             release.set()
             await expect(page.get_by_role("button", name="Atualizar resultados", exact=True)).to_be_attached()
-            await expect(page.locator("#case-history-dialog")).to_be_visible()
-            await expect(page.locator("#case-history-detail")).to_contain_text("Primeira execução")
-            await expect(page.locator("#case-title")).to_have_text("Resultado mais recente")
+            await expect(page.locator("#case-selected-execution")).to_be_visible()
+            await expect(page.locator("#case-title")).to_have_text("Primeira execução")
             assert page.url == location
             assert json.loads(await page.locator("#report-data").text_content())["scenario_revisions_key"] == "revisions-v2"
             await no_duplicate_ids(page)

@@ -9,15 +9,11 @@
     // A running backend can still hold the previous Python template while
     // loading fresh assets. Remove its obsolete controls before snapshotting
     // exports, not just from newly rendered HTML.
-    ["case-executions-all", "case-history", "case-edit", "result-more", "case-execution-note"].forEach((id) => {
+    ["case-executions-all", "case-history", "case-edit", "result-more", "case-execution-note",
+      "case-execution-summary", "case-execution-metadata", "case-compare"].forEach((id) => {
       const control = document.getElementById(id);
       if (control) control.remove();
     });
-    const compareExecution = document.getElementById("case-compare");
-    if (compareExecution) {
-      compareExecution.setAttribute("aria-haspopup", "dialog");
-      compareExecution.setAttribute("aria-controls", "case-history-dialog");
-    }
     // Capture a self-contained export before temporary filters or enhancements.
     // App-only controls are removed from the detached copy, leaving the live
     // blob's rerun and download actions intact.
@@ -1210,8 +1206,8 @@
     }
 
     function renderExecutionHistory(current) {
-      const list = $("case-execution-list"), metadata = $("case-execution-metadata"), host = $("case-selected-execution");
-      if (!current || !list || !metadata || !host) return;
+      const list = $("case-execution-list"), host = $("case-selected-execution");
+      if (!current || !list || !host) return;
       const history = executionHistory(current), revision = selectedExecution(current);
       const newest = Math.max(...history.map((item) => item.version));
       const recent = history.slice().sort((left, right) => right.version - left.version);
@@ -1248,16 +1244,6 @@
         const start = item.offsetLeft - inset, end = item.offsetLeft + item.offsetWidth + inset;
         if (start < list.scrollLeft || end > list.scrollLeft + list.clientWidth) list.scrollLeft = Math.max(0, start);
       }
-      metadata.replaceChildren(executionNode("strong", "execution-summary-title", "Execução #" + (revision.version + 1)));
-      if (revision.version === newest) metadata.appendChild(executionNode("span", "execution-latest-tag", "Mais recente"));
-      else metadata.appendChild(executionNode("span", "execution-historical-tag", "Execução anterior"));
-      if (revision.current && revision.version !== newest) metadata.appendChild(executionNode("span", "execution-current-tag", "Último resultado"));
-      const info = [executionDate(revision), "Ação: " + executionDuration(revision.duration_seconds),
-        typeof revision.steps_count === "number" ? revision.steps_count + " etapas" : "Etapas não registradas",
-        typeof revision.signals === "number" ? revision.signals + " sinais técnicos" : "Sinais não registrados",
-        revision.version === 0 ? "Origem: exploração inicial" : "Origem: reexecução de CT"];
-      info.forEach((label) => metadata.appendChild(executionNode("span", "execution-summary-item", label)));
-      if ($("case-compare")) $("case-compare").disabled = history.filter((item) => item.has_result).length < 2;
       text($("case-title"), (revision.current ? current.title : revision.title) || current.title || current.id);
       text($("result-case-code"), current.id);
       const badge = $("result-case-status");
