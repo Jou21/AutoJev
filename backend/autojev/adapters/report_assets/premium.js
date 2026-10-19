@@ -7,13 +7,15 @@
     let data;
     try { data = JSON.parse(source.textContent || "{}"); } catch (_) { return; }
     // Capture a self-contained export before temporary filters or enhancements.
-    // Only the detached copy loses the report-download control; the live report
-    // keeps it, while the exported file retains printing and evidence downloads.
+    // App-only controls are removed from the detached copy, leaving the live
+    // blob's rerun and download actions intact.
     const originalDocument = (() => {
       if (!document.getElementById("download-report")) return null;
       const exportRoot = document.documentElement.cloneNode(true);
-      const downloadControl = exportRoot.querySelector("#download-report");
-      if (downloadControl) downloadControl.remove();
+      ["download-report", "case-rerun", "case-rerun-feedback"].forEach((id) => {
+        const control = exportRoot.querySelector("#" + id);
+        if (control) control.remove();
+      });
       const appRuntime = exportRoot.querySelector("#report-app-runtime");
       if (appRuntime) appRuntime.remove();
       return "<!DOCTYPE html>\n" + exportRoot.outerHTML;
@@ -58,6 +60,14 @@
         return { appUrl: url.origin, sourceId: value.source_exploration_id, apiUrl };
       } catch { return null; }
     })();
+    // Historical HTML may retain the old toolbar. Only an app-connected blob
+    // can use that action; downloaded and offline reports omit it.
+    if (!reportConnection) {
+      ["case-rerun", "case-rerun-feedback"].forEach((id) => {
+        const control = $(id);
+        if (control) control.remove();
+      });
+    }
     const statusLabels = {
       ALL: "Todos os status", PASS: "Aprovados", FAIL: "Reprovados",
       BLOCKED: "Bloqueados", SKIPPED: "Sem validação",
@@ -1150,6 +1160,7 @@
       const position = cases.findIndex((item) => String(item.index) === selectedCase);
       text($("case-title"), current ? current.title || current.id || "Caso de teste" : "Nenhum caso disponível");
       if ($("case-rerun")) {
+        $("case-rerun").hidden = !reportConnection;
         $("case-rerun").disabled = !current;
         $("case-rerun").setAttribute("aria-label", current ? "Reexecutar teste " + current.id : "Reexecutar teste");
       }

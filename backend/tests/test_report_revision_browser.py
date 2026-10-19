@@ -58,6 +58,7 @@ async def test_offline_current_history_owner_images_and_download_remain_complete
             # Open from the result cell, not just the title/name hit target.
             await page.locator('#case-rows tr[data-case-index="0"] td').nth(2).click()
             await expect(page.locator("body")).to_have_attribute("data-view", "results")
+            await expect(page.locator("#case-rerun, #case-rerun-feedback")).to_have_count(0)
             await expect(page.locator("#case-title")).to_have_text("Resultado mais recente")
             current = page.locator('#scenarios details[data-case-index="0"]')
             current_image = current.locator('figure img[src^="data:"]')
@@ -175,6 +176,7 @@ async def test_connected_focus_refreshes_latest_report_in_same_blob_and_hash(tmp
               window.__opened = [];
               window.open = (...args) => { window.__opened.push(args); return null; };
             }""")
+            await expect(page.locator("#case-rerun")).to_be_visible()
             await page.locator("#case-rerun").click()
             opened = await page.evaluate("window.__opened")
             assert opened == [[ORIGIN + "/#/reexecutar/latest-rerun/CT001", "_blank", "noopener,noreferrer"]]
@@ -184,6 +186,9 @@ async def test_connected_focus_refreshes_latest_report_in_same_blob_and_hash(tmp
             await (await pending.value).save_as(exported_path)
             exported = exported_path.read_text()
             assert 'id="report-app-runtime"' not in exported
+            assert 'id="case-rerun"' not in exported
+            assert 'id="case-rerun-feedback"' not in exported
+            await expect(page.locator("#case-rerun")).to_be_visible()
             assert 'id="case-history-archive"' in exported
             assert "revisions-v3" in exported and "Mais novo resultado após reexecução" in exported
             assert not errors

@@ -393,16 +393,18 @@ function fixture(options = {}) {
   make("h1", "", resultLocation, "Resultado do teste").id = "result-view-title";
   const resultActions = make("div", "result-actions", resultNavigation);
   const caseNavigation = make("div", "result-case-navigation", resultActions);
-  make("button", "", caseNavigation, "Reexecutar teste").id = "case-rerun";
+  if (!exported || options.legacyRerun) {
+    make("button", "button button-rerun", caseNavigation, "Reexecutar teste").id = "case-rerun";
+    const feedback = make("p", "case-rerun-feedback", resultView);
+    feedback.id = "case-rerun-feedback";
+    feedback.hidden = true;
+    feedback.setAttribute("role", "status");
+    feedback.setAttribute("aria-live", "polite");
+  }
   make("button", "", caseNavigation, "Teste anterior").id = "case-prev";
   make("button", "", caseNavigation, "Teste seguinte").id = "case-next";
   make("div", "", resultActions).id = "result-report-actions";
   if (visualEditor) make("button", "", resultActions, "Editar CT").dataset.editCurrent = "true";
-  const rerunFeedback = make("p", "", resultView);
-  rerunFeedback.id = "case-rerun-feedback";
-  rerunFeedback.hidden = true;
-  rerunFeedback.setAttribute("role", "status");
-  rerunFeedback.setAttribute("aria-live", "polite");
   const scenarios = make("div", "", resultView);
   scenarios.id = "scenarios";
   const originals = [];
@@ -569,6 +571,12 @@ function insertStep(document, gap, type = "sql") {
   assert.equal(picker.hasAttribute("open"), true, "insertion opens the type chooser before creating a draft");
   picker.querySelector(`[data-step-choice="${type}"]`).click();
   assert.equal(picker.hasAttribute("open"), false);
+}
+
+function rerunFromEditor(document) {
+  document.querySelector("[data-edit-current]").click();
+  document.getElementById("case-editor-rerun").click();
+  document.getElementById("case-editor-close").click();
 }
 
 test("golden journey keeps chronological DOM while laying out responsive serpentine rows", () => {
@@ -898,44 +906,22 @@ test("offline, malformed and tampered report connections cannot open an app or c
   }
 });
 
-test("the result toolbar reruns only the selected CT through app confirmation, never the visual draft", () => {
+test("the editor reruns only the selected CT through app confirmation, never the visual draft", () => {
   const { document, window, cards } = fixture({ visualEditor: true,
     runId: "source-123", locationProtocol: "blob:", locationOrigin: "http://localhost:5173",
     appRuntime: { app_url: "http://localhost:5173", source_exploration_id: "source-123" },
   });
   const first = cards[0];
   insertStep(document, first.querySelectorAll(".case-inline-insert")[1]);
-  document.getElementById("case-rerun").click();
+  rerunFromEditor(document);
   assert.deepEqual(window.openedTabs, [["http://localhost:5173/#/reexecutar/source-123/CT001", "_blank", "noopener,noreferrer"]]);
-  const feedback = document.getElementById("case-rerun-feedback");
-  assert.equal(feedback.hidden, false);
-  assert.equal(feedback.getAttribute("role"), "status");
-  assert.equal(feedback.getAttribute("aria-live"), "polite");
+  const feedback = document.getElementById("case-editor-feedback");
   assert.match(feedback.textContent, /Nenhuma ação foi iniciada.*passos extras.*não serão executados/);
-  assert.equal(document.getElementById("case-editor").hasAttribute("open"), false, "toolbar action does not require the step editor");
   document.getElementById("case-next").click();
-  document.getElementById("case-rerun").click();
+  rerunFromEditor(document);
   assert.deepEqual(window.openedTabs.at(-1), ["http://localhost:5173/#/reexecutar/source-123/CT002", "_blank", "noopener,noreferrer"]);
   assert.equal(window.networkCalls, 0);
   assert.deepEqual(cards.map((card) => card.dataset.status), ["PASS", "FAIL"]);
-});
-
-test("the visible rerun button explains offline or untrusted reports without contacting an app", () => {
-  for (const connection of [
-    {},
-    { locationProtocol: "file:", locationOrigin: "http://localhost:5173", appRuntime: { app_url: "http://localhost:5173", source_exploration_id: "source-123" } },
-    { locationProtocol: "blob:", locationOrigin: "http://localhost:5173", appRuntime: { app_url: "https://other.example", source_exploration_id: "source-123" } },
-  ]) {
-    const { document, window } = fixture({ runId: "source-123", ...connection });
-    const rerun = document.getElementById("case-rerun");
-    assert.equal(rerun.hidden, false, "the result screen always offers the reexecution entry point");
-    rerun.click();
-    const feedback = document.getElementById("case-rerun-feedback");
-    assert.equal(feedback.hidden, false);
-    assert.match(feedback.textContent, /Reexecução não iniciada.*Abra o relatório pela aplicação/);
-    assert.equal(window.openedTabs.length, 0);
-    assert.equal(window.networkCalls, 0);
-  }
 });
 
 test("insertion controls appear directly between steps and preserve original evidence through the type picker", () => {
@@ -1126,7 +1112,7 @@ test("standalone wait-print plans a manual capture in the chosen gap without sta
 });
 
 test("connected rerun hands off only saved manual capture checkpoints, never SWS SQL or credentials", () => {
-  const { document, window, cards, originals } = fixture({ runId: "source-123", locationProtocol: "blob:",
+  const { document, window, cards, originals } = fixture({ visualEditor: true, runId: "source-123", locationProtocol: "blob:",
     locationOrigin: "http://localhost:5173", appRuntime: { app_url: "http://localhost:5173", source_exploration_id: "source-123" },
     drafts: { version: 1, cases: { "0": [
       { id: "db-1", type: "wait_print", gap: 1, order: 0, sql: "DROP TABLE users", token: "never-send" },
@@ -1137,7 +1123,7 @@ test("connected rerun hands off only saved manual capture checkpoints, never SWS
     ] } },
   });
   const canonical = originals.map((entry) => entry.outerHTML);
-  document.getElementById("case-rerun").click();
+  rerunFromEditor(document);
   const [target, context, features] = window.openedTabs.at(-1);
   const [route, query] = target.split("?");
   assert.equal(route, "http://localhost:5173/#/reexecutar/source-123/CT001");
@@ -1147,17 +1133,17 @@ test("connected rerun hands off only saved manual capture checkpoints, never SWS
   assert.equal(context, "_blank");
   assert.equal(features, "noopener,noreferrer");
   assert.doesNotMatch(target, /secret|DROP|DELETE|token|sql|sws|credentials/);
-  assert.match(document.getElementById("case-rerun-feedback").textContent, /3 pausa\(s\).*confirmação.*SWS e SQL não serão executados/);
+  assert.match(document.getElementById("case-editor-feedback").textContent, /3 pausa\(s\).*confirmação.*SWS e SQL não serão executados/);
   assert.deepEqual(originals.map((entry) => entry.outerHTML), canonical);
   assert.deepEqual(cards.map((card) => card.dataset.status), ["PASS", "FAIL"]);
   assert.equal(window.networkCalls, 0);
   document.getElementById("case-next").click();
-  document.getElementById("case-rerun").click();
+  rerunFromEditor(document);
   assert.equal(window.openedTabs.at(-1)[0], "http://localhost:5173/#/reexecutar/source-123/CT002", "capture plan belongs only to the selected CT");
 });
 
 test("each visible insertion boundary survives rerun handoff and export without counting the case summary", async () => {
-  const connection = { runId: "source-123", locationProtocol: "blob:", locationOrigin: "http://localhost:5173",
+  const connection = { visualEditor: true, runId: "source-123", locationProtocol: "blob:", locationOrigin: "http://localhost:5173",
     appRuntime: { app_url: "http://localhost:5173", source_exploration_id: "source-123" } };
   for (const gap of [0, 1, 2, 3]) {
     const { document, window, cards, blobs, originals } = fixture(connection);
@@ -1169,7 +1155,7 @@ test("each visible insertion boundary survives rerun handoff and export without 
     const visibleCards = list.children.filter((entry) => entry.classList.contains("case-inline-draft")
       || entry.classList.contains("case-step-button"));
     assert.equal(visibleCards.indexOf(draft), gap + 1, "the non-executable case summary must not consume a capture gap");
-    document.getElementById("case-rerun").click();
+    rerunFromEditor(document);
     const plan = JSON.parse(new URLSearchParams(window.openedTabs.at(-1)[0].split("?")[1]).get("capture_plan"));
     assert.deepEqual(plan, { version: 1, checkpoints: [{ id: draft.dataset.draftId, gap, order: 0 }] });
     document.getElementById("download-report").click();
@@ -1177,7 +1163,7 @@ test("each visible insertion boundary survives rerun handoff and export without 
     const saved = JSON.parse(html.match(/<script[^>]*id="report-drafts"[^>]*>([\s\S]*?)<\/script>/)[1]);
     assert.equal(saved.cases["0"][0].gap, gap);
     const reopened = fixture({ ...connection, drafts: saved });
-    reopened.document.getElementById("case-rerun").click();
+    rerunFromEditor(reopened.document);
     const reopenedPlan = JSON.parse(new URLSearchParams(reopened.window.openedTabs.at(-1)[0].split("?")[1]).get("capture_plan"));
     assert.deepEqual(reopenedPlan, plan, "reopening the same recorded evidence cannot move a capture to the end");
     assert.deepEqual(originals.map((entry) => entry.outerHTML.replace(/ hidden=""/g, "")), canonical);
@@ -1186,14 +1172,14 @@ test("each visible insertion boundary survives rerun handoff and export without 
 });
 
 test("adjacent manual print drafts share their canonical gap and retain local order in the rerun plan", () => {
-  const { document, window, cards } = fixture({ runId: "source-123", locationProtocol: "blob:",
+  const { document, window, cards } = fixture({ visualEditor: true, runId: "source-123", locationProtocol: "blob:",
     locationOrigin: "http://localhost:5173", appRuntime: { app_url: "http://localhost:5173", source_exploration_id: "source-123" } });
   const card = cards[0];
   insertStep(document, card.querySelectorAll(".case-inline-insert")[2], "wait_print");
   const firstId = card.querySelector(".case-inline-draft").dataset.draftId;
   insertStep(document, card.querySelectorAll(".case-inline-insert")[3], "wait_print");
   const secondId = card.querySelectorAll(".case-inline-draft")[1].dataset.draftId;
-  document.getElementById("case-rerun").click();
+  rerunFromEditor(document);
   const plan = JSON.parse(new URLSearchParams(window.openedTabs.at(-1)[0].split("?")[1]).get("capture_plan"));
   assert.deepEqual(plan.checkpoints, [{ id: firstId, gap: 2, order: 0 }, { id: secondId, gap: 2, order: 1 }]);
   assert.equal(card.querySelectorAll(".timeline-entry").length, 3);
@@ -1239,7 +1225,7 @@ test("modal edits must be saved before capture checkpoints can be handed to the 
   assert.equal(window.openedTabs.length, 0, "unsaved modal changes must not be silently omitted from reexecution");
   assert.match(document.getElementById("case-editor-feedback").textContent, /Guarde o rascunho antes/);
   document.getElementById("case-editor-save").click();
-  document.getElementById("case-rerun").click();
+  document.getElementById("case-editor-rerun").click();
   assert.equal(window.openedTabs.at(-1)[0].includes("capture_plan="), true);
   assert.equal(window.networkCalls, 0);
 });
@@ -1249,15 +1235,15 @@ test("manual capture plans stay bounded, reject forged positions, and cannot run
     { id: "db-1", type: "wait_print", gap: 99, order: 0 },
     ...Array.from({ length: 110 }, (_, i) => ({ id: "db-" + (i + 2), type: "wait_print", gap: 1, order: i })),
   ] } };
-  const connected = fixture({ drafts, runId: "source-123", locationProtocol: "blob:", locationOrigin: "http://localhost:5173",
+  const connected = fixture({ visualEditor: true, drafts, runId: "source-123", locationProtocol: "blob:", locationOrigin: "http://localhost:5173",
     appRuntime: { app_url: "http://localhost:5173", source_exploration_id: "source-123" } });
-  connected.document.getElementById("case-rerun").click();
+  rerunFromEditor(connected.document);
   const target = connected.window.openedTabs.at(-1)[0];
   const plan = JSON.parse(new URLSearchParams(target.split("?")[1]).get("capture_plan"));
   assert.ok(plan.checkpoints.length <= 100);
   assert.ok(plan.checkpoints.every((checkpoint) => checkpoint.gap === 1 && checkpoint.id !== "db-1"));
-  const offline = fixture({ drafts, runId: "source-123", locationProtocol: "file:", locationOrigin: "null" });
-  offline.document.getElementById("case-rerun").click();
+  const offline = fixture({ visualEditor: true, drafts, runId: "source-123", locationProtocol: "file:", locationOrigin: "null" });
+  rerunFromEditor(offline.document);
   assert.equal(offline.window.openedTabs.length, 0);
   assert.equal(offline.window.networkCalls, 0);
 });
@@ -1606,6 +1592,52 @@ test("HTML exports omit only their download control while preserving the untouch
   assert.equal(cards[1].querySelector('.case-step-button[aria-current="step"]'), liveSelection);
   assert.equal(window.location.hash, liveHash);
   assert.equal(document.getElementById("evidence-dialog").hasAttribute("open"), true);
+});
+
+test("connected blobs keep the rerun action and its original styling after exporting HTML without it", async () => {
+  const { document, window, blobs } = fixture({ visualEditor: true,
+    runId: "source-123", locationProtocol: "blob:", locationOrigin: "http://localhost:5173",
+    appRuntime: { app_url: "http://localhost:5173", source_exploration_id: "source-123" },
+  });
+  const rerun = document.getElementById("case-rerun");
+  assert.equal(rerun.hidden, false);
+  assert.equal(rerun.classList.contains("button-rerun"), true);
+  assert.equal(rerun.getAttribute("aria-label"), "Reexecutar teste CT001");
+  rerun.click();
+  assert.deepEqual(window.openedTabs, [["http://localhost:5173/#/reexecutar/source-123/CT001", "_blank", "noopener,noreferrer"]]);
+  assert.equal(document.getElementById("case-rerun-feedback").hidden, false);
+  document.getElementById("download-report").click();
+  const html = await blobs.at(-1).text();
+  assert.doesNotMatch(html, /id="case-rerun(?:-feedback)?"/);
+  assert.doesNotMatch(html, /id="report-app-runtime"/);
+  assert.match(html, /id="case-editor-rerun"/);
+  assert.equal(document.getElementById("case-rerun"), rerun);
+  assert.equal(rerun.hidden, false);
+  document.getElementById("case-next").click();
+  assert.equal(rerun.getAttribute("aria-label"), "Reexecutar teste CT002");
+  assert.equal(document.getElementById("case-rerun-feedback").hidden, true);
+  rerun.click();
+  assert.equal(window.openedTabs.at(-1)[0], "http://localhost:5173/#/reexecutar/source-123/CT002");
+  assert.equal(window.networkCalls, 0);
+});
+
+test("offline HTML removes the old rerun toolbar before display and download", async () => {
+  for (const exported of [false, true]) {
+    const { document, window, blobs } = fixture({ legacyRerun: true, exported, visualEditor: true });
+    assert.equal(document.getElementById("case-rerun"), null);
+    assert.equal(document.getElementById("case-rerun-feedback"), null);
+    assert.ok(document.querySelector("[data-edit-current]"));
+    assert.ok(document.getElementById("print-report"));
+    document.getElementById("case-next").click();
+    assert.equal(document.body.dataset.view, "results");
+    assert.equal(window.location.hash, "#view/results/CT002");
+    if (!exported) {
+      document.getElementById("download-report").click();
+      const html = await blobs.at(-1).text();
+      assert.doesNotMatch(html, /id="case-rerun(?:-feedback)?"/);
+      assert.match(html, /id="case-editor-rerun"/);
+    }
+  }
 });
 
 test("an exported report without its HTML download control retains navigation, printing and CSV", async () => {

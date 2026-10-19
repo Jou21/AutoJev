@@ -66,7 +66,8 @@ def test_results_have_a_compact_accessible_header_without_duplicate_report_actio
     assert re.search(r'<h1\b[^>]*id="result-view-title"[^>]*>Resultado do teste</h1>', result_section)
     assert 'id="case-back"' in result_section
     assert 'class="result-actions"' in result_section
-    assert 'id="case-rerun"' in result_section and 'Reexecutar teste</button>' in result_section
+    assert re.search(r'<button\b[^>]*id="case-rerun"[^>]*hidden', result_section)
+    assert 'Reexecutar teste</button>' in result_section
     assert re.search(r'<p\b[^>]*id="case-rerun-feedback"[^>]*role="status"[^>]*aria-live="polite"[^>]*hidden', result_section)
     assert 'id="case-edit"' in result_section
     assert 'id="case-prev"' in result_section and 'id="case-next"' in result_section

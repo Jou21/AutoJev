@@ -304,7 +304,7 @@ def render_premium_report(renderer: Any, exploration: dict[str, Any], scenarios:
         '<div class="result-location"><button id="case-back" class="button button-ghost">← Voltar para testes</button>'
         '<h1 id="result-view-title" tabindex="-1">Resultado do teste</h1></div>'
         '<div class="result-actions"><div class="result-case-navigation" role="group" aria-label="Navegar entre testes">'
-        '<button id="case-rerun" class="button button-rerun" aria-describedby="case-rerun-feedback"><span aria-hidden="true">↻</span> Reexecutar teste</button>'
+        '<button id="case-rerun" class="button button-rerun" aria-describedby="case-rerun-feedback" hidden><span aria-hidden="true">↻</span> Reexecutar teste</button>'
         '<button id="case-history" class="button button-ghost" title="Histórico" aria-haspopup="dialog" aria-controls="case-history-dialog">'
         + _icon("clock") + 'Histórico <span id="case-history-count"></span></button>'
         '<button id="case-edit" class="button button-ghost" data-edit-current>Editar passos</button>'
