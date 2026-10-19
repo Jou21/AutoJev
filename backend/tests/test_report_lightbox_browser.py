@@ -60,6 +60,7 @@ async def test_lightbox_fills_browser_and_fits_landscape_portrait_and_resize(tmp
             await page.set_viewport_size(viewport)
             trigger = page.locator('#scenarios details[data-case-index="0"] .step-evidence-layout:visible').get_by_role("button", name="Ampliar evidência", exact=True)
             original_hash = page.url
+            await page.locator('#scenarios details[data-case-index="0"] .step-evidence-viewport:visible').hover()
             await trigger.click()
             dialog = page.locator("#evidence-dialog")
             await expect(dialog).to_be_visible()
@@ -91,6 +92,7 @@ async def test_lightbox_fills_browser_and_fits_landscape_portrait_and_resize(tmp
             assert not await page.locator("body").evaluate("el => el.classList.contains('evidence-lightbox-open')")
             # Historical captures never enter the current execution's gallery.
             await page.locator('#case-execution-list [data-execution-version="1"]').click()
+            await page.locator("#case-selected-execution .step-evidence-viewport:visible").hover()
             await page.locator("#case-selected-execution .step-evidence-layout:visible").get_by_role("button", name="Ampliar evidência", exact=True).click()
             await expect(dialog.locator(".evidence-lightbox-counter")).to_have_text("1 de 1")
             await expect(page.locator("#evidence-preview")).to_have_attribute("src", images["old-rerun"])
@@ -118,6 +120,7 @@ async def test_lightbox_zoom_pan_keyboard_and_offline_export_preserve_original_b
         context, page = await connected_page(browser, markup, {"key": "revisions-v2", "markup": markup}, requests)
         page.set_default_timeout(5000)
         try:
+            await page.locator('#scenarios details[data-case-index="0"] .step-evidence-viewport:visible').hover()
             await page.locator('#scenarios details[data-case-index="0"] .step-evidence-layout:visible').get_by_role("button", name="Ampliar evidência", exact=True).click()
             dialog = page.locator("#evidence-dialog")
             for _ in range(4):
@@ -158,6 +161,7 @@ async def test_lightbox_zoom_pan_keyboard_and_offline_export_preserve_original_b
             offline_context.on("request", lambda request: offline_requests.append(request.url))
             offline = await offline_context.new_page()
             await offline.goto(exported.as_uri() + "#view/results/CT147")
+            await offline.locator('#scenarios details[data-case-index="0"] .step-evidence-viewport:visible').hover()
             await offline.locator('#scenarios details[data-case-index="0"] .step-evidence-layout:visible').get_by_role("button", name="Ampliar evidência", exact=True).click()
             await expect(offline.locator("#evidence-dialog")).to_have_css("width", "1440px")
             await expect(offline.locator(".evidence-lightbox-counter")).to_have_text("1 de 2")
@@ -180,6 +184,7 @@ async def test_open_lightbox_is_not_discarded_by_background_result_refresh(tmp_p
         context, page = await connected_page(browser, markup, state, requests)
         page.set_default_timeout(5000)
         try:
+            await page.locator('#scenarios details[data-case-index="0"] .step-evidence-viewport:visible').hover()
             await page.locator('#scenarios details[data-case-index="0"] .step-evidence-layout:visible').get_by_role("button", name="Ampliar evidência", exact=True).click()
             state["key"] = "revisions-v3"
             await page.evaluate("window.dispatchEvent(new Event('focus'))")

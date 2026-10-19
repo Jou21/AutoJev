@@ -149,6 +149,62 @@ async def connected_page(browser, markup, state, requests, *, expected_title="Re
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("width", [1440, 390], ids=["desktop", "mobile"])
+async def test_summary_is_an_unnumbered_list_item_for_current_and_previous_executions(tmp_path, width):
+    source, _, _ = rendered_report(tmp_path)
+    errors = []
+    async with async_playwright() as driver:
+        browser = await driver.chromium.launch(headless=True)
+        context = await browser.new_context(viewport={"width": width, "height": 1000})
+        page = await context.new_page()
+        page.set_default_timeout(5000)
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        try:
+            await page.goto(source.as_uri() + "#view/results/CT147")
+            for version, status in [(2, "Aprovado"), (1, "Reprovado")]:
+                await page.locator(f'#case-execution-list [data-execution-version="{version}"]').click()
+                workspace = page.locator(".case-workspace:visible")
+                sidebar = workspace.locator(".case-step-sidebar")
+                steps = sidebar.locator(".case-step-list > .case-step-button")
+                summary = steps.first
+                await expect(steps).to_have_count(3)
+                await expect(sidebar.locator(".case-step-sidebar-header button")).to_have_count(0)
+                await expect(summary).to_have_attribute("data-step-kind", "summary")
+                await expect(summary.locator(".step-label")).to_have_text("Resumo do teste")
+                await expect(summary.locator(".step-number")).to_have_count(0)
+                assert await steps.locator(".step-number").all_text_contents() == ["01", "02"]
+                await expect(sidebar.locator(".case-step-progress")).to_have_text("2 / 2")
+                await summary.click()
+                await expect(summary).to_have_attribute("aria-current", "step")
+                await expect(workspace.locator(".case-summary-panel")).to_be_visible()
+                await expect(workspace.locator(".timeline-entry:visible")).to_have_count(0)
+                await expect(workspace.locator(".case-step-outcome")).to_have_text(status)
+                assert await summary.evaluate("""el => {
+                  const box = el.getBoundingClientRect();
+                  const list = el.parentElement.getBoundingClientRect();
+                  const label = el.querySelector('.step-label').getBoundingClientRect();
+                  const icon = el.querySelector('.step-status-icon').getBoundingClientRect();
+                  return box.width >= list.width - 20 && box.height >= 52 &&
+                    label.width > 50 && icon.width === icon.height &&
+                    Math.abs(icon.y + icon.height / 2 - box.y - box.height / 2) <= 1 &&
+                    getComputedStyle(el, '::after').display === 'none';
+                }""")
+                await sidebar.screenshot(path=str(tmp_path / f"summary-step-{width}-v{version}.png"))
+                await page.keyboard.press("ArrowDown")
+                await expect(steps.nth(1)).to_be_focused()
+                await expect(steps.nth(1)).to_have_attribute("aria-current", "step")
+                await expect(workspace.locator(".case-summary-panel")).not_to_be_visible()
+                await page.keyboard.press("Home")
+                await expect(summary).to_be_focused()
+                await expect(workspace.locator(".case-summary-panel")).to_be_visible()
+                await no_duplicate_ids(page)
+            assert not errors
+        finally:
+            await context.close()
+            await browser.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("width", [1440, 390], ids=["desktop", "mobile"])
 async def test_result_header_has_only_primary_actions_and_a_status_tag_next_to_title(tmp_path, width):
     title = "Comportamento funcional: Sort products — option Name (Z to A)"
     _, markup, _ = rendered_report(tmp_path, title=title)

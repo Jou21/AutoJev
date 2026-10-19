@@ -1332,6 +1332,28 @@ test("step explorer moves canonical evidence without duplicating cards, anchors 
   assert.equal(cards[0].querySelectorAll('.case-step-button[aria-pressed="true"]').length, 1);
 });
 
+test("the summary is the first unnumbered list item, not a header icon or a recorded step", () => {
+  const { cards } = fixture();
+  const card = cards[0], list = card.querySelector(".case-step-list");
+  const buttons = list.querySelectorAll(".case-step-button");
+  const summary = buttons[0];
+  assert.equal(buttons.length, 4);
+  assert.equal(card.querySelector(".case-step-sidebar-header").querySelectorAll(".case-step-button").length, 0);
+  assert.equal(summary.dataset.stepKind, "summary");
+  assert.equal(summary.querySelector(".step-label").textContent, "Resumo do teste");
+  assert.equal(summary.querySelector(".step-number"), null);
+  assert.deepEqual(buttons.slice(1).map((control) => control.querySelector(".step-number").textContent), ["01", "02", "03"]);
+  assert.equal(card.querySelector(".case-step-progress").textContent, "3 / 3");
+  assert.equal(buttons[1].getAttribute("aria-current"), "step", "the first recorded step stays selected initially");
+  summary.click();
+  assert.equal(summary.getAttribute("aria-current"), "step");
+  assert.equal(card.querySelector(".case-summary-panel").hidden, false);
+  assert.ok(card.querySelectorAll(".timeline-entry").every((entry) => entry.hidden));
+  assert.equal(card.querySelector(".case-step-position").textContent, "Visão geral do teste");
+  assert.equal(card.querySelector(".case-step-outcome").textContent, "Aprovado");
+  assert.equal(card.dataset.status, "PASS");
+});
+
 test("each sidebar step explains its own recorded outcome without inheriting the case verdict", () => {
   const { cards } = fixture({
     withSignal: true,
@@ -1347,7 +1369,7 @@ test("each sidebar step explains its own recorded outcome without inheriting the
   assert.deepEqual(buttons.map((button) => button.querySelector(".step-status-label").textContent), [
     "Aprovado", "Captura registrada", "Concluída", "Não passou", "Requer atenção",
   ]);
-  assert.equal(buttons[0].querySelector(".step-label").textContent, "Resultado do caso");
+  assert.equal(buttons[0].querySelector(".step-label").textContent, "Resumo do teste");
   assert.equal(buttons[1].querySelector(".step-kind").textContent, "Captura da página");
   assert.equal(buttons[2].querySelector(".step-kind").textContent, "Ação realizada");
   assert.equal(buttons[3].querySelector(".step-kind").textContent, "Conferência");
@@ -1485,7 +1507,7 @@ test("hiding technical observations excludes their step controls without changin
   assert.equal(card.querySelector(".timeline-entry.signal").hidden, true);
   assert.equal(card.dataset.status, "PASS");
   buttons[0].dispatch("keydown", { key: "End" });
-  assert.ok(document.activeElement === buttons[3], "the header summary shares step keyboard navigation without inspecting cyclic DOM on failure");
+  assert.ok(document.activeElement === buttons[3], "the summary shares step keyboard navigation without inspecting cyclic DOM on failure");
   document.getElementById("show-technical").checked = true;
   document.getElementById("settings-form").dispatch("submit");
   assert.equal(buttons.at(-1).hidden, false);
@@ -1573,10 +1595,19 @@ test("zoomed evidence pans only with the left mouse button and suppresses drag c
   assert.equal(image.src, source);
 });
 
-test("evidence inspector explains unavailable clipboard and missing HTML instead of fabricating content", () => {
+test("evidence inspector overlays image controls without the old tab bar or fabricated HTML", () => {
   const { cards } = fixture();
   const inspector = cards[0].querySelector(".step-evidence-layout");
-  assert.equal(inspector.querySelectorAll("button").find((control) => control.getAttribute("aria-label").startsWith("HTML indisponível")).disabled, true);
+  assert.equal(inspector.querySelector(".step-evidence-bar"), null);
+  assert.equal(inspector.querySelector(".step-evidence-tabs"), null);
+  assert.equal(inspector.querySelector(".step-evidence-tab"), null);
+  const canvas = inspector.querySelector(".step-evidence-canvas");
+  assert.ok(canvas.querySelector(".step-evidence-viewport"));
+  const controls = canvas.querySelector(".step-evidence-tools");
+  assert.equal(controls.getAttribute("role"), "group");
+  assert.deepEqual(controls.querySelectorAll("button").map((control) => control.getAttribute("aria-label")), [
+    "Diminuir zoom", "Restaurar zoom para 100%", "Aumentar zoom", "Ampliar evidência",
+  ]);
   inspector.querySelector('[data-evidence-field="filename"]').querySelector("button").click();
   assert.match(inspector.querySelector(".step-evidence-feedback").textContent, /copie manualmente/);
   assert.equal(inspector.querySelectorAll("iframe").length, 0);
@@ -1661,6 +1692,11 @@ test("printing reveals every step and restores the previous selection afterwards
 test("a CT without temporal evidence still offers its preserved summary", () => {
   const { cards } = fixture({ emptyTimeline: true });
   assert.equal(cards[0].querySelectorAll(".case-step-button").length, 1);
+  const summary = cards[0].querySelector(".case-step-list .case-step-button");
+  assert.equal(summary.querySelector(".step-label").textContent, "Resumo do teste");
+  assert.equal(summary.querySelector(".step-number"), null);
+  assert.equal(summary.getAttribute("aria-current"), "step");
+  assert.equal(cards[0].querySelector(".case-step-progress").textContent, "0 / 0");
   assert.equal(cards[0].querySelector(".case-summary-panel").hidden, false);
   assert.match(cards[0].querySelector(".case-summary-panel").textContent, /Não há evidência temporal registrada/);
 });

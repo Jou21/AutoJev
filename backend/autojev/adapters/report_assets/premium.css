@@ -1018,15 +1018,11 @@ body[data-theme="light"] .dialog-toolbar, body[data-theme="light"] dialog.eviden
   body[data-view="results"] .step-status-label { display: none; }
   .step-selected-tag { display: none; }
   body[data-view="results"] .active > .step-selected-tag { position: absolute; right: 12px; top: 50%; display: block; transform: translateY(-50%); padding: 3px 9px; border-radius: 14px; background: var(--accent); color: #241b0a; font-size: 9px; font-weight: 650; line-height: 1.5; }
-  body[data-view="results"] .case-step-header-tools .case-step-button[data-step-kind="summary"] { display: grid; place-items: center; width: 23px; min-height: 23px; height: 23px; margin: 0; padding: 0; border: 0; border-radius: 50%; background: transparent; box-shadow: none; }
-  body[data-view="results"] .case-step-header-tools .case-step-button[data-step-kind="summary"] .step-copy { display: block; }
-  body[data-view="results"] .case-step-header-tools .case-step-button[data-step-kind="summary"] .step-number,
-  body[data-view="results"] .case-step-header-tools .case-step-button[data-step-kind="summary"] .step-label,
-  body[data-view="results"] .case-step-header-tools .case-step-button[data-step-kind="summary"] .step-description,
-  body[data-view="results"] .case-step-header-tools .case-step-button[data-step-kind="summary"] .step-caption,
-  body[data-view="results"] .case-step-header-tools .case-step-button[data-step-kind="summary"] .step-selected-tag { display: none; }
-  body[data-view="results"] .case-step-header-tools .case-step-button[data-step-kind="summary"] .step-status { display: block; width: 20px; height: 20px; }
-  body[data-view="results"] .case-step-header-tools .case-step-button[data-step-kind="summary"] .step-status-icon { flex-basis: 20px; width: 20px; height: 20px; }
+  body[data-view="results"] .case-step-button[data-step-kind="summary"] { margin-bottom: 8px; }
+  body[data-view="results"] .case-step-button[data-step-kind="summary"]::after { display: none; }
+  body[data-view="results"] .case-step-button[data-step-kind="summary"] .step-copy { grid-column: 1 / -1; grid-template-columns: 36px minmax(0, 1fr); column-gap: 14px; }
+  body[data-view="results"] .case-step-button[data-step-kind="summary"] .step-status { justify-self: center; width: 24px; height: 24px; }
+  body[data-view="results"] .case-step-button[data-step-kind="summary"] .step-status-icon { flex-basis: 24px; width: 24px; height: 24px; }
   body[data-view="results"] .case-inline-gap { position: relative; height: 6px; min-height: 6px; margin: 0; padding: 0; }
   body[data-view="results"] .case-inline-gap::before { display: none; }
   body[data-view="results"] .case-inline-insert { position: absolute; z-index: 3; left: 50%; top: 50%; transform: translate(-50%, -50%); min-height: 21px; padding: 2px 9px; background: var(--surface); opacity: 0; transition: opacity .15s; }
@@ -1107,15 +1103,12 @@ body[data-theme="light"] .dialog-toolbar, body[data-theme="light"] dialog.eviden
   .case-step-outcome[data-step-state="warning"] { color: var(--blocked); border-color: color-mix(in srgb, var(--blocked) 25%, transparent); background: color-mix(in srgb, var(--blocked) 12%, transparent); }
   .step-evidence-layout { display: grid; grid-template-columns: minmax(0, 1.8fr) minmax(245px, 1fr); gap: 16px; align-items: start; min-width: 0; margin: 0 0 14px; }
   .step-evidence-viewer { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: var(--bg); box-shadow: 0 8px 24px #0001; }
-  .step-evidence-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; min-height: 60px; padding: 10px 12px; border-bottom: 1px solid var(--line); background: linear-gradient(135deg, var(--panel), var(--surface)); }
-  .step-evidence-tabs, .step-evidence-tools, .step-evidence-zoom { display: flex; align-items: center; gap: 6px; }
-  .step-evidence-tab { display: inline-flex; align-items: center; gap: 8px; min-height: 36px; padding: 8px 10px; border: 0; border-radius: 7px; background: transparent; color: var(--muted); font-size: 12px; font-weight: 650; }
-  .step-evidence-tab.active { position: relative; background: color-mix(in srgb, var(--text) 4%, transparent); color: var(--text); }
-  .step-evidence-tab.active::after { position: absolute; right: 9px; bottom: -10px; left: 9px; height: 2px; border-radius: 2px; background: var(--accent); content: ""; }
-  .step-evidence-tab:disabled { opacity: .42; cursor: not-allowed; }
-  .step-evidence-tools { margin-left: auto; }
+  .step-evidence-canvas { position: relative; min-width: 0; }
+  .step-evidence-tools, .step-evidence-zoom { display: flex; align-items: center; gap: 6px; }
+  .step-evidence-tools { position: absolute; z-index: 3; top: 12px; right: 12px; max-width: calc(100% - 24px); padding: 5px; border: 1px solid var(--line); border-radius: 10px; background: color-mix(in srgb, var(--surface) 94%, transparent); box-shadow: 0 4px 18px #0003; backdrop-filter: blur(10px); opacity: 0; pointer-events: none; transform: translateY(-4px); transition: opacity .16s ease, transform .16s ease; }
+  .step-evidence-canvas:hover .step-evidence-tools, .step-evidence-canvas:focus-within .step-evidence-tools { opacity: 1; pointer-events: auto; transform: none; }
   .step-evidence-zoom { gap: 0; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
-  .step-evidence-bar .evidence-icon-button { width: 32px; min-width: 32px; height: 34px; min-height: 34px; padding: 6px; border-radius: 8px; }
+  .step-evidence-tools .evidence-icon-button { width: 32px; min-width: 32px; height: 34px; min-height: 34px; padding: 6px; border-radius: 8px; }
   .step-evidence-zoom .evidence-icon-button { border: 0; background: transparent; }
   .evidence-zoom-reset { min-width: 48px; padding: 7px 3px; border: 0; background: transparent; color: var(--text); font-size: 11px; font-variant-numeric: tabular-nums; }
   .step-evidence-viewport { --evidence-zoom: 1; height: clamp(260px, calc(100cqh - 105px), 700px); min-width: 0; padding: 12px; overflow: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: var(--muted) transparent; background: radial-gradient(ellipse at 50% 0, var(--panel-soft), var(--bg)); }
@@ -1171,17 +1164,21 @@ body[data-theme="light"] .dialog-toolbar, body[data-theme="light"] dialog.eviden
   .case-step-meta .case-step-timestamp { display: block; font-size: 9px; }
   .case-step-outcome { min-height: 26px; max-width: 190px; padding: 4px 9px; font-size: 9px; }
   body[data-view="results"] .case-step-content { padding: 10px; max-height: none; overflow: visible; }
-  .step-evidence-bar { gap: 10px; padding: 9px; }
-  .step-evidence-tab { gap: 5px; padding: 7px; font-size: 11px; }
-  .step-evidence-tab .evidence-icon { width: 17px; height: 17px; flex-basis: 17px; }
   .step-evidence-tools { gap: 4px; }
-  .step-evidence-bar .evidence-icon-button { width: 28px; min-width: 28px; padding: 5px; }
+  .step-evidence-tools .evidence-icon-button { width: 28px; min-width: 28px; padding: 5px; }
   .evidence-zoom-reset { min-width: 40px; font-size: 10px; }
   .step-evidence-info-heading { font-size: 14px; }
 }
+@media screen and (hover: none), screen and (pointer: coarse) {
+  .step-evidence-tools { opacity: 1; pointer-events: auto; transform: none; }
+  .step-evidence-tools .evidence-icon-button, .step-evidence-tools .evidence-zoom-reset { min-width: 44px; min-height: 44px; }
+}
+@media screen and (prefers-reduced-motion: reduce) {
+  .step-evidence-tools { transition: none; }
+}
 @media print {
-  .step-evidence-bar, .step-evidence-choice, .step-evidence-info-heading, .step-evidence-fields, .step-evidence-feedback, .step-evidence-download { display: none !important; }
-  .step-evidence-layout, .step-evidence-viewer, .step-evidence-viewport, .step-evidence-info, .step-evidence-info-panel { display: block; height: auto; padding: 0; overflow: visible; border: 0; }
+  .step-evidence-tools, .step-evidence-choice, .step-evidence-info-heading, .step-evidence-fields, .step-evidence-feedback, .step-evidence-download { display: none !important; }
+  .step-evidence-layout, .step-evidence-viewer, .step-evidence-canvas, .step-evidence-viewport, .step-evidence-info, .step-evidence-info-panel { display: block; height: auto; padding: 0; overflow: visible; border: 0; }
   .step-evidence-viewport .shots { width: 100% !important; }
   .step-evidence-viewport figure[hidden] { display: block !important; }
 }

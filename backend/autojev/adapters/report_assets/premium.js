@@ -740,7 +740,7 @@
       model.list.replaceChildren();
       model.draftPanels.replaceChildren();
       model.items = model.originalItems.slice();
-      model.items.forEach((item) => (item.kind === "summary" ? model.summaryActions : model.list).appendChild(item.button));
+      model.items.forEach((item) => model.list.appendChild(item.button));
       const selectedIndex = model.items.findIndex((item) => item.key === selectedKey);
       model.selected = selectedIndex < 0 ? 0 : selectedIndex;
       syncCaseStepAvailability(model);
@@ -985,14 +985,9 @@
       const layout = make("div", "step-evidence-layout");
       const viewer = make("section", "step-evidence-viewer");
       viewer.setAttribute("aria-label", "Visualizador da evidência");
-      const bar = make("div", "step-evidence-bar"), tabs = make("div", "step-evidence-tabs");
-      const imageTab = make("span", "step-evidence-tab active"); imageTab.append(evidenceIcon("image"), make("span", "", "Imagem"));
-      const htmlTab = button("", () => {}, "step-evidence-tab");
-      htmlTab.append(evidenceIcon("code"), make("span", "", "HTML")); htmlTab.disabled = true;
-      htmlTab.setAttribute("title", "O HTML desta etapa não foi preservado no relatório.");
-      htmlTab.setAttribute("aria-label", "HTML indisponível: não registrado nesta execução");
-      tabs.append(imageTab, htmlTab);
+      const canvas = make("div", "step-evidence-canvas");
       const tools = make("div", "step-evidence-tools"), zoomTools = make("div", "step-evidence-zoom");
+      tools.setAttribute("role", "group"); tools.setAttribute("aria-label", "Controles da imagem");
       const viewport = make("div", "step-evidence-viewport");
       viewport.tabIndex = 0; viewport.setAttribute("aria-label", "Imagem da evidência; com zoom, segure o botão esquerdo e arraste para mover, ou use as barras de rolagem");
       let zoom = 100, activeFigure = figures[0];
@@ -1014,7 +1009,7 @@
       zoomTools.append(minus, reset, plus);
       const expand = iconButton("expand", "Ampliar evidência", () => openEvidencePreview(activeFigure.querySelector("img"), expand,
         (activeFigure.querySelector("figcaption") || {}).textContent, (activeFigure.querySelector("figcaption") || {}).textContent));
-      tools.append(zoomTools, expand); bar.append(tabs, tools); viewer.append(bar, viewport);
+      tools.append(zoomTools, expand); canvas.append(viewport, tools); viewer.appendChild(canvas);
       const aside = make("aside", "step-evidence-info"), panel = make("div", "step-evidence-info-panel");
       const heading = make("h4", "step-evidence-info-heading"); heading.append(evidenceIcon("image"), make("span", "", "Informações da evidência"));
       const fields = make("dl", "step-evidence-fields");
@@ -1074,7 +1069,7 @@
         chooser.addEventListener("change", () => {
           activeFigure = figures[Number(chooser.value)] || figures[0]; figures.forEach((figure) => { figure.hidden = figure !== activeFigure; });
           setZoom(100); text(feedback, ""); update();
-        }); viewer.insertBefore(chooser, viewport);
+        }); viewer.insertBefore(chooser, canvas);
       }
       figures.forEach((figure) => {
         figure.classList.add("step-evidence-figure"); figure.hidden = figure !== activeFigure;
@@ -1112,9 +1107,9 @@
       const sidebarHeader = make("div", "case-step-sidebar-header");
       const count = make("small", "case-step-count result-sr-only");
       const progress = make("span", "case-step-progress");
-      const summaryActions = make("div", "case-step-header-tools");
-      summaryActions.appendChild(progress);
-      sidebarHeader.append(make("h3", "", "Passos e evidências"), count, summaryActions);
+      const headerTools = make("div", "case-step-header-tools");
+      headerTools.appendChild(progress);
+      sidebarHeader.append(make("h3", "", "Passos e evidências"), count, headerTools);
       if (timeline.dataset.stepOrder === "planned") {
         sidebarHeader.append(make("small", "case-step-order-note result-sr-only", "Ordem dos passos planejada · horários reais preservados"));
         sidebarHeader.setAttribute("title", "Ordem dos passos planejada · horários reais preservados");
@@ -1141,7 +1136,7 @@
       const draftPanels = make("div", "case-draft-panels");
       content.append(summary, timeline, draftPanels);
       const model = {
-        key, detail, workspace, list, content, count, progress, summaryActions, position, title, items: [], originalItems: [],
+        key, detail, workspace, list, content, count, progress, position, title, items: [], originalItems: [],
         selected: entries.length ? 1 : 0, inlineDrag: null, inlineFeedback, draftPanels, readOnly,
       };
       const move = (direction) => {
@@ -1191,7 +1186,7 @@
         signal: "Registro técnico para análise; não reprova o caso por si só.",
         observation: "Estado da página registrado; não é uma aprovação do teste.",
       };
-      [{ node: summary, kind: "summary", title: "Resultado do caso" }, ...entries.map((node) => ({
+      [{ node: summary, kind: "summary", title: "Resumo do teste" }, ...entries.map((node) => ({
         node, kind: Object.keys(labels).find((kind) => node.classList.contains(kind)) || "observation",
         title: (node.querySelector("h3") || {}).textContent || "Registro da execução",
       }))].forEach((item, index) => {
@@ -1242,7 +1237,8 @@
         compact.setAttribute("aria-hidden", "true");
         compact.setAttribute("title", description);
         copy.append(make("span", "step-kind", kindLabel), make("span", "step-label", sidebarTitle), descriptionNode, compact, status);
-        control.append(make("span", "step-number", index ? String(index).padStart(2, "0") : "i"), copy);
+        if (index) control.appendChild(make("span", "step-number", String(index).padStart(2, "0")));
+        control.appendChild(copy);
         control.appendChild(make("span", "step-selected-tag", "Selecionado"));
         list.appendChild(control);
         originalItem.button = control;

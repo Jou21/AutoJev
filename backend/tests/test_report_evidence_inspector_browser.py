@@ -24,6 +24,82 @@ def inspector_report(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("width,touch", [(1440, False), (390, False), (390, True)], ids=["desktop-mouse", "narrow-mouse", "touch"])
+async def test_image_controls_overlay_on_hover_and_keyboard_and_remain_available_on_touch(tmp_path, width, touch):
+    source, _, images = inspector_report(tmp_path)
+    errors = []
+    async with async_playwright() as driver:
+        browser = await driver.chromium.launch(headless=True)
+        context = await browser.new_context(viewport={"width": width, "height": 1000}, has_touch=touch)
+        page = await context.new_page()
+        page.set_default_timeout(5000)
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        try:
+            await page.goto(source.as_uri() + "#view/results/CT147")
+            viewer = page.locator('#scenarios details[data-case-index="0"] .step-evidence-viewer:visible')
+            canvas = viewer.locator(".step-evidence-canvas")
+            viewport = canvas.locator(".step-evidence-viewport")
+            tools = canvas.get_by_role("group", name="Controles da imagem", exact=True)
+            await expect(viewer.locator(".step-evidence-bar, .step-evidence-tabs, .step-evidence-tab")).to_have_count(0)
+            await expect(tools).to_have_css("opacity", "1" if touch else "0")
+            canvas_box, viewport_box = await canvas.bounding_box(), await viewport.bounding_box()
+            assert abs(canvas_box["height"] - viewport_box["height"]) <= 1, "Controls must not reserve a header row"
+            assert abs(canvas_box["y"] - viewport_box["y"]) <= 1
+            await viewer.screenshot(path=str(tmp_path / f"evidence-idle-{width}-touch-{touch}.png"))
+            if not touch:
+                await viewport.hover()
+                await expect(tools).to_have_css("opacity", "1")
+                await expect(tools).to_have_css("pointer-events", "auto")
+                await page.mouse.move(0, 0)
+                await expect(tools).to_have_css("opacity", "0")
+                await expect(tools).to_have_css("pointer-events", "none")
+                # Keyboard focus reveals the same controls without needing a mouse.
+                await viewport.focus()
+                await expect(tools).to_have_css("opacity", "1")
+                await page.keyboard.press("Tab")  # The canonical capture preview.
+                await page.keyboard.press("Tab")
+                await expect(tools.get_by_role("button", name="Diminuir zoom", exact=True)).to_be_focused()
+            else:
+                assert await tools.locator("button").evaluate_all(
+                    "buttons => buttons.every(el => el.getBoundingClientRect().width >= 44 && el.getBoundingClientRect().height >= 44)")
+            plus = tools.get_by_role("button", name="Aumentar zoom", exact=True)
+            if touch:
+                await plus.tap()
+            else:
+                await plus.click()
+            await expect(tools.locator(".evidence-zoom-reset")).to_have_text("125%")
+            await expect(viewport).to_have_attribute("data-pan-enabled", "true")
+            tools_box = await tools.bounding_box()
+            await viewport.evaluate("el => { el.scrollLeft = 100; el.scrollTop = 50; }")
+            after = await tools.bounding_box()
+            assert abs(after["x"] - tools_box["x"]) <= 1 and abs(after["y"] - tools_box["y"]) <= 1
+            await viewer.screenshot(path=str(tmp_path / f"evidence-hover-{width}-touch-{touch}.png"))
+            expand = tools.get_by_role("button", name="Ampliar evidência", exact=True)
+            if touch:
+                await expand.tap()
+            else:
+                await expand.click()
+            await expect(page.locator("#evidence-dialog")).to_be_visible()
+            await expect(page.locator("#evidence-preview")).to_have_attribute("src", images["latest-rerun"])
+            await page.keyboard.press("Escape")
+            await expect(expand).to_be_focused()
+            await expect(tools).to_have_css("opacity", "1")
+            await page.locator('#scenarios details[data-case-index="0"] .case-step-content').focus()
+            await page.mouse.move(0, 0)
+            await expect(tools).to_have_css("opacity", "1" if touch else "0")
+            await page.emulate_media(media="print")
+            await expect(canvas.locator(".step-evidence-tools")).to_have_css("display", "none")
+            await expect(viewer.locator("img")).to_be_visible()
+            await page.emulate_media(media="screen")
+            assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+            await no_duplicate_ids(page)
+            assert not errors
+        finally:
+            await context.close()
+            await browser.close()
+
+
+@pytest.mark.asyncio
 async def test_zoomed_image_can_be_panned_with_real_mouse_without_opening_preview(tmp_path):
     _, markup, images = inspector_report(tmp_path)
     requests = []
@@ -37,6 +113,7 @@ async def test_zoomed_image_can_be_panned_with_real_mouse_without_opening_previe
             await page.set_viewport_size({"width": 1440, "height": 900})
             viewer = page.locator('#scenarios details[data-case-index="0"] .step-evidence-layout:visible')
             viewport = viewer.locator(".step-evidence-viewport")
+            await viewport.hover()
             for _ in range(4):
                 await viewer.get_by_role("button", name="Aumentar zoom", exact=True).click()
             await expect(viewer.locator(".evidence-zoom-reset")).to_have_text("200%")
@@ -106,7 +183,7 @@ async def test_evidence_viewer_zoom_metadata_download_and_owned_history(tmp_path
             viewer = stage.locator(".step-evidence-layout:visible")
             field = lambda name: viewer.locator(f'[data-evidence-field="{name}"] dd')
             await expect(viewer).to_be_visible()
-            await expect(viewer.get_by_role("button", name="HTML indisponível", exact=False)).to_be_disabled()
+            await expect(viewer.locator(".step-evidence-bar, .step-evidence-tab")).to_have_count(0)
             await expect(stage.locator(".case-step-outcome")).to_have_text("Captura registrada")
             await expect(stage.locator(".case-step-outcome")).to_have_attribute("data-step-state", "recorded")
             await expect(field("type")).to_have_text("Captura de tela")
@@ -119,6 +196,7 @@ async def test_evidence_viewer_zoom_metadata_download_and_owned_history(tmp_path
             await expect(field("size")).to_have_text(f"{len(image_bytes)} B")
             await expect(viewer.locator("img")).to_have_attribute("src", images["latest-rerun"])
             viewport_element = viewer.locator(".step-evidence-viewport")
+            await viewport_element.hover()
             await viewer.get_by_role("button", name="Aumentar zoom", exact=True).click()
             await viewer.get_by_role("button", name="Aumentar zoom", exact=True).click()
             await expect(viewer.locator(".evidence-zoom-reset")).to_have_text("150%")
@@ -132,6 +210,7 @@ async def test_evidence_viewer_zoom_metadata_download_and_owned_history(tmp_path
             await viewer.get_by_role("button", name="Copiar nome do arquivo", exact=True).click()
             assert await page.evaluate("window.__copied") == ["same.png"]
             expand = viewer.get_by_role("button", name="Ampliar evidência", exact=True)
+            await viewport_element.hover()
             await expand.click()
             await expect(page.locator("#evidence-dialog")).to_be_visible()
             await expect(page.locator("#evidence-preview")).to_have_attribute("src", images["latest-rerun"])
