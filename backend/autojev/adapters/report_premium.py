@@ -156,6 +156,14 @@ def _case_timing(exploration: dict[str, Any], scenario: dict[str, Any]) -> tuple
     return elapsed, first
 
 
+def _case_execution_start(scenario: dict[str, Any], action_start: datetime | None) -> str | None:
+    times = [timestamp for entry in (scenario.get("evidence") or {}).get("timeline") or []
+             if (timestamp := _timestamp(entry.get("occurred_at"))) is not None]
+    if action_start:
+        times.append(action_start)
+    return min(times).isoformat() if times else None
+
+
 def render_premium_report(renderer: Any, exploration: dict[str, Any], scenarios: list[dict[str, Any]], contexts: list[dict[str, Any]], legacy_document: str, fragments: dict[str, Any]) -> str:
     cases, pages, rules = [], OrderedDict(), OrderedDict()
     execution_time = execution_duration_summary(exploration)
@@ -188,7 +196,9 @@ def render_premium_report(renderer: Any, exploration: dict[str, Any], scenarios:
         # timestamp into its last bucket or inflate the original run duration.
         offset = max(0, (first - started).total_seconds()) if original_owner and started and first else None
         signals = evidence.get("technical_signals") or []
-        case = {"index": index, "id": str(scenario.get("id") or f"CT{index+1:03d}"), "title": str(scenario.get("title") or "Caso sem título"), "status": status, "category": category, "page": page, "url": url, "duration_seconds": elapsed, "signals": len(signals), "offset": offset}
+        case = {"index": index, "id": str(scenario.get("id") or f"CT{index+1:03d}"), "title": str(scenario.get("title") or "Caso sem título"), "status": status, "category": category, "page": page, "url": url, "duration_seconds": elapsed, "signals": len(signals), "offset": offset,
+                "started_at": _case_execution_start(scenario, first), "recorded_at": scenario.get("created_at"),
+                "steps_count": len(timeline)}
         revision = scenario.get("execution_revision")
         if isinstance(revision, dict):
             case["execution_revision"] = revision
@@ -205,11 +215,14 @@ def render_premium_report(renderer: Any, exploration: dict[str, Any], scenarios:
                 if isinstance(snapshot, dict):
                     snapshot = localize_report_presentation({"scenarios": [snapshot]})["scenarios"][0]
                     snapshot_timing = {**snapshot, "execution_actions": item.get("actions") or []}
+                    snapshot_elapsed, snapshot_first = _case_timing(exploration, snapshot_timing)
                     summary.update({
                         "title": str(snapshot.get("title") or case["title"]),
                         "category": _category(snapshot),
-                        "duration_seconds": _case_timing(exploration, snapshot_timing)[0],
+                        "duration_seconds": snapshot_elapsed,
                         "signals": len((snapshot.get("evidence") or {}).get("technical_signals") or []),
+                        "started_at": _case_execution_start(snapshot, snapshot_first),
+                        "steps_count": len((snapshot.get("evidence") or {}).get("timeline") or []),
                     })
                     if not item.get("current"):
                         historical = renderer._scenario_card(str(item.get("exploration_id") or exploration["id"]), snapshot)
@@ -301,19 +314,32 @@ def render_premium_report(renderer: Any, exploration: dict[str, Any], scenarios:
     tests += '<div class="table-wrap"><table class="report-table"><thead><tr><th>CT</th><th>Título</th><th>Resultado</th><th>Categoria</th><th>Página</th><th>Tempo da ação</th><th>Sinais</th><th>Detalhes</th></tr></thead><tbody id="case-rows">' + "".join(_case_row(case) for case in cases) + '</tbody></table></div><div class="table-footer"><span id="table-count" role="status"></span><div class="pagination" id="pagination" aria-label="Paginação dos testes"></div><select id="page-size" aria-label="Testes por página"><option value="15">15 por página</option><option value="30">30 por página</option><option value="50">50 por página</option></select></div><p class="muted">Tempo da ação usa horários registrados pelo executor. A duração total inclui navegação, revisões auxiliares e relatório.</p>'
     results = (
         '<div class="result-navigation">'
-        '<div class="result-location"><button id="case-back" class="button button-ghost">← Voltar para testes</button>'
-        '<h1 id="result-view-title" tabindex="-1">Resultado do teste</h1></div>'
+        '<div class="result-location"><div class="result-breadcrumb"><button id="case-back" class="button button-ghost" aria-label="Voltar para testes">Resultados</button>'
+        '<span aria-hidden="true">/</span><strong id="result-case-code"></strong><span aria-hidden="true">›</span></div>'
+        '<h1 id="result-view-title" class="result-sr-only" tabindex="-1">Resultado do teste</h1></div>'
         '<div class="result-actions"><div class="result-case-navigation" role="group" aria-label="Navegar entre testes">'
         '<button id="case-rerun" class="button button-rerun" aria-describedby="case-rerun-feedback" hidden><span aria-hidden="true">↻</span> Reexecutar teste</button>'
         '<button id="case-history" class="button button-ghost" title="Histórico" aria-haspopup="dialog" aria-controls="case-history-dialog">'
         + _icon("clock") + 'Histórico <span id="case-history-count"></span></button>'
         '<button id="case-edit" class="button button-ghost" data-edit-current>Editar passos</button>'
-        '<button id="case-prev" class="button button-ghost">← Teste anterior</button>'
-        '<button id="case-next" class="button button-ghost">Teste seguinte →</button></div>'
-        '<div id="result-report-actions" class="result-report-actions"></div></div></div>'
+        '<details id="result-more" class="result-more"><summary class="button button-ghost">··· Mais <span aria-hidden="true">⌄</span></summary>'
+        '<div id="result-more-actions" class="result-more-actions"><button id="case-prev" class="button button-ghost">← Teste anterior</button>'
+        '<button id="case-next" class="button button-ghost">Teste seguinte →</button></div></details></div>'
+        '<div id="result-report-actions" class="result-report-actions"></div></div>'
+        '<div class="result-heading"><h2 id="case-title">Detalhes do caso</h2><span id="result-case-status" class="badge"></span></div></div>'
         '<p id="case-rerun-feedback" class="case-rerun-feedback" role="status" aria-live="polite" hidden></p>'
-        '<h2 id="case-title" class="result-title">Detalhes do caso</h2><section id="scenarios">'
+        '<section id="case-execution-history" class="case-execution-history" aria-labelledby="case-execution-history-title">'
+        '<div class="execution-history-heading"><h2 id="case-execution-history-title">' + _icon("clock") + 'Histórico de execuções</h2>'
+        '<span id="case-execution-total" class="muted"></span></div>'
+        '<div class="execution-history-track"><ol id="case-execution-list" aria-label="Selecionar execução deste teste"></ol>'
+        '<button id="case-executions-all" class="button button-ghost" aria-expanded="false">Ver todas →</button></div></section>'
+        '<section id="case-execution-summary" class="case-execution-summary" aria-label="Execução selecionada">'
+        '<div id="case-execution-metadata" class="case-execution-metadata"></div>'
+        '<button id="case-compare" class="button button-ghost">' + _icon("settings") + 'Comparar execução</button></section>'
+        '<p id="case-execution-note" class="case-execution-note" role="status" aria-live="polite" hidden></p>'
+        '<section id="scenarios">'
         + ("".join(case_html) or _empty("Nenhum caso individual registrado nesta execução.")) + '</section>'
+        '<section id="case-selected-execution" class="case-selected-execution" aria-label="Evidências da execução selecionada" hidden></section>'
         '<div id="case-history-archive" hidden aria-hidden="true">' + "".join(history_html) + '</div>'
     )
     evidence_view = '<div class="report-tools"><input id="evidence-search" class="search" type="search" aria-label="Buscar evidências" placeholder="Buscar por CT, página ou arquivo"><div class="filters"><button class="active" data-evidence-filter="all">Todas</button><button data-evidence-filter="screenshot">Capturas</button><button data-evidence-filter="log">Console e rede</button><button data-evidence-filter="data">Dados</button></div></div><p class="muted">Capturas e registros reais desta execução. Nenhum vídeo foi registrado. Cada arquivo aparece uma vez na galeria, com links para todos os CTs que compartilham a captura.</p><div class="evidence-grid" id="evidence-grid">' + ("".join(evidence_cards) or _empty("Nenhuma evidência associada a um CT está disponível.")) + '</div>' + fragments["observations"]

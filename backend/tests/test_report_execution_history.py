@@ -123,6 +123,8 @@ def test_histories_embed_all_offline_evidence_without_extra_current_cts(tmp_path
     history = payload["cases"][0]["execution_history"]
     assert [item["version"] for item in history] == [0, 1, 2, 3]
     assert history[2]["current"] is True
+    assert history[2]["started_at"] == "2026-10-18T12:00:00+00:00"
+    assert history[2]["steps_count"] == len(fixture()["scenarios"][0]["evidence"]["timeline"])
     assert history[3]["has_result"] is False and history[3]["run_status"] == "canceled"
     assert all("scenario" not in item and "actions" not in item for item in history)
     assert "private-selector-not-in-report" not in document
@@ -147,6 +149,15 @@ def test_revision_without_owner_actions_does_not_borrow_original_step_duration(t
     del run["scenarios"][0]["execution_actions"]
     _, payload, _ = render(tmp_path, run)
     assert payload["cases"][0]["duration_seconds"] == 7
+
+
+def test_execution_date_uses_its_first_recorded_evidence_and_keeps_action_duration(tmp_path):
+    run = fixture()
+    run["scenarios"][0]["execution_history"][1]["scenario"]["evidence"]["timeline"][0]["occurred_at"] = "2026-10-18T11:59:20Z"
+    _, payload, _ = render(tmp_path, run)
+    older = payload["cases"][0]["execution_history"][1]
+    assert older["started_at"] == "2026-10-18T11:59:20+00:00"
+    assert older["duration_seconds"] == 7
 
 
 def test_history_dom_ids_and_internal_accessibility_references_are_namespaced():

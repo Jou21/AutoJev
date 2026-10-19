@@ -113,6 +113,9 @@
     const prefersReducedMotion = () => window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     let activeView = "overview";
     let selectedCase = cases.length ? String(cases[0].index) : null;
+    const selectedExecutions = new Map();
+    const expandedExecutions = new Set();
+    let displayedHistory = null;
     let selectedStatus = "ALL";
     let pageNumber = 1;
     let filteredCases = cases.slice();
@@ -302,10 +305,12 @@
         feedback("Guarde o rascunho antes de reexecutar para incluir as pausas para print que você acabou de editar. Nenhuma reexecução foi solicitada.");
         return;
       }
-      const plan = caseCapturePlan(key);
-      const owner = typeof current.rerun_source_exploration_id === "string" && current.rerun_source_exploration_id
+      const revision = selectedExecution(current);
+      if (!revision.has_result) { feedback("Esta tentativa não tem resultado registrado. Selecione uma execução com resultado para reexecutar o teste."); return; }
+      const plan = revision.current ? caseCapturePlan(key) : null;
+      const owner = !revision.current ? revision.exploration_id : typeof current.rerun_source_exploration_id === "string" && current.rerun_source_exploration_id
         ? current.rerun_source_exploration_id : reportConnection.sourceId;
-      const scenario = typeof current.rerun_source_scenario_id === "string" && current.rerun_source_scenario_id
+      const scenario = !revision.current ? revision.scenario_id : typeof current.rerun_source_scenario_id === "string" && current.rerun_source_scenario_id
         ? current.rerun_source_scenario_id : String(current.id);
       const target = reportConnection.appUrl + "/#/reexecutar/" + encodeURIComponent(owner) + "/" + encodeURIComponent(scenario)
         + (plan ? "?capture_plan=" + encodeURIComponent(JSON.stringify(plan)) : "");
@@ -632,10 +637,16 @@
     // single instance and its listeners when navigating to another report view.
     const reportToolbar = document.querySelector(".report-topbar .toolbar");
     const reportToolbarHome = reportToolbar && reportToolbar.parentElement;
+    const reportPrint = $("print-report");
 
     function syncResultHeader(view) {
       const destination = view === "results" ? $("result-report-actions") : reportToolbarHome;
       if (reportToolbar && destination && reportToolbar.parentElement !== destination) destination.appendChild(reportToolbar);
+      const more = $("result-more-actions");
+      if (reportPrint && more && reportToolbar) {
+        const printDestination = view === "results" ? more : reportToolbar;
+        if (reportPrint.parentElement !== printDestination) printDestination.appendChild(reportPrint);
+      }
     }
 
     function inlineSequence(model) {
@@ -661,6 +672,12 @@
       const selectedKey = requestedKey || selected && selected.key || "original:0";
       model.list.replaceChildren();
       model.draftPanels.replaceChildren();
+      if (model.readOnly) {
+        model.items = model.originalItems.slice();
+        model.items.forEach((item) => (item.kind === "summary" ? model.summaryActions : model.list).appendChild(item.button));
+        syncCaseStepAvailability(model);
+        return;
+      }
       const sequence = inlineSequence(model);
       const draftCount = sequence.filter(isDraft).length;
       const create = (tag, className, label) => {
@@ -721,7 +738,7 @@
         model.list.appendChild(gap);
       };
       model.items = [model.originalItems[0]];
-      model.list.appendChild(model.originalItems[0].button);
+      model.summaryActions.appendChild(model.originalItems[0].button);
       sequence.forEach((entry, sequenceIndex) => {
         addGap(sequenceIndex);
         if (entry.type === "recorded") {
@@ -836,6 +853,9 @@
       text(model.position, selected.kind === "summary" ? "Visão geral do teste" : selected.draftId
         ? "Passo extra · Rascunho visual · Não executado"
         : "Etapa " + selected.originalIndex + " de " + (model.originalItems.length - 1) + " · " + selected.kindLabel);
+      const time = selected.node.querySelector("time");
+      text(model.timestamp, time && time.getAttribute("datetime") ? executionDate({ started_at: time.getAttribute("datetime") })
+        : time ? time.textContent : "Horário não registrado");
       const cursor = available.findIndex((item) => item.index === index);
       model.previous.disabled = cursor <= 0;
       model.next.disabled = cursor === available.length - 1;
@@ -850,6 +870,11 @@
       const visible = model.originalItems.slice(1).filter((item) => !item.button.hidden).length;
       const total = model.originalItems.length - 1;
       text(model.count, visible === total ? total + " registros na linha do tempo" : visible + " de " + total + " registros visíveis");
+      text(model.progress, visible + " / " + total);
+      model.progress.setAttribute("aria-label", visible + " de " + total + " etapas registradas visíveis");
+      const recorded = model.originalItems.slice(1).filter((item) => !item.button.hidden);
+      model.originalItems.forEach((item) => item.button.removeAttribute("data-step-last"));
+      if (recorded.length) recorded[recorded.length - 1].button.setAttribute("data-step-last", "true");
       selectCaseStep(model, model.selected);
     }
 
@@ -962,7 +987,8 @@
     }
 
     function ensureCaseExplorer(detail) {
-      const key = detail.dataset.caseIndex;
+      const readOnly = detail.hasAttribute("data-history-case-index");
+      const key = readOnly ? "history-" + detail.dataset.historyCaseIndex + "-" + detail.dataset.historyVersion : detail.dataset.caseIndex;
       if (caseExplorers.has(key)) return caseExplorers.get(key);
       const body = detail.querySelector(".scenario-body");
       if (!body) return null;
@@ -983,11 +1009,16 @@
       const workspace = make("div", "case-workspace");
       const sidebar = make("aside", "case-step-sidebar");
       sidebar.setAttribute("aria-label", "Passos e evidências do CT");
+      sidebar.dataset.readOnly = String(readOnly);
       const sidebarHeader = make("div", "case-step-sidebar-header");
-      const count = make("small", "case-step-count");
-      sidebarHeader.append(make("h3", "", "Passos e evidências"), count);
+      const count = make("small", "case-step-count result-sr-only");
+      const progress = make("span", "case-step-progress");
+      const summaryActions = make("div", "case-step-header-tools");
+      summaryActions.appendChild(progress);
+      sidebarHeader.append(make("h3", "", "Passos e evidências"), count, summaryActions);
       if (timeline.dataset.stepOrder === "planned") {
-        sidebarHeader.append(make("small", "case-step-order-note", "Ordem dos passos planejada · horários reais preservados"));
+        sidebarHeader.append(make("small", "case-step-order-note result-sr-only", "Ordem dos passos planejada · horários reais preservados"));
+        sidebarHeader.setAttribute("title", "Ordem dos passos planejada · horários reais preservados");
       }
       const inlineFeedback = make("p", "case-inline-feedback");
       inlineFeedback.hidden = true;
@@ -1004,15 +1035,15 @@
       const title = make("h3", "case-selected-title");
       title.id = "case-selected-title-" + key;
       stage.setAttribute("aria-labelledby", title.id);
-      caption.append(position, title);
+      caption.append(make("h3", "case-stage-heading", "Detalhes da etapa"), position, title);
       const content = make("div", "case-step-content");
       content.tabIndex = 0;
       content.setAttribute("aria-label", "Detalhes e evidências do passo selecionado");
       const draftPanels = make("div", "case-draft-panels");
       content.append(summary, timeline, draftPanels);
       const model = {
-        key, detail, workspace, list, content, count, position, title, items: [], originalItems: [],
-        selected: entries.length ? 1 : 0, inlineDrag: null, inlineFeedback, draftPanels,
+        key, detail, workspace, list, content, count, progress, summaryActions, position, title, items: [], originalItems: [],
+        selected: entries.length ? 1 : 0, inlineDrag: null, inlineFeedback, draftPanels, readOnly,
       };
       const move = (direction) => {
         const available = model.items.map((item, index) => ({ item, index })).filter(({ item }) => !item.button.hidden);
@@ -1025,6 +1056,8 @@
       model.next = button("Próximo →", () => move(1), "button button-ghost case-step-next");
       model.next.setAttribute("aria-label", "Próximo passo");
       const controls = make("div", "case-step-controls");
+      model.timestamp = make("span", "case-step-timestamp");
+      controls.appendChild(model.timestamp);
       controls.append(model.previous, model.next);
       toolbar.append(caption, controls);
       stage.append(toolbar, content);
@@ -1084,14 +1117,31 @@
         control.dataset.stepState = result.state;
         control.setAttribute("aria-controls", item.node.id);
         control.setAttribute("aria-label", (index ? "Etapa " + index + ": " : "") + sidebarTitle + ". " + description + " Resultado: " + outcome + ".");
+        if (!index) control.setAttribute("title", "Ver resumo do resultado: " + outcome);
         const copy = make("span", "step-copy");
         const status = make("span", "step-status");
         status.dataset.stepState = result.state;
         const icon = make("span", "step-status-icon", state.symbol);
         icon.setAttribute("aria-hidden", "true");
         status.append(icon, make("span", "step-status-label", outcome));
-        copy.append(make("span", "step-kind", kindLabel), make("span", "step-label", sidebarTitle), make("small", "step-description", description), status);
+        const descriptionNode = make("small", "step-description", description);
+        descriptionNode.setAttribute("title", description);
+        let caption = description;
+        if (item.kind === "observation" && item.node.dataset.imageSource === "user_upload") caption = "Imagem escolhida pelo usuário.";
+        else if (item.kind === "observation" && result.state === "recorded") caption = /^Antes/i.test(item.title)
+          ? "Captura da página antes da ação." : /^Depois/i.test(item.title) ? "Captura da página após a ação." : "Captura da página registrada.";
+        else if (item.kind === "action") caption = "Ação: " + item.title.charAt(0).toLocaleLowerCase("pt-BR") + item.title.slice(1) + ".";
+        else if (item.kind === "assertion") caption = result.state === "fail" ? "Resultado diferente do esperado."
+          : result.state === "unknown" ? "Conferência sem resultado registrado."
+          : /opção/i.test(sidebarTitle) ? "Confirmação da opção escolhida."
+          : /ordena/i.test(sidebarTitle) ? "Conferência da ordem dos produtos."
+          : /erros/i.test(sidebarTitle) ? "Verificação de erros da aplicação." : "Conferência do resultado registrado.";
+        const compact = make("small", "step-caption", caption);
+        compact.setAttribute("aria-hidden", "true");
+        compact.setAttribute("title", description);
+        copy.append(make("span", "step-kind", kindLabel), make("span", "step-label", sidebarTitle), descriptionNode, compact, status);
         control.append(make("span", "step-number", index ? String(index).padStart(2, "0") : "i"), copy);
+        control.appendChild(make("span", "step-selected-tag", "Selecionado"));
         list.appendChild(control);
         originalItem.button = control;
         model.items.push(originalItem);
@@ -1155,17 +1205,168 @@
       }
     }
 
+    function executionHistory(current) {
+      const history = current && current.execution_history;
+      if (Array.isArray(history) && history.length) return history.filter((item) => item && Number.isInteger(item.version) && item.version >= 0);
+      return current ? [{ ...current, version: 0, current: true, has_result: true,
+        exploration_id: current.rerun_source_exploration_id || data.run_id,
+        scenario_id: current.rerun_source_scenario_id || current.id }] : [];
+    }
+
+    function selectedExecution(current) {
+      const history = executionHistory(current);
+      return history.find((item) => item.version === selectedExecutions.get(String(current && current.index)))
+        || history.find((item) => item.current) || history.filter((item) => item.has_result).at(-1) || history.at(-1) || {};
+    }
+
+    function executionDate(revision, compact = false) {
+      const date = new Date(revision.started_at || revision.recorded_at || "");
+      if (Number.isNaN(date.getTime())) return "Horário não registrado";
+      return compact ? date.toLocaleString("pt-BR", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })
+        : date.toLocaleString("pt-BR", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit", timeZoneName: "short" });
+    }
+
+    function executionDuration(value) {
+      if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return "Duração não registrada";
+      const seconds = Math.round(value);
+      return [Math.floor(seconds / 3600), Math.floor(seconds / 60) % 60, seconds % 60].map((part) => String(part).padStart(2, "0")).join(":");
+    }
+
+    function executionVerdict(revision) {
+      return verdictLabels[revision.status] || ({ running: "Em execução", queued: "Na fila", waiting_input: "Aguardando você",
+        cancelled: "Cancelada", canceled: "Cancelada", failed: "Interrompida", postprocessing: "Gerando relatório" })[revision.run_status] || "Sem resultado";
+    }
+
+    function executionNode(tag, className, label) {
+      const node = document.createElement(tag);
+      node.className = className;
+      if (label != null) node.textContent = label;
+      return node;
+    }
+
+    function archivedExecution(current, revision) {
+      return all("details[data-history-case-index][data-history-version]").find((item) =>
+        !item.closest("#case-history-dialog") && item.dataset.historyCaseIndex === String(current.index)
+        && item.dataset.historyVersion === String(revision.version));
+    }
+
+    function selectExecution(version) {
+      const current = byIndex.get(selectedCase);
+      if (!executionHistory(current).some((item) => item.version === version)) return;
+      if (stepPickerRequest) closeStepPicker();
+      const focusTimeline = document.activeElement && document.activeElement.closest("#case-execution-list");
+      selectedExecutions.set(selectedCase, version);
+      navigate("results", false);
+      if (focusTimeline) {
+        const control = $("case-execution-list").querySelector('[data-execution-version="' + version + '"]');
+        if (control) control.focus({ preventScroll: true });
+      }
+    }
+
+    function renderExecutionHistory(current) {
+      const list = $("case-execution-list"), metadata = $("case-execution-metadata"), host = $("case-selected-execution");
+      if (!current || !list || !metadata || !host) return;
+      const history = executionHistory(current), revision = selectedExecution(current);
+      const newest = Math.max(...history.map((item) => item.version));
+      const recent = history.slice().sort((left, right) => right.version - left.version);
+      const expanded = expandedExecutions.has(selectedCase);
+      let visible = expanded ? recent : recent.slice(0, 4);
+      if (!visible.some((entry) => entry.version === revision.version)) visible = visible.slice(0, 3).concat(revision);
+      list.replaceChildren();
+      visible.forEach((entry) => {
+        const selected = entry.version === revision.version;
+        const control = button("", () => selectExecution(entry.version), "execution-card" + (selected ? " active" : ""));
+        control.dataset.executionVersion = String(entry.version);
+        control.dataset.status = entry.status || "";
+        control.setAttribute("aria-pressed", String(selected));
+        control.setAttribute("aria-label", "Execução " + (entry.version + 1) + ", " + executionDate(entry) + ", " + executionVerdict(entry)
+          + (entry.version === newest ? ", mais recente" : "") + (selected ? ", selecionada" : ""));
+        control.appendChild(executionNode("strong", "execution-card-title", "Execução #" + (entry.version + 1)));
+        if (entry.version === newest) control.appendChild(executionNode("span", "execution-latest-tag", "Mais recente"));
+        const time = executionNode("time", "execution-card-time", executionDate(entry, true));
+        const date = new Date(entry.started_at || entry.recorded_at || "");
+        if (!Number.isNaN(date.getTime())) time.setAttribute("datetime", date.toISOString());
+        const outcome = executionNode("span", "execution-card-outcome");
+        outcome.dataset.status = entry.status || "";
+        outcome.append(executionNode("span", "execution-outcome-icon", ({ PASS: "✓", FAIL: "×", BLOCKED: "!" })[entry.status] || "·"),
+          executionNode("span", "", executionVerdict(entry)), executionNode("span", "execution-card-duration", executionDuration(entry.duration_seconds)));
+        control.append(time, outcome);
+        outcome.setAttribute("title", "Resultado do teste e duração da ação registrada");
+        const item = executionNode("li", "execution-history-item"); item.appendChild(control); list.appendChild(item);
+      });
+      text($("case-execution-total"), history.length + (history.length === 1 ? " execução registrada" : " execuções registradas"));
+      const allButton = $("case-executions-all");
+      if (allButton) {
+        allButton.hidden = history.length <= 4;
+        allButton.setAttribute("aria-expanded", String(expanded));
+        text(allButton, expanded ? "Recolher ↑" : "Ver todas (" + history.length + ") →");
+      }
+      metadata.replaceChildren(executionNode("strong", "execution-summary-title", "Execução #" + (revision.version + 1)));
+      if (revision.version === newest) metadata.appendChild(executionNode("span", "execution-latest-tag", "Mais recente"));
+      else metadata.appendChild(executionNode("span", "execution-historical-tag", "Execução anterior"));
+      if (revision.current && revision.version !== newest) metadata.appendChild(executionNode("span", "execution-current-tag", "Último resultado"));
+      const info = [executionDate(revision), "Ação: " + executionDuration(revision.duration_seconds),
+        typeof revision.steps_count === "number" ? revision.steps_count + " etapas" : "Etapas não registradas",
+        typeof revision.signals === "number" ? revision.signals + " sinais técnicos" : "Sinais não registrados",
+        revision.version === 0 ? "Origem: exploração inicial" : "Origem: reexecução de CT"];
+      info.forEach((label) => metadata.appendChild(executionNode("span", "execution-summary-item", label)));
+      const note = $("case-execution-note");
+      if (note) {
+        const message = !revision.has_result ? "Esta tentativa não produziu um resultado de teste. O resultado anterior foi preservado."
+          : revision.version !== newest ? "Você está vendo a execução #" + (revision.version + 1) + ". A tentativa mais recente é a #" + (newest + 1) + "."
+          : "";
+        note.replaceChildren();
+        if (message) note.appendChild(executionNode("span", "", message));
+        if (revision.version !== newest) note.appendChild(button("Ver mais recente →", () => selectExecution(newest), "button button-ghost"));
+        note.hidden = !message;
+      }
+      if ($("case-compare")) $("case-compare").disabled = history.filter((item) => item.has_result).length < 2;
+      text($("case-title"), (revision.current ? current.title : revision.title) || current.title || current.id);
+      text($("result-case-code"), current.id);
+      const badge = $("result-case-status");
+      if (badge) { badge.className = "badge " + (revision.status || "SKIPPED").toLowerCase(); text(badge, executionVerdict(revision)); }
+      const identity = selectedCase + ":" + revision.version;
+      if (displayedHistory && displayedHistory.identity !== identity) {
+        $("case-history-archive").appendChild(displayedHistory.detail);
+        displayedHistory = null;
+      }
+      host.replaceChildren();
+      host.hidden = !!revision.current;
+      $("scenarios").hidden = !revision.current;
+      if (!revision.current) {
+        const detail = revision.has_result && (displayedHistory && displayedHistory.detail || archivedExecution(current, revision));
+        if (detail) {
+          detail.hidden = false; detail.open = true;
+          host.appendChild(detail); displayedHistory = { identity, detail };
+          ensureCaseExplorer(detail);
+        } else {
+          const empty = executionNode("div", "execution-empty");
+          empty.append(executionNode("span", "execution-empty-icon", "◷"), executionNode("h2", "", executionVerdict(revision)),
+            executionNode("p", "", revision.has_result ? "As evidências desta execução não estão disponíveis neste arquivo."
+              : "Esta tentativa não tem passos ou evidências de um resultado concluído. Consulte outra execução na linha do tempo."));
+          const latestResult = history.find((item) => item.current);
+          if (latestResult) empty.appendChild(button("Ver último resultado disponível", () => selectExecution(latestResult.version), "button button-primary"));
+          host.appendChild(empty);
+        }
+      }
+    }
+
     function updateCaseNavigation() {
       const current = byIndex.get(selectedCase);
       const position = cases.findIndex((item) => String(item.index) === selectedCase);
+      const revision = selectedExecution(current);
       text($("case-title"), current ? current.title || current.id || "Caso de teste" : "Nenhum caso disponível");
       if ($("case-rerun")) {
         $("case-rerun").hidden = !reportConnection;
-        $("case-rerun").disabled = !current;
+        $("case-rerun").disabled = !current || !revision.has_result;
         $("case-rerun").setAttribute("aria-label", current ? "Reexecutar teste " + current.id : "Reexecutar teste");
       }
       const feedback = $("case-rerun-feedback");
       if (feedback) { feedback.hidden = true; feedback.textContent = ""; }
+      if ($("case-edit")) {
+        $("case-edit").disabled = !revision.current;
+        $("case-edit").title = revision.current ? "Editar passos do último resultado" : "Execuções anteriores são preservadas para consulta";
+      }
       if ($("case-prev")) $("case-prev").disabled = position <= 0;
       if ($("case-next")) $("case-next").disabled = position < 0 || position >= cases.length - 1;
       const history = current && Array.isArray(current.execution_history) ? current.execution_history : [];
@@ -1176,6 +1377,7 @@
         detail.hidden = !selected;
         if (selected) { detail.open = true; ensureCaseExplorer(detail); }
       });
+      renderExecutionHistory(current);
     }
 
     function closeCaseHistory() {
@@ -1202,17 +1404,28 @@
           control.classList.toggle("active", selected);
           control.setAttribute("aria-pressed", String(selected));
         });
-        const label = revision.version === 0 ? "Execução original" : "Reexecução " + revision.version;
+        const label = "Execução #" + (revision.version + 1) + (revision.version === 0 ? " · Original" : "");
         text($("case-history-note"), label + (revision.current ? " · Resultado atual da lista de testes" : " · Versão histórica, somente leitura"));
         if (revision.current) {
           const message = document.createElement("p");
           message.textContent = "Esta é a versão mostrada na lista de testes. As versões anteriores continuam disponíveis na linha do tempo ao lado.";
-          content.append(message, button("Ver resultado atual", closeCaseHistory, "button button-primary"));
+          content.append(message, button("Ver resultado atual", () => { closeCaseHistory(); selectExecution(revision.version); }, "button button-primary"));
           return;
         }
-        const archive = all("#case-history-archive details[data-history-case-index][data-history-version]")
-          .find((item) => item.dataset.historyCaseIndex === String(current.index)
-            && item.dataset.historyVersion === String(revision.version));
+        content.appendChild(button("Abrir esta execução na tela →", () => { closeCaseHistory(); selectExecution(revision.version); }, "button button-primary"));
+        const latest = revisions.find((item) => item.current);
+        if (latest && revision.has_result) {
+          const comparison = executionNode("div", "execution-comparison");
+          [revision, latest].forEach((entry) => {
+            const card = executionNode("div", "execution-comparison-card");
+            card.append(executionNode("strong", "", "Execução #" + (entry.version + 1) + (entry.current ? " · Último resultado" : " · Comparando")),
+              executionNode("span", "", executionDate(entry)), executionNode("span", "", executionVerdict(entry) + " · Ação: " + executionDuration(entry.duration_seconds)),
+              executionNode("small", "", (entry.steps_count ?? "—") + " etapas · " + (entry.signals ?? "—") + " sinais técnicos"));
+            comparison.appendChild(card);
+          });
+          content.appendChild(comparison);
+        }
+        const archive = archivedExecution(current, revision);
         if (!revision.has_result || !archive) {
           const message = document.createElement("p");
           message.className = "reading-guide";
@@ -1223,6 +1436,13 @@
           return;
         }
         const detail = archive.cloneNode(true);
+        const enhancedSummary = detail.querySelector(".case-summary-panel"), enhancedTimeline = detail.querySelector(".evidence-timeline");
+        if (enhancedSummary && enhancedTimeline) {
+          detail.querySelector(".scenario-body").replaceChildren(...Array.from(enhancedSummary.childNodes), enhancedTimeline);
+          detail.classList.remove("step-explorer");
+          enhancedTimeline.classList.remove("case-timeline-panels");
+          Array.from(enhancedTimeline.children).forEach((entry) => { entry.hidden = false; });
+        }
         // The immutable archived card remains available for later visits. Its
         // visible clone gets a separate ID namespace, including internal links.
         const ids = new Map();
@@ -1246,21 +1466,23 @@
         if (!revision || !Number.isInteger(revision.version) || revision.version < 0) return;
         const control = button("", () => select(revision), "case-history-version");
         const title = document.createElement("strong");
-        title.textContent = (revision.version === 0 ? "Execução original" : "Reexecução " + revision.version)
-          + (revision.current ? " · Atual" : "");
+        const newest = Math.max(...revisions.map((entry) => entry.version));
+        title.textContent = "Execução #" + (revision.version + 1) + (revision.version === 0 ? " · Original" : "")
+          + (revision.version === newest ? " · Mais recente" : revision.current ? " · Último resultado" : "");
         const date = document.createElement("time");
-        const recorded = new Date(revision.recorded_at || "");
-        date.textContent = Number.isNaN(recorded.getTime()) ? "Horário não registrado" : recorded.toLocaleString("pt-BR");
+        const recorded = new Date(revision.started_at || revision.recorded_at || "");
+        date.textContent = executionDate(revision);
         if (!Number.isNaN(recorded.getTime())) date.dateTime = recorded.toISOString();
         const result = document.createElement("span");
         result.className = "case-history-verdict";
         result.dataset.status = revision.status || "";
-        result.textContent = verdictLabels[revision.status] || ({ running: "Em execução", queued: "Na fila", waiting_input: "Aguardando você", cancelled: "Cancelada", failed: "Interrompida" })[revision.run_status] || "Sem resultado";
+        result.textContent = executionVerdict(revision);
         const item = document.createElement("li");
         control.append(title, date, result); item.appendChild(control); list.appendChild(item);
         controls.push({ control, value: revision });
       });
-      const first = revisions.find((revision) => !revision.current) || revisions[0];
+      const active = selectedExecution(current);
+      const first = !active.current ? active : revisions.find((revision) => !revision.current && revision.has_result) || revisions[0];
       if (first) select(first);
       if (typeof dialog.showModal === "function") dialog.showModal(); else dialog.setAttribute("open", "");
       if (controls.length) controls[0].control.focus();
@@ -1306,7 +1528,7 @@
       showView(view, focus);
       const current = byIndex.get(selectedCase);
       const hash = view === "results" && current
-        ? "#view/results/" + encodeURIComponent(String(current.id))
+        ? "#view/results/" + encodeURIComponent(String(current.id)) + (!selectedExecution(current).current ? "?execution=" + selectedExecution(current).version : "")
         : "#view/" + view;
       if (window.location.hash !== hash) window.history.replaceState(null, "", hash);
     }
@@ -1337,7 +1559,8 @@
         });
         return;
       }
-      const parts = hash.split("/");
+      const [routeHash, query] = hash.split("?");
+      const parts = routeHash.split("/");
       if (parts[0] !== "view" || !Object.prototype.hasOwnProperty.call(views, parts[1])) {
         if (!hash) showView("overview", focus);
         return;
@@ -1346,6 +1569,8 @@
         const current = byId.get(parts.slice(2).join("/"));
         if (!current) return;
         selectedCase = String(current.index);
+        const requested = query && query.match(/(?:^|&)execution=(\d+)(?:&|$)/);
+        if (requested && executionHistory(current).some((entry) => entry.version === Number(requested[1]))) selectedExecutions.set(selectedCase, Number(requested[1]));
       }
       showView(parts[1], focus);
     }
@@ -1365,6 +1590,7 @@
     document.addEventListener("click", (event) => {
       const target = event.target instanceof Element ? event.target : null;
       if (!target) return;
+      if ($("result-more") && !target.closest("#result-more")) $("result-more").removeAttribute("open");
       const open = target.closest("[data-open-case]");
       if (open) { event.preventDefault(); openCase(open.dataset.openCase); return; }
       const caseRow = target.closest("#case-rows tr[data-case-index]");
@@ -1383,6 +1609,7 @@
       const edit = target.closest("[data-edit-case], [data-edit-current]");
       if (edit) {
         event.preventDefault();
+        if (edit.hasAttribute("data-edit-current") && !selectedExecution(byIndex.get(selectedCase)).current) return;
         openEditor(edit.hasAttribute("data-edit-current") ? selectedCase : edit.dataset.editCase, edit);
         return;
       }
@@ -1463,12 +1690,18 @@
       if (feedback) feedback.hidden = false;
     }));
     listen("case-history", "click", openCaseHistory);
+    listen("case-compare", "click", openCaseHistory);
+    listen("case-executions-all", "click", () => {
+      if (expandedExecutions.has(selectedCase)) expandedExecutions.delete(selectedCase); else expandedExecutions.add(selectedCase);
+      renderExecutionHistory(byIndex.get(selectedCase));
+    });
     listen("case-history-close", "click", closeCaseHistory);
     listen("case-history-dialog", "cancel", (event) => { event.preventDefault(); closeCaseHistory(); });
     document.addEventListener("keydown", (event) => {
       if (event.defaultPrevented || event.key !== "Escape") return;
       if ($("step-picker") && $("step-picker").hasAttribute("open")) { event.preventDefault(); closeStepPicker(); }
       else if ($("case-editor") && $("case-editor").hasAttribute("open")) { event.preventDefault(); closeEditor(); }
+      else if ($("result-more") && $("result-more").hasAttribute("open")) { event.preventDefault(); $("result-more").removeAttribute("open"); }
       else closeJourneyPickers(true);
     });
     window.addEventListener("resize", scheduleJourneyLayout);
@@ -1487,10 +1720,12 @@
     window.addEventListener("hashchange", () => revealHash(true));
     listen("case-back", "click", () => navigate("tests"));
     listen("case-prev", "click", () => {
+      if ($("result-more")) $("result-more").removeAttribute("open");
       const index = cases.findIndex((item) => String(item.index) === selectedCase);
       if (index > 0) openCase(cases[index - 1].index);
     });
     listen("case-next", "click", () => {
+      if ($("result-more")) $("result-more").removeAttribute("open");
       const index = cases.findIndex((item) => String(item.index) === selectedCase);
       if (index >= 0 && index + 1 < cases.length) openCase(cases[index + 1].index);
     });
@@ -1612,6 +1847,14 @@
       };
       reveal.forEach((element) => { element.hidden = false; });
       printState.details.forEach(([element]) => { element.open = true; });
+      if (activeView === "results" && displayedHistory) {
+        // Print the selected historical evidence under its own execution date.
+        all('.report-view[data-view], #scenarios').forEach((element) => {
+          if (element.dataset.view === "results") return;
+          printState.styles.set(element, element.getAttribute("style"));
+          element.style.setProperty("display", "none", "important");
+        });
+      }
       if (!document.body.classList.contains("hide-screenshots")) {
         // Unvisited cases have not built their step explorer yet. Their action
         // captures still need the exact same target overlay in the printed report.
@@ -1768,6 +2011,7 @@
       const base = reportConnection.apiUrl + "/explorations/" + encodeURIComponent(reportConnection.sourceId);
       const options = { cache: "no-store", credentials: "omit", redirect: "error" };
       const hasLocalWork = () => savedDrafts.size > 0
+        || (activeView === "results" && !selectedExecution(byIndex.get(selectedCase)).current)
         || ["case-editor", "step-picker", "case-history-dialog"].some((id) => $(id) && $(id).hasAttribute("open"));
       const stop = () => {
         stopped = true;

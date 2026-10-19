@@ -1154,7 +1154,7 @@ test("each visible insertion boundary survives rerun handoff and export without 
     const list = card.querySelector(".case-step-list");
     const visibleCards = list.children.filter((entry) => entry.classList.contains("case-inline-draft")
       || entry.classList.contains("case-step-button"));
-    assert.equal(visibleCards.indexOf(draft), gap + 1, "the non-executable case summary must not consume a capture gap");
+    assert.equal(visibleCards.indexOf(draft), gap, "the case summary stays in the header and does not consume a capture gap");
     rerunFromEditor(document);
     const plan = JSON.parse(new URLSearchParams(window.openedTabs.at(-1)[0].split("?")[1]).get("capture_plan"));
     assert.deepEqual(plan, { version: 1, checkpoints: [{ id: draft.dataset.draftId, gap, order: 0 }] });
