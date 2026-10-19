@@ -202,3 +202,59 @@ body[data-density="compact"] .journey-page-card { padding-top: 9px; padding-bott
   .journey-sequence-details { break-inside: avoid; }
   .journey-sequence-details .journey-sequence { overflow: visible; flex-wrap: wrap; }
 }
+
+/* A separate workspace for planning a rerun; the result remains read-only. */
+@media screen {
+  dialog.case-editor-dialog.case-rerun-planner { width: min(1600px, calc(100vw - 40px)); max-width: calc(100vw - 40px); height: min(850px, calc(100dvh - 40px)); max-height: calc(100dvh - 40px); border-radius: 16px; }
+  .case-rerun-planner .case-editor-header { padding: 23px 26px 20px; background: linear-gradient(110deg, var(--panel), var(--surface)); }
+  .case-rerun-planner .case-editor-header .page-kicker { color: var(--accent); letter-spacing: .1em; font-size: 10px; }
+  .case-rerun-planner .case-editor-header h2 { margin-top: 8px; font-size: clamp(17px, 1.6vw, 24px); }
+  .case-rerun-planner .case-editor-notice { margin: 14px 22px 0; padding: 11px 14px; border-left: 3px solid var(--accent); }
+  .case-rerun-planner .case-editor-layout { grid-template-columns: 225px minmax(0, 1fr); margin-top: 14px; }
+  .case-rerun-planner .case-editor-palette { padding: 22px 16px; }
+  .case-planner-tool { display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 4px 10px; width: 100%; margin: 0 0 12px; padding: 14px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); text-align: left; cursor: grab; }
+  .case-planner-tool > svg, .case-planner-tool > .step-picker-icon, .case-planner-tool-icon { grid-column: 1; grid-row: 1 / span 2; align-self: center; width: 28px; height: 28px; color: var(--editor-draft); }
+  .case-planner-tool .step-picker-icon svg { width: 24px; height: 24px; }
+  .case-planner-tool > strong { grid-column: 2; font-size: 12px; }
+  .case-planner-tool > small { grid-column: 2; font-size: 10px; font-weight: 400; line-height: 1.5; }
+  .case-planner-tool[data-step-template="wait_print"] { border-color: color-mix(in srgb, #61d7c5 35%, var(--line)); }
+  .case-planner-tool[data-step-template="wait_print"] .step-picker-icon { color: #61d7c5; }
+  .case-planner-tool:hover, .case-planner-tool[aria-pressed="true"] { border-color: var(--editor-draft); background: color-mix(in srgb, var(--editor-draft) 10%, var(--surface)); }
+  .case-planner-count { display: block; margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 10px; line-height: 1.6; }
+  .case-rerun-planner .case-editor-canvas { display: flex; flex-direction: column; padding: 24px 22px; overflow: hidden; }
+  .case-rerun-planner .case-editor-canvas > h3 { font-size: 16px; }
+  .case-rerun-planner .case-editor-canvas > p { margin: -4px 0 18px; font-size: 11px; }
+  .case-rerun-planner #case-editor-steps { display: flex; flex: 1; align-items: flex-start; gap: 0; min-height: 0; padding: 10px 6px 20px; overflow: auto; overscroll-behavior: contain; scrollbar-color: var(--muted) var(--panel); }
+  .case-rerun-planner .case-editor-step { flex: 0 0 252px; min-height: 224px; padding: 18px; box-shadow: 0 6px 22px #0002; }
+  .case-planner-order { display: grid; place-items: center; width: 30px; height: 30px; margin-bottom: 16px; border: 1px solid var(--line); border-radius: 8px; color: var(--accent); font-size: 11px; font-weight: 700; }
+  .case-rerun-planner .case-editor-step h3 { margin: 9px 0 12px; font-size: 14px; line-height: 1.45; }
+  .case-rerun-planner .case-editor-prototype .case-planner-order { border-color: var(--editor-draft); color: var(--editor-draft); }
+  .case-rerun-planner .case-editor-gap { flex: 0 0 62px; align-self: stretch; min-height: 224px; max-height: 320px; padding: 0; }
+  .case-rerun-planner .case-editor-gap::before { top: 111px; }
+  .case-rerun-planner .case-editor-gap .case-editor-insert { align-self: start; margin-top: 91px; width: 40px; height: 40px; min-height: 40px; padding: 0; border: 1px dashed color-mix(in srgb, var(--editor-draft) 55%, var(--line)); border-radius: 10px; background: var(--surface); color: var(--editor-draft); font-size: 25px; font-weight: 400; }
+  .case-rerun-planner .case-editor-gap.drag-over { min-height: 224px; outline-offset: -7px; }
+  .case-rerun-planner .case-editor-gap.drag-over .case-editor-insert { border-style: solid; background: color-mix(in srgb, var(--editor-draft) 18%, var(--surface)); box-shadow: 0 0 16px color-mix(in srgb, var(--editor-draft) 22%, transparent); }
+  .case-rerun-planner .case-editor-step-actions button { flex: 1 1 auto; font-size: 9px; }
+  .case-rerun-planner .case-editor-prototype > p { font-size: 10px; }
+  .case-rerun-planner .case-draft-wait-option { padding: 10px; }
+  .case-rerun-planner .case-draft-wait-option small { display: none; }
+  .case-rerun-planner .case-editor-footer #case-editor-rerun { border-style: solid; }
+}
+@media screen and (max-width: 700px) {
+  dialog.case-editor-dialog.case-rerun-planner { width: calc(100vw - 16px); max-width: calc(100vw - 16px); height: calc(100dvh - 16px); max-height: calc(100dvh - 16px); }
+  .case-rerun-planner .case-editor-header { padding: 16px; gap: 10px; }
+  .case-rerun-planner .case-editor-header h2 { font-size: 15px; }
+  .case-rerun-planner .case-editor-header > button { padding: 7px; font-size: 9px; }
+  .case-rerun-planner .case-editor-notice { margin: 10px 12px 0; padding: 8px 10px; font-size: 10px; }
+  .case-rerun-planner .case-editor-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); margin-top: 10px; }
+  .case-rerun-planner .case-editor-palette { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-right: 0; border-bottom: 1px solid var(--line); overflow-x: auto; }
+  .case-rerun-planner .case-editor-palette > h3, .case-rerun-planner .case-editor-palette > p, .case-planner-count { display: none; }
+  .case-rerun-planner .case-planner-tool { flex: 0 0 166px; margin: 0; padding: 10px; }
+  .case-rerun-planner .case-editor-canvas { padding: 14px 8px 0; }
+  .case-rerun-planner .case-editor-canvas > h3, .case-rerun-planner .case-editor-canvas > p { margin-left: 6px; margin-right: 6px; }
+  .case-rerun-planner .case-editor-step { flex-basis: 224px; }
+  .case-rerun-planner .case-editor-gap { flex-basis: 52px; }
+  .case-rerun-planner .case-editor-footer { padding: 12px; }
+  .case-rerun-planner .case-editor-footer > div { width: 100%; }
+  .case-rerun-planner .case-editor-footer > div button { flex: 1; padding: 8px; font-size: 10px; }
+}

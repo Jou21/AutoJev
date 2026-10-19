@@ -134,6 +134,9 @@
     const draftLimit = 100;
     let draftSerial = 0;
     let editorCase = null;
+    let editorPlanKey = null;
+    let editorRevision = null;
+    let editorTool = null;
     let editorSequence = [];
     let editorTrigger = null;
     let editorDrag = null;
@@ -154,8 +157,13 @@
     const editorKinds = { action: "Ação realizada", assertion: "Conferência", signal: "Sinal técnico", observation: "Registro da página" };
     const editorStates = { pass: "Passou", fail: "Não passou", unknown: "Sem resultado", recorded: "Captura registrada", info: "Informativo", warning: "Atenção" };
 
-    function originalEditorSteps(key) {
-      const detail = all("#scenarios details.scenario[data-case-index]").find((item) => item.dataset.caseIndex === key);
+    function plannerKey(key, revision) {
+      return revision && !revision.current ? "history:" + key + ":" + revision.version : String(key);
+    }
+
+    function originalEditorSteps(key, revision) {
+      const detail = revision && !revision.current ? archivedExecution(byIndex.get(String(key)), revision)
+        : all("#scenarios details.scenario[data-case-index]").find((item) => item.dataset.caseIndex === String(key));
       const timeline = detail && detail.querySelector(".evidence-timeline");
       const entries = timeline && Array.from(timeline.children).filter((item) => item.classList.contains("timeline-entry"));
       if (entries && entries.length) return entries.map((item) => ({
@@ -166,6 +174,7 @@
           ? item.dataset.stepOutcome.trim() : "",
       }));
       const payload = byIndex.get(key);
+      if (revision && !revision.current) return [];
       return Array.isArray(payload && payload.editor_steps) ? payload.editor_steps.slice(0, 5000).filter((item) => item && typeof item === "object").map((item) => ({
         title: typeof item.title === "string" ? item.title : "Registro da execução",
         kind: Object.prototype.hasOwnProperty.call(editorKinds, item.kind) ? item.kind : "observation",
@@ -180,20 +189,23 @@
       try { value = JSON.parse(draftSource.textContent || "{}"); } catch { return; }
       if (!value || value.version !== 1 || !value.cases || typeof value.cases !== "object" || Array.isArray(value.cases)) return;
       cases.forEach((item) => {
-        const key = String(item.index);
-        if (!Object.prototype.hasOwnProperty.call(value.cases, key) || !Array.isArray(value.cases[key])) return;
-        const count = originalEditorSteps(key).length;
-        const ids = new Set();
-        const drafts = value.cases[key].slice(0, draftLimit).filter((draft) => {
-          if (!isDraft(draft) || typeof draft.id !== "string" || !/^db-\d{1,9}$/.test(draft.id)
-            || ids.has(draft.id) || !Number.isInteger(draft.gap) || draft.gap < 0 || draft.gap > count
-            || !Number.isInteger(draft.order) || draft.order < 0 || draft.order >= draftLimit) return false;
-          ids.add(draft.id);
-          draftSerial = Math.max(draftSerial, Number(draft.id.slice(3)));
-          return true;
-        }).map((draft) => ({ ...draftFields(draft), gap: draft.gap, order: draft.order }))
-          .sort((left, right) => left.gap - right.gap || left.order - right.order);
-        if (drafts.length) savedDrafts.set(key, drafts);
+        const contexts = [null, ...executionHistory(item).filter((revision) => !revision.current && revision.has_result)];
+        contexts.forEach((revision) => {
+          const key = plannerKey(String(item.index), revision);
+          if (!Object.prototype.hasOwnProperty.call(value.cases, key) || !Array.isArray(value.cases[key])) return;
+          const count = originalEditorSteps(String(item.index), revision).length;
+          const ids = new Set();
+          const drafts = value.cases[key].slice(0, draftLimit).filter((draft) => {
+            if (!isDraft(draft) || typeof draft.id !== "string" || !/^db-\d{1,9}$/.test(draft.id)
+              || ids.has(draft.id) || !Number.isInteger(draft.gap) || draft.gap < 0 || draft.gap > count
+              || !Number.isInteger(draft.order) || draft.order < 0 || draft.order >= draftLimit) return false;
+            ids.add(draft.id);
+            draftSerial = Math.max(draftSerial, Number(draft.id.slice(3)));
+            return true;
+          }).map((draft) => ({ ...draftFields(draft), gap: draft.gap, order: draft.order }))
+            .sort((left, right) => left.gap - right.gap || left.order - right.order);
+          if (drafts.length) savedDrafts.set(key, drafts);
+        });
       });
     }
 
@@ -216,6 +228,7 @@
       if (!dialog) return;
       if (stepPickerRequest) closeStepPicker();
       editorDrag = null;
+      editorTool = null;
       if (typeof dialog.close === "function") dialog.close(); else dialog.removeAttribute("open");
       if (editorTrigger) editorTrigger.focus();
     }
@@ -280,12 +293,12 @@
       container.appendChild(options);
     }
 
-    function caseCapturePlan(key) {
+    function caseCapturePlan(key, revision) {
       // Construct a new minimal object, not a serialization of arbitrary draft
       // data. SWS/SQL can request a print, never execution of an integration.
-      const count = originalEditorSteps(String(key)).length;
+      const count = originalEditorSteps(String(key), revision).length;
       const ids = new Set();
-      const checkpoints = (savedDrafts.get(String(key)) || []).filter((item) => {
+      const checkpoints = (savedDrafts.get(plannerKey(key, revision)) || []).filter((item) => {
         if (!(item.type === "wait_print" || (["sws", "sql"].includes(item.type) && item.wait_for_print === true))
           || typeof item.id !== "string" || !/^db-\d{1,9}$/.test(item.id) || ids.has(item.id)
           || !Number.isInteger(item.gap) || item.gap < 0 || item.gap > count
@@ -304,14 +317,15 @@
         return;
       }
       const editor = $("case-editor");
+      const revision = editor && editor.hasAttribute("open") && editorCase === String(key) && editorRevision
+        ? editorRevision : selectedExecution(current);
       if (editor && editor.hasAttribute("open") && editorCase === String(key)
-        && JSON.stringify(draftsInSequence(editorSequence)) !== JSON.stringify(savedDrafts.get(String(key)) || [])) {
+        && JSON.stringify(draftsInSequence(editorSequence)) !== JSON.stringify(savedDrafts.get(editorPlanKey) || [])) {
         feedback("Guarde o rascunho antes de reexecutar para incluir as pausas para print que você acabou de editar. Nenhuma reexecução foi solicitada.");
         return;
       }
-      const revision = selectedExecution(current);
       if (!revision.has_result) { feedback("Esta tentativa não tem resultado registrado. Selecione uma execução com resultado para reexecutar o teste."); return; }
-      const plan = revision.current ? caseCapturePlan(key) : null;
+      const plan = caseCapturePlan(key, revision);
       const owner = !revision.current ? revision.exploration_id : typeof current.rerun_source_exploration_id === "string" && current.rerun_source_exploration_id
         ? current.rerun_source_exploration_id : reportConnection.sourceId;
       const scenario = !revision.current ? revision.scenario_id : typeof current.rerun_source_scenario_id === "string" && current.rerun_source_scenario_id
@@ -353,7 +367,7 @@
         return element;
       };
       const placeholderCount = editorSequence.filter(isDraft).length;
-      const insert = (position, type = "database") => {
+      const insert = (position, type) => {
         if (editorSequence.filter(isDraft).length >= draftLimit) { editorMessage("Limite de 100 passos extras por CT."); return; }
         if (!Object.prototype.hasOwnProperty.call(draftKinds, type)) return;
         let id;
@@ -370,7 +384,7 @@
         event.preventDefault();
         const dragged = editorDrag;
         editorDrag = null;
-        if (dragged === "new") { insert(position); return; }
+        if (dragged.startsWith("new:")) { insert(position, dragged.slice(4)); return; }
         const previous = editorSequence.findIndex((item) => isDraft(item) && item.id === dragged);
         if (previous < 0) return;
         const [item] = editorSequence.splice(previous, 1);
@@ -382,9 +396,11 @@
         const gap = create("li", "case-editor-gap");
         gap.dataset.editorGap = String(position);
         gap.setAttribute("aria-label", position === 0 ? "Antes do primeiro passo" : position === editorSequence.length ? "Depois do último passo" : "Entre os passos " + position + " e " + (position + 1));
-        const control = button("+ Adicionar aqui", () => openStepPicker(control, gap.getAttribute("aria-label"), (type) => insert(position, type), editorCase), "button button-ghost case-editor-insert");
+        const control = button("+", () => editorTool ? insert(position, editorTool)
+          : openStepPicker(control, gap.getAttribute("aria-label"), (type) => insert(position, type), editorCase), "button button-ghost case-editor-insert");
         control.disabled = placeholderCount >= draftLimit;
         control.setAttribute("aria-label", "Adicionar passo: " + gap.getAttribute("aria-label"));
+        control.setAttribute("title", "Adicionar passo · clique ou solte um card aqui");
         control.setAttribute("aria-haspopup", "dialog");
         control.setAttribute("aria-controls", "step-picker");
         gap.appendChild(control);
@@ -398,6 +414,7 @@
         addGap(index);
         const card = create("li", "case-editor-step " + (isDraft(item) ? "case-editor-prototype" : "case-editor-recorded"));
         card.dataset.editorStep = item.type;
+        card.appendChild(create("span", "case-planner-order", String(index + 1).padStart(2, "0")));
         if (item.type === "recorded") {
           card.dataset.recordedIndex = String(item.stepIndex);
           card.dataset.stepKind = item.step.kind;
@@ -413,7 +430,8 @@
           card.tabIndex = 0;
           card.setAttribute("aria-label", metadata.title + ". Exemplo visual não executado. Use Alt mais seta para cima ou para baixo para mover.");
           card.append(create("small", "case-editor-kind", "Novo passo · rascunho visual"),
-            create("h3", "", metadata.title), create("p", "", metadata.description));
+            create("h3", "", metadata.title), create("p", "", item.type === "wait_print"
+              ? "Pausa para anexar uma imagem à nova execução. Ela só será incluída após sua confirmação na aplicação." : metadata.description));
           appendDraftOptions(card, item, () => editorMessage("Configuração atualizada no editor. Salve o rascunho para mantê-la. Nenhuma captura ou integração foi executada."), true);
           const move = (direction) => {
             const current = editorSequence.findIndex((entry) => isDraft(entry) && entry.id === item.id);
@@ -425,8 +443,8 @@
             editorMessage("Passo extra reposicionado no rascunho visual.");
           };
           const controls = create("div", "case-editor-step-actions");
-          const up = button("↑ Mover antes", () => move(-1), "button button-ghost");
-          const down = button("↓ Mover depois", () => move(1), "button button-ghost");
+          const up = button("← Mover antes", () => move(-1), "button button-ghost");
+          const down = button("Mover depois →", () => move(1), "button button-ghost");
           up.disabled = index === 0;
           down.disabled = index === editorSequence.length - 1;
           const remove = button("Remover", () => {
@@ -439,9 +457,9 @@
           controls.append(up, down, remove);
           card.appendChild(controls);
           card.addEventListener("keydown", (event) => {
-            if (event.target !== card || !event.altKey || !["ArrowUp", "ArrowDown"].includes(event.key)) return;
+            if (event.target !== card || !event.altKey || !["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)) return;
             event.preventDefault();
-            move(event.key === "ArrowUp" ? -1 : 1);
+            move(["ArrowUp", "ArrowLeft"].includes(event.key) ? -1 : 1);
           });
           card.addEventListener("dragstart", (event) => {
             editorDrag = item.id;
@@ -452,30 +470,89 @@
         list.appendChild(card);
       });
       addGap(editorSequence.length);
+      text($("case-planner-count"), originalEditorSteps(editorCase, editorRevision).length + " etapas originais · " + placeholderCount + " passos extras");
       if (focusId) {
         const target = all("[data-draft-id]", list).find((item) => item.dataset.draftId === focusId);
         if (target) target.focus();
       }
     }
 
-    function openEditor(key, trigger) {
+    function preparePlanner() {
+      const dialog = $("case-editor"), palette = $("case-editor-palette");
+      if (!dialog || !palette) return;
+      dialog.classList.add("case-rerun-planner");
+      text(dialog.querySelector(".page-kicker"), "PLANEJAMENTO · NOVA EXECUÇÃO");
+      text(dialog.querySelector(".case-editor-notice"), "Planeje sem alterar este resultado. Os cards originais são referências da execução selecionada. As pausas para print serão apresentadas para confirmação na aplicação. SWS e SQL continuam indisponíveis; nenhuma ação começa aqui.");
+      text($("case-editor-close"), "Voltar ao resultado");
+      if ($("case-editor-close")) $("case-editor-close").setAttribute("aria-label", "Voltar ao resultado sem iniciar a reexecução");
+      text($("case-editor-save"), "Guardar planejamento");
+      const save = $("case-editor-save"), rerun = $("case-editor-rerun");
+      if (save && rerun) {
+        save.classList.remove("button-primary"); save.classList.add("button-ghost");
+        rerun.classList.remove("button-ghost"); rerun.classList.add("button-primary");
+        save.parentElement.append(save, rerun);
+      }
+      const canvas = dialog.querySelector(".case-editor-canvas");
+      if (canvas) {
+        text(canvas.querySelector("h3"), "Roteiro da próxima execução");
+        text(canvas.querySelector("p"), "Leia da esquerda para a direita. Clique nos quadrados + ou arraste um passo até eles. Os registros originais não podem ser removidos.");
+      }
+      if (palette.dataset.plannerReady === "true") return;
+      palette.dataset.plannerReady = "true";
+      palette.replaceChildren();
+      const heading = executionNode("h3", "", "Adicionar ao roteiro");
+      const hint = executionNode("p", "", "Arraste até um + ou selecione um tipo e clique na posição desejada.");
+      palette.append(heading, hint);
+      ["wait_print", "sws", "sql"].forEach((type) => {
+        const metadata = draftKinds[type];
+        const tool = button("", () => {
+          editorTool = editorTool === type ? null : type;
+          all("[data-step-template]", palette).forEach((item) => item.setAttribute("aria-pressed", String(item.dataset.stepTemplate === editorTool)));
+          editorMessage(editorTool ? metadata.title + ": escolha um quadrado + no roteiro." : "Escolha um passo ou clique em um + para ver as opções.");
+        }, "case-planner-tool");
+        tool.dataset.stepTemplate = type;
+        tool.setAttribute("draggable", "true");
+        tool.setAttribute("aria-pressed", "false");
+        const sourceIcon = document.querySelector('#step-picker [data-step-choice="' + type + '"] .step-picker-icon');
+        tool.append(sourceIcon ? sourceIcon.cloneNode(true) : executionNode("span", "case-planner-tool-icon", metadata.symbol),
+          executionNode("strong", "", metadata.title), executionNode("small", "", type === "wait_print" ? "Pausa para anexar sua imagem" : "Em breve · integração indisponível"));
+        tool.addEventListener("dragstart", (event) => {
+          if (!editorCase) return;
+          editorDrag = "new:" + type;
+          if (event.dataTransfer) { event.dataTransfer.effectAllowed = "copy"; event.dataTransfer.setData("text/plain", "Passo planejado: " + type); }
+        });
+        tool.addEventListener("dragend", () => { editorDrag = null; all(".drag-over", $("case-editor-steps")).forEach((gap) => gap.classList.remove("drag-over")); });
+        palette.appendChild(tool);
+      });
+      const count = executionNode("small", "case-planner-count");
+      count.id = "case-planner-count";
+      palette.appendChild(count);
+    }
+
+    function openEditor(key, trigger, rerun = false) {
       key = String(key);
       const current = byIndex.get(key);
       const dialog = $("case-editor");
       if (!current || !dialog || !$("case-editor-steps")) return;
       editorCase = key;
+      editorRevision = rerun ? selectedExecution(current) : { ...current, current: true, has_result: true };
+      if (!editorRevision.has_result) return;
+      editorPlanKey = plannerKey(key, editorRevision);
       editorTrigger = trigger;
       editorDrag = null;
-      const steps = originalEditorSteps(key);
-      const drafts = savedDrafts.get(key) || [];
+      editorTool = null;
+      preparePlanner();
+      all("[data-step-template]", dialog).forEach((tool) => tool.setAttribute("aria-pressed", "false"));
+      const steps = originalEditorSteps(key, editorRevision);
+      const drafts = savedDrafts.get(editorPlanKey) || [];
       editorSequence = [];
       for (let gap = 0; gap <= steps.length; gap += 1) {
         drafts.filter((item) => item.gap === gap).forEach((item) => editorSequence.push(draftFields(item)));
         if (gap < steps.length) editorSequence.push({ type: "recorded", stepIndex: gap, step: steps[gap] });
       }
-      text($("case-editor-title"), "Editor visual · " + current.id + " · " + (current.title || "Caso de teste"));
-      text($("case-editor-rerun"), reportConnection ? "Reexecutar este teste" : "Como reexecutar");
-      editorMessage("Rascunho visual · não executado · não altera este resultado.");
+      text($("case-editor-title"), "Planejar reexecução · " + current.id + " · " + (editorRevision.title || current.title || "Caso de teste"));
+      text($("case-editor-rerun"), reportConnection ? "Revisar e confirmar na aplicação →" : "Como reexecutar");
+      editorMessage("Rascunho visual · não executado · não altera este resultado. " + (rerun && Number.isInteger(editorRevision.version) ? "Base: execução #" + (editorRevision.version + 1) + "." : ""));
       renderEditor();
       if (typeof dialog.showModal === "function") dialog.showModal(); else dialog.setAttribute("open", "");
       if ($("case-editor-close")) $("case-editor-close").focus();
@@ -653,186 +730,15 @@
       }
     }
 
-    function inlineSequence(model) {
-      const steps = model.originalItems.slice(1);
-      const drafts = savedDrafts.get(model.key) || [];
-      const sequence = [];
-      for (let gap = 0; gap <= steps.length; gap += 1) {
-        drafts.filter((item) => item.gap === gap).forEach((item) => sequence.push(draftFields(item)));
-        if (gap < steps.length) sequence.push({ type: "recorded", item: steps[gap] });
-      }
-      return sequence;
-    }
-
-    function inlineMessage(model, value) {
-      text(model.inlineFeedback, value);
-      model.inlineFeedback.hidden = !value;
-    }
-
     function rebuildInlineSteps(model, requestedKey) {
-      // The canonical timeline stays untouched. Drafts are separate panels and
-      // navigation items, never observations, assertions, or executed actions.
+      // Results show only recorded evidence. Draft insertion and reordering
+      // belong exclusively to the separate rerun planner.
       const selected = model.items[model.selected];
       const selectedKey = requestedKey || selected && selected.key || "original:0";
       model.list.replaceChildren();
       model.draftPanels.replaceChildren();
-      if (model.readOnly) {
-        model.items = model.originalItems.slice();
-        model.items.forEach((item) => (item.kind === "summary" ? model.summaryActions : model.list).appendChild(item.button));
-        syncCaseStepAvailability(model);
-        return;
-      }
-      const sequence = inlineSequence(model);
-      const draftCount = sequence.filter(isDraft).length;
-      const create = (tag, className, label) => {
-        const element = document.createElement(tag);
-        element.className = className;
-        if (label != null) element.textContent = label;
-        return element;
-      };
-      const commit = (nextSequence, focusKey, message) => {
-        saveDraftSequence(model.key, nextSequence);
-        rebuildInlineSteps(model, focusKey);
-        inlineMessage(model, message + ($("download-report")
-          ? " Baixe o relatório para conservar o rascunho."
-          : " As alterações ficam somente nesta aba; o arquivo original não será alterado."));
-        const current = model.items.find((item) => item.key === focusKey);
-        if (current) current.button.focus({ preventScroll: true });
-      };
-      const insert = (position, type) => {
-        if (sequence.filter(isDraft).length >= draftLimit) { inlineMessage(model, "Limite de 100 passos extras por CT."); return; }
-        if (!["sws", "sql", "wait_print"].includes(type)) return;
-        let id;
-        do {
-          draftSerial = draftSerial >= 999999999 ? 1 : draftSerial + 1;
-          id = "db-" + draftSerial;
-        } while (sequence.some((item) => isDraft(item) && item.id === id));
-        sequence.splice(position, 0, draftFields({ type, id }));
-        commit(sequence, "draft:" + id, draftKinds[type].title + " adicionado ao rascunho desta aba. Nada foi executado; os registros originais foram preservados.");
-      };
-      const dropAt = (position, event) => {
-        if (!model.inlineDrag) return;
-        event.preventDefault();
-        const dragged = model.inlineDrag;
-        model.inlineDrag = null;
-        const previous = sequence.findIndex((item) => isDraft(item) && item.id === dragged);
-        if (previous < 0) return;
-        const [item] = sequence.splice(previous, 1);
-        sequence.splice(position > previous ? position - 1 : position, 0, item);
-        commit(sequence, "draft:" + item.id, "Passo extra reposicionado no rascunho visual. Nada foi executado.");
-      };
-      const addGap = (position) => {
-        const gap = create("div", "case-inline-gap");
-        gap.dataset.inlineGap = String(position);
-        const label = position === 0 ? "Antes do primeiro cartão" : position === sequence.length
-          ? "Depois do último cartão" : "Entre os cartões " + position + " e " + (position + 1);
-        gap.setAttribute("aria-label", label);
-        const control = button("+ Adicionar aqui", () => openStepPicker(control, label, (type) => insert(position, type), model.key), "button button-ghost case-inline-insert");
-        control.disabled = draftCount >= draftLimit;
-        control.setAttribute("aria-label", "Adicionar passo: " + label);
-        control.setAttribute("title", "Planejar um passo extra · não altera este resultado");
-        control.setAttribute("aria-haspopup", "dialog");
-        control.setAttribute("aria-controls", "step-picker");
-        gap.appendChild(control);
-        gap.addEventListener("dragover", (event) => {
-          if (model.inlineDrag) { event.preventDefault(); gap.classList.add("drag-over"); }
-        });
-        gap.addEventListener("dragleave", () => gap.classList.remove("drag-over"));
-        gap.addEventListener("drop", (event) => dropAt(position, event));
-        model.list.appendChild(gap);
-      };
-      model.items = [model.originalItems[0]];
-      model.summaryActions.appendChild(model.originalItems[0].button);
-      sequence.forEach((entry, sequenceIndex) => {
-        addGap(sequenceIndex);
-        if (entry.type === "recorded") {
-          model.items.push(entry.item);
-          model.list.appendChild(entry.item.button);
-          return;
-        }
-        const metadata = draftKinds[entry.type];
-        const card = create("div", "case-inline-draft");
-        card.dataset.draftId = entry.id;
-        card.dataset.draftType = entry.type;
-        card.setAttribute("draggable", "true");
-        card.tabIndex = 0;
-        card.setAttribute("aria-label", metadata.title + ". Rascunho visual não executado. Use Alt mais seta para cima ou para baixo para mover.");
-        const panel = create("section", "case-draft-panel");
-        panel.id = "case-draft-" + model.key + "-" + entry.id;
-        panel.dataset.draftId = entry.id;
-        panel.dataset.draftType = entry.type;
-        const heading = create("div", "case-draft-heading");
-        const icon = create("span", "case-draft-icon", metadata.symbol);
-        icon.setAttribute("aria-hidden", "true");
-        heading.append(icon, create("h3", "", metadata.title));
-        panel.append(create("span", "case-draft-status", "Rascunho visual · Não executado"), heading,
-          create("p", "case-draft-note", entry.type === "database"
-            ? "Este é um passo extra de exemplo. Ele ainda não se conecta a um banco, não executa consultas e não utiliza credenciais." : metadata.description),
-          create("p", "case-draft-position", "Você pode reposicionar ou remover este card sem alterar as etapas, as evidências ou o resultado do teste original."));
-        appendDraftOptions(panel, entry, () => {
-          saveDraftSequence(model.key, sequence);
-          inlineMessage(model, "Preferência de captura guardada no rascunho. Nenhum print ou integração foi executado." + ($("download-report")
-            ? " Baixe o relatório para conservar a configuração." : " As alterações ficam somente nesta aba."));
-        });
-        model.draftPanels.appendChild(panel);
-        const item = { key: "draft:" + entry.id, node: panel, kind: entry.type, kindLabel: "Rascunho visual", title: metadata.title, draftId: entry.id };
-        const control = button("", () => selectCaseStep(model, model.items.indexOf(item)), "case-step-button case-inline-draft-button");
-        control.dataset.stepKind = entry.type;
-        control.dataset.stepState = "draft";
-        control.setAttribute("aria-controls", panel.id);
-        control.setAttribute("aria-label", metadata.title + ". Rascunho visual. Não executado.");
-        const copy = create("span", "step-copy");
-        const status = create("span", "step-status");
-        status.dataset.stepState = "draft";
-        const statusIcon = create("span", "step-status-icon", "◇");
-        statusIcon.setAttribute("aria-hidden", "true");
-        status.append(statusIcon, create("span", "step-status-label", "Não executado"));
-        copy.append(create("span", "step-kind", "Passo extra · rascunho"), create("span", "step-label", item.title),
-          create("small", "step-description", entry.type === "wait_print" ? "Pausa para colar ou anexar sua imagem na próxima reexecução." : "Planejado. Não interfere no resultado original."), status);
-        control.append(create("span", "step-number", "+"), copy);
-        item.button = control;
-        card.appendChild(control);
-        const move = (direction) => {
-          const current = sequence.findIndex((step) => isDraft(step) && step.id === entry.id);
-          const next = current + direction;
-          if (current < 0 || next < 0 || next >= sequence.length) return;
-          const [step] = sequence.splice(current, 1);
-          sequence.splice(next, 0, step);
-          commit(sequence, item.key, "Passo extra reposicionado no rascunho visual. Nada foi executado.");
-        };
-        const actions = create("div", "case-inline-draft-actions");
-        const up = button("↑", () => move(-1), "button button-ghost case-inline-move-before");
-        const down = button("↓", () => move(1), "button button-ghost case-inline-move-after");
-        up.setAttribute("aria-label", "Mover passo extra para antes");
-        down.setAttribute("aria-label", "Mover passo extra para depois");
-        up.disabled = sequenceIndex === 0;
-        down.disabled = sequenceIndex === sequence.length - 1;
-        const remove = button("Remover", () => {
-          const nextSequence = sequence.filter((step) => step !== entry);
-          commit(nextSequence, "original:0", "Passo extra removido do rascunho. Nenhuma etapa original foi removida.");
-        }, "button button-ghost case-inline-remove");
-        remove.setAttribute("aria-label", "Remover passo extra");
-        actions.append(up, down, remove);
-        card.appendChild(actions);
-        card.addEventListener("keydown", (event) => {
-          if (!event.altKey || !["ArrowUp", "ArrowDown"].includes(event.key)) return;
-          if (event.target !== card && event.target !== control) return;
-          event.preventDefault();
-          move(event.key === "ArrowUp" ? -1 : 1);
-        });
-        card.addEventListener("dragstart", (event) => {
-          model.inlineDrag = entry.id;
-          if (event.dataTransfer) { event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", "Passo extra não executado"); }
-        });
-        card.addEventListener("dragend", () => {
-          model.inlineDrag = null;
-          all(".drag-over", model.list).forEach((gap) => gap.classList.remove("drag-over"));
-        });
-        model.items.push(item);
-        model.list.appendChild(card);
-      });
-      addGap(sequence.length);
-      model.items.forEach((item, index) => { item.button.dataset.stepIndex = String(index); });
+      model.items = model.originalItems.slice();
+      model.items.forEach((item) => (item.kind === "summary" ? model.summaryActions : model.list).appendChild(item.button));
       const selectedIndex = model.items.findIndex((item) => item.key === selectedKey);
       model.selected = selectedIndex < 0 ? 0 : selectedIndex;
       syncCaseStepAvailability(model);
@@ -1151,7 +1057,7 @@
         model.items.push(originalItem);
         model.originalItems.push(originalItem);
       });
-      list.addEventListener("keydown", (event) => {
+      sidebar.addEventListener("keydown", (event) => {
         if (event.altKey || !["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
         const target = event.target instanceof Element ? event.target.closest(".case-step-button") : null;
         if (!target) return;
@@ -1271,13 +1177,15 @@
       const list = $("case-execution-list");
       const track = list && list.closest(".execution-history-track");
       if (track) {
+        // Fixed edge gutters let cards move into the blur instead of switching
+        // a full-width overlay on top of their content after a tiny scroll.
+        track.dataset.scrollable = String(list.scrollWidth - list.clientWidth > 2);
         track.dataset.previousExecutions = String(list.scrollLeft > 2);
         track.dataset.moreExecutions = String(list.scrollWidth - list.clientWidth - list.scrollLeft > 2);
       }
     }
 
-    function scrollExecutionHistory(event) {
-      const list = $("case-execution-list");
+    function scrollHorizontalList(list, event) {
       // Keep native horizontal gestures, Shift scrolling and browser zoom.
       if (!list || event.defaultPrevented || !event.cancelable || event.ctrlKey || event.metaKey || event.shiftKey
         || !event.deltaY || Math.abs(event.deltaX) >= Math.abs(event.deltaY)) return;
@@ -1288,7 +1196,11 @@
       if (Math.abs(target - list.scrollLeft) < 1) return;
       event.preventDefault();
       list.scrollLeft = target;
-      updateExecutionOverflow();
+      return true;
+    }
+
+    function scrollExecutionHistory(event) {
+      if (scrollHorizontalList($("case-execution-list"), event)) updateExecutionOverflow();
     }
 
     function renderExecutionHistory(current) {
@@ -1320,12 +1232,14 @@
         const item = executionNode("li", "execution-history-item"); item.appendChild(control); list.appendChild(item);
       });
       text($("case-execution-total"), history.length + (history.length === 1 ? " execução registrada" : " execuções registradas"));
+      updateExecutionOverflow();
       const selectedItem = list.querySelector('.execution-card[aria-pressed="true"]');
       if (selectedItem) {
         // Reveal only within the horizontal track, without moving the page or
         // changing keyboard focus when opening an older execution directly.
         const item = selectedItem.parentElement;
-        const start = item.offsetLeft - 10, end = item.offsetLeft + item.offsetWidth + 10;
+        const inset = parseFloat(window.getComputedStyle(list).paddingLeft) || 10;
+        const start = item.offsetLeft - inset, end = item.offsetLeft + item.offsetWidth + inset;
         if (start < list.scrollLeft || end > list.scrollLeft + list.clientWidth) list.scrollLeft = Math.max(0, start);
       }
       metadata.replaceChildren(executionNode("strong", "execution-summary-title", "Execução #" + (revision.version + 1)));
@@ -1518,6 +1432,7 @@
 
     function showView(view, focus) {
       if (stepPickerRequest) closeStepPicker();
+      if ($("case-editor") && $("case-editor").hasAttribute("open")) closeEditor();
       if (!Object.prototype.hasOwnProperty.call(views, view)) view = "overview";
       activeView = view;
       document.body.dataset.view = view;
@@ -1687,36 +1602,30 @@
     listen("case-editor-close", "click", closeEditor);
     listen("case-editor", "cancel", (event) => { event.preventDefault(); closeEditor(); });
     listen("case-editor", "close", () => { editorDrag = null; if (editorTrigger) editorTrigger.focus(); });
+    const plannerSteps = $("case-editor-steps");
+    if (plannerSteps) plannerSteps.addEventListener("wheel", (event) => {
+      // On short screens allow vertical access to card settings; otherwise
+      // the ordinary mouse wheel follows the horizontal planning sequence.
+      if (plannerSteps.scrollHeight <= plannerSteps.clientHeight + 2) scrollHorizontalList(plannerSteps, event);
+    }, { passive: false });
     listen("case-editor-save", "click", () => {
       if (!editorCase) return;
-      saveDraftSequence(editorCase, editorSequence);
+      saveDraftSequence(editorPlanKey, editorSequence);
       const explorer = caseExplorers.get(editorCase);
       if (explorer) rebuildInlineSteps(explorer);
       editorMessage($("download-report")
         ? "Rascunho guardado nesta aba. Baixe o relatório para conservar esta versão. Resultados e evidências originais não foram alterados."
         : "Rascunho guardado nesta aba. O arquivo original não foi alterado. Nada foi executado.");
     });
-    listen("database-step-card", "dragstart", (event) => {
-      if (!editorCase) return;
-      editorDrag = "new";
-      if (event.dataTransfer) { event.dataTransfer.effectAllowed = "copy"; event.dataTransfer.setData("text/plain", "Consulta de exemplo não executada"); }
-    });
-    listen("database-step-card", "dragend", () => {
-      editorDrag = null;
-      all(".drag-over", $("case-editor-steps") || document).forEach((gap) => gap.classList.remove("drag-over"));
-    });
-    listen("database-step-card", "click", () => {
-      const gaps = all(".case-editor-insert", $("case-editor-steps") || document);
-      if (gaps.length) { gaps[gaps.length - 1].focus(); editorMessage("Escolha «Adicionar aqui» entre as etapas e selecione o tipo de passo."); }
-    });
     listen("case-editor-rerun", "click", () => {
+      if (reportConnection && editorCase) {
+        saveDraftSequence(editorPlanKey, editorSequence);
+        const explorer = caseExplorers.get(editorCase);
+        if (explorer) rebuildInlineSteps(explorer);
+      }
       requestCaseRerun(editorCase, editorMessage);
     });
-    listen("case-rerun", "click", () => requestCaseRerun(selectedCase, (value) => {
-      const feedback = $("case-rerun-feedback");
-      text(feedback, value);
-      if (feedback) feedback.hidden = false;
-    }));
+    listen("case-rerun", "click", () => openEditor(selectedCase, $("case-rerun"), true));
     listen("case-history", "click", openCaseHistory);
     listen("case-compare", "click", openCaseHistory);
     listen("case-execution-list", "scroll", updateExecutionOverflow);

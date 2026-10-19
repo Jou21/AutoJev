@@ -528,25 +528,32 @@ def _journey(exploration: dict[str, Any], cases: list[dict[str, Any]], renderer:
 
 
 def _case_editor() -> str:
+    tools = "".join(
+        f'<button type="button" class="case-planner-tool" data-step-template="{kind}" draggable="true" aria-pressed="false">'
+        + _icon(icon) + f'<strong>{title}</strong><small>{note}</small></button>'
+        for kind, icon, title, note in (
+            ("wait_print", "image", "Aguardar print", "Pausa para anexar sua imagem"),
+            ("sws", "route", "Executar SWS", "Em breve · integração indisponível"),
+            ("sql", "database", "Executar SQL", "Em breve · integração indisponível"),
+        )
+    )
     return (
-        '<dialog id="case-editor" class="case-editor-dialog" aria-labelledby="case-editor-title">'
-        '<header class="case-editor-header"><div><span class="page-kicker">Roteiro do teste</span>'
-        '<h2 id="case-editor-title">Editar passos do teste</h2></div>'
+        '<dialog id="case-editor" class="case-editor-dialog case-rerun-planner" aria-labelledby="case-editor-title">'
+        '<header class="case-editor-header"><div><span class="page-kicker">Planejamento · nova execução</span>'
+        '<h2 id="case-editor-title">Planejar reexecução</h2></div>'
         '<button id="case-editor-close" class="button button-ghost" aria-label="Fechar editor de passos">Fechar ✕</button></header>'
         '<div class="case-editor-notice">Rascunho visual · não executado · não altera este resultado. '
         'As etapas registradas ficam preservadas. “Aguardar print” pode pausar uma nova reexecução confirmada na aplicação; '
         'adicionar cards aqui não inicia ações, integrações ou capturas.</div>'
         '<div class="case-editor-layout"><aside id="case-editor-palette" class="case-editor-palette">'
-        '<span class="ct-summary-eyebrow">Adicionar ao roteiro</span>'
-        f'<button id="database-step-card" class="database-step-card" draggable="true">{_icon("database")}'
-        '<strong>Consulta em banco de dados</strong><small>Somente visual · sem conexão ou execução</small></button>'
-        '<p class="muted">Arraste a consulta de exemplo ou use “Adicionar aqui” para escolher SWS, SQL ou Aguardar print.</p></aside>'
-        '<section class="case-editor-canvas" aria-label="Etapas do roteiro"><h3>Passos do teste</h3>'
-        '<p class="muted">Etapas originais são somente leitura. Posicione seus novos cards entre elas.</p>'
+        '<h3>Adicionar ao roteiro</h3><p class="muted">Arraste um tipo de passo até um quadrado + ou clique no + para escolher SWS, SQL ou Aguardar print.</p>'
+        + tools + '</aside>'
+        '<section class="case-editor-canvas" aria-label="Etapas do roteiro"><h3>Roteiro da próxima execução</h3>'
+        '<p class="muted">Etapas originais são somente leitura. Leia da esquerda para a direita e posicione seus novos cards entre elas.</p>'
         '<ol id="case-editor-steps"></ol></section></div>'
         '<footer class="case-editor-footer"><p id="case-editor-feedback" role="status" aria-live="polite"></p>'
-        '<div><button id="case-editor-rerun" class="button button-ghost">Ver disponibilidade de reexecução</button>'
-        '<button id="case-editor-save" class="button button-primary">Guardar rascunho neste relatório</button></div></footer></dialog>'
+        '<div><button id="case-editor-save" class="button button-ghost">Guardar planejamento</button>'
+        '<button id="case-editor-rerun" class="button button-primary">Revisar e confirmar na aplicação →</button></div></footer></dialog>'
     )
 
 

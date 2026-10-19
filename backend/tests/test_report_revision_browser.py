@@ -211,7 +211,11 @@ async def test_execution_timeline_switches_owned_evidence_without_changing_lates
             await offline.close()
             await page.evaluate("() => { window.__opened = []; window.open = (...args) => { window.__opened.push(args); return null; }; }")
             await page.locator("#case-rerun").click()
+            await expect(page.locator("#case-editor")).to_be_visible()
+            assert await page.evaluate("window.__opened") == []
+            await page.locator("#case-editor-rerun").click()
             assert await page.evaluate("window.__opened") == [[ORIGIN + "/#/reexecutar/old-rerun/CT001", "_blank", "noopener,noreferrer"]]
+            await page.locator("#case-editor-close").click()
             await page.locator("#case-compare").click()
             await expect(page.locator(".execution-comparison")).to_contain_text("Último resultado")
             await no_duplicate_ids(page)
@@ -278,12 +282,39 @@ async def test_execution_timeline_scrolls_all_attempts_and_keeps_an_older_select
             }""")
             await track.evaluate("el => el.scrollTo({left: 0, behavior: 'instant'})")
             await expect(edge).to_have_attribute("data-previous-executions", "false")
-            assert await edge.evaluate("el => getComputedStyle(el, '::before').opacity === '0'")
+            await expect(edge).to_have_attribute("data-scrollable", "true")
+            assert await edge.evaluate("el => getComputedStyle(el, '::before').opacity === '1'")
             await expect(edge).to_have_attribute("data-more-executions", "true")
             assert await edge.evaluate("el => getComputedStyle(el, '::after').opacity === '1'")
             assert await edge.evaluate("el => getComputedStyle(el, '::after').backdropFilter === 'blur(3px)'")
             assert await edge.evaluate("el => getComputedStyle(el, '::after').pointerEvents === 'none'")
             await page.locator("#case-execution-history").screenshot(path=str(tmp_path / f"execution-blur-{viewport['width']}.png"))
+
+            # The blur stays fixed in a reserved edge gutter. At tiny offsets
+            # only the part of the card actually entering that gutter is affected.
+            async def left_edge_geometry():
+                return await edge.evaluate("""el => {
+                  const style = getComputedStyle(el, '::before');
+                  const first = el.querySelector('.execution-card').getBoundingClientRect();
+                  const bounds = el.getBoundingClientRect();
+                  return {width: parseFloat(style.width), left: style.left, opacity: style.opacity,
+                    cardLeft: first.left - bounds.left};
+                }""")
+
+            initial_edge = await left_edge_geometry()
+            assert initial_edge["cardLeft"] >= initial_edge["width"]
+            for offset in (3, 10, 20):
+                await track.evaluate("(el, offset) => el.scrollLeft = offset", offset)
+                current_edge = await left_edge_geometry()
+                assert {key: current_edge[key] for key in ("width", "left", "opacity")} == {
+                    key: initial_edge[key] for key in ("width", "left", "opacity")
+                }
+                assert abs(current_edge["cardLeft"] - (initial_edge["cardLeft"] - offset)) <= 1
+                assert max(0, current_edge["width"] - current_edge["cardLeft"]) <= offset + 1
+                if offset == 3:
+                    assert current_edge["cardLeft"] >= current_edge["width"] - 1
+                    await page.locator("#case-execution-history").screenshot(path=str(tmp_path / f"execution-tiny-scroll-{viewport['width']}.png"))
+            await track.evaluate("el => el.scrollLeft = 0")
 
             # A normal mouse emits vertical deltas, including small wheel ticks.
             # Handle the heading and cards, without scrolling the whole page.
@@ -348,10 +379,12 @@ async def test_execution_timeline_scrolls_all_attempts_and_keeps_an_older_select
             await expect(page.locator('#case-execution-list [data-execution-version="0"]')).to_have_attribute("aria-pressed", "true")
             await expect(edge).to_have_attribute("data-more-executions", "false")
             await expect(edge).to_have_attribute("data-previous-executions", "true")
-            await page.wait_for_function("""() => {
-              const edge = document.querySelector('.execution-history-track');
-              return edge.dataset.moreExecutions === 'false' && getComputedStyle(edge, '::after').opacity === '0';
-            }""", timeout=5000)
+            assert await edge.evaluate("""el => {
+              const last = el.querySelector('.execution-history-item:last-child .execution-card').getBoundingClientRect();
+              const bounds = el.getBoundingClientRect();
+              const width = parseFloat(getComputedStyle(el, '::after').width);
+              return last.right <= bounds.right - width + 1;
+            }""")
             assert page.url.endswith("?execution=0")
             await page.screenshot(path=str(tmp_path / f"execution-scroll-{viewport['width']}.png"))
             await page.reload()
@@ -366,6 +399,8 @@ async def test_execution_timeline_scrolls_all_attempts_and_keeps_an_older_select
             await expect(track.locator("button")).to_have_count(1)
             assert await wheel_event({"deltaY": 100}) == {"prevented": False, "left": 0}
             await expect(edge).to_have_attribute("data-previous-executions", "false")
+            await expect(edge).to_have_attribute("data-scrollable", "false")
+            assert await edge.evaluate("el => getComputedStyle(el, '::before').opacity === '0'")
             assert not errors
         finally:
             await browser.close()
@@ -398,8 +433,12 @@ async def test_connected_focus_refreshes_latest_report_in_same_blob_and_hash(tmp
             }""")
             await expect(page.locator("#case-rerun")).to_be_visible()
             await page.locator("#case-rerun").click()
+            await expect(page.locator("#case-editor")).to_be_visible()
+            assert await page.evaluate("window.__opened") == []
+            await page.locator("#case-editor-rerun").click()
             opened = await page.evaluate("window.__opened")
             assert opened == [[ORIGIN + "/#/reexecutar/latest-rerun/CT001", "_blank", "noopener,noreferrer"]]
+            await page.locator("#case-editor-close").click()
             async with page.expect_download() as pending:
                 await page.locator("#download-report").click()
             exported_path = tmp_path / "connected-download.html"
@@ -486,8 +525,11 @@ async def test_connected_saved_draft_blocks_auto_refresh_and_cancel_preserves_it
         browser = await driver.chromium.launch(headless=True)
         context, page = await connected_page(browser, original, state, requests)
         try:
-            await page.locator(".case-inline-insert").first.click()
+            await page.locator("#case-rerun").click()
+            await page.locator(".case-editor-insert").first.click()
             await page.locator('#step-picker [data-step-choice="wait_print"]').click()
+            await page.locator("#case-editor-save").click()
+            await page.locator("#case-editor-close").click()
             before = await page.locator("#report-drafts").text_content()
             assert json.loads(before)["cases"]["0"][0]["type"] == "wait_print"
             state["key"] = "revisions-v3"

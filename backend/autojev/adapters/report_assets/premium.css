@@ -959,13 +959,13 @@ body[data-theme="light"] .dialog-toolbar, body[data-theme="light"] dialog.eviden
   .execution-history-heading .nav-icon { width: 20px; height: 20px; color: var(--accent); }
   #case-execution-total { font-size: 10px; }
   #case-executions-all { display: none !important; }
-  .execution-history-track { position: relative; display: flex; min-width: 0; }
-  .execution-history-track::before, .execution-history-track::after { position: absolute; z-index: 2; top: 0; bottom: 21px; width: clamp(42px, 6vw, 88px); backdrop-filter: blur(3px); opacity: 0; pointer-events: none; content: ""; }
+  .execution-history-track { --execution-edge-width: 10px; --execution-edge-gap: 4px; --execution-track-padding: var(--execution-edge-gap); position: relative; display: flex; min-width: 0; }
+  .execution-history-track[data-scrollable="true"] { --execution-track-padding: calc(var(--execution-edge-width) + var(--execution-edge-gap)); }
+  .execution-history-track::before, .execution-history-track::after { position: absolute; z-index: 2; top: 0; bottom: 21px; width: var(--execution-edge-width); backdrop-filter: blur(3px); opacity: 0; pointer-events: none; content: ""; }
   .execution-history-track::before { left: 0; background: linear-gradient(270deg, transparent, var(--surface)); mask-image: linear-gradient(270deg, transparent, #000 85%); }
   .execution-history-track::after { right: 0; background: linear-gradient(90deg, transparent, var(--surface)); mask-image: linear-gradient(90deg, transparent, #000 85%); }
-  .execution-history-track[data-previous-executions="true"]::before { opacity: 1; }
-  .execution-history-track[data-more-executions="true"]::after { opacity: 1; }
-  #case-execution-list { position: relative; display: flex; flex: 1; gap: clamp(16px, 3.2vw, 65px); min-width: 0; margin: 0; padding: 12px 10px; overflow-x: auto; overflow-y: hidden; overscroll-behavior-x: contain; scroll-padding-inline: 10px; list-style: none; }
+  .execution-history-track[data-scrollable="true"]::before, .execution-history-track[data-scrollable="true"]::after { opacity: 1; }
+  #case-execution-list { position: relative; display: flex; flex: 1; gap: clamp(16px, 3.2vw, 65px); min-width: 0; margin: 0; padding: 12px var(--execution-track-padding); overflow-x: auto; overflow-y: hidden; overscroll-behavior-x: contain; scroll-padding-inline: var(--execution-track-padding); list-style: none; }
   #case-execution-list::-webkit-scrollbar { height: 8px; }
   #case-execution-list::-webkit-scrollbar-track { border-radius: 8px; background: var(--panel); }
   #case-execution-list::-webkit-scrollbar-thumb { border-radius: 8px; background: var(--muted); }
@@ -1090,7 +1090,8 @@ body[data-theme="light"] .dialog-toolbar, body[data-theme="light"] dialog.eviden
   .result-heading .badge { padding: 3px 7px; font-size: 8px; }
   .case-execution-history { padding: 12px 10px; }
   .execution-history-heading h2 { font-size: 14px; }
-  #case-execution-list { gap: 20px; padding-left: 3px; padding-right: 3px; scroll-padding-inline: 3px; }
+  .execution-history-track { --execution-edge-gap: 3px; }
+  #case-execution-list { gap: 20px; }
   .execution-history-item { flex: 0 0 190px; }
   .execution-history-item:not(:last-child)::after { width: 20px; }
   .case-execution-summary { flex-wrap: wrap; padding: 11px; }
