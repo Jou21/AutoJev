@@ -75,6 +75,20 @@ class ScenarioCapturePrintInput(ApiModel):
         return value
 
 
+class ScenarioCapturePreviewInput(ApiModel):
+    checkpoint_id: StrictStr = Field(pattern=r"^db-[0-9]{1,9}$")
+    checkpoint_version: StrictInt = Field(ge=1, le=10000)
+    expected_revision: StrictInt = Field(ge=0)
+    # Clearing and staging a preview never authorize final attachment.
+    image_data_url: StrictStr | None = Field(max_length=MAX_IMAGE_DATA_URL_LENGTH)
+
+
+class ScenarioPreparationConsentInput(ApiModel):
+    preparation_version: StrictInt = Field(ge=1, le=10000)
+    expected_revision: StrictInt = Field(ge=0)
+    checked: StrictBool
+
+
 class ProviderModelInput(ApiModel):
     # Provider editors often send both `id` and the equivalent `model_id`.
     # Ignore the duplicate while still accepting model_id-only clients.

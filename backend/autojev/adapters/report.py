@@ -291,10 +291,12 @@ class StandaloneHtmlReport:
         identity = str(scenario.get("id") or "scenario").encode("utf-8").hex()
         return f"timeline-{identity}-{index}"
 
-    def _action_anchor(self, step: Any, scenarios: list[dict[str, Any]]) -> str | None:
+    def _action_anchor(self, step: Any, scenarios: list[dict[str, Any]], *, exploration_id: str | None = None) -> str | None:
         if not isinstance(step, int) or isinstance(step, bool) or step < 1:
             return None
         for scenario in scenarios:
+            if exploration_id is not None and str(scenario.get("evidence_exploration_id") or exploration_id) != exploration_id:
+                continue
             for index, entry in enumerate(presentation_scenario_steps(scenario.get("evidence") or {})):
                 if (entry.get("kind") == "action"
                         and entry.get("step_number", entry.get("action_step")) == step):
@@ -311,7 +313,7 @@ class StandaloneHtmlReport:
                 or not dependency.get("failed_assertion_kinds")):
             return ""
         step = dependency.get("action_step")
-        anchor = self._action_anchor(step, scenarios)
+        anchor = self._action_anchor(step, scenarios, exploration_id=exploration_id)
         step_note = (
             f'<a href="#{anchor}">Ver falha anterior da etapa {_h(step)} na linha do tempo</a>'
             if anchor else f'Etapa {_h(step)} · ação anterior registrada' if step is not None else
@@ -364,7 +366,7 @@ class StandaloneHtmlReport:
     ) -> str:
         resolution = item["resolution"]
         step = resolution["action_step"]
-        anchor = self._action_anchor(step, scenarios)
+        anchor = self._action_anchor(step, scenarios, exploration_id=exploration_id)
         screenshot = str(resolution.get("screenshot") or "")
         image = self._image_data(exploration_id, screenshot) if screenshot else None
         result_note = (
@@ -1251,6 +1253,10 @@ class StandaloneHtmlReport:
     def _timeline(
         self, exploration_id: str, scenario: dict[str, Any], *, observation: bool = False,
     ) -> str:
+        # A current CT can belong to a later execution while retaining its
+        # original CT number in this report. Filenames alone are not globally
+        # unique: always resolve evidence in the run that actually recorded it.
+        exploration_id = str(scenario.get("evidence_exploration_id") or exploration_id)
         evidence = scenario.get("evidence") or {}
         # A planned attachment belongs at its selected script boundary, even
         # when submitted later. Keep the chronological evidence itself intact.
@@ -1526,6 +1532,7 @@ class StandaloneHtmlReport:
         )
 
     def _scenario_card(self, exploration_id: str, scenario: dict[str, Any]) -> str:
+        exploration_id = str(scenario.get("evidence_exploration_id") or exploration_id)
         status = str(scenario.get("status", "SKIPPED"))
         if status not in {"PASS", "FAIL", "BLOCKED", "SKIPPED"}:
             status = "SKIPPED"

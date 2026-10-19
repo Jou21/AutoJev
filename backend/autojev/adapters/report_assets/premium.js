@@ -47,7 +47,15 @@
         const url = new URL(value.app_url);
         if (!["http:", "https:"].includes(url.protocol) || url.origin !== window.location.origin
           || url.username || url.password || url.pathname !== "/" || url.search || url.hash) return null;
-        return { appUrl: url.origin, sourceId: value.source_exploration_id };
+        let apiUrl = null;
+        if (typeof value.api_url === "string") {
+          const api = new URL(value.api_url);
+          if (["http:", "https:"].includes(api.protocol) && !api.username && !api.password
+            && !api.search && !api.hash && (url.protocol !== "https:" || api.protocol === "https:")) {
+            apiUrl = api.href.replace(/\/$/, "");
+          }
+        }
+        return { appUrl: url.origin, sourceId: value.source_exploration_id, apiUrl };
       } catch { return null; }
     })();
     const statusLabels = {
@@ -285,7 +293,11 @@
         return;
       }
       const plan = caseCapturePlan(key);
-      const target = reportConnection.appUrl + "/#/reexecutar/" + encodeURIComponent(reportConnection.sourceId) + "/" + encodeURIComponent(String(current.id))
+      const owner = typeof current.rerun_source_exploration_id === "string" && current.rerun_source_exploration_id
+        ? current.rerun_source_exploration_id : reportConnection.sourceId;
+      const scenario = typeof current.rerun_source_scenario_id === "string" && current.rerun_source_scenario_id
+        ? current.rerun_source_scenario_id : String(current.id);
+      const target = reportConnection.appUrl + "/#/reexecutar/" + encodeURIComponent(owner) + "/" + encodeURIComponent(scenario)
         + (plan ? "?capture_plan=" + encodeURIComponent(JSON.stringify(plan)) : "");
       window.open(target, "_blank", "noopener,noreferrer");
       feedback("Confirmação de reexecução solicitada na aplicação. Nenhuma ação foi iniciada por este relatório. "
@@ -1145,11 +1157,102 @@
       if (feedback) { feedback.hidden = true; feedback.textContent = ""; }
       if ($("case-prev")) $("case-prev").disabled = position <= 0;
       if ($("case-next")) $("case-next").disabled = position < 0 || position >= cases.length - 1;
+      const history = current && Array.isArray(current.execution_history) ? current.execution_history : [];
+      if ($("case-history")) $("case-history").disabled = !history.length;
+      text($("case-history-count"), history.length > 1 ? String(history.length) : "");
       all("#scenarios details.scenario[data-case-index]").forEach((detail) => {
         const selected = current && detail.dataset.caseIndex === selectedCase;
         detail.hidden = !selected;
         if (selected) { detail.open = true; ensureCaseExplorer(detail); }
       });
+    }
+
+    function closeCaseHistory() {
+      const dialog = $("case-history-dialog");
+      if (!dialog) return;
+      if (typeof dialog.close === "function") dialog.close(); else dialog.removeAttribute("open");
+      const trigger = $("case-history");
+      if (trigger) trigger.focus({ preventScroll: true });
+    }
+
+    function openCaseHistory() {
+      const current = byIndex.get(selectedCase);
+      const dialog = $("case-history-dialog");
+      const list = $("case-history-list"), content = $("case-history-detail");
+      if (!current || !dialog || !list || !content || !Array.isArray(current.execution_history)) return;
+      list.replaceChildren(); content.replaceChildren();
+      text($("case-history-title"), "Histórico de " + current.id);
+      const revisions = current.execution_history.slice().reverse();
+      const controls = [];
+      const select = (revision) => {
+        content.replaceChildren();
+        controls.forEach(({ control, value }) => {
+          const selected = value === revision;
+          control.classList.toggle("active", selected);
+          control.setAttribute("aria-pressed", String(selected));
+        });
+        const label = revision.version === 0 ? "Execução original" : "Reexecução " + revision.version;
+        text($("case-history-note"), label + (revision.current ? " · Resultado atual da lista de testes" : " · Versão histórica, somente leitura"));
+        if (revision.current) {
+          const message = document.createElement("p");
+          message.textContent = "Esta é a versão mostrada na lista de testes. As versões anteriores continuam disponíveis na linha do tempo ao lado.";
+          content.append(message, button("Ver resultado atual", closeCaseHistory, "button button-primary"));
+          return;
+        }
+        const archive = all("#case-history-archive details[data-history-case-index][data-history-version]")
+          .find((item) => item.dataset.historyCaseIndex === String(current.index)
+            && item.dataset.historyVersion === String(revision.version));
+        if (!revision.has_result || !archive) {
+          const message = document.createElement("p");
+          message.className = "reading-guide";
+          message.textContent = !revision.has_result
+            ? "Esta tentativa ainda não tem um resultado de teste registrado. Ela não substitui nem aprova o resultado anterior."
+            : "As evidências desta versão não estão disponíveis neste arquivo.";
+          content.appendChild(message);
+          return;
+        }
+        const detail = archive.cloneNode(true);
+        // The immutable archived card remains available for later visits. Its
+        // visible clone gets a separate ID namespace, including internal links.
+        const ids = new Map();
+        [detail, ...all("[id]", detail)].filter((node) => node.id).forEach((node) => {
+          const old = node.id; ids.set(old, old + "--view"); node.id = old + "--view";
+        });
+        [detail, ...all("[href],[aria-controls],[aria-labelledby],[aria-describedby],[for]", detail)].forEach((node) => {
+          for (const attribute of ["aria-controls", "aria-labelledby", "aria-describedby", "for"]) {
+            if (node.hasAttribute(attribute)) node.setAttribute(attribute, node.getAttribute(attribute).split(/\s+/).map((id) => ids.get(id) || id).join(" "));
+          }
+          const href = node.getAttribute("href");
+          if (href && href[0] === "#" && ids.has(href.slice(1))) node.setAttribute("href", "#" + ids.get(href.slice(1)));
+        });
+        detail.hidden = false; detail.open = true;
+        all("details", detail).forEach((node) => { node.open = true; });
+        all("figure", detail).forEach(prepareCapturePreview);
+        content.appendChild(detail);
+        content.scrollTop = 0;
+      };
+      revisions.forEach((revision) => {
+        if (!revision || !Number.isInteger(revision.version) || revision.version < 0) return;
+        const control = button("", () => select(revision), "case-history-version");
+        const title = document.createElement("strong");
+        title.textContent = (revision.version === 0 ? "Execução original" : "Reexecução " + revision.version)
+          + (revision.current ? " · Atual" : "");
+        const date = document.createElement("time");
+        const recorded = new Date(revision.recorded_at || "");
+        date.textContent = Number.isNaN(recorded.getTime()) ? "Horário não registrado" : recorded.toLocaleString("pt-BR");
+        if (!Number.isNaN(recorded.getTime())) date.dateTime = recorded.toISOString();
+        const result = document.createElement("span");
+        result.className = "case-history-verdict";
+        result.dataset.status = revision.status || "";
+        result.textContent = verdictLabels[revision.status] || ({ running: "Em execução", queued: "Na fila", waiting_input: "Aguardando você", cancelled: "Cancelada", failed: "Interrompida" })[revision.run_status] || "Sem resultado";
+        const item = document.createElement("li");
+        control.append(title, date, result); item.appendChild(control); list.appendChild(item);
+        controls.push({ control, value: revision });
+      });
+      const first = revisions.find((revision) => !revision.current) || revisions[0];
+      if (first) select(first);
+      if (typeof dialog.showModal === "function") dialog.showModal(); else dialog.setAttribute("open", "");
+      if (controls.length) controls[0].control.focus();
     }
 
     function showView(view, focus) {
@@ -1348,6 +1451,9 @@
       text(feedback, value);
       if (feedback) feedback.hidden = false;
     }));
+    listen("case-history", "click", openCaseHistory);
+    listen("case-history-close", "click", closeCaseHistory);
+    listen("case-history-dialog", "cancel", (event) => { event.preventDefault(); closeCaseHistory(); });
     document.addEventListener("keydown", (event) => {
       if (event.defaultPrevented || event.key !== "Escape") return;
       if ($("step-picker") && $("step-picker").hasAttribute("open")) { event.preventDefault(); closeStepPicker(); }
@@ -1642,11 +1748,83 @@
       saveBlob(new Blob([new XMLSerializer().serializeToString(copy)], { type: "image/svg+xml;charset=utf-8" }), "autojev-jornada.svg");
     });
 
+    // Connected app reports follow the latest durable CT versions. A saved
+    // offline HTML has no runtime connection and never makes these requests.
+    function followReportRevisions() {
+      if (!reportConnection || !reportConnection.apiUrl || typeof window.fetch !== "function"
+        || typeof data.scenario_revisions_key !== "string" || !data.scenario_revisions_key) return;
+      let checking = false, stopped = false, refreshNotice = null, revisionTimer = null;
+      const base = reportConnection.apiUrl + "/explorations/" + encodeURIComponent(reportConnection.sourceId);
+      const options = { cache: "no-store", credentials: "omit", redirect: "error" };
+      const hasLocalWork = () => savedDrafts.size > 0
+        || ["case-editor", "step-picker", "case-history-dialog"].some((id) => $(id) && $(id).hasAttribute("open"));
+      const stop = () => {
+        stopped = true;
+        if (revisionTimer != null) window.clearInterval(revisionTimer);
+        window.removeEventListener("focus", check);
+        document.removeEventListener("visibilitychange", check);
+      };
+      const refresh = async (explicit = false) => {
+        if (stopped) return;
+        if (explicit && savedDrafts.size && !window.confirm("Atualizar os resultados descarta os passos extras deste rascunho. Baixe o relatório para preservá-los antes de continuar. Deseja atualizar agora?")) return;
+        const response = await window.fetch(base + "/report", options);
+        if (!response.ok) throw new Error("Relatório atualizado ainda não disponível");
+        const markup = await response.text();
+        const parsed = new DOMParser().parseFromString(markup, "text/html");
+        const newSource = parsed.getElementById("report-data");
+        let next;
+        try { next = JSON.parse(newSource && newSource.textContent || "{}"); } catch { return; }
+        if (!parsed.body.classList.contains("report-premium") || next.run_id !== data.run_id
+          || !next.scenario_revisions_key || next.scenario_revisions_key === data.scenario_revisions_key) return;
+        // A user can open history or start a draft while the response is in
+        // flight. Re-check immediately before replacing the visible document.
+        if (stopped) return;
+        if (!explicit && hasLocalWork()) { notify(); return; }
+        parsed.querySelectorAll("#report-app-runtime").forEach((node) => node.remove());
+        const runtime = parsed.createElement("script");
+        runtime.id = "report-app-runtime"; runtime.type = "application/json";
+        runtime.textContent = JSON.stringify({ app_url: reportConnection.appUrl,
+          source_exploration_id: reportConnection.sourceId, api_url: reportConnection.apiUrl }).replace(/</g, "\\u003c");
+        parsed.head.prepend(runtime);
+        stop();
+        document.open(); document.write("<!DOCTYPE html>\n" + parsed.documentElement.outerHTML); document.close();
+      };
+      const notify = () => {
+        if (refreshNotice) return;
+        refreshNotice = document.createElement("div");
+        refreshNotice.className = "report-revision-refresh"; refreshNotice.setAttribute("role", "status");
+        const message = document.createElement("span");
+        message.textContent = "Há uma nova versão deste relatório. Seu rascunho ou histórico aberto foi mantido.";
+        const update = button("Atualizar resultados", () => {
+          update.disabled = true;
+          refresh(true).catch(() => { message.textContent = "Não foi possível atualizar agora. Tente novamente."; })
+            .finally(() => { update.disabled = false; });
+        }, "button button-primary");
+        refreshNotice.append(message, update); document.body.appendChild(refreshNotice);
+      };
+      async function check() {
+        if (checking || stopped || document.visibilityState === "hidden") return;
+        checking = true;
+        try {
+          const response = await window.fetch(base + "/scenario-revisions", options);
+          if (!response.ok) return;
+          const revisions = await response.json();
+          if (typeof revisions.key !== "string" || revisions.key === data.scenario_revisions_key) return;
+          if (hasLocalWork()) notify(); else await refresh();
+        } catch (_) { /* Offline/disconnected reports keep their last complete snapshot. */ }
+        finally { checking = false; }
+      }
+      revisionTimer = window.setInterval(check, 10000);
+      window.addEventListener("focus", check); document.addEventListener("visibilitychange", check);
+      window.addEventListener("pagehide", stop, { once: true });
+    }
+
     filterCases();
     filterEvidence();
     filterTimeline();
     showView("overview", false);
     revealHash(false);
+    followReportRevisions();
   }
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", initializeReport, { once: true });

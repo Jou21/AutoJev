@@ -5,16 +5,20 @@ The existing evidence renderer remains the source of each case's full timeline.
 """
 from __future__ import annotations
 
-from collections import Counter, OrderedDict
-from datetime import datetime
 import html
 import json
+import re
+from collections import Counter, OrderedDict
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 from autojev.services.execution_summary import execution_duration_summary
-from autojev.services.report_localization import check_label
+from autojev.services.report_localization import (
+    check_label,
+    localize_report_presentation,
+)
 from autojev.services.verification_summary import evidence_verification_summary
 
 REPORT_LAYOUT_VERSION = "premium-v1"
@@ -103,24 +107,73 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, allow_nan=False).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
 
 
+def _history_card(card: str, index: int, version: int) -> str:
+    """Namespace canonical historical evidence without altering its contents."""
+    suffix = f"--history-{index}-v{version}"
+    identities = {item: item + suffix for item in re.findall(r'(?<![\w:-])id="([^"]+)"', card)}
+    card = re.sub(r'(?<![\w:-])id="([^"]+)"', lambda match: f'id="{identities[match[1]]}"', card)
+
+    def references(match: re.Match[str]) -> str:
+        values = match[2].split()
+        return match[1] + '="' + " ".join(identities.get(item, item) for item in values) + '"'
+
+    card = re.sub(r'\b(for|aria-labelledby|aria-describedby|aria-controls)="([^"]*)"', references, card)
+    card = re.sub(r'\bhref="#([^"]+)"', lambda match: f'href="#{identities.get(match[1], match[1])}"', card)
+    return card.replace(
+        '<details class="scenario" ',
+        f'<details class="scenario" data-history-case-index="{index}" data-history-version="{version}" ',
+        1,
+    )
+
+
+def _case_actions(exploration: dict[str, Any], scenario: dict[str, Any]) -> dict[Any, dict[str, Any]]:
+    # Missing owner actions must never borrow root step1 just because a rerun
+    # also uses step1. A versioned case's own recorded times are the fallback.
+    values = scenario.get("execution_actions")
+    if not isinstance(values, list):
+        foreign_owner = str(scenario.get("evidence_exploration_id") or exploration.get("id")) != str(exploration.get("id"))
+        values = [] if scenario.get("execution_revision") or foreign_owner else exploration.get("actions") or []
+    return {item.get("step_number"): item.get("result") or {} for item in values if isinstance(item, dict)}
+
+
+def _case_timing(exploration: dict[str, Any], scenario: dict[str, Any]) -> tuple[float | None, datetime | None]:
+    evidence = scenario.get("evidence") or {}
+    timeline = evidence.get("timeline") or []
+    actions = _case_actions(exploration, scenario)
+    elapsed = _seconds(evidence.get("action_started_at"), evidence.get("action_finished_at"))
+    first = _timestamp(evidence.get("action_started_at"))
+    steps = {entry.get("step_number", entry.get("action_step")) for entry in timeline if entry.get("kind") == "action"}
+    recorded_times = [_seconds(actions[step].get("started_at"), actions[step].get("finished_at")) for step in steps if step in actions]
+    if steps and len(recorded_times) == len(steps) and all(value is not None for value in recorded_times):
+        elapsed = sum(recorded_times)
+    elif len(steps) > 1:
+        elapsed = None
+    action_starts = [_timestamp(actions[step].get("started_at")) for step in steps if step in actions]
+    if any(action_starts):
+        first = min(value for value in action_starts if value is not None)
+    if first is None:
+        first = next((_timestamp(entry.get("occurred_at")) for entry in timeline if _timestamp(entry.get("occurred_at"))), None)
+    return elapsed, first
+
+
 def render_premium_report(renderer: Any, exploration: dict[str, Any], scenarios: list[dict[str, Any]], contexts: list[dict[str, Any]], legacy_document: str, fragments: dict[str, Any]) -> str:
     cases, pages, rules = [], OrderedDict(), OrderedDict()
     execution_time = execution_duration_summary(exploration)
     started = _timestamp(execution_time.get("started_at"))
     duration = execution_time.get("total_seconds")
-    actions = {item.get("step_number"): item.get("result") or {} for item in exploration.get("actions") or []}
-    case_html, evidence_cards, execution_events = [], [], []
-    evidence_seen: set[str] = set()
+    case_html, history_html, evidence_cards, execution_events = [], [], [], []
+    evidence_seen: set[tuple[str, str]] = set()
     uploaded_shots = {
-        Path(entry["screenshot"]).name for scenario in scenarios
+        (str(scenario.get("evidence_exploration_id") or exploration["id"]), Path(entry["screenshot"]).name) for scenario in scenarios
         for entry in (scenario.get("evidence") or {}).get("timeline") or []
         if entry.get("image_source") == "user_upload" and entry.get("screenshot")
     }
-    shot_owners: dict[str, list[tuple[int, str]]] = {}
+    shot_owners: dict[tuple[str, str], list[tuple[int, str]]] = {}
     for owner_index, owner in enumerate(scenarios):
         owner_evidence = owner.get("evidence") or {}
         for path in dict.fromkeys([entry.get("screenshot") for entry in owner_evidence.get("timeline") or [] if entry.get("screenshot")] + list(owner.get("screenshots") or [])):
-            shot_owners.setdefault(Path(path).name, []).append((owner_index, str(owner.get("id") or f"CT{owner_index+1:03d}")))
+            owner_key = (str(owner.get("evidence_exploration_id") or exploration["id"]), Path(path).name)
+            shot_owners.setdefault(owner_key, []).append((owner_index, str(owner.get("id") or f"CT{owner_index+1:03d}")))
     for index, scenario in enumerate(scenarios):
         evidence = scenario.get("evidence") or {}
         timeline = evidence.get("timeline") or []
@@ -129,23 +182,40 @@ def render_premium_report(renderer: Any, exploration: dict[str, Any], scenarios:
         url = renderer._public_issue_url(scenario.get("url") or "")
         page = _page(url)
         category = _category(scenario)
-        elapsed = _seconds(evidence.get("action_started_at"), evidence.get("action_finished_at"))
-        first = _timestamp(evidence.get("action_started_at"))
-        # Multi-action cases use recorded action durations, not LLM/documentation timestamps.
-        steps = {entry.get("step_number", entry.get("action_step")) for entry in timeline if entry.get("kind") == "action"}
-        recorded_times = [_seconds(actions[step].get("started_at"), actions[step].get("finished_at")) for step in steps if step in actions]
-        if steps and len(recorded_times) == len(steps) and all(value is not None for value in recorded_times):
-            elapsed = sum(recorded_times)
-        elif len(steps) > 1:
-            elapsed = None
-        action_starts = [_timestamp(actions[step].get("started_at")) for step in steps if step in actions]
-        if any(action_starts):
-            first = min(value for value in action_starts if value is not None)
-        if first is None:
-            first = next((_timestamp(entry.get("occurred_at")) for entry in timeline if _timestamp(entry.get("occurred_at"))), None)
-        offset = max(0, (first - started).total_seconds()) if started and first else None
+        elapsed, first = _case_timing(exploration, scenario)
+        original_owner = str(scenario.get("evidence_exploration_id") or exploration["id"]) == str(exploration["id"])
+        # The chart spans the original run only. Never clip a later rerun's
+        # timestamp into its last bucket or inflate the original run duration.
+        offset = max(0, (first - started).total_seconds()) if original_owner and started and first else None
         signals = evidence.get("technical_signals") or []
         case = {"index": index, "id": str(scenario.get("id") or f"CT{index+1:03d}"), "title": str(scenario.get("title") or "Caso sem título"), "status": status, "category": category, "page": page, "url": url, "duration_seconds": elapsed, "signals": len(signals), "offset": offset}
+        revision = scenario.get("execution_revision")
+        if isinstance(revision, dict):
+            case["execution_revision"] = revision
+            case["rerun_source_exploration_id"] = revision.get("exploration_id")
+            case["rerun_source_scenario_id"] = revision.get("scenario_id")
+        revisions = scenario.get("execution_history")
+        if isinstance(revisions, list):
+            history = []
+            for item in revisions:
+                if not isinstance(item, dict) or type(item.get("version")) is not int or item["version"] < 0:
+                    continue
+                snapshot = item.get("scenario")
+                summary = {key: value for key, value in item.items() if key not in {"scenario", "actions"}}
+                if isinstance(snapshot, dict):
+                    snapshot = localize_report_presentation({"scenarios": [snapshot]})["scenarios"][0]
+                    snapshot_timing = {**snapshot, "execution_actions": item.get("actions") or []}
+                    summary.update({
+                        "title": str(snapshot.get("title") or case["title"]),
+                        "category": _category(snapshot),
+                        "duration_seconds": _case_timing(exploration, snapshot_timing)[0],
+                        "signals": len((snapshot.get("evidence") or {}).get("technical_signals") or []),
+                    })
+                    if not item.get("current"):
+                        historical = renderer._scenario_card(str(item.get("exploration_id") or exploration["id"]), snapshot)
+                        history_html.append(_history_card(historical, index, item["version"]))
+                history.append(summary)
+            case["execution_history"] = history
         case["search"] = " ".join([case["id"], case["title"], url, str(scenario.get("description") or ""), str(scenario.get("actual_result") or ""), *[str(item.get("message") or "") for item in signals]])
         cases.append(case)
         record = pages.setdefault(url or "Página não registrada", {"url": url, "page": page, "cases": [], "durations": []})
@@ -170,15 +240,16 @@ def render_premium_report(renderer: Any, exploration: dict[str, Any], scenarios:
         paths = list(dict.fromkeys([entry.get("screenshot") for entry in timeline if entry.get("screenshot")] + list(scenario.get("screenshots") or [])))
         for shot in paths:
             name = Path(shot).name
-            key = name
+            owner_id = str(scenario.get("evidence_exploration_id") or exploration["id"])
+            key = (owner_id, name)
             # Only reference files embedded by the canonical timeline renderer.
-            if key in evidence_seen or not (renderer.artifact_root / str(exploration["id"]) / "screenshots" / name).is_file():
+            if key in evidence_seen or renderer._image_path(owner_id, name) is None:
                 continue
             evidence_seen.add(key)
-            owners = shot_owners[name]
+            owners = shot_owners[key]
             owner_ids = ", ".join(owner_id for _, owner_id in owners)
             links = "".join(f'<button class="button button-ghost" data-open-case="{owner_index}">{_h(owner_id)} →</button>' for owner_index, owner_id in owners)
-            image_context = "Imagem anexada pelo usuário" if name in uploaded_shots else page
+            image_context = "Imagem anexada pelo usuário" if key in uploaded_shots else page
             evidence_cards.append(f'<article class="evidence-card" data-evidence-kind="screenshot" data-case-index="{index}" data-filename="{_h(name)}" data-search="{_h(owner_ids)}"><button data-preview-evidence aria-label="Ampliar imagem {_h(name)}"><img loading="lazy" data-source-case="{index}" data-source-shot="{_h(name)}" alt="{_h(owner_ids)} · {_h(name)}"></button><div class="evidence-meta"><strong>{_h(case["id"])}</strong><p>{_h(name)}</p><small>{_h(image_context)} · {len(owners)} CT(s) associado(s)</small><div>{links}</div></div></article>')
         if signals:
             evidence_cards.append(f'<article class="evidence-card" data-evidence-kind="log" data-case-index="{index}"><div class="evidence-meta"><span class="event-chip">Console e rede</span><h3>{_h(case["id"])} · {len(signals)} sinais técnicos</h3><p>{_h(str(signals[0].get("message") or "Sinal técnico registrado")[:300])}</p><small>Um sinal técnico não confirma sozinho um defeito funcional.</small><button class="button button-ghost" data-open-case="{index}">Ver na linha do tempo do CT</button></div></article>')
@@ -207,7 +278,7 @@ def render_premium_report(renderer: Any, exploration: dict[str, Any], scenarios:
     categories_html = '<div class="category-list">' + "".join(f'<div class="category-row"><span>{label}</span><strong>{category_counts[key]}</strong><div class="progress-track"><span class="progress-fill" style="width:{category_counts[key]/max(1,total)*100:.2f}%"></span></div></div>' for key, label in CATEGORIES.items()) + '</div>'
     top_pages = _pages_table(list(pages.values())[:6], compact=True)
     meta = f'<div class="meta"><div><strong>Aplicação</strong><div class="url">{_h(renderer._public_issue_url(exploration.get("app_url")))}</div></div><div><strong>Escopo</strong><div>{_h(fragments["scope"])}</div></div><div><strong>Evidência da LLM</strong><div>{_h(fragments["evidence_mode"])}</div></div><div><strong>Status</strong><div>{_h(fragments["status"])}</div></div><div><strong>Duração total</strong><div>{_h(renderer._duration(exploration))}</div></div><div><strong>Gerado em</strong><div>{_h(fragments["generated"])}</div></div></div>'
-    overview = meta + '<p class="muted">A duração total inclui revisões auxiliares e geração do relatório.</p>' + metrics_html + '<div class="dashboard-grid">' + _panel("Resultado dos testes", donut, "Distribuição dos resultados registrados") + _panel("Atividade ao longo da execução", chart, "Início dos CTs por intervalo · não representa uso de CPU") + _panel("Natureza das verificações", categories_html, "Classificação derivada das evidências de cada CT") + _panel("Páginas com casos registrados", top_pages, "Contagem de CTs, não percentual de cobertura da página") + '</div>' + fragments["cost_summary"] + fragments["visual_summary"] + fragments["strength_summary"]
+    overview = meta + '<p class="muted">A duração total inclui revisões auxiliares e geração do relatório.</p>' + metrics_html + '<div class="dashboard-grid">' + _panel("Resultado dos testes", donut, "Distribuição dos resultados registrados") + _panel("Atividade ao longo da execução", chart, "Início dos CTs por intervalo da execução original · reexecuções posteriores não entram neste gráfico · não representa uso de CPU") + _panel("Natureza das verificações", categories_html, "Classificação derivada das evidências de cada CT") + _panel("Páginas com casos registrados", top_pages, "Contagem de CTs, não percentual de cobertura da página") + '</div>' + fragments["cost_summary"] + fragments["visual_summary"] + fragments["strength_summary"]
     rerun_source = next((event.get("payload") for event in exploration.get("events", [])
                          if event.get("type") == "scenario_rerun_source"
                          and isinstance(event.get("payload"), dict)), None)
@@ -215,7 +286,8 @@ def render_premium_report(renderer: Any, exploration: dict[str, Any], scenarios:
         overview = (
             '<div class="reading-guide rerun-provenance"><strong>Reexecução individual de '
             + _h(rerun_source.get("source_scenario_id")) + '.</strong> '
-            'Este é um novo resultado; o relatório original permanece inalterado. '
+            'A lista de testes mostra o resultado mais recente de cada CT; as execuções anteriores ficam no histórico do teste. '
+            'Os registros e arquivos de cada tentativa são preservados. '
             'Foram previstas a ação original, as conferências locais e, quando confirmadas, pausas para anexar imagens escolhidas pelo usuário. '
             'Análises por modelo e cartões de consulta ao banco não são executados. '
             '<br>Execução de origem: <span class="url">'
@@ -233,6 +305,8 @@ def render_premium_report(renderer: Any, exploration: dict[str, Any], scenarios:
         '<h1 id="result-view-title" tabindex="-1">Resultado do teste</h1></div>'
         '<div class="result-actions"><div class="result-case-navigation" role="group" aria-label="Navegar entre testes">'
         '<button id="case-rerun" class="button button-rerun" aria-describedby="case-rerun-feedback"><span aria-hidden="true">↻</span> Reexecutar teste</button>'
+        '<button id="case-history" class="button button-ghost" title="Histórico" aria-haspopup="dialog" aria-controls="case-history-dialog">'
+        + _icon("clock") + 'Histórico <span id="case-history-count"></span></button>'
         '<button id="case-edit" class="button button-ghost" data-edit-current>Editar passos</button>'
         '<button id="case-prev" class="button button-ghost">← Teste anterior</button>'
         '<button id="case-next" class="button button-ghost">Teste seguinte →</button></div>'
@@ -240,6 +314,7 @@ def render_premium_report(renderer: Any, exploration: dict[str, Any], scenarios:
         '<p id="case-rerun-feedback" class="case-rerun-feedback" role="status" aria-live="polite" hidden></p>'
         '<h2 id="case-title" class="result-title">Detalhes do caso</h2><section id="scenarios">'
         + ("".join(case_html) or _empty("Nenhum caso individual registrado nesta execução.")) + '</section>'
+        '<div id="case-history-archive" hidden aria-hidden="true">' + "".join(history_html) + '</div>'
     )
     evidence_view = '<div class="report-tools"><input id="evidence-search" class="search" type="search" aria-label="Buscar evidências" placeholder="Buscar por CT, página ou arquivo"><div class="filters"><button class="active" data-evidence-filter="all">Todas</button><button data-evidence-filter="screenshot">Capturas</button><button data-evidence-filter="log">Console e rede</button><button data-evidence-filter="data">Dados</button></div></div><p class="muted">Capturas e registros reais desta execução. Nenhum vídeo foi registrado. Cada arquivo aparece uma vez na galeria, com links para todos os CTs que compartilham a captura.</p><div class="evidence-grid" id="evidence-grid">' + ("".join(evidence_cards) or _empty("Nenhuma evidência associada a um CT está disponível.")) + '</div>' + fragments["observations"]
     for key, title in (("started_at", "Início da execução"), ("ended_at", "Encerramento da execução")):
@@ -260,18 +335,39 @@ def render_premium_report(renderer: Any, exploration: dict[str, Any], scenarios:
         app_name = urlsplit(public_app).hostname or "Aplicação em teste"
     except ValueError:
         app_name = "Aplicação em teste"
-    payload = {"run_id": str(exploration["id"]), "cases": cases, "pages": [item["page"] for item in pages.values()], "started_at": exploration.get("started_at"), "duration_seconds": duration}
+    payload = {"run_id": str(exploration["id"]), "cases": cases, "pages": [item["page"] for item in pages.values()], "started_at": exploration.get("started_at"), "duration_seconds": duration,
+               "scenario_revisions_key": exploration.get("scenario_revisions_key")}
     data = '<script id="report-data" type="application/json">' + _json(payload) + '</script>'
     head = legacy_document.split('</head>', 1)[0]
     head = head.replace('<html lang="pt-BR"', f'<html data-report-layout="{REPORT_LAYOUT_VERSION}" lang="pt-BR"', 1)
     css = (ASSETS / "premium.css").read_text() + '\n' + (ASSETS / "journey.css").read_text()
     js = (ASSETS / "premium.js").read_text()
-    data = _case_editor() + _step_picker() + data + '<script id="report-drafts" type="application/json">{"version":1,"cases":{}}</script>'
+    data = _case_history_dialog() + _case_editor() + _step_picker() + data + '<script id="report-drafts" type="application/json">{"version":1,"cases":{}}</script>'
     return head + f'<style>{css}</style></head><body class="report-premium" data-view="overview" data-theme="dark" data-density="comfortable" data-report-schema="ct-timeline-v1"><aside class="report-sidebar"><div class="report-brand"><span class="brand-mark">{_icon("robot")}</span><div><strong class="brand-name">AUTOJEV</strong><span class="brand-caption">Relatório exploratório</span></div></div><nav aria-label="Seções do relatório">{nav}</nav><div class="sidebar-footer"><span class="legend-dot"></span>Relatório local e independente<small>Dados preservados · sem chamadas de IA</small></div></aside><main class="report-main"><header class="report-topbar"><div><span class="page-kicker">{_h(app_name)} / RELATÓRIO</span><h1 id="view-title" tabindex="-1">Visão geral</h1><p id="view-subtitle">Uma visão clara dos testes, resultados e evidências da execução.</p></div><div class="toolbar"><button id="print-report" class="button button-ghost">Imprimir</button><button id="download-report" class="button button-primary">{_icon("download")}Baixar relatório</button></div></header>{views}<noscript><style>.report-view[hidden],#scenarios .scenario[hidden]{{display:block!important}}.report-sidebar,.report-tools,.result-navigation,.toolbar{{display:none!important}}</style><p>JavaScript está desativado. Todas as seções são exibidas para leitura; abra os casos para ver suas evidências.</p></noscript></main><dialog id="evidence-dialog" class="evidence-dialog"><div class="dialog-toolbar"><strong id="evidence-caption">Captura registrada</strong><a id="download-evidence" class="button button-ghost" download>Baixar captura</a><button id="close-evidence" class="button button-ghost" aria-label="Fechar captura">Fechar ✕</button></div><div class="dialog-content"><img id="evidence-preview" alt="Captura de evidência ampliada"></div></dialog>{data}<script>{js}</script></body></html>'
 
 
 def _case_row(case: dict[str, Any]) -> str:
-    return f'<tr data-case-index="{case["index"]}" data-open-case-row="{case["index"]}" tabindex="0" aria-label="Abrir resultado de {_h(case["id"])}: {_h(case["title"])}"><td><span class="case-id">{_h(case["id"])}</span></td><td><button class="case-title-button" data-open-case="{case["index"]}">{_h(case["title"])}</button></td><td><span class="badge {case["status"].lower()}">{STATUS_LABELS[case["status"]]}</span></td><td>{CATEGORIES[case["category"]]}</td><td class="page-url" title="{_h(case["url"])}">{_h(case["page"])}</td><td>{_time(case["duration_seconds"])}</td><td>{case["signals"]}</td><td><button class="button button-ghost" data-open-case="{case["index"]}" aria-label="Abrir {_h(case["id"])}">Ver →</button></td></tr>'
+    revision = case.get("execution_revision") or {}
+    version = revision.get("version")
+    revision_note = ""
+    if type(version) is int and version > 0:
+        timestamp = _timestamp(revision.get("recorded_at"))
+        recorded = timestamp.astimezone().strftime("%d/%m/%Y %H:%M") if timestamp else ""
+        revision_note = f'<small class="case-revision-label">Reexecução {version}' + (f' · {_h(recorded)}' if recorded else '') + '</small>'
+    return f'<tr data-case-index="{case["index"]}" data-open-case-row="{case["index"]}" tabindex="0" aria-label="Abrir resultado de {_h(case["id"])}: {_h(case["title"])}"><td><span class="case-id">{_h(case["id"])}</span></td><td><button class="case-title-button" data-open-case="{case["index"]}">{_h(case["title"])}</button>{revision_note}</td><td><span class="badge {case["status"].lower()}">{STATUS_LABELS[case["status"]]}</span></td><td>{CATEGORIES[case["category"]]}</td><td class="page-url" title="{_h(case["url"])}">{_h(case["page"])}</td><td>{_time(case["duration_seconds"])}</td><td>{case["signals"]}</td><td><button class="button button-ghost" data-open-case="{case["index"]}" aria-label="Abrir {_h(case["id"])}">Ver →</button></td></tr>'
+
+
+def _case_history_dialog() -> str:
+    return (
+        '<dialog id="case-history-dialog" class="case-history-dialog" aria-labelledby="case-history-title">'
+        '<header class="case-history-header"><div><span class="page-kicker">Linha do tempo do teste</span>'
+        '<h2 id="case-history-title">Histórico de execuções</h2></div>'
+        '<button id="case-history-close" class="button button-ghost" aria-label="Fechar histórico">Fechar ✕</button></header>'
+        '<p id="case-history-note" class="muted" role="status" aria-live="polite">A lista de testes sempre mostra o resultado mais recente. '
+        'Selecione uma execução abaixo para consultar suas evidências preservadas.</p>'
+        '<div class="case-history-layout"><ol id="case-history-list" class="case-history-list" aria-label="Execuções do teste"></ol>'
+        '<section id="case-history-detail" class="case-history-detail" aria-label="Evidências da execução selecionada" tabindex="-1"></section></div></dialog>'
+    )
 
 
 def _pages_table(pages: list[dict[str, Any]], compact: bool = False) -> str:

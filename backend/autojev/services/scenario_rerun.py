@@ -10,6 +10,7 @@ guessed action. The original run is read-only.
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import json
 import math
@@ -22,24 +23,51 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from autojev.adapters.playwright_executor import BrowserUnavailableError, LoginAttempt, PlaywrightExecutor
+from autojev.adapters.playwright_executor import (
+    BrowserUnavailableError,
+    LoginAttempt,
+    PlaywrightExecutor,
+)
 from autojev.adapters.repository import NotFoundError
 from autojev.adapters.secrets import redact
 from autojev.domain.models import (
-    ActionResult, AgentDecision, ExplorationOptions, ExplorationRequest,
-    ExplorationStatus, ModelSelection, Observation, ScenarioStatus, TestScenario, utc_now,
+    ActionResult,
+    AgentDecision,
+    ExplorationOptions,
+    ExplorationRequest,
+    ExplorationStatus,
+    ModelSelection,
+    Observation,
+    ScenarioStatus,
+    TestScenario,
+    utc_now,
 )
 from autojev.services.business_checks import check_business_outcomes
 from autojev.services.exploration import ExplorationManager
 from autojev.services.report_localization import check_label
-from autojev.services.scenario_timeline import prepare_scenario_timelines
-from autojev.services.scenario_step_order import capture_position_anchor, presentation_scenario_steps
-from autojev.services.rerun_step_progress import build_step_plan, project_step_progress, progress_check_bindings
-from autojev.services.user_image_upload import ValidatedUserImage, validate_user_image
-from autojev.services.rerun_recipe import (
-    RerunRecipeBlocked, recipe_effect_digest, resolve_rerun_decision, validate_rerun_recipe,
+from autojev.services.rerun_initial_observation import (
+    INITIAL_OBSERVATION_EVENT,
+    initial_observation_from_events,
+    with_initial_observation,
 )
-
+from autojev.services.rerun_recipe import (
+    RerunRecipeBlocked,
+    recipe_effect_digest,
+    resolve_rerun_decision,
+    validate_rerun_recipe,
+)
+from autojev.services.rerun_step_progress import (
+    build_step_plan,
+    progress_check_bindings,
+    project_step_progress,
+)
+from autojev.services.scenario_step_order import (
+    capture_position_anchor,
+    presentation_scenario_steps,
+)
+from autojev.services.scenario_timeline import prepare_scenario_timelines
+from autojev.services.user_image_upload import ValidatedUserImage, validate_user_image
+from autojev.services.rerun_preparation_presentation import preparation_presentation
 
 SOURCE_EVENT = "scenario_rerun_source"
 STATE_EVENT = "scenario_rerun_state"
@@ -127,8 +155,17 @@ class ScenarioRerunService:
         self.capture_events: dict[str, asyncio.Event] = {}
         self.capture_records: dict[str, list[dict[str, Any]]] = {}
         self.pending_images: dict[str, dict[str, Any]] = {}
+        # Unconfirmed images exist only in memory, scoped to one live pause.
+        # Never include these bytes in durable state/events or AI payloads.
+        self.capture_previews: dict[str, dict[str, Any]] = {}
+        # The temporary shared checkbox never submits anything by itself.
+        # It gates passive native-login continuation only together with an
+        # observed completed login and all original precondition guards.
+        self.preparation_consents: dict[str, dict[str, Any]] = {}
         self.states: dict[str, dict[str, Any]] = {}
         self.intervention_timeout_seconds = 300.0
+        self.manual_login_poll_seconds = 0.75
+        self.manual_login_observation_timeout_seconds = 5.0
         self.operation_timeout_seconds = 120.0
         self.capture_timeout_seconds = 900.0
         self.capture_total_timeout_seconds = 3600.0
@@ -289,6 +326,8 @@ class ScenarioRerunService:
         self.input_events.pop(exploration_id, None)
         self.capture_events.pop(exploration_id, None)
         self.capture_records.pop(exploration_id, None)
+        self.capture_previews.pop(exploration_id, None)
+        self.preparation_consents.pop(exploration_id, None)
         pending_image = self.pending_images.pop(exploration_id, None)
         if pending_image is not None:
             # Only this generated, never committed file is eligible for
@@ -298,6 +337,17 @@ class ScenarioRerunService:
 
     def _persist(self, exploration_id: str, **changes: Any) -> None:
         self.states[exploration_id].update(changes)
+        preview = self.capture_previews.get(exploration_id)
+        state = self.states[exploration_id]
+        checkpoint = state.get("capture_checkpoint") or {}
+        if preview is not None and (state.get("running") is not True or state.get("phase") != "waiting_capture"
+                                    or (preview["checkpoint_id"], preview["checkpoint_version"]) !=
+                                    (checkpoint.get("id"), checkpoint.get("version"))):
+            self.capture_previews.pop(exploration_id, None)
+        consent = self.preparation_consents.get(exploration_id)
+        if consent is not None and (state.get("running") is not True or state.get("phase") != "waiting_preparation"
+                                    or consent["preparation_version"] != (state.get("preparation") or {}).get("version")):
+            self.preparation_consents.pop(exploration_id, None)
         self.repository.add_event(exploration_id, "info", STATE_EVENT,
                                   "Estado da reexecução individual", copy.deepcopy(self.states[exploration_id]))
 
@@ -317,7 +367,47 @@ class ScenarioRerunService:
             # Presentation projection also covers historical machine codes.
             # Do not rewrite already preserved reports or terminal events.
             result["reason_label"] = rerun_block_reason(str(result["reason"]))
+        if isinstance(result.get("preparation"), dict):
+            result["preparation"]["consent"] = self._optional_preparation_consent(exploration_id, result["preparation"].get("version"))
+            result["preparation"]["presentation"] = preparation_presentation(result["preparation"], result.get("phase"))
         return result
+
+    def _require_preparation_consent(self, exploration_id: str, preparation_version: int) -> None:
+        self.repository.get_exploration(exploration_id, include_details=False)
+        state = self.states.get(exploration_id) or {}
+        event = self.input_events.get(exploration_id)
+        if (event is None or event.is_set() or state.get("running") is not True
+                or state.get("phase") != "waiting_preparation" or type(preparation_version) is not int
+                or (state.get("preparation") or {}).get("version") != preparation_version
+                or self.repository.is_cancel_requested(exploration_id)):
+            raise ValueError("Esta preparação não está aguardando confirmação ou foi atualizada. Confira o painel e tente novamente.")
+
+    def preparation_consent_for(self, exploration_id: str, preparation_version: int) -> dict[str, Any]:
+        """Read only this current preparation's temporary shared checkbox."""
+        self._require_preparation_consent(exploration_id, preparation_version)
+        consent = self.preparation_consents.get(exploration_id)
+        if consent is None or consent["preparation_version"] != preparation_version:
+            consent = {"preparation_version": preparation_version, "revision": 0, "checked": False}
+            self.preparation_consents[exploration_id] = consent
+        return copy.deepcopy(consent)
+
+    def _optional_preparation_consent(self, exploration_id: str, preparation_version: Any) -> dict[str, Any] | None:
+        try:
+            return self.preparation_consent_for(exploration_id, preparation_version)
+        except (NotFoundError, ValueError):
+            return None
+
+    def set_preparation_consent(self, exploration_id: str, preparation_version: int,
+                                expected_revision: int, checked: bool) -> dict[str, Any]:
+        """Synchronize UI selection only; never set the continuation event."""
+        current = self.preparation_consent_for(exploration_id, preparation_version)
+        if type(expected_revision) is not int or expected_revision < 0 or type(checked) is not bool:
+            raise ValueError("A seleção da preparação não é válida. Confira o painel e tente novamente.")
+        if current["revision"] != expected_revision:
+            raise ValueError("A preparação foi alterada em outra janela. Confira a seleção atual e tente novamente.")
+        current.update(revision=expected_revision + 1, checked=checked)
+        self.preparation_consents[exploration_id] = current
+        return copy.deepcopy(current)
 
     def resume(self, exploration_id: str) -> None:
         self.repository.get_exploration(exploration_id, include_details=False)
@@ -385,19 +475,30 @@ class ScenarioRerunService:
         login = preparation.get("login_attempt") or {}
         safe_preparation = {"version": number(preparation.get("version")),
                             **{key: text(preparation.get(key), 2000) for key in (
-                                "reason_label", "expected_url", "current_url", "instruction")}}
+                                "reason_label", "expected_url", "current_url", "instruction")},
+                            "reason_code": (preparation.get("reason_code")
+                                            if preparation.get("reason_code") in RECOVERABLE_PREPARATION_REASONS else None)}
         if isinstance(login, dict) and login:
             safe_preparation["login_attempt"] = {
                 "status": login.get("status") if login.get("status") in {"success", "rejected", "manual_required"} else "manual_required",
                 "reason_label": text(login.get("reason_label")),
             }
+        manual_login = preparation.get("manual_login")
+        if isinstance(manual_login, dict) and manual_login.get("status") in {"waiting", "ready", "blocked"}:
+            safe_preparation["manual_login"] = {
+                "status": manual_login["status"],
+                "reason_code": (manual_login.get("reason_code")
+                                if manual_login.get("reason_code") in RECOVERABLE_PREPARATION_REASONS else None),
+            }
+        safe_preparation["consent"] = self._optional_preparation_consent(exploration_id, preparation.get("version"))
+        safe_preparation["presentation"] = preparation_presentation(safe_preparation, state.get("phase"))
         usage = item.get("usage") or {}
         cost = usage.get("cost")
         cost = float(cost) if type(cost) in {int, float} and math.isfinite(cost) and cost >= 0 else None
         timeout = state.get("capture_timeout_seconds")
         timeout = float(timeout) if type(timeout) in {int, float} and math.isfinite(timeout) and timeout >= 0 else 0
         return {
-            "version": 1, "scenario_id": "CT001",
+            "version": 1, "exploration_id": exploration_id, "scenario_id": "CT001",
             "phase": state.get("phase") if state.get("phase") in {
                 "queued", "preparing", "waiting_preparation", "validating_preparation", "executing", "waiting_capture", "capturing_print", "finished"} else "queued",
             "running": state.get("running") is True,
@@ -421,8 +522,24 @@ class ScenarioRerunService:
         update = getattr(executor, "update_rerun_panel", None)
         if not callable(update):
             return
+        update_preview = getattr(executor, "update_rerun_preview", None)
+        last_preview_key = None
         while True:
             try:
+                if callable(update_preview):
+                    state = self.states.get(exploration_id) or {}
+                    checkpoint = state.get("capture_checkpoint") or {}
+                    if state.get("phase") == "waiting_capture" and state.get("running") is True:
+                        known_revision = (last_preview_key[2] if last_preview_key is not None and
+                                          last_preview_key[:2] == (checkpoint.get("id"), checkpoint.get("version")) else None)
+                        snapshot = self.preview_for(exploration_id, checkpoint.get("id"), checkpoint.get("version"), known_revision)
+                    else:
+                        snapshot = {"checkpoint_id": None, "checkpoint_version": None,
+                                    "revision": 0, "changed": True, "image": None}
+                    preview_key = (snapshot["checkpoint_id"], snapshot["checkpoint_version"], snapshot["revision"])
+                    if preview_key != last_preview_key:
+                        await update_preview(snapshot)
+                        last_preview_key = preview_key
                 await update(self._browser_panel_payload(exploration_id, secrets))
             except asyncio.CancelledError:
                 raise
@@ -466,18 +583,69 @@ class ScenarioRerunService:
             raise ValueError("O destino desta imagem não é válido.")
         return path
 
-    def capture_print(self, exploration_id: str, checkpoint_id: str, checkpoint_version: int,
-                      image_data_url: str | ValidatedUserImage) -> dict[str, Any]:
-        """Accept one explicit attachment; untrusted page code cannot confirm it."""
+    def _require_capture_checkpoint(self, exploration_id: str, checkpoint_id: str,
+                                    checkpoint_version: int) -> dict[str, Any]:
+        """A synchronous, authoritative gate shared by preview and acceptance."""
         self.repository.get_exploration(exploration_id, include_details=False)
         state = self.states.get(exploration_id) or {}
         checkpoint = state.get("capture_checkpoint") or {}
         event = self.capture_events.get(exploration_id)
-        if (event is None or not state.get("running") or state.get("phase") != "waiting_capture"
+        if (event is None or state.get("running") is not True or state.get("phase") != "waiting_capture"
                 or checkpoint.get("id") != checkpoint_id or type(checkpoint_version) is not int
                 or checkpoint.get("version") != checkpoint_version
                 or self.repository.is_cancel_requested(exploration_id)):
             raise ValueError("Esta captura não está aguardando confirmação ou já foi solicitada. Atualize a execução.")
+        return state
+
+    def preview_for(self, exploration_id: str, checkpoint_id: str, checkpoint_version: int,
+                    known_revision: int | None = None) -> dict[str, Any]:
+        """Read only the current ephemeral preview, never evidence or state."""
+        self._require_capture_checkpoint(exploration_id, checkpoint_id, checkpoint_version)
+        if known_revision is not None and (type(known_revision) is not int or known_revision < 0):
+            raise ValueError("A revisão da prévia não é válida. Atualize a execução.")
+        preview = self.capture_previews.get(exploration_id)
+        if preview is None or (preview["checkpoint_id"], preview["checkpoint_version"]) != (checkpoint_id, checkpoint_version):
+            preview = {"checkpoint_id": checkpoint_id, "checkpoint_version": checkpoint_version,
+                       "revision": 0, "image": None}
+            self.capture_previews[exploration_id] = preview
+        changed = known_revision != preview["revision"]
+        result = {"checkpoint_id": checkpoint_id, "checkpoint_version": checkpoint_version,
+                  "revision": preview["revision"], "changed": changed}
+        if changed:
+            image = preview["image"]
+            result["image"] = ({"data_url": f"data:{image.mime_type};base64,{base64.b64encode(image.content).decode('ascii')}",
+                                "name": "Print sincronizado", "size": len(image.content)} if image is not None else None)
+        return result
+
+    async def preview_from_browser_panel(self, exploration_id: str, checkpoint_id: str, checkpoint_version: int,
+                                         expected_revision: int, image_data_url: str | None) -> dict[str, Any]:
+        """Stage/clear a validated image without attachment or continuation.
+
+        CAS prevents a delayed validation or another window from overwriting a
+        newer choice. State is checked both before and after worker decoding.
+        """
+        self._require_capture_checkpoint(exploration_id, checkpoint_id, checkpoint_version)
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValueError("A revisão da prévia não é válida. Atualize a execução.")
+        initial = self.preview_for(exploration_id, checkpoint_id, checkpoint_version, expected_revision)
+        if initial["changed"]:
+            raise ValueError("O print foi alterado em outra janela. Confira a prévia atual e tente novamente.")
+        image = await asyncio.to_thread(validate_user_image, image_data_url) if image_data_url is not None else None
+        self._require_capture_checkpoint(exploration_id, checkpoint_id, checkpoint_version)
+        preview = self.capture_previews.get(exploration_id)
+        if (preview is None or preview["checkpoint_id"] != checkpoint_id or preview["checkpoint_version"] != checkpoint_version
+                or preview["revision"] != expected_revision):
+            raise ValueError("O print foi alterado em outra janela. Confira a prévia atual e tente novamente.")
+        self.capture_previews[exploration_id] = {"checkpoint_id": checkpoint_id, "checkpoint_version": checkpoint_version,
+                                               "revision": expected_revision + 1, "image": image}
+        return self.preview_for(exploration_id, checkpoint_id, checkpoint_version)
+
+    def capture_print(self, exploration_id: str, checkpoint_id: str, checkpoint_version: int,
+                      image_data_url: str | ValidatedUserImage) -> dict[str, Any]:
+        """Accept one explicit attachment; untrusted page code cannot confirm it."""
+        state = self._require_capture_checkpoint(exploration_id, checkpoint_id, checkpoint_version)
+        checkpoint = state["capture_checkpoint"]
+        event = self.capture_events[exploration_id]
         # Both the HTTP route and the isolated browser-panel callback validate
         # in a worker thread, then return here to recheck the live checkpoint.
         # Direct service clients are validated too.
@@ -496,6 +664,7 @@ class ScenarioRerunService:
         if anchor is not None:
             entry["position_anchor"] = copy.deepcopy(anchor)
         original_state = copy.deepcopy(state)
+        original_preview = self.capture_previews.get(exploration_id)
         try:
             # Synchronous phase change precedes the event: concurrent/double
             # clicks cannot overwrite this image or consume the next checkpoint.
@@ -504,6 +673,8 @@ class ScenarioRerunService:
         except Exception:
             self.pending_images.pop(exploration_id, None)
             self.states[exploration_id] = original_state
+            if original_preview is not None:
+                self.capture_previews[exploration_id] = original_preview
             self._uploaded_image_path(exploration_id, upload["screenshot"]).unlink(missing_ok=True)
             raise
         event.set()
@@ -537,6 +708,8 @@ class ScenarioRerunService:
 
     def cancel(self, exploration_id: str) -> None:
         self.repository.request_cancel(exploration_id)
+        self.capture_previews.pop(exploration_id, None)
+        self.preparation_consents.pop(exploration_id, None)
         event = self.input_events.get(exploration_id)
         if event is not None:
             event.set()
@@ -550,6 +723,8 @@ class ScenarioRerunService:
             task.cancel()
 
     async def shutdown(self) -> None:
+        self.capture_previews.clear()
+        self.preparation_consents.clear()
         tasks = list(self.tasks.values())
         for exploration_id, task in list(self.tasks.items()):
             self._persist(exploration_id, running=False, phase="finished", reason="backend_shutdown",
@@ -560,30 +735,105 @@ class ScenarioRerunService:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    @staticmethod
+    def _preparation_reason(observation: Observation, expected_url: str,
+                            fallback: str | None = None) -> str | None:
+        """Recognize the observed login before reporting a same-site redirect.
+
+        This is presentation of a prerequisite, not permission to submit a
+        form. A foreign origin retains its safety warning and every attempt
+        still needs the existing explicit user confirmation and resolver.
+        """
+        current_origin = _origin(observation.url)
+        if current_origin is None or current_origin != _origin(expected_url):
+            return "cross_origin_source"
+        if ExplorationManager._needs_login(observation):
+            return "authentication_required"
+        return fallback or ("before_url_changed" if observation.url != expected_url else None)
+
+    async def _watch_manual_login(self, exploration_id: str, executor: Any, deadline: float,
+                                 preparation_version: int, recipe: dict[str, Any], app_url: str) -> str:
+        """Observe native-site login without submitting or photographing it.
+
+        A completed login alone is not authorization. The current temporary
+        checkbox and all original guards must hold together; the main path
+        still takes a fresh observation before any original action dispatch.
+        """
+        observe = executor.observe_preparation
+        while time.monotonic() < deadline:
+            state = self.states.get(exploration_id) or {}
+            preparation = state.get("preparation") or {}
+            event = self.input_events.get(exploration_id)
+            if (state.get("running") is not True or state.get("phase") != "waiting_preparation"
+                    or preparation.get("version") != preparation_version or event is None or event.is_set()
+                    or self.repository.is_cancel_requested(exploration_id)):
+                return "superseded"
+            try:
+                observation = await asyncio.wait_for(observe(), min(self.manual_login_observation_timeout_seconds,
+                                                                   max(0.001, deadline - time.monotonic())))
+                reason = self._preparation_reason(observation, recipe["before_url"])
+                if reason is None:
+                    try:
+                        resolve_rerun_decision(recipe, observation, app_url)
+                    except RerunRecipeBlocked as exc:
+                        reason = str(exc)
+                status = "waiting" if reason == "authentication_required" else "blocked" if reason else "ready"
+                # Observation may yield while a new preparation/continue/cancel
+                # wins. Never publish or authorize against that stale read.
+                self._require_preparation_consent(exploration_id, preparation_version)
+                current = self.states[exploration_id]["preparation"]
+                manual_login = {"status": status, "reason_code": reason}
+                if current.get("manual_login") != manual_login or current.get("current_url") != observation.url:
+                    label = ("Você está na tela de login. Preencha usuário e senha para continuar."
+                             if reason == "authentication_required" else rerun_block_reason(reason) if reason else None)
+                    updated = {**current, "manual_login": manual_login, "reason_code": reason,
+                               "reason_label": label, "current_url": observation.url}
+                    updated["instruction"] = preparation_presentation(updated, "waiting_preparation")["instruction"]
+                    self._persist(exploration_id, preparation=updated)
+                    self.repository.update_exploration(exploration_id, current_url=observation.url)
+                if reason is None and self.preparation_consent_for(exploration_id, preparation_version)["checked"] is True:
+                    return "manual_login_ready"
+            except asyncio.CancelledError:
+                raise
+            except BrowserUnavailableError:
+                return "browser_closed"
+            except Exception:
+                # A transient navigation/DOM read is not proof of login, and
+                # cannot skip the finite preparation deadline or confirm it.
+                pass
+            await asyncio.sleep(min(self.manual_login_poll_seconds, max(0, deadline - time.monotonic())))
+        return "preparation_timeout"
+
     async def _wait_for_preparation(self, exploration_id: str, executor: Any,
-                                    deadline: float, preparation: dict[str, Any]) -> str:
+                                    deadline: float, preparation: dict[str, Any], *,
+                                    recipe: dict[str, Any] | None = None, app_url: str | None = None) -> str:
         event = self.input_events[exploration_id]
         event.clear()
         self.repository.update_exploration(exploration_id, status=ExplorationStatus.WAITING_INPUT)
         expected_url, current_url = preparation["expected_url"], preparation["current_url"]
         login_feedback = preparation.get("login_attempt") or {}
+        presentation = preparation_presentation(preparation, "waiting_preparation")
         message = ((login_feedback.get("reason_label") + " " if login_feedback else "")
                    + (preparation.get("reason_label") + " " if preparation.get("reason_label") else "")
-                   + "Se estiver na tela de login, preencha usuário e senha e clique em Continuar exploração: "
-                   + "o AutoJev tentará entrar com esses campos. Se já entrou, apenas conferirá a preparação. "
-                   + "Prepare também os demais pré-requisitos do CT (carrinho, opções ou formulário). "
+                   + presentation["instruction"] + " "
                    + f"Página esperada: {expected_url}. Página aberta: {current_url}. "
-                   + "Nenhuma ação do CT foi executada. Depois de corrigir a preparação, confirme novamente para continuar.")
+                   + "Nenhuma ação do CT foi executada. " + presentation["note"])
         preparation = {**preparation, "instruction": message}
         self._persist(exploration_id, phase="waiting_preparation", preparation=preparation)
         self.repository.add_event(exploration_id, "warning", "waiting_input", message,
                                   {"kind": "scenario_rerun_preparation", "manual_preparation_required": True,
                                    "preparation": copy.deepcopy(preparation)})
-        await executor.show_intervention_panel(message)
+        await executor.show_intervention_panel(message, title=presentation["title"], button_label=presentation["button_label"])
         app_resume = asyncio.create_task(event.wait())
         browser_resume = asyncio.create_task(executor.wait_for_user_input())
         browser_closed = asyncio.create_task(executor.wait_until_inactive())
         pending_tasks = {app_resume, browser_resume, browser_closed}
+        manual_login = None
+        if (preparation.get("reason_code") == "authentication_required" and recipe is not None and app_url
+                and callable(getattr(executor, "observe_preparation", None))):
+            manual_login = asyncio.create_task(self._watch_manual_login(
+                exploration_id, executor, deadline, preparation["version"], recipe, app_url))
+            pending_tasks.add(manual_login)
         try:
             # The caller supplies one absolute preparation deadline. An early
             # confirmation must never buy another full five-minute window.
@@ -595,6 +845,13 @@ class ScenarioRerunService:
                 return "preparation_timeout"
             if browser_closed in done:
                 return "browser_closed"
+            # An explicit continue wins any race with the passive observer.
+            if app_resume not in done and browser_resume not in done and not event.is_set() and manual_login in done:
+                result = manual_login.result()
+                if result != "manual_login_ready":
+                    return "browser_closed" if result == "browser_closed" else "preparation_timeout"
+                await executor.hide_intervention_panel()
+                return result
             for task in done:
                 task.result()
             await executor.hide_intervention_panel()
@@ -663,7 +920,58 @@ class ScenarioRerunService:
                     task.cancel()
             await asyncio.gather(*pending_tasks, return_exceptions=True)
 
+    def _record_initial_observation(self, exploration_id: str, observation: Observation,
+                                    reached_gap: int, secrets: list[str]) -> bool:
+        """Complete the real initial record when its roteiro position is reached.
+
+        A pause before step one must not complete that step. Conversely, a
+        pause after the initial observation must not wait for action dispatch
+        to publish evidence already obtained during validated preparation.
+        Subsequent guard observations never replace this immutable record.
+        """
+        state = self.states[exploration_id]
+        item = self.repository.get_exploration(exploration_id)
+        if initial_observation_from_events(item) is not None:
+            return True
+        rows = [row for row in (state.get("step_plan") or {}).get("steps", [])
+                if row.get("kind") == "observation"
+                and (row.get("identity") or {}).get("role") == "before_action"]
+        if (len(rows) != 1 or (rows[0].get("identity") or {}).get("total") != 1
+                or type(rows[0].get("source_index")) is not int
+                or rows[0]["source_index"] >= reached_gap
+                or self.repository.is_cancel_requested(exploration_id)):
+            return False
+        row = rows[0]
+        entry = {
+            "id": f"rerun-{row['id']}-before", "source_step_id": row["id"],
+            "kind": "observation", "title": "Antes da ação",
+            "occurred_at": observation.captured_at,
+            "url": redact(observation.url, secrets),
+            "screenshot": Path(observation.screenshot).name if observation.screenshot else None,
+            "message": "Estado inicial registrado antes de continuar o roteiro.",
+        }
+        self.repository.add_event(exploration_id, "info", INITIAL_OBSERVATION_EVENT,
+                                  "Estado inicial da reexecução registrado",
+                                  {"scenario_id": "CT001", "entry": entry})
+        if entry["screenshot"]:
+            self.repository.add_screenshot(exploration_id, entry["screenshot"], "Antes da reexecução", "CT001")
+        return True
+
     def _apply_captures(self, exploration_id: str, scenario: TestScenario) -> None:
+        initial = initial_observation_from_events(self.repository.get_exploration(exploration_id))
+        if initial is not None:
+            previous_before = scenario.evidence.get("before_screenshot")
+            scenario.evidence = with_initial_observation(scenario.evidence, initial)
+            # Revalidation remains in raw action evidence and explicit metadata,
+            # not as a second 'Antes da ação' step that would break print anchors.
+            represented = {entry.get("screenshot") for entry in scenario.evidence.get("timeline", [])}
+            represented.update((entry.get("action_preview") or {}).get("screenshot")
+                               for entry in scenario.evidence.get("timeline", [])
+                               if isinstance(entry.get("action_preview"), dict))
+            scenario.screenshots = [shot for shot in scenario.screenshots
+                                    if shot != previous_before or shot in represented]
+            if initial.get("screenshot"):
+                scenario.screenshots = list(dict.fromkeys([initial["screenshot"], *scenario.screenshots]))
         captures = copy.deepcopy(self.capture_records.get(exploration_id) or [])
         scenario.evidence["capture_plan"] = copy.deepcopy(self.states[exploration_id].get("capture_plan"))
         scenario.evidence["manual_captures"] = captures
@@ -757,6 +1065,7 @@ class ScenarioRerunService:
         dispatched = False
         scenario_saved = False
         scenario = None
+        initial_recorded = False
         capture_wait_total = 0.0
         terminal, reason = ExplorationStatus.PARTIAL, None
         secrets = list(self.manager.credential_vault.get(exploration_id).values())
@@ -783,11 +1092,24 @@ class ScenarioRerunService:
                         return await self._capture_from_browser_panel(
                             exploration_id, checkpoint_id, checkpoint_version, image_data_url)
                     configure_panel(capture_handler)
+                configure_preview = getattr(executor, "configure_rerun_preview", None)
+                if callable(configure_preview):
+                    async def preview_handler(checkpoint_id: str, checkpoint_version: int,
+                                              expected_revision: int, image_data_url: str | None) -> dict[str, Any]:
+                        return await self.preview_from_browser_panel(
+                            exploration_id, checkpoint_id, checkpoint_version, expected_revision, image_data_url)
+                    configure_preview(preview_handler)
                 configure_resume = getattr(executor, "configure_rerun_resume", None)
                 if callable(configure_resume):
                     async def resume_handler(preparation_version: int) -> dict[str, Any]:
                         return await self._resume_from_browser_panel(exploration_id, preparation_version)
                     configure_resume(resume_handler)
+                configure_consent = getattr(executor, "configure_rerun_consent", None)
+                if callable(configure_consent):
+                    async def consent_handler(preparation_version: int, expected_revision: int,
+                                              checked: bool) -> dict[str, Any]:
+                        return self.set_preparation_consent(exploration_id, preparation_version, expected_revision, checked)
+                    configure_consent(consent_handler)
                 self.repository.update_exploration(exploration_id, status=ExplorationStatus.RUNNING, started_at=utc_now())
                 self._persist(exploration_id, phase="preparing")
                 observation = await asyncio.wait_for(executor.start(recipe["before_url"]), operation_timeout())
@@ -797,7 +1119,7 @@ class ScenarioRerunService:
                 preparation_deadline = min(deadline, time.monotonic() + self.intervention_timeout_seconds)
                 attempts, version = 0, 0
                 login_feedback = None
-                preparation_reason = "before_url_changed" if observation.url != recipe["before_url"] else None
+                preparation_reason = self._preparation_reason(observation, recipe["before_url"])
                 decision = None
                 while decision is None:
                     version += 1
@@ -805,24 +1127,47 @@ class ScenarioRerunService:
                         "version": version, "attempts": attempts,
                         "expected_url": recipe["before_url"], "current_url": observation.url,
                         "reason_code": preparation_reason,
-                        "reason_label": rerun_block_reason(preparation_reason) if preparation_reason else None,
+                        "reason_label": ("Você está na tela de login. Preencha usuário e senha para continuar."
+                                         if preparation_reason == "authentication_required" else
+                                         rerun_block_reason(preparation_reason) if preparation_reason else None),
                         **({"login_attempt": login_feedback} if login_feedback else {}),
                     }
-                    reason = await self._wait_for_preparation(exploration_id, executor, preparation_deadline, preparation)
-                    if reason != "ready":
+                    reason = await self._wait_for_preparation(exploration_id, executor, preparation_deadline, preparation,
+                                                              recipe=recipe, app_url=source["app_url"])
+                    automatic_preparation = reason == "manual_login_ready"
+                    if reason not in {"ready", "manual_login_ready"}:
                         break
+                    reason = "ready"
+                    if automatic_preparation:
+                        try:
+                            authorized = self.preparation_consent_for(exploration_id, version)["checked"] is True
+                        except ValueError:
+                            # A real explicit continue may win while the panel
+                            # hides. It is not an automatic login submission.
+                            if self.input_events[exploration_id].is_set():
+                                automatic_preparation = False
+                                authorized = True
+                            else:
+                                authorized = False
+                        if not authorized:
+                            continue
                     attempts += 1
                     self._persist(exploration_id, phase="validating_preparation",
                                   preparation={**self.states[exploration_id]["preparation"], "attempts": attempts})
-                    # Always read again after the user's changes. Correcting a
-                    # page by itself is not a confirmation and never dispatches.
+                    # Always read again after user changes. Passive login
+                    # completion needs current authorization plus fresh guards;
+                    # other preparation still requires explicit continuation.
                     remaining = preparation_deadline - time.monotonic()
                     if remaining <= 0:
                         reason = "preparation_timeout"
                         break
                     try:
                         observation = await asyncio.wait_for(executor.observe("rerun_before"), min(operation_timeout(), remaining))
-                        if ExplorationManager._needs_login(observation):
+                        if automatic_preparation and ExplorationManager._needs_login(observation):
+                            preparation_reason = self._preparation_reason(observation, recipe["before_url"])
+                            continue
+                        if (_origin(observation.url) == _origin(recipe["before_url"])
+                                and ExplorationManager._needs_login(observation)):
                             await executor.show_intervention_panel(
                                 "Tentando entrar com os campos que você preencheu. Aguarde; nenhuma ação do CT foi executada.",
                                 title="Entrando e conferindo a preparação", button_label="Conferindo…", button_disabled=True)
@@ -855,9 +1200,10 @@ class ScenarioRerunService:
                     try:
                         decision = resolve_rerun_decision(recipe, observation, source["app_url"])
                     except RerunRecipeBlocked as exc:
-                        preparation_reason = str(exc)
-                        if preparation_reason not in RECOVERABLE_PREPARATION_REASONS:
+                        blocked_reason = str(exc)
+                        if blocked_reason not in RECOVERABLE_PREPARATION_REASONS:
                             raise
+                        preparation_reason = self._preparation_reason(observation, recipe["before_url"], blocked_reason)
                         # Keep the browser open so login redirects, an incorrect
                         # cart, or a premature click can be corrected. Nothing is
                         # saved as a CT and no original action has been started.
@@ -875,6 +1221,8 @@ class ScenarioRerunService:
                 checkpoints = self.states[exploration_id]["capture_plan"]["checkpoints"]
                 action_index = self.states[exploration_id]["capture_action_index"]
                 for checkpoint in (entry for entry in checkpoints if entry["gap"] <= action_index):
+                    initial_recorded = self._record_initial_observation(
+                        exploration_id, observation, checkpoint["gap"], secrets) or initial_recorded
                     wait_started = time.monotonic()
                     reason = await self._wait_for_capture(exploration_id, executor, checkpoint,
                         self.capture_total_timeout_seconds - capture_wait_total, "before_action")
@@ -890,6 +1238,8 @@ class ScenarioRerunService:
                     # again before the one and only action dispatch.
                     observation = await asyncio.wait_for(executor.observe("rerun_before_manual_print"), operation_timeout())
                     decision = resolve_rerun_decision(recipe, observation, source["app_url"])
+                initial_recorded = self._record_initial_observation(
+                    exploration_id, observation, action_index, secrets) or initial_recorded
                 if time.monotonic() >= deadline:
                     raise asyncio.TimeoutError("Original operation budget expired before action dispatch")
                 self.repository.update_exploration(exploration_id, status=ExplorationStatus.RUNNING, current_url=observation.url)
@@ -934,7 +1284,8 @@ class ScenarioRerunService:
                 self.repository.add_action(exploration_id, 1, redact(asdict(decision), secrets), safe_result)
                 self._save_capture_scenario(exploration_id, scenario, secrets)
                 scenario_saved = True
-                for shot, label in [(observation.screenshot, "Antes da reexecução"), (after.screenshot, "Depois da reexecução")]:
+                for shot, label in [(None if initial_recorded else observation.screenshot, "Antes da reexecução"),
+                                    (after.screenshot, "Depois da reexecução")]:
                     if shot:
                         self.repository.add_screenshot(exploration_id, shot, label, scenario.id)
                 self.repository.update_exploration(exploration_id, current_url=after.url, steps_completed=1)
@@ -962,11 +1313,11 @@ class ScenarioRerunService:
         except asyncio.CancelledError:
             terminal = ExplorationStatus.CANCELLED
             reason = self.states[exploration_id].get("reason") or "cancelled"
-            if not scenario_saved and (dispatched or self.capture_records.get(exploration_id)):
+            if not scenario_saved and (dispatched or self.capture_records.get(exploration_id) or initial_recorded):
                 self._blocked_scenario(exploration_id, original, recipe, reason, observation, dispatched=dispatched)
         except BrowserUnavailableError:
             terminal, reason = ExplorationStatus.CANCELLED, "browser_closed"
-            if not scenario_saved and (dispatched or self.capture_records.get(exploration_id)):
+            if not scenario_saved and (dispatched or self.capture_records.get(exploration_id) or initial_recorded):
                 self._blocked_scenario(exploration_id, original, recipe, reason, observation, dispatched=dispatched)
         except Exception as exc:
             reason = str(redact(f"{type(exc).__name__}: {exc}", secrets))[:1000]

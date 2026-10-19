@@ -11,6 +11,10 @@ async function loadDetailView() {
     ...react,
     useState: (value) => [typeof value === "function" ? value() : value, () => {}],
     useRef: (value) => ({ current: value }),
+    useMemo: (callback) => callback(),
+    useCallback: (callback) => callback,
+    useEffect() {},
+    useId: () => "report-open-freshness",
   } : nativeRequire(name);
   const compile = async (path, filename) => transpileModule(await readFile(path, "utf8"), {
     fileName: filename,

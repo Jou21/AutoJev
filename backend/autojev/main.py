@@ -65,7 +65,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(router)
 
     @app.exception_handler(RequestValidationError)
-    async def safe_validation_error(_, exc: RequestValidationError) -> JSONResponse:
+    async def safe_validation_error(request, exc: RequestValidationError) -> JSONResponse:
         # FastAPI's default response includes the rejected raw input. That can be
         # an API key or test credential, so expose locations/messages only.
         errors = [
@@ -79,6 +79,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return JSONResponse(
             status_code=422,
             content={"detail": "Request validation failed", "errors": errors},
+            headers={"Cache-Control": "no-store"} if request.url.path.endswith(("/capture-print/preview", "/preparation-consent")) else None,
         )
 
     return app

@@ -241,6 +241,18 @@ def _enrich_action_previews(data: dict[str, Any]) -> None:
         *(data.get("scenarios") or []),
         *(data.get("scenario_contexts") or []),
     ]:
+        # A report can display the latest result from a separate reexecution.
+        # Its step 1 is not the original run's step 1, even when filenames and
+        # action numbers happen to match. Never borrow the original preview.
+        scenario_actions = scenario.get("execution_actions")
+        foreign_owner = scenario.get("evidence_exploration_id") not in {None, data.get("id")}
+        if foreign_owner or isinstance(scenario_actions, list):
+            owner_by_step: dict[Any, list[dict[str, Any]]] = {}
+            for action in scenario_actions if isinstance(scenario_actions, list) else []:
+                if isinstance(action, dict) and action.get("step_number") is not None:
+                    owner_by_step.setdefault(action["step_number"], []).append(action)
+        else:
+            owner_by_step = by_step
         evidence = scenario.get("evidence") or {}
         entries = [
             entry
@@ -253,7 +265,7 @@ def _enrich_action_previews(data: dict[str, Any]) -> None:
                 step = entry.get("action_step")
             if step is None and len(entries) == 1:
                 step = evidence.get("action_step")
-            candidates = by_step.get(step, []) if step is not None else []
+            candidates = owner_by_step.get(step, []) if step is not None else []
             if len(candidates) != 1:
                 continue
             preview = ((candidates[0].get("result") or {}).get("evidence") or {}).get(

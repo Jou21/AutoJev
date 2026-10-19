@@ -312,7 +312,12 @@ async def test_premature_confirmation_can_be_corrected_then_executes_once(tmp_pa
     assert waiting["status"] == "waiting_input" and waiting["actions"] == waiting["scenarios"] == []
     assert not browsers[0].actions and not browsers[0].closed
     event = next(event for event in reversed(waiting["events"]) if event["type"] == "waiting_input")
-    assert event["payload"]["preparation"] == retry
+    assert event["payload"]["preparation"] == {key: value for key, value in retry.items()
+                                                if key not in {"consent", "presentation"}}
+    assert "consent" not in event["payload"]["preparation"]
+    assert "presentation" not in event["payload"]["preparation"]
+    assert retry["consent"] == {"preparation_version": 2, "revision": 0, "checked": False}
+    assert retry["presentation"]
     page.url = URL
     await asyncio.sleep(0.01)
     # Finishing a login/navigation cannot trigger the original action by itself.

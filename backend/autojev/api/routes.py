@@ -34,6 +34,7 @@ from autojev.services.visual_checks import visual_review_counts
 from autojev.services.verification_summary import verification_summary
 from autojev.services.visual_review_resume import visual_review_resume_summary
 from autojev.services.rerun_projection import without_rerun_recipes
+from autojev.services.scenario_revisions import project_scenario_revisions, scenario_report_origin
 from autojev.services.user_image_upload import UploadedImageError, validate_user_image
 
 from .schemas import (
@@ -41,7 +42,9 @@ from .schemas import (
     ExplorationCreate,
     ProviderCreate,
     ProviderUpdate,
+    ScenarioCapturePreviewInput,
     ScenarioCapturePrintInput,
+    ScenarioPreparationConsentInput,
     ScenarioRerunInput,
     VisualReviewResumeInput,
 )
@@ -76,7 +79,8 @@ def _attach_rerun_state(result: dict[str, Any], rerun: dict[str, Any], repositor
                 plan = build_step_plan(presentation_scenario_steps(evidence), rerun.get("capture_plan") or {}, evidence)
         except NotFoundError:
             pass
-    result["rerun"] = {**rerun, "step_progress": project_step_progress(result, rerun, plan)}
+    report_origin = scenario_report_origin(repository, result["id"]) if repository is not None else {}
+    result["rerun"] = {**rerun, **report_origin, "step_progress": project_step_progress(result, rerun, plan)}
     if rerun.get("phase") in {"waiting_capture", "capturing_print"}:
         waiting = rerun["phase"] == "waiting_capture"
         result["phase"] = "waiting_input" if waiting else "exploring"
@@ -863,13 +867,34 @@ async def get_exploration(
     try:
         rerun = request.app.state.scenario_rerun_service.state_for(exploration_id)
         item = _repository(request).get_exploration(exploration_id)
-        result = _exploration_payload(item)
+        # The original workspace follows latest CT versions. A rerun's live
+        # workspace still describes its own action/progress, never a child run.
+        # Older snapshots may preserve the parent link without a state event.
+        own_rerun = rerun.get("source_exploration_id") or any(
+            event.get("type") == "scenario_rerun_source" for event in item.get("events") or [])
+        display = (item if own_rerun else
+                   await run_in_threadpool(project_scenario_revisions, _repository(request), item))
+        result = _exploration_payload(display)
         result["visual_review_resume"] = request.app.state.visual_review_resume_service.state_for(exploration_id, item)
         if rerun.get("source_exploration_id"):
             _attach_rerun_state(result, rerun, _repository(request))
         return result
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/explorations/{exploration_id}/scenario-revisions")
+async def get_scenario_revisions(exploration_id: str, request: Request, response: Response) -> dict[str, str]:
+    """A small read-only freshness token for an app-connected report."""
+    try:
+        repository = _repository(request)
+        item = repository.get_exploration(exploration_id)
+        display = await run_in_threadpool(project_scenario_revisions, repository, item)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Pragma"] = "no-cache"
+    return {"key": display["scenario_revisions_key"]}
 
 
 @router.get("/explorations/{exploration_id}/scenarios/{scenario_id}/rerun")
@@ -886,7 +911,7 @@ async def scenario_rerun_preflight(
             "effects": [
                 "A ação original será repetida uma única vez e pode modificar dados na aplicação em teste.",
                 "Preencha o login no navegador e confirme a continuação para tentar entrar; se já estiver conectado, apenas os pré-requisitos serão conferidos.",
-                "O resultado ficará em uma nova execução; o relatório original será preservado.",
+                "O resultado ficará em uma nova execução e será mostrado no relatório de origem; as versões anteriores e suas evidências ficam preservadas no histórico do teste.",
                 "SWS e consultas de banco de dados não serão executados; pausas para print exigem confirmação manual.",
                 "Esta reexecução usa verificações locais, sem chamadas ao JEV ou à LLM auxiliar.",
             ],
@@ -913,6 +938,85 @@ async def scenario_rerun_start(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/explorations/{exploration_id}/preparation-consent")
+async def scenario_rerun_preparation_consent(
+    exploration_id: str, request: Request, response: Response,
+    preparation_version: int = Query(ge=1, le=10000),
+) -> dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        _require_rerun_origin(request)
+        return request.app.state.scenario_rerun_service.preparation_consent_for(exploration_id, preparation_version)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc), headers={"Cache-Control": "no-store"}) from exc
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc), headers={"Cache-Control": "no-store"}) from exc
+    except HTTPException as exc:
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
+        raise
+
+
+@router.post("/explorations/{exploration_id}/preparation-consent")
+async def scenario_rerun_set_preparation_consent(
+    exploration_id: str, body: ScenarioPreparationConsentInput, request: Request, response: Response,
+) -> dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        _require_rerun_origin(request)
+        return request.app.state.scenario_rerun_service.set_preparation_consent(
+            exploration_id, body.preparation_version, body.expected_revision, body.checked)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc), headers={"Cache-Control": "no-store"}) from exc
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc), headers={"Cache-Control": "no-store"}) from exc
+    except HTTPException as exc:
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
+        raise
+
+
+@router.get("/explorations/{exploration_id}/capture-print/preview")
+async def scenario_rerun_capture_preview(
+    exploration_id: str, request: Request, response: Response,
+    checkpoint_id: str = Query(pattern=r"^db-[0-9]{1,9}$"),
+    checkpoint_version: int = Query(ge=1, le=10000),
+    known_revision: int | None = Query(default=None, ge=0),
+) -> dict[str, Any]:
+    """The sole image-bearing read endpoint; it is never cacheable or public."""
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        _require_rerun_origin(request)
+        return request.app.state.scenario_rerun_service.preview_for(
+            exploration_id, checkpoint_id, checkpoint_version, known_revision)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc), headers={"Cache-Control": "no-store"}) from exc
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc), headers={"Cache-Control": "no-store"}) from exc
+    except HTTPException as exc:
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
+        raise
+
+
+@router.post("/explorations/{exploration_id}/capture-print/preview")
+async def scenario_rerun_stage_capture_preview(
+    exploration_id: str, body: ScenarioCapturePreviewInput, request: Request, response: Response,
+) -> dict[str, Any]:
+    """Synchronize a selection, without saving evidence or resuming the CT."""
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        _require_rerun_origin(request)
+        return await request.app.state.scenario_rerun_service.preview_from_browser_panel(
+            exploration_id, body.checkpoint_id, body.checkpoint_version, body.expected_revision, body.image_data_url)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc), headers={"Cache-Control": "no-store"}) from exc
+    except UploadedImageError as exc:
+        raise HTTPException(status_code=422, detail=str(exc), headers={"Cache-Control": "no-store"}) from exc
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc), headers={"Cache-Control": "no-store"}) from exc
+    except HTTPException as exc:
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
+        raise
 
 
 @router.post("/explorations/{exploration_id}/capture-print", status_code=status.HTTP_202_ACCEPTED)
@@ -1005,8 +1109,9 @@ async def get_report(exploration_id: str, request: Request) -> FileResponse:
     # Existing reports are immutable evidence. Render their updated presentation
     # to a separate artifact, retaining original verdicts and the original HTML.
     # No browser/model calls or historical data changes are needed.
-    snapshot = _repository(request).get_exploration(exploration_id)
-    snapshot["visual_review_resume"] = visual_review_resume_summary(snapshot)
+    raw_snapshot = _repository(request).get_exploration(exploration_id)
+    snapshot = await run_in_threadpool(project_scenario_revisions, _repository(request), raw_snapshot)
+    snapshot["visual_review_resume"] = visual_review_resume_summary(raw_snapshot)
     marker = b'data-report-summary="execution-v2"'
     coverage_marker = b'data-coverage-ledger="execution-evidence-v1"'
     cost_marker = b'data-cost-breakdown="roles-v1"'
@@ -1036,6 +1141,7 @@ async def get_report(exploration_id: str, request: Request) -> FileResponse:
             Path(getfile(StandaloneHtmlReport)).stat().st_mtime,
             Path(getfile(prepare_scenario_timelines)).stat().st_mtime,
             Path(getfile(presentation_scenario_steps)).stat().st_mtime,
+            Path(getfile(project_scenario_revisions)).stat().st_mtime,
             Path(getfile(coverage_restriction_ledger)).stat().st_mtime,
             Path(getfile(execution_duration_summary)).stat().st_mtime,
             Path(getfile(visual_review_counts)).stat().st_mtime,

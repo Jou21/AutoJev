@@ -51,18 +51,19 @@
       </div>
       <p id="capture-status" class="status" role="status" aria-live="polite">Primeiro, cole, arraste ou escolha uma imagem.</p>
       <button class="primary" id="confirm-capture" type="button" disabled>Anexar print e continuar →</button>
-      <p class="privacy">A imagem só é enviada ao confirmar. Ela não aprova nem reprova o teste.</p>
+      <p class="privacy">A prévia é compartilhada com a tela principal. Só salva no relatório e continua ao confirmar. A imagem não aprova nem reprova o teste.</p>
     </section>
 
     <section class="action" id="preparation" aria-labelledby="preparation-heading" hidden>
-      <div class="eyebrow">PREPARE A PÁGINA</div>
-      <h2 id="preparation-heading">Faça login para continuar</h2>
-      <p class="hint">Se estiver no login, preencha os campos na página. Ao continuar, o AutoJev tentará entrar. Se já entrou, confira os demais pré-requisitos.</p>
-      <details class="prep-details"><summary>Conferir a preparação da página</summary><div class="url-row"><span>Página esperada</span><b id="expected-url"></b></div><div class="url-row"><span>Página aberta</span><b id="current-url"></b></div><p id="preparation-instruction"></p></details>
-      <label class="consent"><input id="preparation-consent" type="checkbox"><span>Preparei a página e autorizo continuar a reexecução.</span></label>
+      <div class="eyebrow" id="preparation-eyebrow">Prepare a página</div>
+      <h2 id="preparation-heading">Prepare a página para continuar</h2>
+      <p class="hint" id="preparation-hint">Prepare a página e os dados iniciais do teste. Depois, marque a autorização e clique em “Continuar reexecução”. Se houver um login preenchido no site autorizado, o AutoJev tentará entrar. A ação do teste só será executada se os pré-requisitos forem confirmados.</p>
+      <p class="hint" id="preparation-feedback" hidden></p>
+      <details class="prep-details"><summary id="preparation-details-label">Ver detalhes da preparação</summary><div class="url-row"><span>Página esperada</span><b id="expected-url"></b></div><div class="url-row"><span>Página aberta</span><b id="current-url"></b></div><p id="preparation-instruction"></p></details>
+      <label class="consent"><input id="preparation-consent" type="checkbox"><span id="preparation-consent-label">Autorizo tentar entrar com o login preenchido e executar a ação original somente se a conferência dos pré-requisitos passar.</span></label>
       <p id="preparation-status" class="status" role="status" aria-live="polite"></p>
-      <button class="primary" id="confirm-preparation" type="button" disabled>Continuar exploração →</button>
-      <p class="privacy">Nenhuma ação do teste é repetida antes desta confirmação.</p>
+      <button class="primary" id="confirm-preparation" type="button" disabled>Continuar reexecução</button>
+      <p class="privacy" id="preparation-note">Marcar a autorização não inicia o teste. Clique em “Continuar reexecução” para confirmar.</p>
     </section>
 
     <section class="phase-note" id="phase-note" aria-live="polite"><h2 id="phase-heading">Preparando a reexecução</h2><p id="phase-description">As etapas vão mudar de cor conforme os resultados forem registrados.</p></section>
@@ -83,6 +84,19 @@
       let busy = false;
       let accepted = false;
       let preparationBusy = false;
+      let consentBusy = false;
+      let consentUnsynced = false;
+      let consentInitialized = false;
+      let consentRevision = 0;
+      let consentAuthorized = false;
+      let deferredConsent = null;
+      let preparationCopy = {};
+      let previewBusy = false;
+      let previewRevision = 0;
+      let previewInitialized = false;
+      let previewUnsynced = false;
+      let deferredPreview = null;
+      const previewCache = new Map();
       let readVersion = 0;
       let lastMap = '';
       let lastCurrentStep = '';
@@ -95,13 +109,13 @@
 
       function refreshCaptureControls() {
         const ready = canCapture();
-        $('confirm-capture').disabled = !ready || !staged || reading;
+        $('confirm-capture').disabled = !ready || !staged || reading || previewBusy || previewUnsynced;
         $('confirm-capture').textContent = accepted ? 'Enviado. Salvando imagem…' : busy ? 'Anexando print…' : 'Anexar print e continuar →';
-        for (const id of ['choose-file', 'replace-file', 'remove-file', 'file-input']) $(id).disabled = !ready;
-        $('dropzone').setAttribute('aria-disabled', String(!ready));
+        for (const id of ['choose-file', 'replace-file', 'remove-file', 'file-input']) $(id).disabled = !ready || reading || previewBusy;
+        $('dropzone').setAttribute('aria-disabled', String(!ready || reading || previewBusy));
       }
 
-      function clearImage() {
+      function clearImage(resetStatus = true) {
         readVersion += 1;
         staged = null;
         reading = false;
@@ -111,15 +125,91 @@
         $('file-input').value = '';
         $('selected-file').hidden = true;
         $('dropzone').hidden = false;
-        status('Primeiro, cole, arraste ou escolha uma imagem.');
+        if (resetStatus) status('Primeiro, cole, arraste ou escolha uma imagem.');
         refreshCaptureControls();
       }
 
+      function renderImage(image) {
+        if (!image) { clearImage(); return; }
+        staged = { data: image.data_url, name: short(image.name || 'Print compartilhado', 200), size: integer(image.size) };
+        $('preview').src = staged.data;
+        $('file-name').textContent = staged.name;
+        $('file-size').textContent = (staged.size < 1024 * 1024 ? Math.max(1, Math.round(staged.size / 1024)) + ' KB' : (staged.size / (1024 * 1024)).toFixed(1) + ' MB') + ' · Pronto para enviar';
+        $('selected-file').hidden = false;
+        $('dropzone').hidden = true;
+        status('Print selecionado. Falta confirmar o envio.', 'success');
+        refreshCaptureControls();
+      }
+
+      function snapshotKey(snapshot) {
+        return snapshot && typeof snapshot.checkpoint_id === 'string' && Number.isInteger(snapshot.checkpoint_version)
+          ? snapshot.checkpoint_id + ':' + snapshot.checkpoint_version : '';
+      }
+
+      function applyPreview(snapshot) {
+        if (snapshotKey(snapshot) !== checkpointKey || snapshot.revision < previewRevision) return;
+        if (previewInitialized && snapshot.revision === previewRevision && !previewUnsynced) return;
+        previewRevision = snapshot.revision;
+        previewInitialized = true;
+        previewUnsynced = false;
+        renderImage(snapshot.image);
+      }
+
+      function updatePreview(snapshot) {
+        const key = snapshotKey(snapshot);
+        if (!key || !Number.isInteger(snapshot.revision) || snapshot.revision < 0) return;
+        if ((current && !current.running) || (snapshot.changed === false && !Object.prototype.hasOwnProperty.call(snapshot, 'image'))) return;
+        if (snapshot.image && (typeof snapshot.image.data_url !== 'string' || snapshot.image.data_url.length > 14000000 || !/^data:image\/(?:png|jpeg|webp);base64,/.test(snapshot.image.data_url))) return;
+        const cached = previewCache.get(key);
+        if (!cached || snapshot.revision >= cached.revision) previewCache.set(key, snapshot);
+        while (previewCache.size > 6) previewCache.delete(previewCache.keys().next().value);
+        if (key !== checkpointKey || !current || !current.running || current.phase !== 'waiting_capture' || accepted || snapshot.revision < previewRevision) return;
+        if (reading || previewBusy) {
+          if (!deferredPreview || snapshot.revision >= deferredPreview.revision) deferredPreview = snapshot;
+          return;
+        }
+        applyPreview(snapshot);
+      }
+
+      async function sharePreview(image, expectedRevision) {
+        const key = checkpointKey;
+        const cp = checkpoint();
+        previewBusy = true;
+        previewUnsynced = true;
+        refreshCaptureControls();
+        try {
+          if (typeof window.__autojev_rerun_command !== 'function') throw new Error('unavailable');
+          const result = await window.__autojev_rerun_command({op: 'preview', nonce: current.nonce, checkpoint_id: cp.id, checkpoint_version: cp.version, expected_revision: expectedRevision, image_data_url: image ? image.data_url : null});
+          if (key !== checkpointKey) return;
+          const snapshot = result && (result.snapshot || result);
+          if (snapshotKey(snapshot) !== key || !Number.isInteger(snapshot.revision)) throw new Error('invalid-response');
+          // A conflicting edit returns the newest authoritative preview. Never
+          // silently replace it with an older, locally selected image.
+          previewBusy = false;
+          updatePreview(snapshot);
+          if (result.conflict || result.accepted === false) status('A imagem mudou na outra tela. Confira a prévia antes de confirmar.', '');
+        } catch (_) {
+          if (key === checkpointKey) {
+            previewBusy = false;
+            previewUnsynced = true;
+            status('Não foi possível compartilhar a prévia. Aguarde a atualização e confira a imagem antes de confirmar.', 'error');
+          }
+        } finally {
+          if (key === checkpointKey) {
+            previewBusy = false;
+            const latest = deferredPreview;
+            deferredPreview = null;
+            if (latest && latest.revision > previewRevision) applyPreview(latest);
+            refreshCaptureControls();
+          }
+        }
+      }
+
       async function stageFile(file) {
-        if (!canCapture()) return;
-        clearImage();
+        if (!canCapture() || reading || previewBusy) return;
         const version = ++readVersion;
         const key = checkpointKey;
+        const expectedRevision = previewRevision;
         if (!file || !(file instanceof Blob) || !file.size || file.size > MAX_BYTES) {
           status('Escolha uma imagem de até 10 MB.', 'error');
           return;
@@ -148,25 +238,26 @@
             image.src = imageData;
           });
           if (version !== readVersion || key !== checkpointKey || !canCapture()) return;
-          staged = { data: imageData, name: short(file.name || 'Print colado', 200), size: file.size };
-          $('preview').src = imageData;
-          $('file-name').textContent = staged.name;
-          $('file-size').textContent = (file.size < 1024 * 1024 ? Math.max(1, Math.round(file.size / 1024)) + ' KB' : (file.size / (1024 * 1024)).toFixed(1) + ' MB') + ' · Pronto para enviar';
-          $('selected-file').hidden = false;
-          $('dropzone').hidden = true;
-          status('Print selecionado. Falta confirmar o envio.', 'success');
-          refreshCaptureControls();
+          const image = { data_url: imageData, name: short(file.name || 'Print colado', 200), size: file.size };
+          renderImage(image);
+          reading = false;
+          await sharePreview(image, expectedRevision);
         } catch (_) {
           if (version === readVersion && key === checkpointKey) status('Não foi possível abrir essa imagem. Use um arquivo PNG, JPG ou WEBP válido.', 'error');
         } finally {
-          if (version === readVersion) { reading = false; refreshCaptureControls(); if (staged) $('confirm-capture').focus({ preventScroll: true }); }
+          if (version === readVersion) {
+            reading = false;
+            if (deferredPreview && !previewBusy) { const latest = deferredPreview; deferredPreview = null; applyPreview(latest); }
+            refreshCaptureControls();
+            if (staged) $('confirm-capture').focus({ preventScroll: true });
+          }
         }
       }
 
-      function pick() { if (canCapture()) $('file-input').click(); }
+      function pick() { if (canCapture() && !reading && !previewBusy) $('file-input').click(); }
       $('choose-file').addEventListener('click', pick);
       $('replace-file').addEventListener('click', pick);
-      $('remove-file').addEventListener('click', () => { if (canCapture()) { clearImage(); $('dropzone').focus({ preventScroll: true }); } });
+      $('remove-file').addEventListener('click', async () => { if (canCapture() && !reading && !previewBusy) { const revision = previewRevision; clearImage(); await sharePreview(null, revision); $('dropzone').focus({ preventScroll: true }); } });
       $('file-input').addEventListener('change', event => { const files = event.target.files; if (files && files.length === 1) stageFile(files[0]); else if (files && files.length > 1) status('Adicione uma imagem por pausa.', 'error'); event.target.value = ''; });
       document.addEventListener('paste', event => {
         if (!canCapture()) return;
@@ -188,7 +279,7 @@
       });
 
       $('confirm-capture').addEventListener('click', async event => {
-        if (!event.isTrusted || !canCapture() || !staged || reading) return;
+        if (!event.isTrusted || !canCapture() || !staged || reading || previewBusy || previewUnsynced) return;
         if (typeof window.__autojev_rerun_command !== 'function') { status('A conexão com o AutoJev não está disponível. Aguarde e tente novamente.', 'error'); return; }
         const key = checkpointKey;
         const cp = checkpoint();
@@ -208,14 +299,96 @@
         }
       });
 
-      $('preparation-consent').addEventListener('change', () => { $('confirm-preparation').disabled = preparationBusy || !$('preparation-consent').checked || !current || current.phase !== 'waiting_preparation'; });
+      function refreshPreparationControls() {
+        const waiting = !!(current && current.running && current.phase === 'waiting_preparation');
+        const prep = current && current.preparation || {};
+        const invalidSharedConsent = Object.prototype.hasOwnProperty.call(prep, 'consent') && !validConsent(prep.consent);
+        $('preparation-consent').disabled = !waiting || preparationBusy || consentBusy || invalidSharedConsent;
+        $('confirm-preparation').disabled = !waiting || preparationBusy || consentBusy || consentUnsynced || !consentAuthorized || !$('preparation-consent').checked;
+        $('confirm-preparation').textContent = preparationBusy
+          ? 'Entrando e conferindo preparação…' : consentBusy ? 'Sincronizando autorização…' : preparationCopy.button_label || 'Continuar reexecução';
+      }
+
+      function validConsent(snapshot) {
+        return !!(snapshot && current && current.running && current.phase === 'waiting_preparation' && current.preparation && snapshot.preparation_version === current.preparation.version
+          && Number.isInteger(snapshot.revision) && snapshot.revision >= 0 && typeof snapshot.checked === 'boolean');
+      }
+
+      function applyConsent(snapshot) {
+        if (!validConsent(snapshot) || snapshot.revision < consentRevision) return;
+        if (consentInitialized && snapshot.revision === consentRevision && !consentUnsynced) return;
+        consentRevision = snapshot.revision;
+        consentAuthorized = snapshot.checked;
+        consentInitialized = true;
+        consentUnsynced = false;
+        $('preparation-consent').checked = snapshot.checked;
+        $('preparation-status').textContent = '';
+        refreshPreparationControls();
+      }
+
+      function receiveConsent(snapshot) {
+        if (!validConsent(snapshot) || snapshot.revision < consentRevision) return;
+        if (consentBusy) {
+          if (!deferredConsent || snapshot.revision >= deferredConsent.revision) deferredConsent = snapshot;
+          return;
+        }
+        applyConsent(snapshot);
+      }
+
+      $('preparation-consent').addEventListener('change', async event => {
+        if (!event || !event.isTrusted || !current || !current.running || current.phase !== 'waiting_preparation' || preparationBusy || consentBusy) {
+          $('preparation-consent').checked = consentAuthorized;
+          refreshPreparationControls();
+          return;
+        }
+        const checked = $('preparation-consent').checked;
+        const prep = current.preparation || {};
+        // Older local-only fixture/runner payloads have no synchronization
+        // contract. They still require a native checkbox and a native continue.
+        if (!Object.prototype.hasOwnProperty.call(prep, 'consent')) {
+          consentAuthorized = checked;
+          refreshPreparationControls();
+          return;
+        }
+        if (!validConsent(prep.consent)) { $('preparation-consent').checked = false; consentAuthorized = false; refreshPreparationControls(); return; }
+        const key = preparationKey;
+        const expectedRevision = consentRevision;
+        consentAuthorized = checked;
+        consentBusy = true;
+        consentUnsynced = true;
+        $('preparation-status').textContent = 'Sincronizando autorização nas duas janelas…';
+        refreshPreparationControls();
+        try {
+          if (typeof window.__autojev_rerun_command !== 'function') throw new Error('unavailable');
+          const result = await window.__autojev_rerun_command({op: 'consent', nonce: current.nonce, preparation_version: prep.version, expected_revision: expectedRevision, checked});
+          if (key !== preparationKey || !current || !current.running || current.phase !== 'waiting_preparation') return;
+          const snapshot = result;
+          if (!validConsent(snapshot)) throw new Error('invalid-response');
+          consentBusy = false;
+          applyConsent(snapshot);
+        } catch (_) {
+          if (key === preparationKey && current && current.running && current.phase === 'waiting_preparation') {
+            consentBusy = false;
+            consentUnsynced = true;
+            $('preparation-status').textContent = 'A autorização mudou ou não foi sincronizada. Aguarde a atualização e confira o checkbox antes de continuar.';
+          }
+        } finally {
+          if (key === preparationKey && current && current.running && current.phase === 'waiting_preparation') {
+            consentBusy = false;
+            const latest = deferredConsent;
+            deferredConsent = null;
+            if (latest && latest.revision > consentRevision) applyConsent(latest);
+            refreshPreparationControls();
+          }
+        }
+      });
       $('confirm-preparation').addEventListener('click', async event => {
-        if (!event.isTrusted || preparationBusy || !$('preparation-consent').checked || !current || current.phase !== 'waiting_preparation' || !current.preparation) return;
+        if (!event.isTrusted || preparationBusy || consentBusy || consentUnsynced || !consentAuthorized || !$('preparation-consent').checked || !current || !current.running || current.phase !== 'waiting_preparation' || !current.preparation) return;
         if (typeof window.__autojev_rerun_command !== 'function') { $('preparation-status').textContent = 'A conexão com o AutoJev não está disponível. Aguarde e tente novamente.'; return; }
         const key = preparationKey;
         preparationBusy = true;
         $('confirm-preparation').disabled = true;
-        $('confirm-preparation').textContent = 'Conferindo a página…';
+        $('confirm-preparation').textContent = 'Entrando e conferindo preparação…';
         $('preparation-status').textContent = 'A confirmação foi enviada. Aguarde a conferência da página.';
         try {
           const result = await window.__autojev_rerun_command({op: 'resume', nonce: current.nonce, preparation_version: current.preparation.version, confirm: true});
@@ -224,8 +397,7 @@
           if (key === preparationKey) {
             preparationBusy = false;
             $('preparation-status').textContent = 'Não foi possível continuar. Confira a etapa e tente novamente.';
-            $('confirm-preparation').textContent = 'Continuar exploração →';
-            $('confirm-preparation').disabled = !$('preparation-consent').checked;
+            refreshPreparationControls();
           }
         }
       });
@@ -267,19 +439,21 @@
         const newKey = cp && typeof cp.id === 'string' && Number.isInteger(cp.version) ? cp.id + ':' + cp.version : '';
         const terminal = ['finished', 'completed', 'partial', 'failed', 'cancelled'].includes(phase);
         const newCapture = !!newKey && newKey !== checkpointKey;
-        if (newCapture || terminal) {
+        if (newKey !== checkpointKey || terminal) {
           checkpointKey = newKey;
+          previewRevision = 0; previewInitialized = false; previewUnsynced = false;
+          previewBusy = false; deferredPreview = null;
           busy = false; accepted = false; clearImage();
         }
         const prep = payload.preparation || {};
-        const newPrepKey = Number.isInteger(prep.version) ? String(prep.version) : '';
+        const newPrepKey = Number.isInteger(prep.version) ? String(payload.exploration_id || payload.run_id || '') + ':' + prep.version : '';
         if (newPrepKey !== preparationKey || phase !== 'waiting_preparation') {
           preparationKey = newPrepKey; preparationBusy = false;
+          consentBusy = false; consentUnsynced = false; consentInitialized = false;
+          consentRevision = 0; consentAuthorized = false; deferredConsent = null;
           $('preparation-consent').checked = false;
           $('preparation-status').textContent = '';
         }
-        $('confirm-preparation').textContent = preparationBusy || phase === 'validating_preparation' ? 'Conferindo a página…' : 'Continuar exploração →';
-        $('confirm-preparation').disabled = preparationBusy || phase !== 'waiting_preparation' || !$('preparation-consent').checked;
         renderMap(payload.progress || {});
         $('notice').textContent = short((payload.progress || {}).notice, 1500) || 'Os cards mostram apenas os resultados desta reexecução.';
         $('live-label').textContent = terminal ? 'Execução encerrada' : 'Atualização ao vivo';
@@ -289,8 +463,36 @@
         $('capture-eyebrow').textContent = phase === 'capturing_print' ? 'SALVANDO SUA IMAGEM' : 'SUA VEZ · AGUARDANDO PRINT';
         $('capture-position').textContent = 'Print ' + Math.min(integer(payload.captures_completed) + 1, integer(payload.capture_count) || 1) + ' de ' + (integer(payload.capture_count) || 1) + (cp && Number.isInteger(cp.gap) ? ' · ' + (cp.gap ? 'Após a etapa ' + cp.gap : 'Antes da primeira etapa') : '');
         if (phase === 'capturing_print') { accepted = true; status('Envio confirmado. Aguardando a imagem ser salva.', 'success'); }
-        $('preparation-heading').textContent = short(prep.reason_label, 120) || 'Prepare a página para continuar';
+        const loginRequired = prep.reason_code === 'authentication_required';
+        const loginReady = (prep.manual_login || {}).status === 'ready';
+        const validating = phase === 'validating_preparation';
+        const defaults = {
+          kicker: validating ? 'Conferindo a preparação' : loginReady ? 'Login reconhecido' : loginRequired ? 'Login necessário' : 'Prepare a página',
+          title: validating ? 'Entrando e conferindo preparação…' : loginReady ? 'Login realizado. Autorize para continuar' : loginRequired ? 'Faça login para continuar' : 'Prepare a página para continuar',
+          instruction: validating ? 'Aguarde a conferência do login, da página e dos pré-requisitos. Não é necessário confirmar novamente.' : loginReady
+            ? 'Seu login foi reconhecido e os pré-requisitos foram conferidos. Marque a autorização para o teste continuar automaticamente.' : loginRequired
+            ? 'Marque a autorização e faça login pelo próprio site. O AutoJev identifica o login e continua automaticamente após conferir a página e os pré-requisitos. Se preferir, preencha usuário e senha e clique em “Continuar reexecução” para o AutoJev tentar entrar.'
+            : 'Prepare a página e os dados iniciais do teste. Depois, marque a autorização e clique em “Continuar reexecução”. Se houver um login preenchido no site autorizado, o AutoJev tentará entrar. A ação do teste só será executada se os pré-requisitos forem confirmados.',
+          consent_label: 'Autorizo tentar entrar com o login preenchido e executar a ação original somente se a conferência dos pré-requisitos passar.',
+          button_label: validating ? 'Entrando e conferindo preparação…' : 'Continuar reexecução',
+          details_label: 'Ver detalhes da preparação',
+          note: validating ? 'Aguarde o resultado da conferência.' : loginRequired || loginReady
+            ? 'Com a autorização marcada, o teste continua automaticamente após o login e a conferência dos pré-requisitos.'
+            : 'Marcar a autorização não inicia o teste. Clique em “Continuar reexecução” para confirmar.',
+          feedback: loginReady && !validating ? 'Login reconhecido; aguardando sua autorização para continuar.' : short((prep.login_attempt || {}).reason_label || prep.reason_label, 2000),
+        };
         $('preparation-instruction').textContent = short(prep.instruction, 2200);
+        preparationCopy = {...defaults, ...(prep.presentation && typeof prep.presentation === 'object' ? prep.presentation : {})};
+        for (const [field, id] of [['kicker', 'preparation-eyebrow'], ['title', 'preparation-heading'], ['instruction', 'preparation-hint'], ['consent_label', 'preparation-consent-label'], ['details_label', 'preparation-details-label'], ['note', 'preparation-note']]) {
+          if (typeof preparationCopy[field] === 'string') $(id).textContent = short(preparationCopy[field], 2200);
+        }
+        $('preparation-feedback').textContent = short(preparationCopy.feedback, 2000);
+        $('preparation-feedback').hidden = !$('preparation-feedback').textContent;
+        if (phase === 'waiting_preparation' && Object.prototype.hasOwnProperty.call(prep, 'consent')) {
+          if (validConsent(prep.consent)) receiveConsent(prep.consent);
+          else { consentUnsynced = true; consentAuthorized = false; $('preparation-consent').checked = false; }
+        }
+        refreshPreparationControls();
         for (const [id, value] of [['expected-url', prep.expected_url], ['current-url', prep.current_url]]) { $(id).textContent = short(value, 1500) || 'Não informada'; $(id).title = short(value, 1500); }
         const phaseTitles = {queued:'Preparando a reexecução', preparing:'Preparando a página', executing:'Executando o teste', saving:'Salvando as evidências', finished:'Reexecução encerrada', completed:'Reexecução concluída', cancelled:'Reexecução cancelada', failed:'Reexecução encerrada com falha'};
         $('phase-heading').textContent = phaseTitles[phase] || 'Acompanhando a reexecução';
@@ -299,9 +501,11 @@
         $('usage-tokens').textContent = String(integer(usage.total_tokens));
         $('usage-cost').textContent = usage.cost_known && typeof usage.cost === 'number' && Number.isFinite(usage.cost) && usage.cost >= 0 ? '$' + usage.cost.toFixed(6) : '—';
         refreshCaptureControls();
+        if (newCapture && !terminal && previewCache.has(newKey)) updatePreview(previewCache.get(newKey));
+        if (terminal) previewCache.clear();
         if (newCapture && phase === 'waiting_capture') $('dropzone').focus({ preventScroll: true });
       }
-      window.__autojevRerunPanel = Object.freeze({update});
+      window.__autojevRerunPanel = Object.freeze({update, updatePreview});
     })();
   </script>
 </body>

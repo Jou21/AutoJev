@@ -37,6 +37,8 @@ class BrowserRerunPanel:
         self.executor = executor
         self.capture_handler = capture_handler
         self.resume_handler: Callable[..., Awaitable[dict]] | None = None
+        self.consent_handler: Callable[..., Awaitable[dict]] | None = None
+        self.preview_handler: Callable[..., Awaitable[dict]] | None = None
         self.frame: Any = None
         self._element: Any = None
         self._page: Any = None
@@ -51,6 +53,8 @@ class BrowserRerunPanel:
         self._bound_pages: set[Any] = set()
         self._document_version = 0
         self._blocked_document: tuple | None = None
+        self._preview_snapshot: dict[str, Any] | None = None
+        self._preview_delivered: tuple | None = None
 
     async def bind_page(self, page: Any) -> None:
         if page in self._bound_pages:
@@ -65,6 +69,7 @@ class BrowserRerunPanel:
         elif frame is self.frame:
             self._nonce = secrets.token_urlsafe(32)
             self._delivered = None
+            self._preview_delivered = None
 
     @property
     def unavailable(self) -> bool:
@@ -95,6 +100,8 @@ class BrowserRerunPanel:
         self._payload = {}
         self.frame = self._page = self._element = None
         self._delivered = None
+        self._preview_snapshot = None
+        self._preview_delivered = None
 
     async def ensure(self) -> bool:
         page = self.executor._page
@@ -114,6 +121,7 @@ class BrowserRerunPanel:
         self.frame = None
         self._nonce = secrets.token_urlsafe(32)
         self._delivered = None
+        self._preview_delivered = None
         self._page = page
         handle = await page.evaluate_handle("""() => {
           const panel = document.getElementById('autojev-sidepanel');
@@ -156,10 +164,39 @@ class BrowserRerunPanel:
         await element.evaluate("""el => {
           const panel = el.closest('#autojev-sidepanel');
           panel.dataset.rerun = 'true';
-          panel.dataset.pinned = 'true';
-          panel.querySelector('.autojev-panel-rail')?.setAttribute('aria-expanded', 'true');
+          const expanded = panel.dataset.collapsed !== 'true';
+          panel.dataset.pinned = expanded ? 'true' : 'false';
+          panel.querySelector('.autojev-panel-rail')?.setAttribute('aria-expanded', String(expanded));
         }""")
         return True
+
+    async def set_preview(self, snapshot: dict[str, Any]) -> None:
+        """Share only ephemeral user-selected pixels with the isolated UI.
+
+        Images never enter the progress payload, recorded events or storage.
+        Service ownership/checkpoint validation precedes this host-only call.
+        """
+        self._preview_snapshot = copy.deepcopy(snapshot) if not self._closed else None
+
+    async def _deliver_preview(self) -> None:
+        snapshot = self._preview_snapshot
+        if (self._closed or self.frame is None or snapshot is None
+                or self._payload.get("phase") != "waiting_capture"):
+            return
+        checkpoint = self._payload.get("checkpoint") or {}
+        if (snapshot.get("checkpoint_id") != checkpoint.get("id")
+                or snapshot.get("checkpoint_version") != checkpoint.get("version")):
+            return
+        key = (snapshot.get("checkpoint_id"), snapshot.get("checkpoint_version"), snapshot.get("revision"), self._nonce)
+        if key == self._preview_delivered:
+            return
+        delivered = await self.frame.evaluate("""snapshot => {
+          if (!window.__autojevRerunPanel?.updatePreview) return false;
+          window.__autojevRerunPanel.updatePreview(snapshot);
+          return true;
+        }""", snapshot)
+        if delivered:
+            self._preview_delivered = key
 
     async def update(self, payload: dict[str, Any]) -> bool:
         async with self._lock:
@@ -188,6 +225,7 @@ class BrowserRerunPanel:
                 if not updated:
                     return False
                 self._delivered = serial
+            await self._deliver_preview()
             return True
 
     async def command(self, source: dict[str, Any], command: Any) -> dict[str, Any]:
@@ -199,7 +237,7 @@ class BrowserRerunPanel:
                        and self.frame.url == PANEL_URL and not self.frame.is_detached()
                        and isinstance(command, dict)
                        and secrets.compare_digest(str(command.get("nonce", "")), self._nonce)
-                       and command.get("confirm") is True
+                       and (command.get("op") in {"preview", "consent"} or command.get("confirm") is True)
                        and self._payload.get("running") is True
                        and not self._busy)
         except Exception:
@@ -207,29 +245,63 @@ class BrowserRerunPanel:
         if not trusted:
             raise ValueError("Esta confirmação não está mais disponível. Confira a etapa atual.")
         phase = self._payload.get("phase")
-        if command.get("op") == "capture":
+        if command.get("op") in {"capture", "preview"}:
             checkpoint = self._payload.get("checkpoint") or {}
             if (phase != "waiting_capture" or command.get("checkpoint_id") != checkpoint.get("id")
                     or type(command.get("checkpoint_version")) is not int
                     or command["checkpoint_version"] != checkpoint.get("version")):
                 raise ValueError("Este print pertence a outra etapa. Confira a etapa atual.")
-            key = ("capture", checkpoint.get("id"), checkpoint.get("version"))
+            key = (command["op"], checkpoint.get("id"), checkpoint.get("version"))
             image = command.get("image_data_url")
-            if not isinstance(image, str) or len(image) > 14_000_000:
+            if (not isinstance(image, str) or len(image) > 14_000_000) and not (
+                    command["op"] == "preview" and image is None):
                 raise ValueError("Anexe uma imagem PNG, JPEG ou WebP de até 10 MB.")
-        elif command.get("op") == "resume":
+            if command["op"] == "preview" and (self.preview_handler is None
+                    or type(command.get("expected_revision")) is not int or command["expected_revision"] < 0):
+                raise ValueError("A prévia mudou. Confira a imagem atual e tente novamente.")
+        elif command.get("op") in {"resume", "consent"}:
             preparation = self._payload.get("preparation") or {}
             if (phase != "waiting_preparation" or type(command.get("preparation_version")) is not int
                     or command["preparation_version"] != preparation.get("version")):
                 raise ValueError("A preparação mudou. Confira a etapa atual.")
-            key = ("resume", preparation.get("version"))
+            key = (command["op"], preparation.get("version"))
+            if command["op"] == "consent" and (self.consent_handler is None
+                    or type(command.get("checked")) is not bool
+                    or type(command.get("expected_revision")) is not int or command["expected_revision"] < 0):
+                raise ValueError("Não foi possível sincronizar a autorização. Confira a preparação atual.")
         else:
             raise ValueError("Ação não disponível neste painel.")
         if key in self._used:
             raise ValueError("A confirmação já foi recebida. Aguarde a atualização.")
         self._busy = True
         try:
-            if command["op"] == "capture":
+            if command["op"] == "consent":
+                try:
+                    # Sharing a checkbox is not a resume command and must never
+                    # consume its one-use confirmation or signal either waiter.
+                    return await self.consent_handler(preparation["version"], command["expected_revision"],
+                                                      command["checked"])
+                except ValueError:
+                    raise
+                except Exception as exc:
+                    raise ValueError("Não foi possível sincronizar a autorização. Tente novamente.") from exc
+                finally:
+                    # Retry an authoritative snapshot after a pending UI update
+                    # or CAS conflict, even if the progress payload is unchanged.
+                    self._delivered = None
+            elif command["op"] == "preview":
+                try:
+                    return await self.preview_handler(checkpoint["id"], checkpoint["version"],
+                                                      command["expected_revision"], image)
+                except ValueError:
+                    raise
+                except Exception as exc:
+                    raise ValueError("Não foi possível sincronizar a prévia. Tente novamente.") from exc
+                finally:
+                    # A rejected CAS must restore the authoritative preview,
+                    # even if that revision was already delivered while busy.
+                    self._preview_delivered = None
+            elif command["op"] == "capture":
                 try:
                     result = await self.capture_handler(checkpoint["id"], checkpoint["version"], image)
                 except ValueError:

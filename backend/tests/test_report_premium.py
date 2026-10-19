@@ -237,7 +237,8 @@ def test_rerun_report_explains_provenance_and_non_executable_scope(tmp_path):
     document = render(tmp_path, run)
     assert 'class="reading-guide rerun-provenance"' in document
     assert "Reexecução individual de CT008" in document
-    assert "o relatório original permanece inalterado" in document
+    assert "histórico" in document
+    assert "resultado mais recente" in document
     assert "cartões de consulta ao banco não são executados" in document
     assert "cartões de consulta ao banco não foram executados" in document
     assert "original<script>bad</script>" not in document

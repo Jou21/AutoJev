@@ -173,7 +173,64 @@ test("standard view retains its results workspace and offers the separate live s
   assert.match(html, /Visão geral e resultados/);
   assert.equal((html.match(/class="panel intervention-card /g) || []).length, 1);
   assert.match(html, /<section class="panel rerun-provenance" aria-label="Origem da reexecução">/);
-  assert.doesNotMatch(html, /rerun-origin-details|rerun-compact-back/);
+  assert.match(html, /class="rerun-origin-details"/);
+  assert.match(html, /class="icon-button rerun-compact-back"/);
+  assert.match(html, /<h1>Reexecução de CT001<\/h1>/);
+});
+
+test("both rerun screens keep the exact same compact header, collapsed provenance and navigation shell", async () => {
+  const base = exploration();
+  const states = [
+    base,
+    exploration({ rerun: { ...base.rerun, phase: "waiting_capture", capture_count: 1, captures_completed: 0,
+      capture_checkpoint: { id: "print-1", gap: 2, order: 0, version: 1 } } }),
+    exploration({ status: "completed", report_available: true, finished_at: "2026-10-16T15:01:00Z",
+      rerun: { ...base.rerun, running: false, phase: "finished", capture_count: 1, captures_completed: 1 } }),
+    exploration({ status: "failed", error: "A execução encontrou um erro.",
+      rerun: { ...base.rerun, running: false, phase: "failed" } }),
+  ];
+  const extract = (html, expression, description) => {
+    const match = html.match(expression);
+    assert.ok(match, `missing ${description}`);
+    return match[0];
+  };
+  const normalizeNavigation = (html) => html.replace(/ class="(?:active)?"/g, "").replace(/ aria-current="page"/g, "");
+  for (const data of states) {
+    const live = await detailMarkup(data, true);
+    const overview = await detailMarkup(data, false);
+    for (const html of [live, overview]) {
+      assert.match(html, /class="view-stack detail-view rerun-detail\b/,
+        "both screens need the same compact sizing and spacing scope");
+      assert.match(html, /<h1>Reexecução de CT001<\/h1>/);
+      assert.equal((html.match(/aria-label="Voltar para explorações"/g) || []).length, 1);
+      const provenance = extract(html, /<details class="rerun-origin-details"[\s\S]*?<\/details>/, "rerun provenance");
+      assert.doesNotMatch(provenance.split(">")[0], /\bopen(?:=|\s|$)/,
+        "switching screens must not expand provenance and move the view switch");
+      assert.ok(html.indexOf('<header class="detail-header"') < html.indexOf('<nav class="rerun-view-switch"'),
+        "the view switch must follow the common header in both screens");
+    }
+    assert.match(live, /\brerun-live-detail\b/);
+    assert.doesNotMatch(overview, /class="view-stack detail-view[^"]*rerun-live-detail/);
+    assert.equal(extract(live, /<header class="detail-header">[\s\S]*?<\/header>/, "live header"),
+      extract(overview, /<header class="detail-header">[\s\S]*?<\/header>/, "overview header"),
+      `header title, URL, status and actions must stay unchanged in phase ${data.rerun.phase}`);
+    assert.equal(extract(live, /<details class="rerun-origin-details"[\s\S]*?<\/details>/, "live provenance"),
+      extract(overview, /<details class="rerun-origin-details"[\s\S]*?<\/details>/, "overview provenance"));
+    assert.equal(normalizeNavigation(extract(live, /<nav class="rerun-view-switch"[\s\S]*?<\/nav>/, "live navigation")),
+      normalizeNavigation(extract(overview, /<nav class="rerun-view-switch"[\s\S]*?<\/nav>/, "overview navigation")),
+      "only the active/aria-current tab may change, never the switch geometry or labels");
+  }
+});
+
+test("ordinary explorations retain the original non-rerun heading and navigation", async () => {
+  for (const liveRerun of [true, false]) {
+    const html = await detailMarkup(exploration({ rerun: undefined }), liveRerun);
+    assert.match(html, /class="detail-breadcrumb"/);
+    assert.match(html, /<h1>example\.test<\/h1>/);
+    assert.match(html, /class="app-avatar large"/);
+    assert.doesNotMatch(html, /\brerun-detail\b|rerun-origin-details|rerun-compact-back|aria-label="Telas da reexecução"/);
+    assert.match(html, /role="tablist" aria-label="Detalhes da exploração"/);
+  }
 });
 
 test("live dashboard collapses provenance by default and passes compact presentation to its board", async () => {
@@ -184,7 +241,8 @@ test("live dashboard collapses provenance by default and passes compact presenta
   assert.doesNotMatch(origin[0], /\bopen(?:=|\s|>)/, "provenance must start collapsed, saving vertical room");
   assert.equal((html.match(/class="rerun-origin-details"/g) || []).length, 1);
   assert.match(html, /Sobre esta reexecução/);
-  assert.match(html, /O relatório original não é alterado/);
+  assert.match(html, /As versões anteriores e suas evidências ficam preservadas no histórico do teste/);
+  assert.match(html, /o relatório de origem mostra o resultado mais recente/);
   assert.equal((html.match(/aria-label="Voltar para explorações"/g) || []).length, 1);
   assert.match(html, /class="rerun-live-workspace"/);
   assert.match(html, /class="rerun-live-board is-compact"/);
@@ -261,11 +319,11 @@ test("compact preparation preserves long page URLs and full instructions without
   assert.ok(html.includes(`<strong title="${current}">${current}</strong>`));
   assert.match(html, /Nenhuma ação do CT foi executada/);
   assert.match(html, /class="rerun-preparation-next-step"/);
-  assert.match(html, /Se precisar entrar, preencha o login na janela aberta/);
+  assert.match(html, /Prepare a página e os dados iniciais do teste/);
   const details = html.match(/<details\b[^>]*class="rerun-preparation-instructions"[^>]*>/);
   assert.ok(details);
   assert.doesNotMatch(details[0], /\bopen(?:=|\s|>)/);
-  assert.match(html, /Ver instruções completas/);
+  assert.match(html, /Ver detalhes da preparação/);
   assert.match(html, /Prepare também o carrinho original/);
   assert.match(html, /&lt;script&gt;not executable&lt;\/script&gt;/);
   assert.doesNotMatch(html, /<script>|before_url_changed/);
@@ -273,8 +331,36 @@ test("compact preparation preserves long page URLs and full instructions without
 
   const standard = await detailMarkup(data, false);
   assert.match(standard, /class="rerun-preparation-guide"/);
-  assert.doesNotMatch(standard, /rerun-preparation-next-step|rerun-preparation-instructions/);
+  assert.doesNotMatch(standard, /rerun-preparation-next-step/);
+  assert.match(standard, /Ver detalhes da preparação/);
   assert.match(standard, /Prepare também o carrinho original/);
+});
+
+test("a detected login gives a specific heading and direct instructions instead of a wrong-page warning", async () => {
+  const base = exploration();
+  const login = exploration({ rerun: { ...base.rerun, preparation: {
+    ...base.rerun.preparation, reason_code: "authentication_required",
+    reason_label: "Você está na tela de login. Preencha usuário e senha para continuar.",
+  } } });
+  for (const live of [true, false]) {
+    const html = await detailMarkup(login, live);
+    assert.match(html, /<h2>Faça login para continuar<\/h2>/);
+    assert.match(html, /Você está na tela de login/);
+    assert.match(html, /Marque a autorização e faça login pelo próprio site/);
+    assert.match(html, /continua automaticamente após conferir a página e os pré-requisitos/);
+    assert.match(html, /Ver detalhes da preparação/);
+    assert.doesNotMatch(html, /A página aberta não é a mesma|Ajuste a página e tente novamente/);
+    assert.match(html, /Nenhuma ação do CT foi executada/);
+    assert.match(html, /<input type="checkbox"/);
+    assert.match(html, /Autorizo tentar entrar com o login preenchido/);
+    assert.match(html, /<button class="button primary" disabled="">[\s\S]*?Continuar reexecução<\/button>/);
+  }
+  const incorrectPage = await detailMarkup(exploration({ rerun: { ...base.rerun, preparation: {
+    ...base.rerun.preparation, reason_code: "before_url_changed", reason_label: "A página aberta não é a mesma do teste original.",
+  } } }));
+  assert.match(incorrectPage, /Prepare a página para continuar/);
+  assert.match(incorrectPage, /A página aberta não é a mesma/);
+  assert.doesNotMatch(incorrectPage, /Você está na tela de login|Ver página de destino após o login/);
 });
 
 test("compact validation and rejected-login feedback stay clear without granting continuation or claiming a test passed", async () => {

@@ -828,6 +828,71 @@ class SQLiteRepository:
             results.append(item)
         return results
 
+    def list_scenario_rerun_sources(self) -> list[dict[str, Any]]:
+        """Read every durable CT-parent link, without a paginated run cutoff.
+
+        Keep duplicate events visible: the presentation layer must reject
+        conflicting ancestry instead of silently choosing a different parent.
+        No browser state, credentials or private action recipes are read here.
+        """
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """SELECT ev.id AS event_id, ev.exploration_id, ev.payload_json,
+                          e.created_at, e.finished_at, e.status
+                   FROM explorations e
+                   JOIN exploration_events ev INDEXED BY idx_exploration_events
+                     ON ev.exploration_id = e.id
+                   WHERE ev.type = ?
+                   ORDER BY e.created_at, e.id, ev.id""",
+                ("scenario_rerun_source",),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except (json.JSONDecodeError, TypeError):
+                payload = None
+            result.append({
+                "event_id": row["event_id"], "exploration_id": row["exploration_id"],
+                "created_at": row["created_at"], "finished_at": row["finished_at"],
+                "status": row["status"], "payload": payload,
+            })
+        return result
+
+    def get_scenario_revision_ancestry(self, exploration_id: str) -> dict[str, Any]:
+        """A small ancestor slice for live rerun report links, without actions."""
+        with self._lock, self._connect() as connection:
+            if connection.execute("SELECT id FROM explorations WHERE id = ?", (exploration_id,)).fetchone() is None:
+                raise NotFoundError(f"Exploration {exploration_id} was not found")
+            events = connection.execute(
+                """SELECT payload_json FROM exploration_events
+                   WHERE exploration_id = ? AND type = 'scenario_rerun_source' ORDER BY id""",
+                (exploration_id,),
+            ).fetchall()
+            scenarios = connection.execute(
+                """SELECT id,
+                     CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.id') END AS saved_id,
+                     CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.status') END AS status,
+                     CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.evidence.source_exploration_id') END AS source_exploration_id,
+                     CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.evidence.source_scenario_id') END AS source_scenario_id
+                   FROM scenarios WHERE exploration_id = ? ORDER BY sequence""",
+                (exploration_id,),
+            ).fetchall()
+        sources: list[dict[str, Any] | None] = []
+        for event in events:
+            try:
+                payload = json.loads(event["payload_json"])
+            except (json.JSONDecodeError, TypeError):
+                payload = None
+            sources.append({key: payload.get(key) for key in ("source_exploration_id", "source_scenario_id")}
+                           if isinstance(payload, dict) else None)
+        return {"id": exploration_id, "sources": sources, "scenarios": [
+            {"id": row["id"] if row["id"] == row["saved_id"] else None,
+             "status": row["status"], "source_exploration_id": row["source_exploration_id"],
+             "source_scenario_id": row["source_scenario_id"]}
+            for row in scenarios
+        ]}
+
     def get_report_path(self, exploration_id: str) -> str | None:
         with self._lock, self._connect() as connection:
             row = connection.execute(

@@ -8,6 +8,8 @@ import pytest
 from autojev.adapters.browser_rerun_panel import BrowserRerunPanel, PANEL_URL
 from autojev.adapters.playwright_executor import PlaywrightExecutor
 from autojev.domain.models import ExplorationOptions
+from autojev.services.user_image_upload import validate_user_image
+from autojev.services.rerun_preparation_presentation import preparation_presentation
 
 
 LIVE_PAYLOAD = {
@@ -40,6 +42,25 @@ async def isolated_browser_panel():
             return {"accepted": True}
 
         panel = BrowserRerunPanel(executor, capture)
+        preview = {"checkpoint_id": "print-one", "checkpoint_version": 3,
+                   "revision": 0, "changed": True, "image": None}
+
+        async def share_preview(checkpoint_id, checkpoint_version, expected_revision, image_data_url):
+            # This fixture emulates the service's ephemeral CAS store. Sharing
+            # never calls capture or signals a waiter; the real sandbox/frame
+            # and nonce gates still run before this handler is reached.
+            if ((checkpoint_id, checkpoint_version) != (preview["checkpoint_id"], preview["checkpoint_version"])
+                    or expected_revision != preview["revision"]):
+                raise ValueError("A prévia mudou em outra janela")
+            image = validate_user_image(image_data_url) if image_data_url is not None else None
+            preview.update(revision=expected_revision + 1, image=(
+                {"data_url": image_data_url, "name": "Print sincronizado", "size": len(image.content)}
+                if image is not None else None))
+            await panel.set_preview(preview)
+            return dict(preview)
+
+        panel.preview_handler = share_preview
+        await panel.set_preview(preview)
         await panel.bind_page(page)
 
         async def intercept(route, request):
@@ -332,8 +353,91 @@ async def test_real_frame_is_cross_origin_and_cannot_connect_or_store_data(isola
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reason_code, manual_status", [
+    ("authentication_required", None), ("before_url_changed", None),
+    ("authentication_required", "ready"), ("before_url_changed", "blocked"),
+])
+async def test_real_preparation_ui_distinguishes_detected_login_from_other_url_mismatch(
+        isolated_browser_panel, reason_code, manual_status):
+    from playwright.async_api import expect
+
+    panel, _, calls, signals = isolated_browser_panel
+    shared = {"preparation_version": 2, "revision": 0, "checked": False}
+    changes = []
+
+    async def share_consent(version, expected_revision, checked):
+        assert version == shared["preparation_version"] and expected_revision == shared["revision"]
+        shared.update(revision=expected_revision + 1, checked=checked)
+        changes.append(dict(shared))
+        return dict(shared)
+
+    panel.consent_handler = share_consent
+    payload = {**LIVE_PAYLOAD, "phase": "waiting_preparation", "checkpoint": None,
+               "preparation": {"version": 2, "reason_code": reason_code,
+                               "reason_label": "A página aberta não é a mesma em que o teste original começou.",
+                               "expected_url": "https://fixture.invalid/inventory",
+                               "current_url": "https://fixture.invalid/", "instruction": "Confira a preparação.",
+                               "consent": dict(shared)}}
+    if manual_status is not None:
+        payload["preparation"]["manual_login"] = {"status": manual_status}
+    canonical = preparation_presentation(payload["preparation"], "waiting_preparation")
+    assert await panel.update(payload) is True
+    frame = panel.frame
+    # Legacy clients can omit the presentation object. The panel's safe
+    # defaults must match the canonical main-app vocabulary exactly.
+    for key, selector in (("kicker", "#preparation-eyebrow"), ("title", "#preparation-heading"),
+                          ("instruction", "#preparation-hint"), ("consent_label", "#preparation-consent-label"),
+                          ("button_label", "#confirm-preparation"), ("details_label", "#preparation-details-label"),
+                          ("note", "#preparation-note"), ("feedback", "#preparation-feedback")):
+        assert await frame.locator(selector).inner_text() == canonical[key]
+    assert not await frame.locator("#preparation-consent").is_checked()
+    assert await frame.locator("#confirm-preparation").is_disabled()
+    await frame.locator("#confirm-preparation").dispatch_event("click")
+    assert calls == signals == []
+    assert changes == []
+    # Better wording does not authorize a login attempt: both explicit consent
+    # and a native confirmation remain necessary in the trusted frame.
+    await frame.locator("#preparation-consent").check()
+    await expect(frame.locator("#confirm-preparation")).to_be_enabled()
+    assert changes == [{"preparation_version": 2, "revision": 1, "checked": True}]
+    assert calls == signals == [], "sharing authorization does not submit login or resume"
+    await frame.locator("#confirm-preparation").dispatch_event("click")
+    assert calls == signals == []
+    await frame.locator("#confirm-preparation").click()
+    async with asyncio.timeout(3):
+        while not signals:
+            await asyncio.sleep(0.01)
+    assert signals == [True] and calls == []
+
+
+@pytest.mark.asyncio
+async def test_real_shared_consent_from_other_surface_enables_native_continue_without_second_checkbox(isolated_browser_panel):
+    from playwright.async_api import expect
+
+    panel, _, calls, signals = isolated_browser_panel
+    preparation = {"version": 2, "reason_code": "authentication_required",
+                   "consent": {"preparation_version": 2, "revision": 0, "checked": False}}
+    payload = {**LIVE_PAYLOAD, "phase": "waiting_preparation", "checkpoint": None, "preparation": preparation}
+    assert await panel.update(payload) is True
+    frame = panel.frame
+    await expect(frame.locator("#preparation-consent")).not_to_be_checked()
+    preparation = {**preparation, "consent": {"preparation_version": 2, "revision": 1, "checked": True}}
+    assert await panel.update({**payload, "preparation": preparation}) is True
+    await expect(frame.locator("#preparation-consent")).to_be_checked()
+    await expect(frame.locator("#confirm-preparation")).to_be_enabled()
+    assert signals == calls == []
+    await frame.locator("#confirm-preparation").click()
+    async with asyncio.timeout(3):
+        while not signals:
+            await asyncio.sleep(0.01)
+    assert signals == [True] and calls == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("source", ["file", "paste", "drop"])
 async def test_real_ui_requires_native_confirmation_after_file_preview(isolated_browser_panel, user_print_image, source):
+    from playwright.async_api import expect
+
     panel, _, calls, _ = isolated_browser_panel
     assert await panel.update(LIVE_PAYLOAD) is True
     frame = panel.frame
@@ -343,7 +447,8 @@ async def test_real_ui_requires_native_confirmation_after_file_preview(isolated_
         })
     else:
         # Exercise the same clipboard/drop event handlers with a public fixture
-        # image. These events may stage a preview, never authorize its upload.
+        # image. These events may share an ephemeral preview, never authorize
+        # its attachment as evidence or resume the test.
         await frame.evaluate("""({data, source}) => {
           const bytes = Uint8Array.from(atob(data.split(',')[1]), c => c.charCodeAt(0));
           const transfer = new DataTransfer();
@@ -352,10 +457,12 @@ async def test_real_ui_requires_native_confirmation_after_file_preview(isolated_
             ? new ClipboardEvent('paste', {clipboardData:transfer,bubbles:true,cancelable:true})
             : new DragEvent('drop', {dataTransfer:transfer,bubbles:true,cancelable:true}));
         }""", {"data": user_print_image["data_url"], "source": source})
-    await frame.wait_for_function("document.querySelector('#confirm-capture').disabled === false")
+    await expect(frame.locator("#confirm-capture")).to_be_enabled()
     assert "Falta confirmar" in await frame.locator("#capture-status").inner_text()
     assert await frame.locator("#preview").get_attribute("src") == user_print_image["data_url"]
     assert calls == []
+    assert panel._preview_snapshot["revision"] == 1
+    assert panel._preview_snapshot["image"]["data_url"] == user_print_image["data_url"]
     await frame.locator("#confirm-capture").dispatch_event("click")
     await asyncio.sleep(0.05)
     assert calls == []
@@ -402,6 +509,8 @@ async def test_frame_restriction_fails_closed_without_disabling_application_csp(
 
 @pytest.mark.asyncio
 async def test_iframe_only_reload_revokes_confirmation_and_restores_same_projection(isolated_browser_panel, user_print_image):
+    from playwright.async_api import expect
+
     panel, _, calls, _ = isolated_browser_panel
     assert await panel.update(LIVE_PAYLOAD) is True
     frame = panel.frame
@@ -411,19 +520,24 @@ async def test_iframe_only_reload_revokes_confirmation_and_restores_same_project
         await frame.locator("#file-input").set_input_files({
             "name": "another-application.png", "mimeType": "image/png", "buffer": user_print_image["bytes"],
         })
-        await frame.wait_for_function("document.querySelector('#confirm-capture').disabled === false")
+        await expect(frame.locator("#confirm-capture")).to_be_enabled()
 
     await stage()
     await frame.goto(PANEL_URL, wait_until="domcontentloaded")
     assert panel.frame is frame
     assert await panel.update(LIVE_PAYLOAD) is True
     assert await frame.locator("#steps .step").count() == 4
-    assert await frame.locator("#confirm-capture").is_disabled()
-    assert await frame.locator("#selected-file").is_hidden()
+    # A reload revokes the old document's nonce, not the service-owned preview.
+    # The same pending checkpoint is restored without any new capture call.
+    await expect(frame.locator("#confirm-capture")).to_be_enabled()
+    assert await frame.locator("#selected-file").is_visible()
+    assert await frame.locator("#preview").get_attribute("src") == user_print_image["data_url"]
     with pytest.raises(ValueError):
         await panel.command(trusted_source(panel), old_command)
     assert calls == []
-    await stage()
+    await frame.locator("#confirm-capture").dispatch_event("click")
+    await asyncio.sleep(0.05)
+    assert calls == []
     await frame.locator("#confirm-capture").click()
     async with asyncio.timeout(3):
         while not calls:
@@ -435,7 +549,7 @@ async def test_iframe_only_reload_revokes_confirmation_and_restores_same_project
     assert await panel.update(LIVE_PAYLOAD) is True
     await stage()
     await frame.locator("#confirm-capture").click()
-    await frame.wait_for_function("document.querySelector('#capture-status').dataset.tone === 'error'")
+    await expect(frame.locator("#capture-status")).to_have_attribute("data-tone", "error")
     assert len(calls) == 1
 
 

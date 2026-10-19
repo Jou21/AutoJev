@@ -75,6 +75,7 @@ def report_snapshot_key(exploration: dict[str, Any]) -> str:
         "started_at": duration["started_at"],
         "ended_at": duration["ended_at"],
         "usage": exploration.get("usage") or {},
+        "scenario_revisions_key": exploration.get("scenario_revisions_key"),
         "visual_reviews": [
             {"id": scenario.get("id"),
              "assessment": (scenario.get("evidence") or {}).get("visual_assessment"),

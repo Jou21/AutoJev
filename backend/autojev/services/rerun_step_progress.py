@@ -13,10 +13,17 @@ from collections import Counter
 from copy import deepcopy
 from typing import Any
 
-from autojev.services.report_localization import ACTION_LABELS, CHECK_LABELS, check_label
+from autojev.services.report_localization import (
+    ACTION_LABELS,
+    CHECK_LABELS,
+    check_label,
+)
+from autojev.services.rerun_initial_observation import (
+    initial_observation_from_events,
+    with_initial_observation,
+)
 from autojev.services.scenario_step_order import presentation_scenario_steps
 from autojev.services.scenario_timeline import prepare_scenario_timelines
-
 
 TERMINAL = {"completed", "partial", "failed", "cancelled"}
 
@@ -128,12 +135,18 @@ def progress_check_bindings(original_action: dict[str, Any] | None, current_asse
     return result
 
 
-def _current_steps(item: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def _current_steps(item: dict[str, Any], plan: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     # This item is the *current* run only; no source result is consulted.
     prepared = prepare_scenario_timelines(item)
     scenarios = prepared.get("scenarios") or []
     scenario = next((value for value in scenarios if value.get("id") == "CT001"), None)
     evidence = (scenario or {}).get("evidence") or {}
+    initial = initial_observation_from_events(item)
+    before_rows = [row for row in plan.get("steps", []) if isinstance(row, dict)
+                   and (row.get("identity") or {}).get("kind") == "observation"
+                   and (row.get("identity") or {}).get("role") == "before_action"]
+    if initial is not None and len(before_rows) == 1 and before_rows[0].get("id") == initial["source_step_id"]:
+        evidence = with_initial_observation(evidence, initial)
     return presentation_scenario_steps(evidence), evidence
 
 
@@ -144,7 +157,7 @@ def project_step_progress(item: dict[str, Any], rerun: dict[str, Any],
     if plan.get("version") != 1 or not isinstance(plan.get("steps"), list):
         return {"version": 1, "steps": [], "completed": 0, "total": 0,
                 "notice": "O roteiro original não está disponível. As evidências desta execução permanecem preservadas."}
-    entries, evidence = _current_steps(item)
+    entries, evidence = _current_steps(item, plan)
     identities = _identities(entries, evidence)
     bindings = rerun.get("step_check_bindings") or []
     rebound = {}

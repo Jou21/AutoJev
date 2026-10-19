@@ -379,7 +379,7 @@ class PlaywrightExecutor:
         "transform:translate3d(calc(100% - 54px),0,0);opacity:.42;filter:saturate(.82);"
         "transition:none !important;pointer-events:none !important;contain:layout paint style;}"
         "#autojev-sidepanel,#autojev-sidepanel *{box-sizing:border-box !important;}"
-        "#autojev-sidepanel[data-pinned='true'],#autojev-sidepanel[data-mode='attention']{"
+        "#autojev-sidepanel[data-pinned='true'],#autojev-sidepanel[data-mode='attention']:not([data-collapsed='true']){"
         "transform:translate3d(0,0,0);opacity:1;filter:saturate(1);}"
         "#autojev-sidepanel .autojev-panel-rail{position:relative;display:grid;width:54px;height:54px;"
         "min-height:54px;place-items:center;padding:7px;border:1px solid rgba(255,255,255,.16);"
@@ -400,7 +400,8 @@ class PlaywrightExecutor:
         "backdrop-filter:blur(22px) saturate(1.35);-webkit-backdrop-filter:blur(22px) saturate(1.35);"
         "scrollbar-width:thin;scrollbar-color:#3e4b4c transparent;opacity:0;pointer-events:none !important;transition:none !important;}"
         "#autojev-sidepanel[data-pinned='true'] .autojev-panel-surface,"
-        "#autojev-sidepanel[data-mode='attention'] .autojev-panel-surface{opacity:1;pointer-events:auto !important;}"
+        "#autojev-sidepanel[data-mode='attention']:not([data-collapsed='true']) .autojev-panel-surface{opacity:1;pointer-events:auto !important;}"
+        "#autojev-sidepanel[data-collapsed='true']{opacity:1;filter:saturate(1);}"
         "#autojev-sidepanel .autojev-panel-header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;}"
         "#autojev-sidepanel .autojev-panel-kicker{display:flex;align-items:center;gap:7px;margin:0;color:#f4c65a;"
         "font-size:9px;font-weight:800;letter-spacing:.13em;text-transform:uppercase;}"
@@ -475,8 +476,14 @@ class PlaywrightExecutor:
       const PIN_KEY = 'autojev-panel-open';
       const USAGE_KEY = 'autojev-panel-usage';
       let savedPinned = false;
-      try { savedPinned = sessionStorage.getItem(PIN_KEY) === 'true'; } catch (error) {}
+      let userCollapsed = false;
+      try {
+        const stored = sessionStorage.getItem(PIN_KEY);
+        savedPinned = stored === 'true';
+        userCollapsed = stored === 'false';
+      } catch (error) {}
       panel.dataset.pinned = savedPinned ? 'true' : 'false';
+      panel.dataset.collapsed = userCollapsed ? 'true' : 'false';
       panel.setAttribute('aria-label', 'Status da exploração do AutoJev');
       panel.setAttribute('aria-live', 'polite');
 
@@ -488,8 +495,11 @@ class PlaywrightExecutor:
       rail.setAttribute('aria-expanded', savedPinned ? 'true' : 'false');
       rail.innerHTML = '<span class="autojev-rail-mark">J</span><span class="autojev-rail-status"></span><span class="autojev-rail-label">AutoJev</span>';
       const togglePinned = () => {
-        const next = panel.dataset.pinned !== 'true';
+        const expanded = panel.dataset.pinned === 'true'
+          || panel.dataset.mode === 'attention' && panel.dataset.collapsed !== 'true';
+        const next = !expanded;
         panel.dataset.pinned = next ? 'true' : 'false';
+        panel.dataset.collapsed = next ? 'false' : 'true';
         rail.setAttribute('aria-expanded', next ? 'true' : 'false');
         const hint = document.getElementById('autojev-panel-hint');
         if (hint && panel.dataset.mode !== 'attention') hint.textContent = next ? 'Clique no J para recolher' : 'Clique no J para abrir';
@@ -505,6 +515,7 @@ class PlaywrightExecutor:
       panel.addEventListener('keydown', (event) => {
         if (event.key === 'Escape') {
           panel.dataset.pinned = 'false';
+          panel.dataset.collapsed = 'true';
           rail.setAttribute('aria-expanded', 'false');
           const hint = document.getElementById('autojev-panel-hint');
           if (hint) hint.textContent = 'Clique no J para abrir';
@@ -621,6 +632,18 @@ class PlaywrightExecutor:
     def configure_rerun_resume(self, resume_handler: Any) -> None:
         if self._rerun_panel is not None:
             self._rerun_panel.resume_handler = resume_handler
+
+    def configure_rerun_consent(self, consent_handler: Any) -> None:
+        if self._rerun_panel is not None:
+            self._rerun_panel.consent_handler = consent_handler
+
+    def configure_rerun_preview(self, preview_handler: Any) -> None:
+        if self._rerun_panel is not None:
+            self._rerun_panel.preview_handler = preview_handler
+
+    async def update_rerun_preview(self, snapshot: dict[str, Any]) -> None:
+        if self._rerun_panel is not None:
+            await self._rerun_panel.set_preview(snapshot)
 
     async def update_rerun_panel(self, payload: dict[str, Any]) -> bool:
         if self._rerun_panel is None or not await self._ensure_sidepanel():
@@ -1849,7 +1872,18 @@ class PlaywrightExecutor:
         except Exception:
             return None
 
-    async def observe(self, screenshot_label: str = "page") -> Observation:
+    async def observe_preparation(self) -> Observation:
+        """Read the live login/precondition state without capturing evidence.
+
+        A passive login check must not consume technical signals before the
+        regular evidence-bearing observation or submit any form itself.
+        The caller serializes this probe with normal observation/execution.
+        """
+        return await self.observe("rerun_login_watch", capture_screenshot=False)
+
+    async def observe(
+        self, screenshot_label: str = "page", *, capture_screenshot: bool = True,
+    ) -> Observation:
         if not self.is_active():
             raise BrowserUnavailableError("Browser page is not active")
         await self._release_observed_element_handles()
@@ -2411,11 +2445,12 @@ class PlaywrightExecutor:
               };
             }""")),
         )
-        screenshot = await self._capture(screenshot_label)
-        console_errors = list(self._console_buffer)
-        network_errors = list(self._network_buffer)
-        self._console_buffer.clear()
-        self._network_buffer.clear()
+        screenshot = await self._capture(screenshot_label) if capture_screenshot else None
+        console_errors = list(self._console_buffer) if capture_screenshot else []
+        network_errors = list(self._network_buffer) if capture_screenshot else []
+        if capture_screenshot:
+            self._console_buffer.clear()
+            self._network_buffer.clear()
         elements = snapshot.get("elements", [])
         self._ref_selectors = {}
         self._ref_semantics = {}

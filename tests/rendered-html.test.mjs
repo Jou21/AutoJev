@@ -509,15 +509,13 @@ test("rerun preparation compares the expected and open pages with readable corre
   assert.match(html, /Faça login e abra a lista de produtos/);
   assert.doesNotMatch(html, /before_url_changed|"version"/);
   const validating = renderToStaticMarkup(createElement(ScenarioRerunPreparation, { validating: true }));
-  assert.match(validating, /Entrando e conferindo preparação/);
-  assert.match(validating, /formulário de login preenchido e seguro/);
-  assert.match(validating, /Depois conferirá a página e os pré-requisitos/);
-  assert.match(validating, /Aguarde o resultado antes de confirmar novamente/);
+  assert.match(validating, /Aguarde a conferência do login, da página e dos pré-requisitos/);
+  assert.match(validating, /Não é necessário confirmar novamente/);
   const fallback = renderToStaticMarkup(createElement(ScenarioRerunPreparation, {}));
-  assert.match(fallback, /preencha usuário e senha/);
+  assert.match(fallback, /Prepare a página e os dados iniciais do teste/);
   assert.match(fallback, /Continuar reexecução/);
-  assert.match(fallback, /tentará enviar o formulário de login/);
-  assert.match(fallback, /Se já estiver conectado, apenas conferirá a preparação/);
+  assert.match(fallback, /Se houver um login preenchido no site autorizado, o AutoJev tentará entrar/);
+  assert.match(fallback, /A ação do teste só será executada se os pré-requisitos forem confirmados/);
 });
 
 test("rerun preparation reports the login attempt without exposing technical codes or claiming the CT passed", async () => {
