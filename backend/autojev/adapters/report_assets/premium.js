@@ -761,7 +761,10 @@
         else item.button.removeAttribute("aria-current");
       });
       const selected = model.items[index];
+      prepareEvidenceInspector(selected);
       text(model.title, selected.title);
+      text(model.outcome, selected.outcome || "Sem resultado registrado");
+      model.outcome.dataset.stepState = selected.state || "unknown";
       text(model.position, selected.kind === "summary" ? "Visão geral do teste" : selected.draftId
         ? "Passo extra · Rascunho visual · Não executado"
         : "Etapa " + selected.originalIndex + " de " + (model.originalItems.length - 1) + " · " + selected.kindLabel);
@@ -898,6 +901,185 @@
       } else control.appendChild(image);
     }
 
+    function evidenceIcon(name) {
+      const icon = document.createElement("span");
+      icon.className = "evidence-icon";
+      icon.setAttribute("aria-hidden", "true");
+      const paths = {
+        image: ["M4 4h16v16H4z", "m4 15 4-4 4 4 3-3 5 5", "M8 8h.01"],
+        code: ["m8 8-4 4 4 4", "m16 8 4 4-4 4", "m14 5-4 14"],
+        minus: ["M4 11a7 7 0 1 0 14 0 7 7 0 0 0-14 0", "m16 16 5 5", "M8 11h6"],
+        plus: ["M4 11a7 7 0 1 0 14 0 7 7 0 0 0-14 0", "m16 16 5 5", "M8 11h6", "M11 8v6"],
+        expand: ["M8 3H3v5", "M16 3h5v5", "M3 16v5h5", "M21 16v5h-5"],
+        copy: ["M9 8h11v13H9z", "M5 16H3V3h11v2"],
+        link: ["m10 13 4-4", "M8 15 6 17a3 3 0 0 1-4-4l4-4a3 3 0 0 1 4 0", "m14 9 2-2a3 3 0 0 1 4 4l-4 4a3 3 0 0 1-4 0"],
+        download: ["M12 3v12", "m7 10 5 5 5-5", "M4 16v5h16v-5"],
+        previous: ["m15 5-7 7 7 7"], next: ["m9 5 7 7-7 7"],
+      };
+      if (typeof document.createElementNS !== "function") {
+        icon.textContent = ({ previous: "‹", next: "›", minus: "−", plus: "+", expand: "⛶", download: "↓", copy: "▣", link: "↗" })[name] || "▧";
+        return icon;
+      }
+      const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      for (const [attribute, value] of Object.entries({ viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "1.8", "stroke-linecap": "round", "stroke-linejoin": "round" })) svg.setAttribute(attribute, value);
+      (paths[name] || paths.image).forEach((value) => {
+        const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        path.setAttribute("d", value); svg.appendChild(path);
+      });
+      icon.appendChild(svg);
+      return icon;
+    }
+
+    function prepareEvidenceInspector(item) {
+      const entry = item.node, content = entry.querySelector(".timeline-content");
+      if (item.kind === "summary" || !content || content.querySelector(".step-evidence-layout")) return;
+      const groups = all(".shots", content).filter((group) => group.querySelector("figure img"));
+      const figures = groups.flatMap((group) => all("figure", group).filter((figure) => figure.querySelector("img")));
+      if (!figures.length) return;
+      const make = (tag, className, value) => {
+        const node = document.createElement(tag); node.className = className;
+        if (value != null) node.textContent = value;
+        return node;
+      };
+      const iconButton = (name, label, action) => {
+        const control = button("", action, "button button-ghost evidence-icon-button");
+        control.appendChild(evidenceIcon(name)); control.setAttribute("aria-label", label); control.setAttribute("title", label);
+        return control;
+      };
+      const layout = make("div", "step-evidence-layout");
+      const viewer = make("section", "step-evidence-viewer");
+      viewer.setAttribute("aria-label", "Visualizador da evidência");
+      const bar = make("div", "step-evidence-bar"), tabs = make("div", "step-evidence-tabs");
+      const imageTab = make("span", "step-evidence-tab active"); imageTab.append(evidenceIcon("image"), make("span", "", "Imagem"));
+      const htmlTab = button("", () => {}, "step-evidence-tab");
+      htmlTab.append(evidenceIcon("code"), make("span", "", "HTML")); htmlTab.disabled = true;
+      htmlTab.setAttribute("title", "O HTML desta etapa não foi preservado no relatório.");
+      htmlTab.setAttribute("aria-label", "HTML indisponível: não registrado nesta execução");
+      tabs.append(imageTab, htmlTab);
+      const tools = make("div", "step-evidence-tools"), zoomTools = make("div", "step-evidence-zoom");
+      const viewport = make("div", "step-evidence-viewport");
+      viewport.tabIndex = 0; viewport.setAttribute("aria-label", "Imagem da evidência; com zoom, segure o botão esquerdo e arraste para mover, ou use as barras de rolagem");
+      let zoom = 100, activeFigure = figures[0], pan = null, suppressPanClick = false;
+      const setZoom = (value) => {
+        finishPan();
+        zoom = Math.max(50, Math.min(200, value));
+        viewport.style.setProperty("--evidence-zoom", String(zoom / 100));
+        viewport.dataset.panEnabled = String(zoom > 100);
+        text(reset, zoom + "%"); minus.disabled = zoom === 50; plus.disabled = zoom === 200;
+        if (zoom === 100) { viewport.scrollTop = 0; viewport.scrollLeft = 0; }
+      };
+      function finishPan(event) {
+        if (!pan || event && event.pointerId !== pan.pointerId) return;
+        const previous = pan; pan = null;
+        viewport.classList.remove("is-panning");
+        suppressPanClick = !!(event && event.type === "pointerup" && previous.moved);
+        if (previous.target.hasPointerCapture && previous.target.hasPointerCapture(previous.pointerId)) previous.target.releasePointerCapture(previous.pointerId);
+      }
+      viewport.addEventListener("pointerdown", (event) => {
+        suppressPanClick = false;
+        if (zoom <= 100 || event.button !== 0 || event.pointerType !== "mouse" || event.isPrimary === false
+          || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey || pan) return;
+        const target = event.target instanceof Element ? event.target.closest(".step-preview-button") : null;
+        if (!target || !activeFigure.contains(target)
+          || viewport.scrollWidth <= viewport.clientWidth && viewport.scrollHeight <= viewport.clientHeight) return;
+        pan = { pointerId: event.pointerId, target, x: event.clientX, y: event.clientY, left: viewport.scrollLeft, top: viewport.scrollTop, moved: false };
+        viewport.classList.add("is-panning");
+        // Capture on the image button: a simple click still opens its preview,
+        // while a real drag keeps tracking outside the viewport and never clicks.
+        if (target.setPointerCapture) target.setPointerCapture(event.pointerId);
+      });
+      viewport.addEventListener("pointermove", (event) => {
+        if (!pan || event.pointerId !== pan.pointerId) return;
+        if (!(event.buttons & 1)) { finishPan(event); return; }
+        const dx = event.clientX - pan.x, dy = event.clientY - pan.y;
+        if (!pan.moved && Math.hypot(dx, dy) < 4) return;
+        pan.moved = true;
+        event.preventDefault();
+        viewport.scrollLeft = pan.left - dx; viewport.scrollTop = pan.top - dy;
+      });
+      ["pointerup", "pointercancel", "lostpointercapture"].forEach((name) => viewport.addEventListener(name, finishPan));
+      viewport.addEventListener("dragstart", (event) => { if (zoom > 100) event.preventDefault(); });
+      viewport.addEventListener("click", (event) => {
+        const suppress = suppressPanClick; suppressPanClick = false;
+        if (suppress && event.detail !== 0) { event.preventDefault(); event.stopPropagation(); }
+      }, true);
+      const minus = iconButton("minus", "Diminuir zoom", () => setZoom(zoom - 25));
+      const reset = button("100%", () => setZoom(100), "evidence-zoom-reset"); reset.setAttribute("aria-label", "Restaurar zoom para 100%");
+      const plus = iconButton("plus", "Aumentar zoom", () => setZoom(zoom + 25));
+      zoomTools.append(minus, reset, plus);
+      const expand = iconButton("expand", "Ampliar evidência", () => openEvidencePreview(activeFigure.querySelector("img"), expand,
+        (activeFigure.querySelector("figcaption") || {}).textContent, (activeFigure.querySelector("figcaption") || {}).textContent));
+      tools.append(zoomTools, expand); bar.append(tabs, tools); viewer.append(bar, viewport);
+      const aside = make("aside", "step-evidence-info"), panel = make("div", "step-evidence-info-panel");
+      const heading = make("h4", "step-evidence-info-heading"); heading.append(evidenceIcon("image"), make("span", "", "Informações da evidência"));
+      const fields = make("dl", "step-evidence-fields");
+      const row = (label, name) => {
+        const wrapper = make("div", "step-evidence-field"); wrapper.dataset.evidenceField = name;
+        const value = make("dd", ""); wrapper.append(make("dt", "", label), value); fields.appendChild(wrapper); return value;
+      };
+      const type = row("Tipo", "type"), filename = row("Nome do arquivo", "filename"), date = row("Data e hora", "date"), url = row("URL da página", "url");
+      const resolution = row("Resolução", "resolution"), size = row("Tamanho", "size");
+      const time = entry.querySelector("time"), recordedTime = time && time.getAttribute("datetime");
+      text(date, recordedTime && !Number.isNaN(new Date(recordedTime).getTime()) ? executionDate({ started_at: recordedTime }) : "Não registrada");
+      const feedback = make("p", "step-evidence-feedback"); feedback.setAttribute("role", "status"); feedback.setAttribute("aria-live", "polite");
+      const copyValue = (value, label) => iconButton("copy", "Copiar " + label, async () => {
+        try {
+          if (!window.navigator || !window.navigator.clipboard || typeof window.navigator.clipboard.writeText !== "function") throw new Error("Clipboard unavailable");
+          await window.navigator.clipboard.writeText(value); text(feedback, label + " copiado.");
+        } catch (_) { text(feedback, "Não foi possível copiar. Selecione o texto e copie manualmente."); }
+      });
+      const rawUrl = (all(".url", content).map((node) => node.textContent.trim().replace(/^Página:\s*/i, "")).find((value) => /^https?:\/\//i.test(value)) || "");
+      let pageUrl = "";
+      try { const candidate = new URL(rawUrl); if (["http:", "https:"].includes(candidate.protocol) && !candidate.username && !candidate.password) pageUrl = candidate.href; } catch (_) {}
+      if (pageUrl) {
+        const link = make("a", "step-evidence-url", pageUrl); link.href = pageUrl; link.target = "_blank"; link.rel = "noopener noreferrer";
+        url.append(link, copyValue(pageUrl, "URL"));
+      } else text(url, "Não registrada");
+      const context = make("div", "step-evidence-context");
+      // Move only the step's short introduction. Rich assertions and technical
+      // records stay intact below the viewer; all canonical images are reused.
+      Array.from(content.children).filter((node) => ["H3", "P"].includes(node.tagName) && !node.classList.contains("url"))
+        .forEach((node) => context.appendChild(node));
+      panel.append(heading, fields, context, feedback);
+      const download = make("a", "button step-evidence-download"); download.append(evidenceIcon("download"), make("span", "", "Baixar imagem"));
+      aside.append(panel, download); layout.append(viewer, aside);
+      groups.forEach((group) => viewport.appendChild(group));
+      content.insertBefore(layout, content.firstChild);
+      const update = () => {
+        const image = activeFigure.querySelector("img"); hydrateImage(image);
+        const name = ((activeFigure.querySelector("figcaption") || {}).textContent || image.dataset.sourceShot || "evidencia.png").trim();
+        type.textContent = entry.dataset.imageSource === "user_upload" ? "Imagem do usuário" : activeFigure.classList.contains("action-preview") ? "Captura anterior à ação" : "Captura de tela";
+        filename.replaceChildren(make("span", "step-evidence-filename", name), copyValue(name, "nome do arquivo"));
+        text(resolution, image.naturalWidth > 0 && image.naturalHeight > 0 ? image.naturalWidth + " × " + image.naturalHeight + " px" : "Não disponível");
+        const src = image.getAttribute("src") || "";
+        const embedded = /^(data:image\/(?:png|jpe?g|webp|gif);base64,|blob:)/i.test(src);
+        if (embedded) { download.href = src; download.download = name; download.removeAttribute("aria-disabled"); }
+        else { download.removeAttribute("href"); download.setAttribute("aria-disabled", "true"); }
+        const comma = src.indexOf(",");
+        if (/^data:image\/[a-z+.-]+;base64,/i.test(src.slice(0, 80)) && comma > 0) {
+          const bytes = Math.floor((src.length - comma - 1) * 3 / 4) - (src.endsWith("==") ? 2 : src.endsWith("=") ? 1 : 0);
+          text(size, bytes < 1024 ? bytes + " B" : (bytes / (bytes < 1048576 ? 1024 : 1048576)).toLocaleString("pt-BR", { maximumFractionDigits: 1 }) + (bytes < 1048576 ? " KB" : " MB"));
+        } else text(size, "Não registrado");
+      };
+      if (figures.length > 1) {
+        const chooser = make("select", "step-evidence-choice"); chooser.setAttribute("aria-label", "Selecionar imagem desta etapa");
+        figures.forEach((figure, index) => {
+          const option = make("option", "", (figure.querySelector("figcaption") || {}).textContent || "Imagem " + (index + 1)); option.value = String(index); chooser.appendChild(option);
+        });
+        chooser.addEventListener("change", () => {
+          activeFigure = figures[Number(chooser.value)] || figures[0]; figures.forEach((figure) => { figure.hidden = figure !== activeFigure; });
+          setZoom(100); text(feedback, ""); update();
+        }); viewer.insertBefore(chooser, viewport);
+      }
+      figures.forEach((figure) => {
+        figure.classList.add("step-evidence-figure"); figure.hidden = figure !== activeFigure;
+        const image = figure.querySelector("img");
+        image.addEventListener("load", () => { if (figure === activeFigure) update(); });
+        image.addEventListener("error", () => { if (figure === activeFigure) { text(resolution, "Não disponível"); text(feedback, "Não foi possível exibir esta imagem."); } });
+      });
+      setZoom(100); update();
+    }
+
     function ensureCaseExplorer(detail) {
       const readOnly = detail.hasAttribute("data-history-case-index");
       const key = readOnly ? "history-" + detail.dataset.historyCaseIndex + "-" + detail.dataset.historyVersion : detail.dataset.caseIndex;
@@ -965,13 +1147,16 @@
       };
       model.previous = button("← Anterior", () => move(-1), "button button-ghost case-step-prev");
       model.previous.setAttribute("aria-label", "Passo anterior");
+      model.previous.setAttribute("title", "Passo anterior"); model.previous.replaceChildren(evidenceIcon("previous"));
       model.next = button("Próximo →", () => move(1), "button button-ghost case-step-next");
       model.next.setAttribute("aria-label", "Próximo passo");
+      model.next.setAttribute("title", "Próximo passo"); model.next.replaceChildren(evidenceIcon("next"));
       const controls = make("div", "case-step-controls");
       model.timestamp = make("span", "case-step-timestamp");
-      controls.appendChild(model.timestamp);
+      model.outcome = make("span", "case-step-outcome"); model.outcome.setAttribute("role", "status");
       controls.append(model.previous, model.next);
-      toolbar.append(caption, controls);
+      const stepMeta = make("div", "case-step-meta"); stepMeta.append(model.timestamp, model.outcome);
+      toolbar.append(controls, caption, stepMeta);
       stage.append(toolbar, content);
       workspace.append(sidebar, stage);
       body.replaceChildren(workspace);
@@ -1021,7 +1206,7 @@
           : item.kind === "observation" && item.node.querySelector(".shots img") ? "Captura da página" : labels[item.kind];
         const sidebarTitle = item.kind === "assertion" && item.title === "Ausência de novas falhas técnicas da aplicação"
           ? "Erros durante a ação" : item.title;
-        const originalItem = { ...item, key: "original:" + index, originalIndex: index, kindLabel };
+        const originalItem = { ...item, key: "original:" + index, originalIndex: index, kindLabel, state: result.state, outcome };
         const control = button("", () => selectCaseStep(model, model.items.indexOf(originalItem)), "case-step-button");
         control.dataset.stepIndex = String(index);
         control.dataset.recordedIndex = String(index);

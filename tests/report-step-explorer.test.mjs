@@ -215,10 +215,11 @@ class FixtureElement {
     this.events.get(type).push(callback);
   }
   dispatch(type, properties = {}) {
-    const event = { target: this, currentTarget: this, preventDefault() { this.defaultPrevented = true; }, ...properties };
+    const event = { type, target: this, currentTarget: this, preventDefault() { this.defaultPrevented = true; }, stopPropagation() { this.cancelBubble = true; }, ...properties };
     for (let current = this; current; current = current.parentElement) {
       event.currentTarget = current;
       for (const callback of current.events.get(type) || []) callback(event);
+      if (event.cancelBubble) break;
     }
     return event;
   }
@@ -1489,6 +1490,96 @@ test("hiding technical observations excludes their step controls without changin
   document.getElementById("settings-form").dispatch("submit");
   assert.equal(buttons.at(-1).hidden, false);
   assert.equal(card.dataset.status, "PASS");
+});
+
+test("evidence inspector reuses canonical images and bounds zoom without changing results", () => {
+  const { cards, originalImages, originals } = fixture({ stepMetadata: {
+    observation: { stepState: "recorded", stepOutcome: "Captura registrada" },
+  } });
+  const card = cards[0], image = originalImages[0], source = image.src;
+  const inspector = card.querySelector(".step-evidence-layout");
+  assert.ok(inspector.querySelector("img") === image, "viewer moves, never clones, the original capture");
+  assert.equal(inspector.querySelector('[data-evidence-field="resolution"]').querySelector("dd").textContent, "1440 × 900 px");
+  assert.equal(inspector.querySelector('[data-evidence-field="size"]').querySelector("dd").textContent, "9 B");
+  assert.equal(inspector.querySelector(".step-evidence-download").href, source);
+  assert.equal(inspector.querySelector(".step-evidence-download").download, "0-original.png");
+  assert.equal(card.querySelector(".case-step-outcome").textContent, "Captura registrada");
+  assert.equal(card.querySelector(".case-step-outcome").dataset.stepState, "recorded");
+  const plus = inspector.querySelectorAll("button").find((control) => control.getAttribute("aria-label") === "Aumentar zoom");
+  const minus = inspector.querySelectorAll("button").find((control) => control.getAttribute("aria-label") === "Diminuir zoom");
+  for (let index = 0; index < 10; index += 1) plus.click();
+  assert.equal(inspector.querySelector(".evidence-zoom-reset").textContent, "200%");
+  assert.equal(plus.disabled, true);
+  for (let index = 0; index < 10; index += 1) minus.click();
+  assert.equal(inspector.querySelector(".evidence-zoom-reset").textContent, "50%");
+  assert.equal(minus.disabled, true);
+  inspector.querySelector(".evidence-zoom-reset").click();
+  assert.equal(inspector.querySelector(".step-evidence-viewport").style.getPropertyValue("--evidence-zoom"), "1");
+  assert.equal(image.src, source);
+  assert.equal(originals[0].querySelector("h3").textContent, "Antes da ação");
+  card.querySelector(".case-step-next").click();
+  assert.equal(card.querySelector(".case-step-outcome").dataset.stepState, "unknown");
+  assert.equal(card.dataset.status, "PASS");
+});
+
+test("zoomed evidence pans only with the left mouse button and suppresses drag clicks", () => {
+  const { cards, document, originalImages } = fixture();
+  const inspector = cards[0].querySelector(".step-evidence-layout");
+  const viewport = inspector.querySelector(".step-evidence-viewport");
+  const image = originalImages[0], target = image.closest(".step-preview-button");
+  const source = image.src;
+  Object.assign(viewport, { clientWidth: 300, clientHeight: 200, scrollWidth: 600, scrollHeight: 500, scrollLeft: 0, scrollTop: 0 });
+  let captured = null;
+  target.setPointerCapture = (id) => { captured = id; };
+  target.hasPointerCapture = (id) => captured === id;
+  target.releasePointerCapture = () => { captured = null; target.dispatch("lostpointercapture", { pointerId: 7 }); };
+  const pointer = (type, options = {}) => image.dispatch(type, {
+    pointerId: 7, pointerType: "mouse", isPrimary: true, button: 0, buttons: 1, clientX: 200, clientY: 150, ...options,
+  });
+  pointer("pointerdown");
+  assert.equal(captured, null, "unzoomed captures retain their normal click interaction");
+  inspector.querySelectorAll("button").find((control) => control.getAttribute("aria-label") === "Aumentar zoom").click();
+  assert.equal(viewport.dataset.panEnabled, "true");
+  for (const options of [{ button: 2, buttons: 2 }, { pointerType: "touch" }, { ctrlKey: true }]) {
+    pointer("pointerdown", options);
+    assert.equal(captured, null);
+  }
+  pointer("pointerdown");
+  assert.equal(captured, 7);
+  assert.equal(viewport.classList.contains("is-panning"), true);
+  pointer("pointermove", { clientX: 110, clientY: 90 });
+  assert.equal(viewport.scrollLeft, 90);
+  assert.equal(viewport.scrollTop, 60);
+  pointer("pointerup", { buttons: 0 });
+  assert.equal(captured, null);
+  assert.equal(viewport.classList.contains("is-panning"), false);
+  const dragClick = image.dispatch("click", { detail: 1 });
+  assert.equal(dragClick.defaultPrevented, true);
+  assert.equal(document.getElementById("evidence-dialog").hasAttribute("open"), false);
+  pointer("pointerdown");
+  pointer("pointerup", { buttons: 0 });
+  image.click();
+  assert.equal(document.getElementById("evidence-dialog").hasAttribute("open"), true, "a click without dragging still opens the preview");
+  document.getElementById("close-evidence").click();
+  pointer("pointerdown");
+  pointer("pointermove", { clientX: 150, clientY: 100 });
+  pointer("pointercancel", { buttons: 0 });
+  assert.equal(viewport.classList.contains("is-panning"), false);
+  assert.equal(captured, null);
+  inspector.querySelector(".evidence-zoom-reset").click();
+  assert.equal(viewport.dataset.panEnabled, "false");
+  assert.equal(viewport.scrollLeft, 0);
+  assert.equal(viewport.scrollTop, 0);
+  assert.equal(image.src, source);
+});
+
+test("evidence inspector explains unavailable clipboard and missing HTML instead of fabricating content", () => {
+  const { cards } = fixture();
+  const inspector = cards[0].querySelector(".step-evidence-layout");
+  assert.equal(inspector.querySelectorAll("button").find((control) => control.getAttribute("aria-label").startsWith("HTML indisponível")).disabled, true);
+  inspector.querySelector('[data-evidence-field="filename"]').querySelector("button").click();
+  assert.match(inspector.querySelector(".step-evidence-feedback").textContent, /copie manualmente/);
+  assert.equal(inspector.querySelectorAll("iframe").length, 0);
 });
 
 test("step capture preview preserves its image and download name and restores keyboard focus on close", () => {
