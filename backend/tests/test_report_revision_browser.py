@@ -154,6 +154,10 @@ async def connected_page(browser, markup, state, requests):
 @pytest.mark.asyncio
 async def test_execution_timeline_switches_owned_evidence_without_changing_latest_results(tmp_path):
     _, markup, images = rendered_report(tmp_path)
+    # Reproduce a long-running backend holding its old template while it loads
+    # current CSS/JS: the obsolete button must leave both the blob and exports.
+    markup = markup.replace('<div class="execution-history-track">',
+                            '<div class="execution-history-track"><button id="case-executions-all">Ver todas →</button>', 1)
     requests = []
     state = {"key": "revisions-v2", "markup": markup}
     async with async_playwright() as driver:
@@ -163,6 +167,7 @@ async def test_execution_timeline_switches_owned_evidence_without_changing_lates
         page.on("pageerror", lambda error: errors.append(str(error)))
         try:
             await expect(page.locator("#case-execution-list button")).to_have_count(4)
+            await expect(page.locator("#case-executions-all")).to_have_count(0)
             await expect(page.locator('#case-execution-list [aria-pressed="true"]')).to_have_attribute("data-execution-version", "2")
             await expect(page.locator("#case-execution-metadata")).to_contain_text("Último resultado")
             await expect(page.locator('#case-execution-list [data-execution-version="3"]')).to_contain_text("Mais recente")
@@ -192,6 +197,7 @@ async def test_execution_timeline_switches_owned_evidence_without_changing_lates
                 await page.locator("#download-report").click()
             exported_path = tmp_path / "timeline-offline.html"
             await (await pending.value).save_as(exported_path)
+            assert 'id="case-executions-all"' not in exported_path.read_text()
             offline = await browser.new_context()
             offline_requests = []
             offline.on("request", lambda request: offline_requests.append(request.url))
@@ -223,6 +229,7 @@ async def test_execution_timeline_switches_owned_evidence_without_changing_lates
             await page.locator("#case-next").click()
             await expect(page.locator("#case-title")).to_have_text("Outro CT não reexecutado")
             await expect(page.locator("#case-execution-list button")).to_have_count(1)
+            await expect(page.locator(".execution-history-track")).to_have_attribute("data-more-executions", "false")
             await no_duplicate_ids(page)
             assert not errors
             assert all(method == "GET" for method, _ in requests)
@@ -232,32 +239,134 @@ async def test_execution_timeline_switches_owned_evidence_without_changing_lates
 
 
 @pytest.mark.asyncio
-async def test_execution_timeline_expands_all_attempts_and_keeps_an_older_selection(tmp_path):
+@pytest.mark.parametrize("viewport", [{"width": 1440, "height": 1000}, {"width": 390, "height": 844}], ids=["desktop", "mobile"])
+async def test_execution_timeline_scrolls_all_attempts_and_keeps_an_older_selection(tmp_path, viewport):
     from test_report_execution_history import revision
 
     run = fixture()
-    run["scenarios"][0]["execution_history"].extend([
-        revision(4, "no-result-4", None, run_status="cancelled"),
-        revision(5, "no-result-5", None, run_status="cancelled"),
-    ])
+    run["scenarios"][0]["execution_history"].extend(
+        revision(version, f"no-result-{version}", None, run_status="cancelled")
+        for version in range(4, 25)
+    )
     source, _, _ = rendered_report(tmp_path)
     StandaloneHtmlReport(tmp_path).generate(run, str(source))
     async with async_playwright() as driver:
-        browser = await driver.chromium.launch(headless=True)
-        page = await browser.new_page(viewport={"width": 1440, "height": 1000})
+        browser = await driver.chromium.launch(headless=True, ignore_default_args=["--hide-scrollbars"])
+        page = await browser.new_page(viewport=viewport)
+        page.set_default_timeout(5000)
+        errors = []
+        page.on("pageerror", lambda error: errors.append(str(error)))
         try:
             await page.goto(source.as_uri() + "#view/results/CT147")
-            await expect(page.locator("#case-execution-list button")).to_have_count(4)
-            await page.locator("#case-executions-all").click()
-            await expect(page.locator("#case-execution-list button")).to_have_count(6)
+            track = page.locator("#case-execution-list")
+            edge = page.locator(".execution-history-track")
+            await expect(track.locator("button")).to_have_count(25)
+            await expect(page.locator("#case-executions-all")).to_have_count(0)
+            assert await track.locator("button").evaluate_all(
+                "buttons => buttons.map(button => Number(button.dataset.executionVersion))"
+            ) == list(range(24, -1, -1))
+            assert await track.evaluate("el => el.scrollWidth > el.clientWidth")
+            assert await track.evaluate("el => el.scrollHeight <= el.clientHeight + 1")
+            assert await track.locator("li").evaluate_all(
+                "items => new Set(items.map(item => Math.round(item.getBoundingClientRect().top))).size === 1"
+            )
+            assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+            assert await track.evaluate("""el => {
+              const selected = el.querySelector('[aria-pressed="true"]').getBoundingClientRect();
+              const bounds = el.getBoundingClientRect();
+              return selected.left >= bounds.left - 1 && selected.right <= bounds.right + 1;
+            }""")
+            await track.evaluate("el => el.scrollTo({left: 0, behavior: 'instant'})")
+            await expect(edge).to_have_attribute("data-previous-executions", "false")
+            assert await edge.evaluate("el => getComputedStyle(el, '::before').opacity === '0'")
+            await expect(edge).to_have_attribute("data-more-executions", "true")
+            assert await edge.evaluate("el => getComputedStyle(el, '::after').opacity === '1'")
+            assert await edge.evaluate("el => getComputedStyle(el, '::after').backdropFilter === 'blur(3px)'")
+            assert await edge.evaluate("el => getComputedStyle(el, '::after').pointerEvents === 'none'")
+            await page.locator("#case-execution-history").screenshot(path=str(tmp_path / f"execution-blur-{viewport['width']}.png"))
+
+            # A normal mouse emits vertical deltas, including small wheel ticks.
+            # Handle the heading and cards, without scrolling the whole page.
+            await page.locator("#case-execution-history-title").hover()
+            page_top = await page.evaluate("scrollY")
+            await page.mouse.wheel(0, 100)
+            await page.wait_for_function("document.getElementById('case-execution-list').scrollLeft >= 99")
+            assert await page.evaluate("scrollY") == page_top
+            await page.mouse.wheel(0, -60)
+            await page.wait_for_function("Math.abs(document.getElementById('case-execution-list').scrollLeft - 40) <= 1")
+            await track.locator("button").first.hover()
+            card_start = await track.evaluate("el => el.scrollLeft")
+            await page.mouse.wheel(0, 60)
+            await page.wait_for_function("target => Math.abs(document.getElementById('case-execution-list').scrollLeft - target) <= 1", arg=card_start + 60)
+            assert await page.evaluate("scrollY") == page_top
+            await track.evaluate("el => el.scrollLeft = 100")
+            await expect(edge).to_have_attribute("data-previous-executions", "true")
+            assert await edge.evaluate("el => getComputedStyle(el, '::before').opacity === '1'")
+            assert await edge.evaluate("""el => {
+              const left = getComputedStyle(el, '::before'), right = getComputedStyle(el, '::after');
+              return left.backdropFilter === right.backdropFilter && left.width === right.width && left.pointerEvents === 'none';
+            }""")
+            await page.locator("#case-execution-history").screenshot(path=str(tmp_path / f"execution-both-blurs-{viewport['width']}.png"))
+
+            async def wheel_event(options, target=None):
+                return await (target or page.locator("#case-execution-history")).evaluate("""(region, options) => {
+                  const list = document.getElementById('case-execution-list');
+                  const event = new WheelEvent('wheel', {bubbles: true, cancelable: true, ...options});
+                  region.dispatchEvent(event);
+                  return {prevented: event.defaultPrevented, left: list.scrollLeft};
+                }""", options)
+
+            # Leave horizontal gestures and zoom/Shift shortcuts to the browser.
+            for options in [
+                {"deltaY": 100, "ctrlKey": True}, {"deltaY": 100, "metaKey": True},
+                {"deltaY": 100, "shiftKey": True}, {"deltaX": 100},
+                {"deltaX": 100, "deltaY": 10}, {"deltaY": 100, "cancelable": False},
+            ]:
+                assert await wheel_event(options) == {"prevented": False, "left": 100}
+            assert await wheel_event({"deltaY": 3, "deltaMode": 1}) == {"prevented": True, "left": 148}
+            page_step = await track.evaluate("el => el.clientWidth")
+            assert await wheel_event({"deltaY": 1, "deltaMode": 2}) == {"prevented": True, "left": 148 + page_step}
+            # Events outside the history and at its edges must not be trapped.
+            before = await track.evaluate("el => el.scrollLeft")
+            assert await wheel_event({"deltaY": 100}, page.locator("#case-title")) == {"prevented": False, "left": before}
+            await track.evaluate("el => el.scrollLeft = 0")
+            assert await wheel_event({"deltaY": -100}) == {"prevented": False, "left": 0}
+            await expect(edge).to_have_attribute("data-previous-executions", "false")
+            await track.evaluate("el => el.scrollLeft = el.scrollWidth")
+            end = await track.evaluate("el => el.scrollLeft")
+            assert await wheel_event({"deltaY": 100}) == {"prevented": False, "left": end}
+            await track.evaluate("el => el.scrollLeft = 0")
+            # Native horizontal input still works independently of the mapping.
+            await track.hover()
+            await page.mouse.wheel(1500, 0)
+            await page.wait_for_function("document.getElementById('case-execution-list').scrollLeft > 100")
             await page.locator('#case-execution-list [data-execution-version="0"]').focus()
             await page.keyboard.press("Enter")
             await expect(page.locator("#case-title")).to_have_text("Primeira execução")
             await expect(page.locator('#case-execution-list [data-execution-version="0"]')).to_be_focused()
-            await page.locator("#case-executions-all").click()
-            await expect(page.locator("#case-execution-list button")).to_have_count(4)
+            await expect(track.locator("button")).to_have_count(25)
             await expect(page.locator('#case-execution-list [data-execution-version="0"]')).to_have_attribute("aria-pressed", "true")
+            await expect(edge).to_have_attribute("data-more-executions", "false")
+            await expect(edge).to_have_attribute("data-previous-executions", "true")
+            await page.wait_for_function("""() => {
+              const edge = document.querySelector('.execution-history-track');
+              return edge.dataset.moreExecutions === 'false' && getComputedStyle(edge, '::after').opacity === '0';
+            }""", timeout=5000)
+            assert page.url.endswith("?execution=0")
+            await page.screenshot(path=str(tmp_path / f"execution-scroll-{viewport['width']}.png"))
+            await page.reload()
+            await expect(page.locator("#case-title")).to_have_text("Primeira execução")
+            assert await track.evaluate("""el => {
+              const selected = el.querySelector('[aria-pressed="true"]').getBoundingClientRect();
+              const bounds = el.getBoundingClientRect();
+              return el.scrollLeft > 0 && selected.left >= bounds.left - 1 && selected.right <= bounds.right + 1;
+            }""")
             await no_duplicate_ids(page)
+            await page.goto(source.as_uri() + "#view/results/CT148")
+            await expect(track.locator("button")).to_have_count(1)
+            assert await wheel_event({"deltaY": 100}) == {"prevented": False, "left": 0}
+            await expect(edge).to_have_attribute("data-previous-executions", "false")
+            assert not errors
         finally:
             await browser.close()
 

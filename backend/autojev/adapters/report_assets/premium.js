@@ -6,6 +6,11 @@
     if (!source || !document.body.classList.contains("report-premium")) return;
     let data;
     try { data = JSON.parse(source.textContent || "{}"); } catch (_) { return; }
+    // A running backend can still hold the previous Python template while
+    // loading fresh assets. Remove its obsolete control before snapshotting
+    // exports, not just from newly rendered HTML.
+    const legacyExecutionsButton = document.getElementById("case-executions-all");
+    if (legacyExecutionsButton) legacyExecutionsButton.remove();
     // Capture a self-contained export before temporary filters or enhancements.
     // App-only controls are removed from the detached copy, leaving the live
     // blob's rerun and download actions intact.
@@ -114,7 +119,6 @@
     let activeView = "overview";
     let selectedCase = cases.length ? String(cases[0].index) : null;
     const selectedExecutions = new Map();
-    const expandedExecutions = new Set();
     let displayedHistory = null;
     let selectedStatus = "ALL";
     let pageNumber = 1;
@@ -1263,17 +1267,38 @@
       }
     }
 
+    function updateExecutionOverflow() {
+      const list = $("case-execution-list");
+      const track = list && list.closest(".execution-history-track");
+      if (track) {
+        track.dataset.previousExecutions = String(list.scrollLeft > 2);
+        track.dataset.moreExecutions = String(list.scrollWidth - list.clientWidth - list.scrollLeft > 2);
+      }
+    }
+
+    function scrollExecutionHistory(event) {
+      const list = $("case-execution-list");
+      // Keep native horizontal gestures, Shift scrolling and browser zoom.
+      if (!list || event.defaultPrevented || !event.cancelable || event.ctrlKey || event.metaKey || event.shiftKey
+        || !event.deltaY || Math.abs(event.deltaX) >= Math.abs(event.deltaY)) return;
+      const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? list.clientWidth : 1;
+      const limit = Math.max(0, list.scrollWidth - list.clientWidth);
+      const target = Math.max(0, Math.min(limit, list.scrollLeft + event.deltaY * unit));
+      // Release the page at either end, and when the cards already fit.
+      if (Math.abs(target - list.scrollLeft) < 1) return;
+      event.preventDefault();
+      list.scrollLeft = target;
+      updateExecutionOverflow();
+    }
+
     function renderExecutionHistory(current) {
       const list = $("case-execution-list"), metadata = $("case-execution-metadata"), host = $("case-selected-execution");
       if (!current || !list || !metadata || !host) return;
       const history = executionHistory(current), revision = selectedExecution(current);
       const newest = Math.max(...history.map((item) => item.version));
       const recent = history.slice().sort((left, right) => right.version - left.version);
-      const expanded = expandedExecutions.has(selectedCase);
-      let visible = expanded ? recent : recent.slice(0, 4);
-      if (!visible.some((entry) => entry.version === revision.version)) visible = visible.slice(0, 3).concat(revision);
       list.replaceChildren();
-      visible.forEach((entry) => {
+      recent.forEach((entry) => {
         const selected = entry.version === revision.version;
         const control = button("", () => selectExecution(entry.version), "execution-card" + (selected ? " active" : ""));
         control.dataset.executionVersion = String(entry.version);
@@ -1295,11 +1320,13 @@
         const item = executionNode("li", "execution-history-item"); item.appendChild(control); list.appendChild(item);
       });
       text($("case-execution-total"), history.length + (history.length === 1 ? " execução registrada" : " execuções registradas"));
-      const allButton = $("case-executions-all");
-      if (allButton) {
-        allButton.hidden = history.length <= 4;
-        allButton.setAttribute("aria-expanded", String(expanded));
-        text(allButton, expanded ? "Recolher ↑" : "Ver todas (" + history.length + ") →");
+      const selectedItem = list.querySelector('.execution-card[aria-pressed="true"]');
+      if (selectedItem) {
+        // Reveal only within the horizontal track, without moving the page or
+        // changing keyboard focus when opening an older execution directly.
+        const item = selectedItem.parentElement;
+        const start = item.offsetLeft - 10, end = item.offsetLeft + item.offsetWidth + 10;
+        if (start < list.scrollLeft || end > list.scrollLeft + list.clientWidth) list.scrollLeft = Math.max(0, start);
       }
       metadata.replaceChildren(executionNode("strong", "execution-summary-title", "Execução #" + (revision.version + 1)));
       if (revision.version === newest) metadata.appendChild(executionNode("span", "execution-latest-tag", "Mais recente"));
@@ -1349,6 +1376,7 @@
           host.appendChild(empty);
         }
       }
+      updateExecutionOverflow();
     }
 
     function updateCaseNavigation() {
@@ -1691,10 +1719,9 @@
     }));
     listen("case-history", "click", openCaseHistory);
     listen("case-compare", "click", openCaseHistory);
-    listen("case-executions-all", "click", () => {
-      if (expandedExecutions.has(selectedCase)) expandedExecutions.delete(selectedCase); else expandedExecutions.add(selectedCase);
-      renderExecutionHistory(byIndex.get(selectedCase));
-    });
+    listen("case-execution-list", "scroll", updateExecutionOverflow);
+    const executionHistoryRegion = $("case-execution-history");
+    if (executionHistoryRegion) executionHistoryRegion.addEventListener("wheel", scrollExecutionHistory, { passive: false });
     listen("case-history-close", "click", closeCaseHistory);
     listen("case-history-dialog", "cancel", (event) => { event.preventDefault(); closeCaseHistory(); });
     document.addEventListener("keydown", (event) => {
@@ -1705,7 +1732,12 @@
       else closeJourneyPickers(true);
     });
     window.addEventListener("resize", scheduleJourneyLayout);
+    window.addEventListener("resize", updateExecutionOverflow);
     window.addEventListener("afterprint", scheduleJourneyLayout);
+    const executionList = $("case-execution-list");
+    if (executionList && typeof window.ResizeObserver === "function") {
+      new window.ResizeObserver(updateExecutionOverflow).observe(executionList);
+    }
     const journeyRoute = document.querySelector(".journey-route");
     if (journeyRoute && typeof window.ResizeObserver === "function") {
       new window.ResizeObserver(scheduleJourneyLayout).observe(journeyRoute);
