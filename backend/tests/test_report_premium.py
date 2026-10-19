@@ -69,8 +69,9 @@ def test_results_have_a_compact_accessible_header_without_duplicate_report_actio
     assert re.search(r'<button\b[^>]*id="case-rerun"[^>]*hidden', result_section)
     assert 'Reexecutar teste</button>' in result_section
     assert re.search(r'<p\b[^>]*id="case-rerun-feedback"[^>]*role="status"[^>]*aria-live="polite"[^>]*hidden', result_section)
-    assert 'id="case-edit"' in result_section
-    assert 'id="case-prev"' in result_section and 'id="case-next"' in result_section
+    for identifier in ("case-history", "case-history-count", "case-edit", "result-more", "case-prev", "case-next", "case-execution-note"):
+        assert f'id="{identifier}"' not in result_section
+    assert re.search(r'<button\b[^>]*id="case-compare"[^>]*aria-haspopup="dialog"[^>]*aria-controls="case-history-dialog"', result_section)
     assert 'id="result-report-actions"' in result_section
     # The progressive enhancement moves this one existing toolbar into the
     # result header; it must not clone controls or canonical result/evidence.

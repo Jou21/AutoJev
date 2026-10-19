@@ -387,6 +387,8 @@ function fixture(options = {}) {
   for (let index = 0; index < 2; index += 1) make("tr", "", rows, `CT00${index + 1}`).dataset.caseIndex = String(index);
   const resultView = make("section", "report-view", main);
   resultView.dataset.view = "results";
+  // Older cached templates still contain this redundant historical notice.
+  make("p", "case-execution-note", resultView, "Você está vendo a execução anterior.").id = "case-execution-note";
   const resultNavigation = make("div", "result-navigation", resultView);
   const resultLocation = make("div", "result-location", resultNavigation);
   make("button", "", resultLocation, "Voltar para testes").id = "case-back";
@@ -1125,6 +1127,16 @@ test("native planned steps retain an uploaded image between the chosen neighbors
   assert.equal(reopened.cards[0].querySelectorAll(".case-step-button[data-recorded-index]")[3].querySelector(".step-kind").textContent, "Imagem do usuário");
   assert.equal(card.dataset.status, "PASS");
   assert.equal(window.networkCalls + reopened.window.networkCalls, 0);
+});
+
+test("legacy execution notices are removed from both results and offline exports", async () => {
+  const { document, cards, blobs } = fixture();
+  assert.equal(document.getElementById("case-execution-note"), null);
+  document.getElementById("case-next").click();
+  assert.equal(document.getElementById("case-execution-note"), null);
+  assert.equal(cards[1].hidden, false);
+  document.getElementById("download-report").click();
+  assert.doesNotMatch(await blobs.at(-1).text(), /id="case-execution-note"/);
 });
 
 test("HTML exports omit only their download control while preserving the untouched offline report", async () => {

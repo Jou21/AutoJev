@@ -7,10 +7,17 @@
     let data;
     try { data = JSON.parse(source.textContent || "{}"); } catch (_) { return; }
     // A running backend can still hold the previous Python template while
-    // loading fresh assets. Remove its obsolete control before snapshotting
+    // loading fresh assets. Remove its obsolete controls before snapshotting
     // exports, not just from newly rendered HTML.
-    const legacyExecutionsButton = document.getElementById("case-executions-all");
-    if (legacyExecutionsButton) legacyExecutionsButton.remove();
+    ["case-executions-all", "case-history", "case-edit", "result-more", "case-execution-note"].forEach((id) => {
+      const control = document.getElementById(id);
+      if (control) control.remove();
+    });
+    const compareExecution = document.getElementById("case-compare");
+    if (compareExecution) {
+      compareExecution.setAttribute("aria-haspopup", "dialog");
+      compareExecution.setAttribute("aria-controls", "case-history-dialog");
+    }
     // Capture a self-contained export before temporary filters or enhancements.
     // App-only controls are removed from the detached copy, leaving the live
     // blob's rerun and download actions intact.
@@ -723,9 +730,8 @@
     function syncResultHeader(view) {
       const destination = view === "results" ? $("result-report-actions") : reportToolbarHome;
       if (reportToolbar && destination && reportToolbar.parentElement !== destination) destination.appendChild(reportToolbar);
-      const more = $("result-more-actions");
-      if (reportPrint && more && reportToolbar) {
-        const printDestination = view === "results" ? more : reportToolbar;
+      if (reportPrint && reportToolbarHome && reportToolbar) {
+        const printDestination = view === "results" ? reportToolbarHome : reportToolbar;
         if (reportPrint.parentElement !== printDestination) printDestination.appendChild(reportPrint);
       }
     }
@@ -1251,16 +1257,6 @@
         typeof revision.signals === "number" ? revision.signals + " sinais técnicos" : "Sinais não registrados",
         revision.version === 0 ? "Origem: exploração inicial" : "Origem: reexecução de CT"];
       info.forEach((label) => metadata.appendChild(executionNode("span", "execution-summary-item", label)));
-      const note = $("case-execution-note");
-      if (note) {
-        const message = !revision.has_result ? "Esta tentativa não produziu um resultado de teste. O resultado anterior foi preservado."
-          : revision.version !== newest ? "Você está vendo a execução #" + (revision.version + 1) + ". A tentativa mais recente é a #" + (newest + 1) + "."
-          : "";
-        note.replaceChildren();
-        if (message) note.appendChild(executionNode("span", "", message));
-        if (revision.version !== newest) note.appendChild(button("Ver mais recente →", () => selectExecution(newest), "button button-ghost"));
-        note.hidden = !message;
-      }
       if ($("case-compare")) $("case-compare").disabled = history.filter((item) => item.has_result).length < 2;
       text($("case-title"), (revision.current ? current.title : revision.title) || current.title || current.id);
       text($("result-case-code"), current.id);
@@ -1326,7 +1322,7 @@
       const dialog = $("case-history-dialog");
       if (!dialog) return;
       if (typeof dialog.close === "function") dialog.close(); else dialog.removeAttribute("open");
-      const trigger = $("case-history");
+      const trigger = $("case-compare");
       if (trigger) trigger.focus({ preventScroll: true });
     }
 
