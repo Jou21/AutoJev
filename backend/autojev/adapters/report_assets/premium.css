@@ -1185,3 +1185,48 @@ body[data-theme="light"] .dialog-toolbar, body[data-theme="light"] dialog.eviden
   .step-evidence-viewport .shots { width: 100% !important; }
   .step-evidence-viewport figure[hidden] { display: block !important; }
 }
+
+/* A viewport-sized lightbox; fit is computed against the image's real ratio. */
+@media screen {
+  body.evidence-lightbox-open { overflow: hidden; }
+  dialog.evidence-dialog.evidence-lightbox, body[data-theme="light"] dialog.evidence-lightbox { position: fixed; inset: 0; width: 100vw; max-width: none; height: 100vh; height: 100dvh; max-height: none; margin: 0; padding: 0; overflow: hidden; border: 0; border-radius: 0; background: #080b0e; color: #f2f4f6; box-shadow: none; }
+  dialog.evidence-lightbox[open] { display: flex; flex-direction: column; }
+  dialog.evidence-lightbox::backdrop { background: #050709; backdrop-filter: none; }
+  .evidence-lightbox .evidence-lightbox-toolbar, body[data-theme="light"] .evidence-lightbox .dialog-toolbar { position: relative; z-index: 3; display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; flex-wrap: nowrap; gap: 20px; min-height: 70px; padding: 12px 24px; border: 0; border-bottom: 1px solid #ffffff0c; background: linear-gradient(180deg, #101315, #080a0c); color: #f2f4f6; }
+  .evidence-lightbox-title { display: flex; flex: 1; flex-direction: column; gap: 4px; min-width: 0; }
+  .evidence-lightbox-title #evidence-caption { display: block; overflow: hidden; flex-basis: auto; width: 100%; margin: 0; color: #f2f4f6; font-size: 14px; font-weight: 650; line-height: 1.4; white-space: nowrap; text-overflow: ellipsis; }
+  .evidence-lightbox-counter { color: #b9c3cd; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .evidence-lightbox-tools { display: flex; flex: 0 0 auto; align-items: center; gap: 8px; }
+  .evidence-lightbox .lightbox-tool { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; width: 40px; height: 40px; min-height: 40px; padding: 9px; border: 1px solid #ffffff18; border-radius: 10px; background: linear-gradient(145deg, #ffffff0c, #ffffff04); color: #eaf0f5; text-decoration: none; }
+  .evidence-lightbox .lightbox-tool:hover { border-color: #ffffff50; background: #ffffff17; color: #fff; }
+  .evidence-lightbox .lightbox-tool:focus-visible { outline: 2px solid #ffbf47; outline-offset: 3px; }
+  .evidence-lightbox .lightbox-tool:disabled { opacity: .28; cursor: default; }
+  .evidence-lightbox .lightbox-zoom-value { width: 56px; padding: 8px 3px; font-size: 11px; font-variant-numeric: tabular-nums; }
+  .evidence-lightbox .lightbox-close { margin-left: 10px; border-color: transparent; background: transparent; }
+  .evidence-lightbox .evidence-icon { width: 21px; height: 21px; flex-basis: 21px; }
+  .evidence-lightbox-stage { position: relative; flex: 1; min-width: 0; min-height: 0; background: radial-gradient(ellipse at center, #161b21, #080b0e 80%); }
+  .evidence-lightbox .evidence-lightbox-viewport { width: 100%; height: 100%; min-width: 0; min-height: 0; margin: 0; padding: 0; overflow: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: #74818e #101316; outline-offset: -3px; }
+  .evidence-lightbox-surface { display: grid; place-items: center; min-width: 100%; min-height: 100%; }
+  .evidence-lightbox .action-modal-canvas { flex: 0 0 auto; min-width: 0; max-width: none; max-height: none; margin: 0; box-shadow: 0 18px 80px #0007; }
+  .evidence-lightbox .action-modal-canvas img { display: block; width: 100%; height: 100%; max-width: none; max-height: none; margin: 0; border: 0; border-radius: 6px; object-fit: contain; }
+  .evidence-lightbox-viewport[data-pan-enabled="true"] .action-modal-canvas { cursor: grab; user-select: none; }
+  .evidence-lightbox-viewport[data-pan-enabled="true"] img { -webkit-user-drag: none; user-select: none; }
+  .evidence-lightbox-viewport.is-panning .action-modal-canvas { cursor: grabbing; }
+  .evidence-lightbox .lightbox-previous, .evidence-lightbox .lightbox-next { position: absolute; z-index: 2; top: 50%; width: 50px; height: 50px; min-height: 50px; padding: 12px; transform: translateY(-50%); border: 1px solid #a5b4c580; border-radius: 50%; background: #1c2631a8; box-shadow: 0 5px 20px #0004; backdrop-filter: blur(6px); }
+  .evidence-lightbox .lightbox-previous { left: 20px; }
+  .evidence-lightbox .lightbox-next { right: 20px; }
+  .evidence-lightbox .lightbox-previous:disabled, .evidence-lightbox .lightbox-next:disabled { opacity: .18; }
+}
+@media screen and (max-width: 600px) {
+  .evidence-lightbox .evidence-lightbox-toolbar { flex-wrap: wrap; gap: 10px; min-height: 96px; padding: 10px 12px; }
+  .evidence-lightbox-title { flex-basis: 100%; gap: 2px; }
+  .evidence-lightbox-title #evidence-caption { font-size: 12px; }
+  .evidence-lightbox-counter { font-size: 10px; }
+  .evidence-lightbox-tools { justify-content: flex-end; width: 100%; gap: 7px; }
+  .evidence-lightbox .lightbox-tool { width: 32px; height: 32px; min-height: 32px; padding: 6px; border-radius: 8px; }
+  .evidence-lightbox .lightbox-zoom-value { width: 48px; }
+  .evidence-lightbox .lightbox-close { margin-left: auto; }
+  .evidence-lightbox .lightbox-previous, .evidence-lightbox .lightbox-next { width: 34px; height: 34px; min-height: 34px; padding: 7px; }
+  .evidence-lightbox .lightbox-previous { left: 7px; }
+  .evidence-lightbox .lightbox-next { right: 7px; }
+}

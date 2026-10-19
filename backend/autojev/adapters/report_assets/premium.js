@@ -914,10 +914,10 @@
         copy: ["M9 8h11v13H9z", "M5 16H3V3h11v2"],
         link: ["m10 13 4-4", "M8 15 6 17a3 3 0 0 1-4-4l4-4a3 3 0 0 1 4 0", "m14 9 2-2a3 3 0 0 1 4 4l-4 4a3 3 0 0 1-4 0"],
         download: ["M12 3v12", "m7 10 5 5 5-5", "M4 16v5h16v-5"],
-        previous: ["m15 5-7 7 7 7"], next: ["m9 5 7 7-7 7"],
+        previous: ["m15 5-7 7 7 7"], next: ["m9 5 7 7-7 7"], close: ["m6 6 12 12", "M18 6 6 18"],
       };
       if (typeof document.createElementNS !== "function") {
-        icon.textContent = ({ previous: "‹", next: "›", minus: "−", plus: "+", expand: "⛶", download: "↓", copy: "▣", link: "↗" })[name] || "▧";
+        icon.textContent = ({ previous: "‹", next: "›", minus: "−", plus: "+", expand: "⛶", download: "↓", copy: "▣", link: "↗", close: "×" })[name] || "▧";
         return icon;
       }
       const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -928,6 +928,42 @@
       });
       icon.appendChild(svg);
       return icon;
+    }
+
+    function enableEvidencePanning(viewport, getTarget) {
+      let pan = null, suppressClick = false;
+      function finish(event) {
+        if (!pan || event && event.pointerId !== pan.pointerId) return;
+        const previous = pan; pan = null;
+        viewport.classList.remove("is-panning");
+        suppressClick = !!(event && event.type === "pointerup" && previous.moved);
+        if (previous.target.hasPointerCapture && previous.target.hasPointerCapture(previous.pointerId)) previous.target.releasePointerCapture(previous.pointerId);
+      }
+      viewport.addEventListener("pointerdown", (event) => {
+        suppressClick = false;
+        if (viewport.dataset.panEnabled !== "true" || event.button !== 0 || event.pointerType !== "mouse" || event.isPrimary === false
+          || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey || pan) return;
+        const target = event.target instanceof Element ? getTarget(event.target) : null;
+        if (!target || viewport.scrollWidth <= viewport.clientWidth && viewport.scrollHeight <= viewport.clientHeight) return;
+        pan = { pointerId: event.pointerId, target, x: event.clientX, y: event.clientY, left: viewport.scrollLeft, top: viewport.scrollTop, moved: false };
+        viewport.classList.add("is-panning");
+        if (target.setPointerCapture) target.setPointerCapture(event.pointerId);
+      });
+      viewport.addEventListener("pointermove", (event) => {
+        if (!pan || event.pointerId !== pan.pointerId) return;
+        if (!(event.buttons & 1)) { finish(event); return; }
+        const dx = event.clientX - pan.x, dy = event.clientY - pan.y;
+        if (!pan.moved && Math.hypot(dx, dy) < 4) return;
+        pan.moved = true; event.preventDefault();
+        viewport.scrollLeft = pan.left - dx; viewport.scrollTop = pan.top - dy;
+      });
+      ["pointerup", "pointercancel", "lostpointercapture"].forEach((name) => viewport.addEventListener(name, finish));
+      viewport.addEventListener("dragstart", (event) => { if (viewport.dataset.panEnabled === "true") event.preventDefault(); });
+      viewport.addEventListener("click", (event) => {
+        const suppress = suppressClick; suppressClick = false;
+        if (suppress && event.detail !== 0) { event.preventDefault(); event.stopPropagation(); }
+      }, true);
+      return finish;
     }
 
     function prepareEvidenceInspector(item) {
@@ -959,7 +995,11 @@
       const tools = make("div", "step-evidence-tools"), zoomTools = make("div", "step-evidence-zoom");
       const viewport = make("div", "step-evidence-viewport");
       viewport.tabIndex = 0; viewport.setAttribute("aria-label", "Imagem da evidência; com zoom, segure o botão esquerdo e arraste para mover, ou use as barras de rolagem");
-      let zoom = 100, activeFigure = figures[0], pan = null, suppressPanClick = false;
+      let zoom = 100, activeFigure = figures[0];
+      const finishPan = enableEvidencePanning(viewport, (node) => {
+        const target = node.closest(".step-preview-button");
+        return target && activeFigure.contains(target) ? target : null;
+      });
       const setZoom = (value) => {
         finishPan();
         zoom = Math.max(50, Math.min(200, value));
@@ -968,41 +1008,6 @@
         text(reset, zoom + "%"); minus.disabled = zoom === 50; plus.disabled = zoom === 200;
         if (zoom === 100) { viewport.scrollTop = 0; viewport.scrollLeft = 0; }
       };
-      function finishPan(event) {
-        if (!pan || event && event.pointerId !== pan.pointerId) return;
-        const previous = pan; pan = null;
-        viewport.classList.remove("is-panning");
-        suppressPanClick = !!(event && event.type === "pointerup" && previous.moved);
-        if (previous.target.hasPointerCapture && previous.target.hasPointerCapture(previous.pointerId)) previous.target.releasePointerCapture(previous.pointerId);
-      }
-      viewport.addEventListener("pointerdown", (event) => {
-        suppressPanClick = false;
-        if (zoom <= 100 || event.button !== 0 || event.pointerType !== "mouse" || event.isPrimary === false
-          || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey || pan) return;
-        const target = event.target instanceof Element ? event.target.closest(".step-preview-button") : null;
-        if (!target || !activeFigure.contains(target)
-          || viewport.scrollWidth <= viewport.clientWidth && viewport.scrollHeight <= viewport.clientHeight) return;
-        pan = { pointerId: event.pointerId, target, x: event.clientX, y: event.clientY, left: viewport.scrollLeft, top: viewport.scrollTop, moved: false };
-        viewport.classList.add("is-panning");
-        // Capture on the image button: a simple click still opens its preview,
-        // while a real drag keeps tracking outside the viewport and never clicks.
-        if (target.setPointerCapture) target.setPointerCapture(event.pointerId);
-      });
-      viewport.addEventListener("pointermove", (event) => {
-        if (!pan || event.pointerId !== pan.pointerId) return;
-        if (!(event.buttons & 1)) { finishPan(event); return; }
-        const dx = event.clientX - pan.x, dy = event.clientY - pan.y;
-        if (!pan.moved && Math.hypot(dx, dy) < 4) return;
-        pan.moved = true;
-        event.preventDefault();
-        viewport.scrollLeft = pan.left - dx; viewport.scrollTop = pan.top - dy;
-      });
-      ["pointerup", "pointercancel", "lostpointercapture"].forEach((name) => viewport.addEventListener(name, finishPan));
-      viewport.addEventListener("dragstart", (event) => { if (zoom > 100) event.preventDefault(); });
-      viewport.addEventListener("click", (event) => {
-        const suppress = suppressPanClick; suppressPanClick = false;
-        if (suppress && event.detail !== 0) { event.preventDefault(); event.stopPropagation(); }
-      }, true);
       const minus = iconButton("minus", "Diminuir zoom", () => setZoom(zoom - 25));
       const reset = button("100%", () => setZoom(100), "evidence-zoom-reset"); reset.setAttribute("aria-label", "Restaurar zoom para 100%");
       const plus = iconButton("plus", "Aumentar zoom", () => setZoom(zoom + 25));
@@ -2014,10 +2019,99 @@
       filterEvidence();
     }));
     listen("evidence-search", "input", filterEvidence);
-    let previewTrigger = null;
+    let previewTrigger = null, lightbox = null;
+
+    function fitEvidenceLightbox(reset = false) {
+      if (!lightbox || !lightbox.dialog.hasAttribute("open") || !lightbox.active) return;
+      const { viewport, surface, canvas, image, active, zoom } = lightbox;
+      const width = viewport.clientWidth, height = viewport.clientHeight;
+      const naturalWidth = active.image.naturalWidth || image.naturalWidth;
+      const naturalHeight = active.image.naturalHeight || image.naturalHeight;
+      if (!(width > 0 && height > 0 && naturalWidth > 0 && naturalHeight > 0)) return;
+      const centerX = (viewport.scrollLeft + width / 2) / (surface.offsetWidth || width);
+      const centerY = (viewport.scrollTop + height / 2) / (surface.offsetHeight || height);
+      const gutter = width < 600 ? 10 : 58, padding = width < 600 ? 10 : 20;
+      const scale = Math.min(Math.max(1, width - gutter * 2) / naturalWidth, Math.max(1, height - padding * 2) / naturalHeight) * zoom;
+      const imageWidth = naturalWidth * scale, imageHeight = naturalHeight * scale;
+      const surfaceWidth = Math.max(width, imageWidth + gutter * 2), surfaceHeight = Math.max(height, imageHeight + padding * 2);
+      canvas.style.setProperty("width", imageWidth + "px"); canvas.style.setProperty("height", imageHeight + "px");
+      surface.style.setProperty("width", surfaceWidth + "px"); surface.style.setProperty("height", surfaceHeight + "px");
+      viewport.scrollLeft = reset ? 0 : centerX * surfaceWidth - width / 2;
+      viewport.scrollTop = reset ? 0 : centerY * surfaceHeight - height / 2;
+    }
+
+    function zoomEvidenceLightbox(value) {
+      if (!lightbox) return;
+      lightbox.finishPan();
+      lightbox.zoom = Math.max(1, Math.min(4, value));
+      lightbox.viewport.dataset.panEnabled = String(lightbox.zoom > 1);
+      text(lightbox.reset, Math.round(lightbox.zoom * 100) + "%");
+      lightbox.minus.disabled = lightbox.zoom === 1; lightbox.plus.disabled = lightbox.zoom === 4;
+      fitEvidenceLightbox(lightbox.zoom === 1);
+    }
+
+    function prepareEvidenceLightbox() {
+      if (lightbox) return lightbox;
+      const dialog = $("evidence-dialog"), image = $("evidence-preview");
+      if (!dialog || !image) return null;
+      const make = (tag, className) => { const node = document.createElement(tag); node.className = className; return node; };
+      const iconButton = (icon, label, action, className = "") => {
+        const node = button("", action, "button lightbox-tool " + className);
+        node.appendChild(evidenceIcon(icon)); node.setAttribute("aria-label", label); node.setAttribute("title", label); return node;
+      };
+      dialog.classList.add("evidence-lightbox"); dialog.setAttribute("aria-labelledby", "evidence-caption");
+      const toolbar = make("div", "dialog-toolbar evidence-lightbox-toolbar"), title = make("div", "evidence-lightbox-title");
+      const counter = make("small", "evidence-lightbox-counter"); counter.setAttribute("role", "status"); counter.setAttribute("aria-live", "polite");
+      title.append($("evidence-caption"), counter);
+      const tools = make("div", "evidence-lightbox-tools");
+      const minus = iconButton("minus", "Diminuir zoom da tela cheia", () => zoomEvidenceLightbox(lightbox.zoom - .25));
+      const reset = button("100%", () => zoomEvidenceLightbox(1), "button lightbox-tool lightbox-zoom-value");
+      reset.setAttribute("aria-label", "Restaurar zoom da tela cheia");
+      const plus = iconButton("plus", "Aumentar zoom da tela cheia", () => zoomEvidenceLightbox(lightbox.zoom + .25));
+      const fit = iconButton("expand", "Ajustar imagem à tela", () => zoomEvidenceLightbox(1));
+      const download = $("download-evidence"), close = $("close-evidence");
+      download.className = "button lightbox-tool"; download.replaceChildren(evidenceIcon("download"));
+      download.setAttribute("aria-label", "Baixar imagem original"); download.setAttribute("title", "Baixar imagem original");
+      close.className = "button lightbox-tool lightbox-close"; close.replaceChildren(evidenceIcon("close")); close.setAttribute("title", "Fechar (Esc)");
+      tools.append(minus, reset, plus, fit, download, close); toolbar.append(title, tools);
+      const stage = make("div", "evidence-lightbox-stage"), viewport = make("div", "dialog-content evidence-lightbox-viewport");
+      viewport.tabIndex = 0; viewport.setAttribute("aria-label", "Imagem em tela cheia; amplie e arraste com o botão esquerdo para explorar");
+      const surface = make("div", "evidence-lightbox-surface");
+      const canvas = image.closest(".action-modal-canvas") || make("div", "action-modal-canvas");
+      canvas.appendChild(image); surface.appendChild(canvas); viewport.appendChild(surface);
+      const previous = iconButton("previous", "Imagem anterior", () => showEvidenceLightboxItem(lightbox.index - 1), "lightbox-previous");
+      const next = iconButton("next", "Próxima imagem", () => showEvidenceLightboxItem(lightbox.index + 1), "lightbox-next");
+      stage.append(viewport, previous, next); dialog.replaceChildren(toolbar, stage);
+      lightbox = { dialog, image, canvas, viewport, surface, counter, previous, next, minus, plus, reset,
+        gallery: [], index: 0, zoom: 1, active: null,
+        finishPan: enableEvidencePanning(viewport, (node) => node.closest(".action-modal-canvas")) };
+      image.addEventListener("load", () => fitEvidenceLightbox());
+      window.addEventListener("resize", () => fitEvidenceLightbox());
+      if (typeof window.ResizeObserver === "function") new window.ResizeObserver(() => fitEvidenceLightbox()).observe(viewport);
+      return lightbox;
+    }
+
+    function showEvidenceLightboxItem(index) {
+      if (!lightbox || index < 0 || index >= lightbox.gallery.length) return;
+      const item = lightbox.gallery[index]; hydrateImage(item.image);
+      const src = item.image.getAttribute("src") || "";
+      if (!/^(data:image\/(?:png|jpe?g|webp|gif);base64,|blob:)/i.test(src)) return;
+      lightbox.finishPan(); lightbox.index = index; lightbox.active = item;
+      lightbox.image.src = src; lightbox.image.alt = item.image.alt || "Captura de evidência";
+      setActionMarker(lightbox.canvas, lightbox.image, item.image.closest("figure.action-preview"));
+      text($("evidence-caption"), item.caption || item.filename || "Captura de evidência");
+      text(lightbox.counter, index + 1 + " de " + lightbox.gallery.length);
+      lightbox.previous.disabled = index === 0; lightbox.next.disabled = index === lightbox.gallery.length - 1;
+      lightbox.previous.hidden = lightbox.next.hidden = lightbox.gallery.length < 2;
+      $("download-evidence").href = src; $("download-evidence").download = item.filename || "autojev-evidencia.png";
+      zoomEvidenceLightbox(1);
+    }
+
     function closeEvidence() {
       const dialog = $("evidence-dialog");
       if (!dialog) return;
+      if (lightbox) lightbox.finishPan();
+      document.body.classList.remove("evidence-lightbox-open");
       if (typeof dialog.close === "function") dialog.close(); else dialog.removeAttribute("open");
       if (previewTrigger) previewTrigger.focus();
     }
@@ -2028,24 +2122,33 @@
       const src = original.getAttribute("src") || "";
       // Reports embed their captures. Never navigate to a script or remote URL.
       if (!/^(data:image\/(?:png|jpe?g|webp|gif);base64,|blob:)/i.test(src)) return;
+      const viewer = prepareEvidenceLightbox();
+      if (!viewer) return;
       previewTrigger = control;
-      const previewImage = $("evidence-preview");
-      let previewCanvas = previewImage.closest(".action-modal-canvas");
-      if (!previewCanvas) {
-        previewCanvas = document.createElement("div");
-        previewCanvas.className = "action-modal-canvas";
-        previewImage.replaceWith(previewCanvas);
-        previewCanvas.appendChild(previewImage);
+      const detail = original.closest("details.scenario");
+      const grid = !detail && original.closest(".evidence-grid");
+      const candidates = detail ? all(".shots figure", detail).filter((figure) =>
+        !(document.body.classList.contains("hide-technical") && figure.closest(".timeline-entry.signal")))
+        : grid ? all(".evidence-card", grid).filter((card) => !card.hidden && card.querySelector("img")) : [];
+      viewer.gallery = candidates.map((node) => {
+        const image = node.querySelector("img");
+        const filename = (node.querySelector("figcaption") || {}).textContent || node.dataset.filename || image && image.dataset.sourceShot || "evidencia.png";
+        return { image, filename: filename.trim(), caption: filename.trim() };
+      }).filter((item) => {
+        if (!item.image) return false;
+        hydrateImage(item.image);
+        return /^(data:image\/(?:png|jpe?g|webp|gif);base64,|blob:)/i.test(item.image.getAttribute("src") || "");
+      });
+      let index = viewer.gallery.findIndex((item) => item.image === original);
+      if (index < 0) { index = viewer.gallery.length; viewer.gallery.push({ image: original }); }
+      viewer.gallery[index] = { image: original, caption: caption || filename || original.alt || "Captura de evidência",
+        filename: filename || original.dataset.sourceShot || "autojev-evidencia.png" };
+      showEvidenceLightboxItem(index);
+      document.body.classList.add("evidence-lightbox-open");
+      if (!dialog.hasAttribute("open")) {
+        if (typeof dialog.showModal === "function") dialog.showModal(); else dialog.setAttribute("open", "");
       }
-      previewImage.src = src;
-      previewImage.alt = original.alt || "Captura de evidência";
-      setActionMarker(previewCanvas, previewImage, original.closest("figure.action-preview"));
-      text($("evidence-caption"), caption || original.alt || "Captura de evidência");
-      if ($("download-evidence")) {
-        $("download-evidence").href = src;
-        $("download-evidence").download = filename || original.dataset.sourceShot || "autojev-evidencia.png";
-      }
-      if (typeof dialog.showModal === "function") dialog.showModal(); else dialog.setAttribute("open", "");
+      fitEvidenceLightbox(true);
       if ($("close-evidence")) $("close-evidence").focus();
     }
     all("[data-preview-evidence]").forEach((control) => control.addEventListener("click", () => {
@@ -2066,9 +2169,22 @@
       const rect = event.target.getBoundingClientRect();
       if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) closeEvidence();
     });
-    listen("evidence-dialog", "close", () => { if (previewTrigger) previewTrigger.focus(); });
+    listen("evidence-dialog", "close", () => {
+      if (lightbox) lightbox.finishPan();
+      document.body.classList.remove("evidence-lightbox-open");
+      if (previewTrigger) previewTrigger.focus();
+    });
+    listen("evidence-dialog", "cancel", (event) => { event.preventDefault(); closeEvidence(); });
     document.addEventListener("keydown", (event) => {
-      if (!event.defaultPrevented && event.key === "Escape" && $("evidence-dialog") && $("evidence-dialog").hasAttribute("open")) closeEvidence();
+      if (event.defaultPrevented || !$("evidence-dialog") || !$("evidence-dialog").hasAttribute("open")) return;
+      if (event.key === "Escape") { event.preventDefault(); closeEvidence(); return; }
+      if (!lightbox || event.ctrlKey || event.metaKey || event.altKey || event.target instanceof Element
+        && event.target.closest('input,select,textarea,[contenteditable="true"]')) return;
+      if (event.key === "ArrowLeft") { event.preventDefault(); showEvidenceLightboxItem(lightbox.index - 1); }
+      else if (event.key === "ArrowRight") { event.preventDefault(); showEvidenceLightboxItem(lightbox.index + 1); }
+      else if (["+", "="].includes(event.key)) { event.preventDefault(); zoomEvidenceLightbox(lightbox.zoom + .25); }
+      else if (event.key === "-") { event.preventDefault(); zoomEvidenceLightbox(lightbox.zoom - .25); }
+      else if (event.key === "0") { event.preventDefault(); zoomEvidenceLightbox(1); }
     });
 
     function filterTimeline() {
@@ -2120,7 +2236,7 @@
       const options = { cache: "no-store", credentials: "omit", redirect: "error" };
       const hasLocalWork = () => savedDrafts.size > 0
         || (activeView === "results" && !selectedExecution(byIndex.get(selectedCase)).current)
-        || ["case-editor", "step-picker", "case-history-dialog"].some((id) => $(id) && $(id).hasAttribute("open"));
+        || ["case-editor", "step-picker", "case-history-dialog", "evidence-dialog"].some((id) => $(id) && $(id).hasAttribute("open"));
       const stop = () => {
         stopped = true;
         if (revisionTimer != null) window.clearInterval(revisionTimer);

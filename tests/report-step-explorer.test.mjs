@@ -1612,6 +1612,39 @@ test("step capture preview preserves its image and download name and restores ke
   assert.equal(dialog.hasAttribute("open"), false, "previews must not navigate to external evidence URLs");
 });
 
+test("fullscreen evidence uses a scoped gallery, keyboard tools and restores the opening focus", () => {
+  const { document, window, originalImages, cards } = fixture({ actionPreview: true });
+  const trigger = originalImages[0].closest(".step-preview-button");
+  const initialHash = window.location.hash;
+  trigger.click();
+  const dialog = document.getElementById("evidence-dialog");
+  assert.equal(dialog.classList.contains("evidence-lightbox"), true);
+  assert.equal(document.body.classList.contains("evidence-lightbox-open"), true);
+  assert.equal(dialog.querySelector(".evidence-lightbox-counter").textContent, "1 de 2");
+  assert.equal(dialog.querySelector(".lightbox-previous").disabled, true);
+  dialog.querySelector(".lightbox-next").click();
+  assert.equal(dialog.querySelector(".evidence-lightbox-counter").textContent, "2 de 2");
+  assert.equal(dialog.querySelector(".action-target-overlay") !== null, true);
+  const close = document.getElementById("close-evidence");
+  close.dispatch("keydown", { key: "ArrowLeft" });
+  assert.equal(dialog.querySelector(".evidence-lightbox-counter").textContent, "1 de 2");
+  assert.equal(dialog.querySelector(".action-target-overlay"), null);
+  close.dispatch("keydown", { key: "+" });
+  assert.equal(dialog.querySelector(".lightbox-zoom-value").textContent, "125%");
+  assert.equal(dialog.querySelector(".evidence-lightbox-viewport").dataset.panEnabled, "true");
+  close.dispatch("keydown", { key: "+", ctrlKey: true });
+  assert.equal(dialog.querySelector(".lightbox-zoom-value").textContent, "125%", "browser zoom shortcuts remain native");
+  close.dispatch("keydown", { key: "0" });
+  assert.equal(dialog.querySelector(".lightbox-zoom-value").textContent, "100%");
+  close.dispatch("keydown", { key: "Escape" });
+  assert.equal(dialog.hasAttribute("open"), false);
+  assert.equal(document.body.classList.contains("evidence-lightbox-open"), false);
+  assert.ok(document.activeElement === trigger, "closing restores the original trigger, not another gallery image");
+  assert.equal(window.location.hash, initialHash);
+  assert.equal(cards[0].dataset.status, "PASS");
+  assert.equal(window.networkCalls, 0);
+});
+
 test("printing reveals every step and restores the previous selection afterwards", () => {
   const { window, cards, originals } = fixture();
   cards[0].querySelectorAll(".case-step-button")[2].click();
