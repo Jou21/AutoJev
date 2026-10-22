@@ -269,9 +269,11 @@ function fixture(options = {}) {
   };
   const source = make("script", "", document.body);
   source.id = "report-data";
-  source.textContent = JSON.stringify({ run_id: options.runId, cases: [
-    { index: 0, id: "CT001", title: "Ordenação de produtos", status: caseStatuses[0], category: "business", page: "/inventory.html" },
-    { index: 1, id: "CT002", title: "Verificar carrinho", status: caseStatuses[1], category: "business", page: "/cart.html" },
+  const fixtureFlow = { id: "flow-boleto", name: "Cadastrar boleto", description: "Casos de cadastro de boleto", entity: "boleto", operation: "create", confidence: "identified", reason: "Operação e entidade explícitas no objetivo." };
+  source.textContent = JSON.stringify({ run_id: options.runId, ...(options.onlinePreview ? { online_preview: options.onlinePreview } : {}),
+    functional_flows: options.flowMetadata ? [fixtureFlow] : [], cases: [
+    { index: 0, id: "CT001", title: "Ordenação de produtos", status: caseStatuses[0], category: "business", page: "/inventory.html", ...(options.flowMetadata ? { flow_classification: { memberships: [] } } : {}) },
+    { index: 1, id: "CT002", title: "Verificar carrinho", status: caseStatuses[1], category: "business", page: "/cart.html", ...(options.flowMetadata ? { flow_classification: { memberships: [fixtureFlow] } } : {}) },
   ] });
   if (options.appRuntime !== undefined) {
     const connection = make("script", "", document.body);
@@ -383,6 +385,27 @@ function fixture(options = {}) {
   make("input", "", testsView).id = "search";
   make("div", "", testsView).id = "filters";
   make("button", "", testsView, "Baixar CSV").id = "download-csv";
+  if (options.flowMetadata) {
+    const panel = make("div", "functional-flows-panel", testsView);
+    for (const key of ["all", "unclassified"]) {
+      const button = make("button", "", panel, key);
+      button.dataset.selectFlow = key;
+      make("span", "", button).setAttribute(key === "all" ? "data-flow-all-count" : "data-flow-unclassified-count", "");
+    }
+    const card = make("button", "functional-flow-card", panel, "Cadastrar boleto");
+    card.dataset.selectFlow = "flow-boleto";
+    for (const key of ["total", "approval", "suggestions", "failure"]) make("span", "", card).setAttribute("data-flow-" + key, "");
+    for (const status of ["PASS", "FAIL", "BLOCKED", "SKIPPED"]) make("span", "", card).dataset.flowStatus = status;
+    const active = make("div", "active-flow-filter", panel);
+    active.id = "active-flow-filter";
+    make("strong", "", active).id = "active-flow-name";
+    make("button", "", active, "Remover filtro").id = "clear-flow-filter";
+    make("p", "", panel).id = "flow-table-context";
+    make("button", "", testsView, "Limpar filtros").id = "clear-filters";
+    make("select", "", testsView).id = "category-filter";
+    make("select", "", testsView).id = "page-filter";
+    make("select", "", testsView).id = "page-size";
+  }
   const rows = make("tbody", "", testsView);
   rows.id = "case-rows";
   for (let index = 0; index < 2; index += 1) make("tr", "", rows, `CT00${index + 1}`).dataset.caseIndex = String(index);
@@ -445,7 +468,7 @@ function fixture(options = {}) {
           const shots = make("div", "shots", content);
           const figure = make("figure", "", shots);
           const image = make("img", "", figure);
-          image.setAttribute("src", "data:image/png;base64,cHJlc2VydmVk");
+          image.setAttribute("src", options.remoteImages?.[caseIndex] || "data:image/png;base64,cHJlc2VydmVk");
           image.naturalWidth = naturalImageSize.width;
           image.naturalHeight = naturalImageSize.height;
           originalImages.push(image);
@@ -575,6 +598,80 @@ function insertStep(document, gap, type = "sql") {
   picker.querySelector(`[data-step-choice="${type}"]`).click();
   assert.equal(picker.hasAttribute("open"), false);
 }
+
+const previewImage = "http://localhost:8000/api/explorations/source-123/screenshots/0-original.png";
+const connectedPreview = (image = previewImage) => ({
+  runId: "source-123", locationProtocol: "blob:", locationOrigin: "http://localhost:5173",
+  appRuntime: { app_url: "http://localhost:5173", api_url: "http://localhost:8000/api", source_exploration_id: "source-123" },
+  onlinePreview: { export_path: "/test-suites/source-123/report?scope=consolidated&case_id=CT001", image_sizes: { [image]: 4096 } },
+  remoteImages: [image],
+});
+
+test("focused online captures retain zoom, full-screen and direct image download without startup fetches", async () => {
+  const { document, window, cards, originalImages, blobs } = fixture(connectedPreview());
+  assert.equal(window.networkCalls, 0, "Browsing does not fetch an offline suite export or call any models");
+  const inspector = cards[0].querySelector(".step-evidence-layout");
+  assert.equal(inspector.querySelector('[data-evidence-field="size"] dd').textContent, "4 KB");
+  assert.equal(inspector.querySelector(".step-evidence-download").getAttribute("aria-disabled"), null);
+  inspector.querySelectorAll("button").find(control => control.getAttribute("aria-label") === "Aumentar zoom").click();
+  assert.equal(inspector.querySelector(".evidence-zoom-reset").textContent, "125%");
+  inspector.querySelectorAll("button").find(control => control.getAttribute("aria-label") === "Ampliar evidência").click();
+  assert.equal(document.getElementById("evidence-dialog").hasAttribute("open"), true);
+  assert.equal(document.getElementById("evidence-preview").src, previewImage);
+  const calls = [];
+  window.fetch = async (url, options) => { calls.push({ url, options }); return { ok: true, blob: async () => new Blob(["png"], { type: "image/png" }) }; };
+  document.getElementById("download-evidence").click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, previewImage);
+  assert.equal(calls[0].options.redirect, "error");
+  assert.equal(calls[0].options.credentials, "omit");
+  assert.equal(blobs.at(-1).type, "image/png");
+  assert.equal(originalImages[0].src, previewImage, "The capture reference remains unmodified");
+});
+
+test("online report download explicitly requests a self-contained CT export, not a snapshot of external links", async () => {
+  const { document, window, blobs, downloads } = fixture(connectedPreview());
+  const calls = [];
+  window.fetch = async (url, options) => {
+    calls.push({ url, options });
+    return { ok: true, text: async () => '<html><body><img src="data:image/png;base64,cG5n"><script id="report-drafts" type="application/json">{"version":1,"cases":{}}</script></body></html>' };
+  };
+  document.getElementById("download-report").click();
+  document.getElementById("download-report").click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls.length, 1, "Repeated clicks cannot launch concurrent large exports");
+  assert.equal(calls[0].url, "http://localhost:8000/api/test-suites/source-123/report?scope=consolidated&case_id=CT001");
+  assert.equal(calls[0].options.cache, "no-store");
+  assert.match(await blobs.at(-1).text(), /src="data:image\/png;base64/);
+  assert.doesNotMatch(await blobs.at(-1).text(), /online_preview|screenshots\/0-original/);
+  assert.equal(downloads.at(-1).filename, "autojev-relatorio.html");
+  assert.equal(document.getElementById("download-report").disabled, false);
+});
+
+test("online previews reject untrusted capture hosts, paths, queries and offline access", () => {
+  for (const source of ["https://other.invalid/capture.png", "javascript:alert(1)", "http://localhost:8000/api/providers/key", "http://localhost:8000/api/explorations/run/screenshots/x.png?token=secret", "http://user@localhost:8000/api/explorations/run/screenshots/x.png"]) {
+    const { document, cards, window } = fixture(connectedPreview(source));
+    cards[0].querySelectorAll("button").find(control => control.getAttribute("aria-label") === "Ampliar evidência").click();
+    assert.equal(document.getElementById("evidence-dialog").hasAttribute("open"), false, source);
+    assert.equal(cards[0].querySelector(".step-evidence-download").getAttribute("aria-disabled"), "true");
+    assert.equal(window.networkCalls, 0);
+  }
+  const { document, cards, window } = fixture({ ...connectedPreview(), locationProtocol: "file:", locationOrigin: "null" });
+  cards[0].querySelectorAll("button").find(control => control.getAttribute("aria-label") === "Ampliar evidência").click();
+  assert.equal(document.getElementById("evidence-dialog").hasAttribute("open"), false);
+  assert.equal(window.networkCalls, 0);
+});
+
+test("failed online exports give recoverable feedback and never save a misleading offline HTML", async () => {
+  const { document, window, blobs } = fixture(connectedPreview());
+  window.fetch = async () => ({ ok: false });
+  document.getElementById("download-report").click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(blobs.length, 0);
+  assert.equal(document.getElementById("download-report").disabled, false);
+  assert.match(document.getElementById("evidence-download-status").textContent, /Não foi possível baixar/);
+});
 
 function rerunFromEditor(document) {
   document.querySelector("[data-edit-current]").click();
@@ -874,7 +971,7 @@ test("a connected blob report hands off only to same-origin app confirmation and
   insertStep(document, document.getElementById("case-editor-steps").querySelector(".case-editor-insert"));
   document.getElementById("case-editor-save").click();
   document.getElementById("case-editor-rerun").click();
-  assert.deepEqual(window.openedTabs, [["http://localhost:5173/#/reexecutar/source-123/CT001", "_blank", "noopener,noreferrer"]]);
+  assert.deepEqual(window.openedTabs, [["http://localhost:5173/#/planejar/source-123/CT001", "_blank", "noopener,noreferrer"]]);
   assert.equal(window.networkCalls, 0);
   assert.equal(cards[0].dataset.status, "PASS");
   assert.match(document.getElementById("case-editor-feedback").textContent, /Nenhuma ação foi iniciada.*passos extras.*não serão executados/);
@@ -927,7 +1024,7 @@ test("rerun toolbar opens a planner before a separate explicit application hando
   assert.equal(document.querySelectorAll(".case-inline-insert, .case-inline-gap").length, 0);
   assert.deepEqual(document.querySelectorAll(".case-editor-insert").map((button) => button.textContent), ["+", "+", "+", "+"]);
   document.getElementById("case-editor-rerun").click();
-  assert.deepEqual(window.openedTabs, [["http://localhost:5173/#/reexecutar/source-123/CT001", "_blank", "noopener,noreferrer"]]);
+  assert.deepEqual(window.openedTabs, [["http://localhost:5173/#/planejar/source-123/CT001", "_blank", "noopener,noreferrer"]]);
   assert.equal(window.networkCalls, 0);
   assert.deepEqual(cards.map((card) => card.dataset.status), ["PASS", "FAIL"]);
 });
@@ -1205,7 +1302,7 @@ test("connected blobs keep the rerun action and its original styling after expor
   rerun.click();
   assert.equal(window.openedTabs.length, 0);
   document.getElementById("case-editor-rerun").click();
-  assert.deepEqual(window.openedTabs, [["http://localhost:5173/#/reexecutar/source-123/CT001", "_blank", "noopener,noreferrer"]]);
+  assert.deepEqual(window.openedTabs, [["http://localhost:5173/#/planejar/source-123/CT001", "_blank", "noopener,noreferrer"]]);
   assert.equal(document.getElementById("case-editor").hasAttribute("open"), true);
   document.getElementById("download-report").click();
   const html = await blobs.at(-1).text();
@@ -1219,7 +1316,7 @@ test("connected blobs keep the rerun action and its original styling after expor
   assert.equal(document.getElementById("case-rerun-feedback").hidden, true);
   rerun.click();
   document.getElementById("case-editor-rerun").click();
-  assert.equal(window.openedTabs.at(-1)[0], "http://localhost:5173/#/reexecutar/source-123/CT002");
+  assert.equal(window.openedTabs.at(-1)[0], "http://localhost:5173/#/planejar/source-123/CT002");
   assert.equal(window.networkCalls, 0);
 });
 
@@ -1264,6 +1361,62 @@ test("an exported report without its HTML download control retains navigation, p
   document.getElementById("print-report").click();
   assert.equal(window.printCalls, 2);
   assert.equal(document.getElementById("download-report"), null);
+});
+
+test("named report flows compose with status, search and CSV without changing evidence", async () => {
+  const { document, window, cards, blobs } = fixture({ flowMetadata: true, hash: "#view/tests", caseStatuses: ["PASS", "FAIL"] });
+  const original = document.getElementById("report-data").textContent;
+  const rows = document.querySelectorAll("#case-rows tr[data-case-index]");
+  const visible = () => rows.filter(row => !row.hidden).map(row => row.dataset.caseIndex);
+  assert.deepEqual(visible(), ["0", "1"]);
+  const card = document.querySelector('[data-select-flow="flow-boleto"]');
+  assert.equal(card.querySelector('[data-flow-total]').textContent, "1");
+  assert.equal(card.querySelector('[data-flow-failure]').hidden, false);
+  card.click();
+  assert.deepEqual(visible(), ["1"]);
+  assert.equal(card.getAttribute("aria-pressed"), "true");
+  document.querySelector('#filters [data-status="PASS"]').click();
+  assert.deepEqual(visible(), []);
+  assert.equal(card.querySelector('[data-flow-total]').textContent, "0");
+  assert.equal(card.querySelector('[data-flow-failure]').hidden, true);
+  document.getElementById("clear-flow-filter").click();
+  assert.deepEqual(visible(), ["0"], "Removing a flow retains the verdict filter");
+  card.click();
+  document.querySelector('#filters [data-status="ALL"]').click();
+  document.getElementById("download-csv").click();
+  const csv = await blobs.at(-1).text();
+  assert.match(csv, /"Fluxos funcionais";"Confiança da associação"/);
+  assert.match(csv, /"CT002"/);
+  assert.doesNotMatch(csv, /"CT001"/);
+  assert.match(csv, /"Cadastrar boleto";"Cadastrar boleto: Identificado"/);
+  document.getElementById("category-filter").value = "technical";
+  document.getElementById("category-filter").dispatch("change");
+  assert.deepEqual(visible(), []);
+  document.getElementById("category-filter").value = "business";
+  document.getElementById("category-filter").dispatch("change");
+  assert.deepEqual(visible(), ["1"]);
+  document.getElementById("page-filter").value = "/inventory.html";
+  document.getElementById("page-filter").dispatch("change");
+  assert.deepEqual(visible(), []);
+  document.getElementById("page-filter").value = "";
+  document.getElementById("page-filter").dispatch("change");
+  document.querySelector('[data-select-flow="unclassified"]').click();
+  assert.deepEqual(visible(), ["0"]);
+  document.getElementById("search").value = "CT002";
+  document.getElementById("search").dispatch("input");
+  assert.deepEqual(visible(), []);
+  document.getElementById("clear-filters").click();
+  assert.deepEqual(visible(), ["0", "1"]);
+  assert.equal(document.querySelector('[data-select-flow="all"]').getAttribute("aria-pressed"), "true");
+  card.click();
+  document.getElementById("download-report").click();
+  const exported = await blobs.at(-1).text();
+  const exportedData = JSON.parse(exported.match(/<script[^>]*id="report-data"[^>]*>(.*?)<\/script>/s)[1]);
+  assert.equal(exportedData.cases.length, 2, "HTML exports always retain every CT, regardless of live filters");
+  assert.equal(document.getElementById("report-data").textContent, original);
+  assert.equal(cards[0].dataset.status, "PASS");
+  assert.equal(cards[1].dataset.status, "FAIL");
+  assert.equal(window.networkCalls, 0);
 });
 
 test("the full-canvas results view reuses report actions and restores them outside results", () => {

@@ -18,6 +18,7 @@ import {
   ChevronRight,
   CircleStop,
   Clock3,
+  ClipboardList,
   ClipboardPaste,
   CloudCog,
   Code2,
@@ -34,6 +35,7 @@ import {
   ImagePlus,
   KeyRound,
   LayoutDashboard,
+  Layers3,
   LoaderCircle,
   Menu,
   MonitorPlay,
@@ -68,8 +70,13 @@ import {
   useId,
   useRef,
   useState,
+  lazy,
+  Suspense,
 } from "react";
 import { RerunLiveBoard, type RerunLiveProgress, type RerunLiveStep } from "./components/RerunLiveBoard";
+
+const TestSuitesWorkspace = lazy(() => import("./components/TestSuitesWorkspace"));
+const PlannedExecutions = lazy(() => import("./components/PlannedExecutions"));
 
 const DEFAULT_API_URL =
   process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
@@ -78,13 +85,14 @@ type View =
   | "dashboard"
   | "new"
   | "explorations"
+  | "planned"
   | "providers"
   | "settings"
   | "detail";
 
 type ScenarioCapturePlan = { version: 1; checkpoints: { id: string; gap: number; order: number }[] };
 type RerunCaptureCheckpoint = { id: string; gap: number; order: number; version: number };
-type AppRoute = { view: View; explorationId?: string; rerunScenarioId?: string; capturePlan?: ScenarioCapturePlan; capturePlanError?: string; liveRerun?: boolean };
+type AppRoute = { view: View; suiteId?: string; planId?: string; roundId?: string; initialCaseId?: string; initialSourceId?: string; initialSourceCase?: string; explorationId?: string; rerunScenarioId?: string; capturePlan?: ScenarioCapturePlan; capturePlanError?: string; liveRerun?: boolean };
 
 type ScenarioRerunPreflight = {
   available: boolean;
@@ -292,6 +300,7 @@ type RerunPreparation = {
 
 type Exploration = {
   id: string;
+  suite_round?: { root_id: string; round_id: string; case_id: string };
   app_url: string;
   status: string;
   rerun?: {
@@ -430,7 +439,8 @@ const NAV_ITEMS: Array<{
 }> = [
   { view: "dashboard", hash: "#/dashboard", label: "Dashboard", icon: LayoutDashboard },
   { view: "new", hash: "#/nova-exploracao", label: "Nova exploração", icon: Rocket },
-  { view: "explorations", hash: "#/exploracoes", label: "Explorações", icon: History },
+  { view: "explorations", hash: "#/exploracoes", label: "Meus testes", icon: History },
+  { view: "planned", hash: "#/execucoes-planejadas", label: "Rascunhos", icon: ClipboardList },
   { view: "providers", hash: "#/provedores", label: "Provedores de IA", icon: CloudCog },
   { view: "settings", hash: "#/configuracoes", label: "Configurações", icon: Settings },
 ];
@@ -1113,6 +1123,25 @@ export function validateCapturePlanForPreflight(plan: ScenarioCapturePlan | unde
 }
 
 export function parseAppHash(hash: string): AppRoute {
+  const planning = hash.match(/^#\/planejar\/([^/?]+)\/([^/?]+)(?:\?(.*))?$/);
+  if (planning) {
+    try {
+      const source = decodeURIComponent(planning[1]), scenario = decodeURIComponent(planning[2]);
+      const parameters = new URLSearchParams(planning[3] || "");
+      return { view: "explorations", suiteId: source, initialCaseId: scenario, initialSourceId: source, initialSourceCase: scenario,
+        ...(parameters.has("capture_plan") ? { capturePlan: validateScenarioCapturePlan(JSON.parse(parameters.get("capture_plan")!)) } : {}) };
+    } catch { return { view: "explorations" }; }
+  }
+  const suite = hash.match(/^#\/conjuntos\/([^/?]+)(?:\?(.*))?$/);
+  if (suite) {
+    try {
+      const params = new URLSearchParams(suite[2] || "");
+      return { view: "explorations", suiteId: decodeURIComponent(suite[1]), planId: params.get("plan") || undefined,
+        roundId: params.get("round") || undefined, initialCaseId: params.get("ct") || undefined,
+        initialSourceId: params.get("source") || undefined, initialSourceCase: params.get("source_ct") || undefined,
+        ...(params.has("capture_plan") ? { capturePlan: validateScenarioCapturePlan(JSON.parse(params.get("capture_plan")!)) } : {}) };
+    } catch { return { view: "explorations" }; }
+  }
   const rerun = hash.match(/^#\/reexecutar\/([^/?]+)\/([^/?]+)(?:\?(.*))?$/);
   try {
     if (rerun) {
@@ -1156,6 +1185,35 @@ export function connectReportToApplication(html: string, sourceExplorationId: st
   const runtime = JSON.stringify({ app_url: url.origin, source_exploration_id: sourceExplorationId, ...(apiUrl ? { api_url: apiUrl } : {}) }).replace(/</g, "\\u003c");
   const clean = html.replace(/<script\b(?=[^>]*\bid=["']report-app-runtime["'])[^>]*>[\s\S]*?<\/script\s*>/gi, "");
   return clean.replace(/<head\b[^>]*>/i, (head) => head + '<script id="report-app-runtime" type="application/json">' + runtime + "</script>");
+}
+
+export async function openTestSuiteReport(request: ApiRequest, options: { root: string; scope: string; roundId?: string; caseId?: string; apiBase?: string }) {
+  // A tiny local loading page paints immediately while the focused CT loads.
+  // It contains no external resources and never leaves a white about:blank tab.
+  const label = (options.caseId || "relatório").replace(/[&<>"']/g, character => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]!);
+  const loadingHtml = `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AutoJev · Abrindo ${label}</title><style>html{color-scheme:dark;background:#0b1013;color:#e4e9ee;font-family:system-ui,sans-serif}body{margin:0;min-height:100vh;display:grid;place-items:center}main{max-width:420px;padding:32px}small{color:#f2c45b;letter-spacing:.15em}h1{font-size:24px;font-weight:600}p{color:#91a0ae;font-size:14px;line-height:1.7}.loader{height:3px;margin-top:28px;background:#263137;overflow:hidden;border-radius:8px}.loader:after{content:"";display:block;width:40%;height:100%;background:#f2c45b;animation:load 1.2s ease-in-out infinite alternate}@keyframes load{to{transform:translateX(150%)}}@media(prefers-reduced-motion:reduce){.loader:after{animation:none}}</style></head><body><main role="status" aria-live="polite"><small>AUTOJEV · EVIDÊNCIAS</small><h1>Abrindo ${label}</h1><p>${options.caseId ? "Buscando os detalhes deste teste. Os prints serão carregados conforme você os visualizar." : "Preparando o relatório com as evidências registradas."}</p><div class="loader" aria-hidden="true"></div></main></body></html>`;
+  const loadingUrl = URL.createObjectURL(new Blob([loadingHtml], { type: "text/html" }));
+  const preview = window.open(loadingUrl, "_blank");
+  if (!preview) { URL.revokeObjectURL(loadingUrl); throw new Error("Permita a abertura de novas abas para visualizar o resultado do teste."); }
+  preview.opener = null;
+  let objectUrl: string | undefined;
+  try {
+    const parameters = new URLSearchParams({ scope: options.scope, ...(options.roundId ? { round_id: options.roundId } : {}), ...(options.caseId ? { case_id: options.caseId, preview: "true" } : {}) });
+    const response = await request<Response>(`/test-suites/${encodeURIComponent(options.root)}/report?${parameters}`, { raw: true });
+    if (preview.closed) return;
+    const html = connectReportToApplication(await response.text(), options.root, window.location.origin, options.apiBase);
+    if (preview.closed) return;
+    objectUrl = URL.createObjectURL(new Blob([html], { type: "text/html" }));
+    preview.location.replace(objectUrl + (options.caseId ? `#view/results/${encodeURIComponent(options.caseId)}` : ""));
+    const loadedUrl = objectUrl;
+    window.setTimeout(() => URL.revokeObjectURL(loadedUrl), 60000);
+  } catch (error) {
+    if (objectUrl) URL.revokeObjectURL(objectUrl);
+    preview.close();
+    throw error;
+  } finally {
+    URL.revokeObjectURL(loadingUrl);
+  }
 }
 
 export async function confirmScenarioRerun(request: ApiRequest, sourceId: string, scenarioId: string, consent: boolean, available: boolean, capturePlan?: ScenarioCapturePlan) {
@@ -1827,7 +1885,14 @@ export default function AutoJevApp() {
   useEffect(() => {
     const saved = window.localStorage.getItem("autojev-poll-interval");
     if (saved && Number(saved) >= 1500) setPollInterval(Number(saved));
+    let acceptedHash = window.location.hash;
     const onHash = () => {
+      const nextHash = window.location.hash;
+      if (acceptedHash && nextHash !== acceptedHash && !window.dispatchEvent(new CustomEvent("autojev:before-navigate", { cancelable: true, detail: { hash: nextHash } }))) {
+        window.history.replaceState(null, "", acceptedHash);
+        return;
+      }
+      acceptedHash = nextHash;
       const nextRoute = parseRoute();
       activeExplorationId.current = nextRoute.explorationId;
       setRoute(nextRoute);
@@ -1870,10 +1935,10 @@ export default function AutoJevApp() {
     return () => window.clearInterval(timer);
   }, [route.view, explorations, pollInterval, loadCore]);
 
-  const navigate = (hash: string) => {
+  const navigate = useCallback((hash: string) => {
     if (window.location.hash === hash) setRoute(parseRoute());
     else window.location.hash = hash;
-  };
+  }, []);
 
   const refreshAll = async () => {
     await loadCore(true);
@@ -1919,7 +1984,13 @@ export default function AutoJevApp() {
           />
         );
       case "explorations":
-        return <ExplorationsView explorations={explorations} loading={loading} navigate={navigate} />;
+        return <Suspense fallback={<section className="panel">Carregando conjuntos de testes…</section>}><TestSuitesWorkspace
+          key={[route.suiteId, route.planId, route.roundId, route.initialCaseId, route.initialSourceId, route.initialSourceCase, JSON.stringify(route.capturePlan)].join("/")}
+          rootId={route.suiteId} planId={route.planId} roundId={route.roundId} initialCaseId={route.initialCaseId}
+          initialSourceId={route.initialSourceId} initialSourceCase={route.initialSourceCase} initialCapturePlan={route.capturePlan}
+          request={request} navigate={navigate} openReport={(root, scope, roundId, caseId) => openTestSuiteReport(request, { root, scope, roundId, caseId, apiBase })} /></Suspense>;
+      case "planned":
+        return <Suspense fallback={<section className="panel" role="status">Carregando execuções planejadas…</section>}><PlannedExecutions request={request} navigate={navigate} /></Suspense>;
       case "providers":
         return (
           <ProvidersView
@@ -1995,11 +2066,11 @@ export default function AutoJevApp() {
 
         <nav className="primary-nav" aria-label="Navegação principal">
           <span className="nav-section-label">Workspace</span>
-          {NAV_ITEMS.slice(0, 3).map((item) => {
+          {NAV_ITEMS.slice(0, 4).map((item) => {
             const Icon = item.icon;
             const active = currentNavView === item.view;
             return (
-              <button key={item.view} className={`nav-item${active ? " active" : ""}`} onClick={() => navigate(item.hash)} title={sidebarCollapsed ? item.label : undefined}>
+              <button key={item.view} className={`nav-item${active ? " active" : ""}`} aria-current={active ? "page" : undefined} onClick={() => navigate(item.hash)} title={sidebarCollapsed ? item.label : undefined}>
                 <Icon size={18} />
                 <span>{item.label}</span>
                 {item.view === "explorations" && explorations.filter((item) => isLive(item.status)).length > 0 && (
@@ -2009,7 +2080,7 @@ export default function AutoJevApp() {
             );
           })}
           <span className="nav-section-label secondary-label">Sistema</span>
-          {NAV_ITEMS.slice(3).map((item) => {
+          {NAV_ITEMS.slice(4).map((item) => {
             const Icon = item.icon;
             const active = currentNavView === item.view;
             return (
@@ -2785,7 +2856,7 @@ function SummaryRow({ label, value }: { label: string; value: string }) {
   return <div className="summary-row"><span>{label}</span><strong title={value}>{value}</strong></div>;
 }
 
-function ExplorationsView({ explorations, loading, navigate }: { explorations: Exploration[]; loading: boolean; navigate: (hash: string) => void }) {
+export function ExplorationsView({ explorations, loading, navigate }: { explorations: Exploration[]; loading: boolean; navigate: (hash: string) => void }) {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("all");
   const filtered = explorations.filter((item) => {
@@ -3355,11 +3426,12 @@ export function ExplorationDetailView({
 
   return (
     <div className={`view-stack detail-view ${rerun ? "rerun-detail" : ""} ${showLiveRerun ? "rerun-live-detail" : ""}`}>
-      <div className="detail-breadcrumb"><button onClick={() => navigate("#/exploracoes")}><ArrowLeft size={15} />Explorações</button><ChevronRight size={14} /><span>{hostFromUrl(exploration.app_url)}</span></div>
+      <div className="detail-breadcrumb"><button onClick={() => navigate("#/exploracoes")}><ArrowLeft size={15} />Meus testes</button><ChevronRight size={14} /><span>{hostFromUrl(exploration.app_url)}</span></div>
       <header className="detail-header">
-        {rerun && <button type="button" className="icon-button rerun-compact-back" aria-label="Voltar para explorações" onClick={() => navigate("#/exploracoes")}><ArrowLeft size={18} /></button>}
+        {rerun && <button type="button" className="icon-button rerun-compact-back" aria-label="Voltar para Meus testes" onClick={() => navigate("#/exploracoes")}><ArrowLeft size={18} /></button>}
         <div className="detail-title"><span className="app-avatar large"><Globe2 size={22} /></span><div><div className="detail-title-line"><h1>{rerun ? `Reexecução de ${rerun.source_scenario_id || "um CT"}` : hostFromUrl(exploration.app_url)}</h1>{terminalOutcomeVisible && actionLimitReached ? <span className="status-badge status-warning"><span className="status-dot" />Limite anterior atingido</span> : terminalOutcomeVisible && completedWithRestrictions ? <span className="status-badge status-warning"><span className="status-dot" />Concluída com restrições</span> : <StatusBadge status={exploration.status} completionType={completion.type} />}</div><a href={exploration.app_url} target="_blank" rel="noreferrer">{exploration.app_url}<SquareArrowOutUpRight size={13} /></a></div></div>
         <div className="page-actions">
+          <button className="button secondary" onClick={() => navigate(`#/conjuntos/${encodeURIComponent(exploration.suite_round?.root_id || exploration.id)}${exploration.suite_round ? "?round=" + encodeURIComponent(exploration.suite_round.round_id) : ""}`)}><Layers3 size={16} />{exploration.suite_round ? "Voltar à execução" : "Ver testes da aplicação"}</button>
           <button className="button secondary" onClick={onRefresh}><RefreshCcw size={16} />Atualizar</button>
           {isLive(exploration.status) ? (
             <button className="button danger" onClick={() => void cancel()} disabled={cancelling}>{cancelling ? <Spinner /> : <CircleStop size={16} />}Cancelar</button>

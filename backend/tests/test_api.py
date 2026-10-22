@@ -56,7 +56,7 @@ def test_economical_mode_does_not_count_unrequested_visual_reviews_as_unavailabl
             assert not counts["assessed"] and not counts["rate_limited"]
 
 
-@pytest.mark.parametrize("missing_marker", [' data-report-locale="pt-BR-v1"', ' data-report-layout="premium-v1"', None])
+@pytest.mark.parametrize("missing_marker", [' data-report-locale="pt-BR-v1"', ' data-report-layout="premium-v1"', ' data-report-flows="functional-flows-v1"', None])
 def test_portuguese_presentation_refreshes_cached_english_report_without_rewriting_evidence(tmp_path, missing_marker):
     from autojev.adapters.report import StandaloneHtmlReport
 
@@ -90,6 +90,7 @@ def test_portuguese_presentation_refreshes_cached_english_report_without_rewriti
         assert response.status_code == 200
         assert 'data-report-locale="pt-BR-v1"' in response.text
         assert 'data-report-layout="premium-v1"' in response.text
+        assert 'data-report-flows="functional-flows-v1"' in response.text
         assert "Relatório de testes exploratórios" in response.text
         assert "Selecionar opção: Name (Z to A)" in response.text
         assert "O Playwright executou a ação selecionar opção com sucesso" in response.text
@@ -205,6 +206,7 @@ def test_current_timeline_report_refreshes_total_duration_without_changing_origi
 
 def test_report_cache_refreshes_role_costs_without_rewriting_original_or_history(tmp_path):
     from autojev.adapters.report import StandaloneHtmlReport
+    from autojev.services.scenario_revisions import project_scenario_revisions
 
     app = create_app(settings(tmp_path))
     with TestClient(app) as client:
@@ -227,7 +229,10 @@ def test_report_cache_refreshes_role_costs_without_rewriting_original_or_history
         )
         directory = tmp_path / "artifacts" / exploration_id
         original = directory / "report.html"
-        StandaloneHtmlReport(tmp_path / "artifacts").generate(repository.get_exploration(exploration_id), str(original))
+        # A current cache uses the same immutable revision projection as GET
+        # /report; a raw snapshot already needs presentation regeneration.
+        current = project_scenario_revisions(repository, repository.get_exploration(exploration_id))
+        StandaloneHtmlReport(tmp_path / "artifacts").generate(current, str(original))
         original_document = original.read_text()
         repository.update_exploration(exploration_id, report_path=str(original))
         assert client.get(f"/api/explorations/{exploration_id}/report").text == original_document

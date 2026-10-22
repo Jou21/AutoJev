@@ -202,7 +202,7 @@ test("both rerun screens keep the exact same compact header, collapsed provenanc
       assert.match(html, /class="view-stack detail-view rerun-detail\b/,
         "both screens need the same compact sizing and spacing scope");
       assert.match(html, /<h1>Reexecução de CT001<\/h1>/);
-      assert.equal((html.match(/aria-label="Voltar para explorações"/g) || []).length, 1);
+      assert.equal((html.match(/aria-label="Voltar para Meus testes"/g) || []).length, 1);
       const provenance = extract(html, /<details class="rerun-origin-details"[\s\S]*?<\/details>/, "rerun provenance");
       assert.doesNotMatch(provenance.split(">")[0], /\bopen(?:=|\s|$)/,
         "switching screens must not expand provenance and move the view switch");
@@ -243,7 +243,7 @@ test("live dashboard collapses provenance by default and passes compact presenta
   assert.match(html, /Sobre esta reexecução/);
   assert.match(html, /As versões anteriores e suas evidências ficam preservadas no histórico do teste/);
   assert.match(html, /o relatório de origem mostra o resultado mais recente/);
-  assert.equal((html.match(/aria-label="Voltar para explorações"/g) || []).length, 1);
+  assert.equal((html.match(/aria-label="Voltar para Meus testes"/g) || []).length, 1);
   assert.match(html, /class="rerun-live-workspace"/);
   assert.match(html, /class="rerun-live-board is-compact"/);
   const view = ScenarioRerunLiveView({ rerun: exploration().rerun, active: true, controls: createElement("div", { id: "rerun-live-controls" }) });

@@ -14,6 +14,8 @@
       const control = document.getElementById(id);
       if (control) control.remove();
     });
+    // Old cached presentations may still contain the superseded binary groups.
+    document.querySelectorAll(".case-focus-panel, .case-focus-badge").forEach((element) => element.remove());
     // Capture a self-contained export before temporary filters or enhancements.
     // App-only controls are removed from the detached copy, leaving the live
     // blob's rerun and download actions intact.
@@ -29,6 +31,9 @@
       return "<!DOCTYPE html>\n" + exportRoot.outerHTML;
     })();
     const cases = Array.isArray(data.cases) ? data.cases : [];
+    const functionalFlows = Array.isArray(data.functional_flows) ? data.functional_flows : [];
+    const flowsById = new Map(functionalFlows.map((flow) => [flow.id, flow]));
+    const membershipsOf = (item) => Array.isArray(item.flow_classification && item.flow_classification.memberships) ? item.flow_classification.memberships : [];
     const byIndex = new Map(cases.map((item) => [String(item.index), item]));
     const byId = new Map(cases.map((item) => [String(item.id), item]));
     const $ = (id) => document.getElementById(id);
@@ -118,12 +123,47 @@
       // Keep the URL alive long enough for the browser to start saving the file.
       window.setTimeout(() => URL.revokeObjectURL(url), 30000);
     };
+    function isEmbeddedImage(src) { return /^(data:image\/(?:png|jpe?g|webp|gif);base64,|blob:)/i.test(src); }
+    function isEvidenceImageSource(src) {
+      if (isEmbeddedImage(src)) return true;
+      // Only app-connected, server-listed captures may be loaded remotely.
+      // Offline HTML never gains arbitrary URL/script navigation privileges.
+      if (!reportConnection || !reportConnection.apiUrl || !data.online_preview
+        || !Object.hasOwn(data.online_preview.image_sizes || {}, src)) return false;
+      try {
+        const base = new URL(reportConnection.apiUrl), url = new URL(src);
+        const prefix = base.pathname.replace(/\/$/, "") + "/explorations/";
+        return url.origin === base.origin && !url.username && !url.password && !url.search && !url.hash
+          && url.pathname.startsWith(prefix) && /^[^/]+\/screenshots\/[^/]+$/.test(url.pathname.slice(prefix.length));
+      } catch { return false; }
+    }
+    const downloadFeedback = (control, message) => {
+      let status = $("evidence-download-status");
+      if (!status) { status = document.createElement("p"); status.id = "evidence-download-status"; status.setAttribute("role", "status"); status.setAttribute("aria-live", "polite"); control.parentElement.appendChild(status); }
+      text(status, message);
+    };
+    document.addEventListener("click", async (event) => {
+      const control = event.target instanceof Element ? event.target.closest("a.step-evidence-download, #download-evidence") : null;
+      if (!control) return;
+      const src = control.getAttribute("href") || "";
+      if (isEmbeddedImage(src)) return;
+      event.preventDefault();
+      if (!isEvidenceImageSource(src) || control.getAttribute("aria-busy") === "true") return;
+      control.setAttribute("aria-busy", "true");
+      try {
+        const response = await window.fetch(src, { credentials: "omit", redirect: "error" });
+        if (!response.ok) throw new Error("Image unavailable");
+        saveBlob(await response.blob(), control.download || "autojev-evidencia.png");
+      } catch { downloadFeedback(control, "Não foi possível baixar a imagem. Tente novamente."); }
+      finally { control.removeAttribute("aria-busy"); }
+    });
     const prefersReducedMotion = () => window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     let activeView = "overview";
     let selectedCase = cases.length ? String(cases[0].index) : null;
     const selectedExecutions = new Map();
     let displayedHistory = null;
     let selectedStatus = "ALL";
+    let selectedFlow = "all";
     let pageNumber = 1;
     let filteredCases = cases.slice();
     const sourceScopes = new Map();
@@ -333,10 +373,10 @@
         ? current.rerun_source_exploration_id : reportConnection.sourceId;
       const scenario = !revision.current ? revision.scenario_id : typeof current.rerun_source_scenario_id === "string" && current.rerun_source_scenario_id
         ? current.rerun_source_scenario_id : String(current.id);
-      const target = reportConnection.appUrl + "/#/reexecutar/" + encodeURIComponent(owner) + "/" + encodeURIComponent(scenario)
+      const target = reportConnection.appUrl + "/#/planejar/" + encodeURIComponent(owner) + "/" + encodeURIComponent(scenario)
         + (plan ? "?capture_plan=" + encodeURIComponent(JSON.stringify(plan)) : "");
       window.open(target, "_blank", "noopener,noreferrer");
-      feedback("Confirmação de reexecução solicitada na aplicação. Nenhuma ação foi iniciada por este relatório. "
+      feedback("Planejamento da rodada aberto na aplicação. Você pode incluir outros CTs e conversar com o assistente antes de confirmar. Nenhuma ação foi iniciada por este relatório. "
         + (plan ? plan.checkpoints.length + " pausa(s) para print do rascunho salvo serão apresentadas para confirmação. SWS e SQL não serão executados. Salve alterações do editor antes de reexecutar."
           : "Os passos extras do rascunho não serão executados. Salve alterações do editor antes de reexecutar."));
     }
@@ -1052,14 +1092,17 @@
         filename.replaceChildren(make("span", "step-evidence-filename", name), copyValue(name, "nome do arquivo"));
         text(resolution, image.naturalWidth > 0 && image.naturalHeight > 0 ? image.naturalWidth + " × " + image.naturalHeight + " px" : "Não disponível");
         const src = image.getAttribute("src") || "";
-        const embedded = /^(data:image\/(?:png|jpe?g|webp|gif);base64,|blob:)/i.test(src);
+        const embedded = isEvidenceImageSource(src);
         if (embedded) { download.href = src; download.download = name; download.removeAttribute("aria-disabled"); }
         else { download.removeAttribute("href"); download.setAttribute("aria-disabled", "true"); }
         const comma = src.indexOf(",");
         if (/^data:image\/[a-z+.-]+;base64,/i.test(src.slice(0, 80)) && comma > 0) {
           const bytes = Math.floor((src.length - comma - 1) * 3 / 4) - (src.endsWith("==") ? 2 : src.endsWith("=") ? 1 : 0);
           text(size, bytes < 1024 ? bytes + " B" : (bytes / (bytes < 1048576 ? 1024 : 1048576)).toLocaleString("pt-BR", { maximumFractionDigits: 1 }) + (bytes < 1048576 ? " KB" : " MB"));
-        } else text(size, "Não registrado");
+        } else {
+          const bytes = isEvidenceImageSource(src) && data.online_preview && (data.online_preview.image_sizes || {})[src];
+          text(size, Number.isFinite(bytes) && bytes > 0 ? (bytes / (bytes < 1048576 ? 1024 : 1048576)).toLocaleString("pt-BR", { maximumFractionDigits: 1 }) + (bytes < 1048576 ? " KB" : " MB") : "Não registrado");
+        }
       };
       if (figures.length > 1) {
         const chooser = make("select", "step-evidence-choice"); chooser.setAttribute("aria-label", "Selecionar imagem desta etapa");
@@ -1857,17 +1900,52 @@
       });
     }
 
+    function matchesFlow(item, identity) {
+      return identity === "all" || (identity === "unclassified" ? !membershipsOf(item).length : membershipsOf(item).some((membership) => membership.id === identity));
+    }
+
+    function updateFunctionalFlows(baseCases) {
+      all("[data-flow-all-count]").forEach((element) => text(element, baseCases.length));
+      all("[data-flow-unclassified-count]").forEach((element) => text(element, baseCases.filter((item) => !membershipsOf(item).length).length));
+      all(".functional-flow-card[data-select-flow]").forEach((card) => {
+        const flowId = card.dataset.selectFlow;
+        const related = baseCases.filter((item) => matchesFlow(item, flowId));
+        const counts = { PASS: 0, FAIL: 0, BLOCKED: 0, SKIPPED: 0 };
+        related.forEach((item) => { counts[Object.hasOwn(counts, item.status) ? item.status : "SKIPPED"] += 1; });
+        text(card.querySelector("[data-flow-total]"), related.length);
+        all("[data-flow-status]", card).forEach((element) => text(element, counts[element.dataset.flowStatus] || 0));
+        const evaluated = counts.PASS + counts.FAIL;
+        text(card.querySelector("[data-flow-approval]"), evaluated
+          ? String(Math.round(counts.PASS * 1000 / evaluated) / 10).replace(".", ",") + "% de aprovação · " + evaluated + "/" + related.length + " CTs avaliados"
+          : "Sem CTs avaliados (aprovado/reprovado)");
+        const failure = card.querySelector("[data-flow-failure]");
+        if (failure) failure.hidden = !counts.FAIL;
+        const suggested = related.filter((item) => membershipsOf(item).some((membership) => membership.id === flowId && membership.confidence === "suggested")).length;
+        const suggestions = card.querySelector("[data-flow-suggestions]");
+        if (suggestions) { text(suggestions, suggested + " associação(ões) sugerida(s)"); suggestions.hidden = !suggested; }
+      });
+      all("[data-select-flow]").forEach((control) => control.setAttribute("aria-pressed", String(control.dataset.selectFlow === selectedFlow)));
+      const active = $("active-flow-filter");
+      if (active) active.hidden = selectedFlow === "all";
+      const name = selectedFlow === "unclassified" ? "Não classificados" : (flowsById.get(selectedFlow) || {}).name || "Todos os testes";
+      text($("active-flow-name"), "Filtro de fluxo: " + name);
+      text($("flow-table-context"), filteredCases.length + " CT(s) nos resultados · " + (selectedFlow === "all" ? "todos os testes, sem filtro de fluxo." : name + "."));
+    }
+
     function filterCases(resetPage = true) {
       if (resetPage) pageNumber = 1;
       const term = normalize($("search") ? $("search").value : "");
       const category = $("category-filter") ? $("category-filter").value : "";
       const page = $("page-filter") ? $("page-filter").value : "";
-      filteredCases = cases.filter((item) => (
+      const baseCases = cases.filter((item) => (
         (selectedStatus === "ALL" || item.status === selectedStatus)
         && (!category || String(item.category) === category)
         && (!page || String(item.page) === page)
-        && (!term || normalize([item.id, item.title, categoryLabels[item.category] || item.category, item.page, item.url, item.search].join(" ")).includes(term))
+        && (!term || normalize([item.id, item.title, categoryLabels[item.category] || item.category, item.page, item.url, item.search,
+          ...membershipsOf(item).map((membership) => membership.name)].join(" ")).includes(term))
       ));
+      filteredCases = baseCases.filter((item) => matchesFlow(item, selectedFlow));
+      updateFunctionalFlows(baseCases);
       const requestedSize = Number($("page-size") ? $("page-size").value : 15);
       const size = Number.isFinite(requestedSize) && requestedSize > 0 ? Math.floor(requestedSize) : 15;
       const count = Math.max(1, Math.ceil(filteredCases.length / size));
@@ -1917,10 +1995,21 @@
       });
     }
     listen("search", "input", () => filterCases());
+    all("[data-select-flow]").forEach((control) => control.addEventListener("click", () => {
+      const identity = control.dataset.selectFlow;
+      if (!["all", "unclassified"].includes(identity) && !flowsById.has(identity)) return;
+      selectedFlow = identity === selectedFlow ? "all" : identity;
+      filterCases();
+    }));
+    listen("clear-flow-filter", "click", () => {
+      selectedFlow = "all";
+      filterCases();
+    });
     ["category-filter", "page-filter", "page-size"].forEach((id) => listen(id, "change", () => filterCases()));
     listen("clear-filters", "click", () => {
       ["search", "category-filter", "page-filter"].forEach((id) => { if ($(id)) $(id).value = ""; });
       selectedStatus = "ALL";
+      selectedFlow = "all";
       filterCases();
     });
 
@@ -1932,15 +2021,35 @@
       return '"' + cell.replace(/"/g, '""') + '"';
     }
     listen("download-csv", "click", () => {
-      const rows = [["CT", "Título", "Status", "Categoria", "Página", "URL", "Duração (segundos)", "Sinais técnicos"]];
+      const rows = [["CT", "Título", "Status", "Categoria", "Página", "URL", "Duração (segundos)", "Sinais técnicos", "Fluxos funcionais", "Confiança da associação", "Motivo da associação"]];
       filteredCases.forEach((item) => rows.push([
         item.id, item.title, verdictLabels[item.status] || item.status, categoryLabels[item.category] || item.category,
         item.page, item.url, item.duration_seconds == null ? "" : item.duration_seconds,
         Array.isArray(item.signals) ? item.signals.length : item.signals,
+        membershipsOf(item).map((membership) => membership.name).join(" | ") || "Não classificado",
+        membershipsOf(item).map((membership) => membership.name + ": " + (membership.confidence === "identified" ? "Identificado" : "Sugerido")).join(" | "),
+        membershipsOf(item).map((membership) => membership.name + ": " + membership.reason).join(" | ") || (item.flow_classification || {}).unclassified_reason || "Metadados insuficientes.",
       ]));
       saveBlob(new Blob(["\ufeff" + rows.map((row) => row.map(csvCell).join(";")).join("\r\n")], { type: "text/csv;charset=utf-8" }), "autojev-casos.csv");
     });
-    listen("download-report", "click", () => saveBlob(new Blob([exportDocument()], { type: "text/html;charset=utf-8" }), "autojev-relatorio.html"));
+    listen("download-report", "click", async () => {
+      const control = $("download-report");
+      if (!data.online_preview) { saveBlob(new Blob([exportDocument()], { type: "text/html;charset=utf-8" }), "autojev-relatorio.html"); return; }
+      if (control.disabled) return;
+      control.disabled = true; control.setAttribute("aria-busy", "true");
+      try {
+        if (!reportConnection || !reportConnection.apiUrl) throw new Error("Application connection unavailable");
+        const url = new URL(reportConnection.apiUrl + data.online_preview.export_path);
+        const expected = new URL(reportConnection.apiUrl + "/test-suites/" + encodeURIComponent(reportConnection.sourceId) + "/report");
+        if (url.origin !== expected.origin || url.pathname !== expected.pathname || url.searchParams.has("preview") || url.hash) throw new Error("Invalid export path");
+        const response = await window.fetch(url.href, { cache: "no-store", credentials: "omit", redirect: "error" });
+        if (!response.ok) throw new Error("Report unavailable");
+        const html = (await response.text()).replace(/(<script\b(?=[^>]*\bid=["']report-drafts["'])[^>]*>)[\s\S]*?(<\/script\s*>)/i,
+          (_match, start, end) => start + serializeDrafts() + end);
+        saveBlob(new Blob([html], { type: "text/html;charset=utf-8" }), "autojev-relatorio.html");
+      } catch { downloadFeedback(control, "Não foi possível baixar o relatório completo com os prints. Tente novamente."); }
+      finally { control.disabled = false; control.removeAttribute("aria-busy"); }
+    });
     listen("print-report", "click", () => window.print());
 
     let printState = null;
@@ -2091,7 +2200,7 @@
       if (!lightbox || index < 0 || index >= lightbox.gallery.length) return;
       const item = lightbox.gallery[index]; hydrateImage(item.image);
       const src = item.image.getAttribute("src") || "";
-      if (!/^(data:image\/(?:png|jpe?g|webp|gif);base64,|blob:)/i.test(src)) return;
+      if (!isEvidenceImageSource(src)) return;
       lightbox.finishPan(); lightbox.index = index; lightbox.active = item;
       lightbox.image.src = src; lightbox.image.alt = item.image.alt || "Captura de evidência";
       setActionMarker(lightbox.canvas, lightbox.image, item.image.closest("figure.action-preview"));
@@ -2116,8 +2225,7 @@
       if (!original || !dialog || !$("evidence-preview")) return;
       hydrateImage(original);
       const src = original.getAttribute("src") || "";
-      // Reports embed their captures. Never navigate to a script or remote URL.
-      if (!/^(data:image\/(?:png|jpe?g|webp|gif);base64,|blob:)/i.test(src)) return;
+      if (!isEvidenceImageSource(src)) return;
       const viewer = prepareEvidenceLightbox();
       if (!viewer) return;
       previewTrigger = control;
@@ -2133,7 +2241,7 @@
       }).filter((item) => {
         if (!item.image) return false;
         hydrateImage(item.image);
-        return /^(data:image\/(?:png|jpe?g|webp|gif);base64,|blob:)/i.test(item.image.getAttribute("src") || "");
+        return isEvidenceImageSource(item.image.getAttribute("src") || "");
       });
       let index = viewer.gallery.findIndex((item) => item.image === original);
       if (index < 0) { index = viewer.gallery.length; viewer.gallery.push({ image: original }); }

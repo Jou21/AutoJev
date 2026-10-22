@@ -143,6 +143,38 @@ code { font-size: .9em; overflow-wrap: anywhere; }
 .mini-stat strong { display: block; margin-bottom: 3px; color: var(--text); font-size: 18px; font-variant-numeric: tabular-nums; }
 
 /* Lista de casos, busca e filtros */
+.functional-flows-panel { margin-bottom: 24px; padding: 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+.functional-flows-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px; margin-bottom: 16px; }
+.functional-flows-heading h2 { margin: 3px 0 7px; font-size: 19px; }
+.functional-flows-heading p { margin: 0; color: var(--muted); font-size: 11px; }
+.functional-flows-tools { display: flex; flex-wrap: wrap; gap: 7px; }
+.functional-flows-tools button { gap: 9px; background: transparent; color: var(--muted); font-size: 11px; }
+.functional-flows-tools button[aria-pressed="true"] { border-color: #86642d; color: var(--accent); background: var(--accent-soft); }
+.functional-flows-tools button span { font-size: 10px; }
+.functional-flow-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+button.functional-flow-card { display: flex; min-width: 0; flex-direction: column; align-items: stretch; justify-content: flex-start; gap: 8px; padding: 15px; background: var(--panel-soft); text-align: left; }
+.functional-flow-card:hover, .functional-flow-card[aria-pressed="true"] { border-color: var(--accent); background: #ffbf470a; }
+.flow-card-top { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 7px; }
+.flow-confidence { color: var(--info); font-size: 9px; font-weight: 500; }
+.flow-confidence[data-flow-confidence="suggested"] { color: var(--draft); }
+.flow-failure { padding: 1px 6px; border-radius: 4px; background: #ff697c16; color: var(--fail); font-size: 9px; }
+.flow-card-name { color: var(--text); font-size: 14px; line-height: 1.4; overflow-wrap: anywhere; }
+.flow-card-description { color: var(--muted); font-size: 10px; line-height: 1.5; font-weight: 400; }
+.flow-card-total { margin-top: 2px; color: var(--muted); font-size: 10px; font-weight: 400; }
+.flow-card-total b { margin-right: 4px; color: var(--text); font-size: 23px; font-weight: 650; }
+.flow-card-stats { display: flex; flex-wrap: wrap; gap: 5px 12px; padding-top: 8px; border-top: 1px solid var(--line-soft); font-size: 9px; font-weight: 400; }
+.flow-stat { color: var(--muted); white-space: nowrap; }
+.flow-stat b { font-weight: 650; }.flow-stat.pass { color: var(--pass); }.flow-stat.fail { color: var(--fail); }.flow-stat.blocked { color: var(--blocked); }
+.flow-card-approval, .flow-card-suggestions { color: var(--muted); font-size: 9px; font-weight: 400; }
+.flow-card-suggestions { color: var(--draft); }
+.functional-flows-more { margin-top: 12px; }.functional-flows-more summary { width: fit-content; margin-bottom: 12px; color: var(--accent); font-size: 11px; cursor: pointer; }
+.active-flow-filter { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-top: 14px; padding: 10px 12px; border: 1px solid #ffbf4740; border-radius: 8px; background: #ffbf4707; font-size: 11px; }
+.active-flow-filter button { padding: 5px 8px; color: var(--accent); background: transparent; font-size: 10px; }
+.functional-flow-note { margin: 13px 0 0; color: var(--muted); font-size: 10px; line-height: 1.65; }
+.functional-flow-context { margin: 9px 0 0; color: var(--text); font-size: 10px; }
+.case-flow-label { display: block; margin-top: 6px; color: var(--muted); font-size: 9px; font-weight: 400; }.case-flow-label.associated { color: #b9cbe0; }
+@media (max-width: 1050px) { .functional-flow-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 640px) { .functional-flows-panel { padding: 13px; } .functional-flow-grid { grid-template-columns: minmax(0, 1fr); } .functional-flows-tools { width: 100%; } .functional-flows-tools button { flex: 1; padding: 8px; font-size: 10px; } }
 .report-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 0 0 18px; }
 .report-tools .search { flex: 1 1 280px; min-width: 180px; }
 .report-tools select { min-height: 37px; font-size: 12px; }

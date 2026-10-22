@@ -36,6 +36,7 @@ from autojev.services.visual_review_resume import visual_review_resume_summary
 from autojev.services.rerun_projection import without_rerun_recipes
 from autojev.services.scenario_revisions import project_scenario_revisions, scenario_report_origin
 from autojev.services.user_image_upload import UploadedImageError, validate_user_image
+from autojev.services.functional_flows import FLOW_VERSION, classify_case_flows
 
 from .schemas import (
     ConnectionTestInput,
@@ -878,6 +879,12 @@ async def get_exploration(
         result["visual_review_resume"] = request.app.state.visual_review_resume_service.state_for(exploration_id, item)
         if rerun.get("source_exploration_id"):
             _attach_rerun_state(result, rerun, _repository(request))
+        suites = request.app.state.test_suite_service
+        round_context = suites.store.execution_context(exploration_id)
+        if round_context:
+            result["suite_round"] = round_context
+            if result.get("rerun"):
+                result["rerun"].update(report_exploration_id=round_context["root_id"], report_scenario_id=round_context["case_id"])
         return result
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -1111,6 +1118,9 @@ async def get_report(exploration_id: str, request: Request) -> FileResponse:
     # No browser/model calls or historical data changes are needed.
     raw_snapshot = _repository(request).get_exploration(exploration_id)
     snapshot = await run_in_threadpool(project_scenario_revisions, _repository(request), raw_snapshot)
+    suites = request.app.state.test_suite_service
+    if suites.root(exploration_id) == exploration_id and suites.store.cases(exploration_id):
+        snapshot = await run_in_threadpool(suites.report_snapshot, exploration_id)
     snapshot["visual_review_resume"] = visual_review_resume_summary(raw_snapshot)
     marker = b'data-report-summary="execution-v2"'
     coverage_marker = b'data-coverage-ledger="execution-evidence-v1"'
@@ -1118,6 +1128,7 @@ async def get_report(exploration_id: str, request: Request) -> FileResponse:
     visual_policy_marker = b'data-visual-review-policy="bounded-v1"'
     locale_marker = f'data-report-locale="{REPORT_LOCALE_VERSION}"'.encode("ascii")
     layout_marker = f'data-report-layout="{REPORT_LAYOUT_VERSION}"'.encode("ascii")
+    flow_marker = f'data-report-flows="{FLOW_VERSION}"'.encode("ascii")
     snapshot_marker = f'data-report-snapshot="{report_snapshot_key(snapshot)}"'.encode("ascii")
 
     def valid_presentation(candidate: Path) -> bool:
@@ -1126,7 +1137,7 @@ async def get_report(exploration_id: str, request: Request) -> FileResponse:
         with candidate.open("rb") as artifact:
             header = artifact.read(8192)
             if any(required not in header for required in (
-                marker, coverage_marker, cost_marker, visual_policy_marker, locale_marker, layout_marker, snapshot_marker,
+                marker, coverage_marker, cost_marker, visual_policy_marker, locale_marker, layout_marker, flow_marker, snapshot_marker,
             )):
                 return False
             artifact.seek(max(candidate.stat().st_size - 1024, 0))
@@ -1147,6 +1158,7 @@ async def get_report(exploration_id: str, request: Request) -> FileResponse:
             Path(getfile(visual_review_counts)).stat().st_mtime,
             Path(getfile(localize_report_presentation)).stat().st_mtime,
             Path(getfile(render_premium_report)).stat().st_mtime,
+            Path(getfile(classify_case_flows)).stat().st_mtime,
             (REPORT_ASSETS / "premium.css").stat().st_mtime,
             (REPORT_ASSETS / "journey.css").stat().st_mtime,
             (REPORT_ASSETS / "premium.js").stat().st_mtime,
@@ -1161,9 +1173,7 @@ async def get_report(exploration_id: str, request: Request) -> FileResponse:
         with NamedTemporaryFile(dir=allowed, suffix=".html", delete=False) as temporary:
             temporary_path = Path(temporary.name)
         try:
-            StandaloneHtmlReport(request.app.state.settings.artifact_dir).generate(
-                snapshot, str(temporary_path)
-            )
+            suites.render_report(snapshot, temporary_path, request.app.state.settings.artifact_dir)
             temporary_path.replace(updated)
         finally:
             temporary_path.unlink(missing_ok=True)

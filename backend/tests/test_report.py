@@ -576,7 +576,7 @@ def test_report_observation_does_not_invent_page_phase_request_or_failure(tmp_pa
     path = tmp_path / "report.html"
     StandaloneHtmlReport(tmp_path).generate(run, str(path))
     document = path.read_text()
-    observations = document.split('<section id="execution-observations"', 1)[1]
+    observations = document.split('<section id="execution-observations"', 1)[1].split('</section>', 1)[0]
     assert "Página:" not in observations and "Fase registrada:" not in observations
     assert "Requisição:" not in observations and "Destino da requisição:" not in observations
     assert "unsupported-fallback" not in document

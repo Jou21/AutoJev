@@ -1,0 +1,64 @@
+.planned-workspace .suite-page-heading { align-items: center; }
+.planned-toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.planned-toolbar .suite-search { flex: 1; min-width: 240px; }
+.planned-toolbar select { width: auto; max-width: 310px; min-height: 40px; }
+.planned-results, .planned-list { display: grid; min-width: 0; gap: 12px; }
+.planned-results-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; color: var(--muted); font-size: 11px; }
+.planned-results-heading p { margin: 0; }
+.suite-workspace .planned-card { display: flex; align-items: center; gap: 18px; padding: 22px; transition: border-color .15s; }
+.suite-workspace .planned-card:hover { border-color: #f2c45b55; }
+.planned-card-main { flex: 1; min-width: 0; }
+.planned-card-title { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.planned-card-title h2 { overflow-wrap: anywhere; }
+.planned-card-title .suite-status { color: #c1a9ee; background: #ab94d609; border-color: #ab94d640; }
+.planned-card-meta { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 10px; color: var(--muted); font-size: 11px; }
+.planned-card-meta > span { display: inline-flex; align-items: center; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
+.planned-card-meta svg { flex-shrink: 0; }
+.planned-suite-link { margin-top: 10px; font-size: 10px; }
+.planned-continue { flex-shrink: 0; }
+.planned-footnote { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.7; }
+.planned-empty p { max-width: 450px; margin: 0; font-size: 12px; line-height: 1.8; }
+@media (max-width: 1000px) {
+  .suite-workspace .planned-card { flex-wrap: wrap; }
+  .planned-continue { margin-left: 64px; }
+}
+@media (max-width: 640px) {
+  .planned-workspace .suite-page-heading { align-items: stretch; flex-direction: column; gap: 14px; }
+  .planned-toolbar .suite-search { min-width: 0; flex-basis: 100%; }
+  .planned-toolbar select { flex: 1; min-width: 0; max-width: none; }
+  .suite-workspace .planned-card { gap: 14px; padding: 16px; }
+  .planned-card > .suite-app-icon { width: 36px; height: 36px; border-radius: 10px; }
+  .planned-card-main { flex-basis: calc(100% - 50px); }
+  .planned-card-title h2 { font-size: 14px; }
+  .planned-card-meta { gap: 8px; }
+  .planned-card-meta > span { flex-basis: 100%; }
+  .planned-continue { width: 100%; margin-left: 0; }
+  .planned-results-heading { align-items: flex-start; font-size: 10px; }
+  .planned-results-heading > span { text-align: right; }
+  .suite-workspace .planned-empty { padding: 28px 18px !important; }
+}
+
+.planned-workspace > .planned-toolbar, .planned-workspace > .planned-footnote { flex-shrink: 0; }
+.planned-workspace .planned-toolbar { gap: 8px; }
+.planned-workspace .planned-toolbar > .button { min-height: 34px; padding: 6px 10px; font-size: 11px; }
+.planned-workspace .planned-results { display: flex; flex-direction: column; flex: 1; min-height: 0; gap: 10px; overflow: auto; scrollbar-width: thin; }
+.planned-workspace .planned-results-heading { flex-shrink: 0; }
+.planned-workspace .planned-list { display: flex; flex-direction: column; gap: 6px; }
+.suite-workspace .planned-card { flex-wrap: nowrap; gap: 12px; padding: 12px; border-radius: 9px; }
+.planned-card > .suite-app-icon { width: 34px; height: 34px; border-radius: 9px; }
+.planned-card-title h2 { font-size: 13px; }
+.planned-card-title .suite-status { padding: 2px 7px; font-size: 9px; }
+.planned-card-meta { gap: 5px 14px; margin-top: 5px; }
+.planned-suite-link { margin-top: 5px; font-size: 10px; }
+.planned-continue { min-height: 34px; margin: 0; padding: 7px 10px; font-size: 11px; }
+.planned-footnote { font-size: 10px; }
+.suite-workspace .planned-empty { align-content: center; flex: 1; gap: 12px; padding: 28px 18px !important; }
+@media (max-width: 640px) {
+  .planned-workspace .planned-toolbar .suite-search { min-width: 0; flex-basis: 100%; }
+  .suite-workspace .planned-card { flex-wrap: wrap; gap: 8px; }
+  .planned-card > .suite-app-icon { display: none; }
+  .planned-card-main { flex-basis: 100%; }
+  .planned-card-meta > span { flex-basis: auto; }
+  .planned-continue { width: auto; margin-left: auto; }
+  .planned-workspace .planned-results-heading > span { font-size: 10px; }
+}

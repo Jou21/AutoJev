@@ -9,6 +9,7 @@ from collections import Counter, OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from collections.abc import Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from autojev.services.scenario_timeline import prepare_scenario_timelines
@@ -62,15 +63,17 @@ CHECK_EXPLANATIONS = {
 
 
 class StandaloneHtmlReport:
-    """Renders a self-contained, escaped HTML report with inline PNG evidence."""
+    """Escaped, self-contained HTML by default; app-only previews may link captures."""
 
     _GENERIC_RESOURCE_ERROR = re.compile(
         r"failed to load resource:.*?status(?:\s+(?:of|code))?\s+(\d{3})",
         re.IGNORECASE,
     )
 
-    def __init__(self, artifact_root: Path) -> None:
+    def __init__(self, artifact_root: Path, *, image_url: Callable[[str, str], str] | None = None) -> None:
         self.artifact_root = artifact_root.resolve()
+        self.image_url = image_url
+        self.online_image_sizes: dict[str, int] = {}
 
     def _image_path(self, exploration_id: str, relative_path: str) -> Path | None:
         candidate = (
@@ -88,6 +91,10 @@ class StandaloneHtmlReport:
         candidate = self._image_path(exploration_id, relative_path)
         if candidate is None:
             return None
+        if self.image_url is not None:
+            url = self.image_url(exploration_id, candidate.name)
+            self.online_image_sizes[url] = candidate.stat().st_size
+            return url
         mime = {".png": "image/png", ".webp": "image/webp"}.get(candidate.suffix.lower(), "image/jpeg")
         return f"data:{mime};base64,{base64.b64encode(candidate.read_bytes()).decode('ascii')}"
 

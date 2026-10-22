@@ -131,6 +131,9 @@ class SQLiteRepository:
         """
         with self._lock, self._connect() as connection:
             connection.executescript(schema)
+            from autojev.adapters.execution_plans import SCHEMA as execution_plans_schema
+            connection.executescript(execution_plans_schema)
+            connection.execute("PRAGMA optimize")
             try:
                 connection.execute("ALTER TABLE screenshots ADD COLUMN image_source TEXT NOT NULL DEFAULT 'browser_capture'")
             except sqlite3.OperationalError as exc:

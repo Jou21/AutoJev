@@ -2,6 +2,7 @@ from copy import deepcopy
 from datetime import datetime
 import json
 import re
+import pytest
 
 from autojev.adapters.report import StandaloneHtmlReport
 from autojev.services.scenario_timeline import TIMELINE_VERSION
@@ -38,6 +39,69 @@ def render(tmp_path, run):
 
 def data(document):
     return json.loads(re.search(r'<script id="report-data" type="application/json">(.*?)</script>', document, re.S)[1])
+
+
+def test_named_functional_flows_preserve_case_identity_evidence_and_results(tmp_path):
+    run = fixture()
+    run["scenarios"][0]["title"] = "Criar cliente"
+    run["scenarios"][1].update(title="Editar cliente", status="BLOCKED")
+    run["scenarios"] += [
+        {"id": "CT003", "title": "Consultar cliente", "status": "FAIL", "evidence": {}},
+        {"id": "CT004", "title": "Excluir cliente", "status": "SKIPPED", "evidence": {}},
+        {"id": "CT005", "title": "Preencher campo nome", "status": "PASS", "evidence": {"assertions": [{"kind": "field_retains_value", "passed": True}]}},
+    ]
+    before = deepcopy(run)
+    document = render(tmp_path, run)
+    payload = data(document)
+    assert 'data-report-flows="functional-flows-v1"' in document[:8192]
+    assert [case["id"] for case in payload["cases"]] == ["CT001", "CT002", "CT003", "CT004", "CT005"]
+    assert [case["status"] for case in payload["cases"]] == ["PASS", "BLOCKED", "FAIL", "SKIPPED", "PASS"]
+    assert [[item["name"] for item in case["flow_classification"]["memberships"]] for case in payload["cases"]] == [
+        ["Cadastrar cliente"], ["Editar cliente"], ["Consultar cliente"], ["Excluir cliente"], []]
+    flows = {flow["name"]: flow for flow in payload["functional_flows"]}
+    assert flows["Cadastrar cliente"]["case_ids"] == ["CT001"]
+    assert flows["Editar cliente"]["counts"]["BLOCKED"] == 1
+    assert flows["Consultar cliente"]["approval_percent"] == 0
+    assert flows["Excluir cliente"]["approval_percent"] is None
+    assert document.count('<details class="scenario"') == 5
+    assert 'id="crud-filter"' not in document
+    assert 'data-case-focus="primary"' not in document
+    assert 'data-select-flow="unclassified"' in document
+    for name in flows:
+        assert name in document
+    assert 'class="functional-flow-card"' in document
+    assert "não representam cobertura" in document
+    assert run == before
+
+
+@pytest.mark.parametrize("scope", ["initial", "consolidated", "round"])
+def test_flow_classification_is_present_in_all_export_scopes_and_safe_for_empty_reports(tmp_path, scope):
+    run = fixture()
+    run["suite_context"] = {"scope": scope, "root_id": "root"}
+    document = render(tmp_path, run)
+    assert all(case["flow_classification"]["version"] == "functional-flows-v1" for case in data(document)["cases"])
+    assert data(document)["functional_flows"]
+    assert data(document)["suite_context"]["scope"] == scope
+    run["scenarios"] = []
+    empty = render(tmp_path, run)
+    assert data(empty)["cases"] == []
+    assert data(empty)["functional_flows"] == []
+    assert "Nenhum fluxo identificado" in empty
+    assert 'data-flow-unclassified-count>0</span>' in empty
+
+
+@pytest.mark.parametrize("scope", ["initial", "consolidated", "round"])
+def test_export_context_is_metadata_not_a_banner_above_the_report(tmp_path, scope):
+    run = fixture()
+    run["suite_context"] = {"root_id": "parent", "scope": scope, "label": "Execução inicial · resultado histórico preservado",
+                            "round_name": "Rodada", "generated_at": "2026-10-20T00:01:39Z", "note": "Contexto preservado nos dados."}
+    before = deepcopy(run)
+    document = render(tmp_path, run)
+    assert "suite-report-context" not in document
+    assert 'aria-label="Contexto da exportação"' not in document
+    assert data(document)["suite_context"] == run["suite_context"]
+    assert [(case["id"], case["status"]) for case in data(document)["cases"]] == [("CT001", "PASS"), ("CT002", "FAIL")]
+    assert run == before
 
 
 def test_premium_has_eight_views_offline_assets_and_one_authoritative_card_per_ct(tmp_path):

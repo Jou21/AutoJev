@@ -109,7 +109,7 @@ async def test_planner_click_drag_reorder_and_explicit_confirmation_preserve_res
             assert len(opened) == 1
             assert opened[0][1:] == ["_blank", "noopener,noreferrer"]
             target = opened[0][0]
-            assert target.startswith(ORIGIN + "/#/reexecutar/latest-rerun/CT001?")
+            assert target.startswith(ORIGIN + "/#/planejar/latest-rerun/CT001?")
             plan = json.loads(parse_qs(target.split("?", 1)[1])["capture_plan"][0])
             assert [(item["gap"], item["order"]) for item in plan["checkpoints"]] == [(1, 0), (2, 1)]
             assert set(plan) == {"version", "checkpoints"}
@@ -155,7 +155,7 @@ async def test_planner_cancel_export_and_historical_plans_are_isolated(tmp_path)
             await page.locator('#step-picker [data-step-choice="wait_print"]').click()
             await page.locator("#case-editor-rerun").click()
             opened = await page.evaluate("window.__opened")
-            assert len(opened) == 1 and "/#/reexecutar/old-rerun/CT001?" in opened[0][0]
+            assert len(opened) == 1 and "/#/planejar/old-rerun/CT001?" in opened[0][0]
             plan = json.loads(parse_qs(opened[0][0].split("?", 1)[1])["capture_plan"][0])
             assert [checkpoint["gap"] for checkpoint in plan["checkpoints"]] == [0]
             drafts = json.loads(await page.locator("#report-drafts").text_content())["cases"]

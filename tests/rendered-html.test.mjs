@@ -33,7 +33,23 @@ test("server-renders the AutoJev application shell", async () => {
   assert.match(html, /AutoJev/);
   assert.match(html, /JEV no comando|Boa exploração começa/);
   assert.match(html, /Nova exploração/);
+  assert.match(html, /Rascunhos/);
+  const nav = html.match(/<nav class="primary-nav"[\s\S]*?<\/nav>/)?.[0];
+  assert.ok(nav);
+  assert.ok(nav.indexOf("Meus testes") < nav.indexOf("Rascunhos"));
+  assert.ok(nav.indexOf("Rascunhos") < nav.indexOf("Sistema"));
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton|Your site is taking shape/i);
+});
+
+test("suite and report planning routes preserve stable identity and capture plans without authorizing execution", async () => {
+  const { parseAppHash } = await timelineComponents();
+  assert.deepEqual(parseAppHash("#/execucoes-planejadas"), { view: "planned" });
+  assert.deepEqual(parseAppHash("#/conjuntos/root?round=round-1"), { view: "explorations", suiteId: "root", planId: undefined,
+    roundId: "round-1", initialCaseId: undefined, initialSourceId: undefined, initialSourceCase: undefined });
+  assert.deepEqual(parseAppHash("#/planejar/child/CT001"), { view: "explorations", suiteId: "child", initialCaseId: "CT001", initialSourceId: "child", initialSourceCase: "CT001" });
+  const plan = { version: 1, checkpoints: [{ id: "db-1", gap: 1, order: 0 }] };
+  assert.deepEqual(parseAppHash("#/planejar/child/CT001?capture_plan=" + encodeURIComponent(JSON.stringify(plan))).capturePlan, plan);
+  assert.deepEqual(parseAppHash("#/planejar/%E0%A4%A/CT001"), { view: "explorations" });
 });
 
 test("removes disposable starter assets and metadata", async () => {
@@ -50,6 +66,55 @@ test("removes disposable starter assets and metadata", async () => {
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
   assert.match(packageJson, /lucide-react/);
   await assert.rejects(access(new URL("app/_sites-preview", root)));
+});
+
+test("catalog result navigation opens its tab before loading and targets the selected CT", async t => {
+  const { openTestSuiteReport } = await timelineComponents();
+  const previousWindow = globalThis.window, sequence = [], blobs = [], revoked = [], timers = [], requests = [];
+  const preview = { opener: {}, closed: false, location: { replace(url) { sequence.push(url); } }, close() { this.closed = true; } };
+  globalThis.window = { location: { origin: "http://localhost:3000" }, open(url, target) { sequence.push([url, target]); return preview; }, setTimeout(callback) { timers.push(callback); } };
+  t.after(() => { if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow; });
+  t.mock.method(URL, "createObjectURL", blob => { blobs.push(blob); return "blob:http://localhost:3000/fixture-" + blobs.length; });
+  t.mock.method(URL, "revokeObjectURL", url => { revoked.push(url); });
+  await openTestSuiteReport(async (path, options) => {
+    assert.equal(preview.opener, null, "The report must not retain access to its originating tab");
+    sequence.push("request"); requests.push({ path, options });
+    return new Response("<html><head></head><body>Evidence</body></html>");
+  }, { root: "root/fixture", scope: "consolidated", caseId: "CT/005", apiBase: "http://localhost:8000/api" });
+  assert.deepEqual(sequence, [["blob:http://localhost:3000/fixture-1", "_blank"], "request", "blob:http://localhost:3000/fixture-2#view/results/CT%2F005"]);
+  assert.deepEqual(requests, [{ path: "/test-suites/root%2Ffixture/report?scope=consolidated&case_id=CT%2F005&preview=true", options: { raw: true } }]);
+  assert.match(await blobs[0].text(), /Abrindo CT\/005/);
+  assert.match(await blobs[0].text(), /role="status"/);
+  assert.match(await blobs[0].text(), /background:#0b1013/);
+  assert.doesNotMatch(await blobs[0].text(), /<script|https?:\/\//);
+  assert.match(await blobs[1].text(), /report-app-runtime/);
+  assert.equal(blobs[0].type, "text/html");
+  assert.deepEqual(revoked, ["blob:http://localhost:3000/fixture-1"]);
+  timers[0]();
+  assert.deepEqual(revoked, ["blob:http://localhost:3000/fixture-1", "blob:http://localhost:3000/fixture-2"]);
+});
+
+test("blocked tabs and report failures never navigate to another CT or leave an empty tab", async t => {
+  const { openTestSuiteReport } = await timelineComponents();
+  const previousWindow = globalThis.window;
+  t.after(() => { if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow; });
+  let calls = 0;
+  const request = async () => { calls++; throw new Error("Relatório indisponível"); };
+  const options = { root: "root", scope: "round", roundId: "round", caseId: "CT005" };
+  globalThis.window = { open() { return null; } };
+  await assert.rejects(openTestSuiteReport(request, options), /Permita a abertura de novas abas/);
+  assert.equal(calls, 0);
+  const preview = { closed: false, location: { replace() { assert.fail("No fallback to overview or another CT"); } }, close() { this.closed = true; } };
+  globalThis.window.open = () => preview;
+  await assert.rejects(openTestSuiteReport(request, options), /Relatório indisponível/);
+  assert.equal(preview.closed, true);
+  assert.equal(calls, 1);
+  preview.closed = false;
+  await openTestSuiteReport(async path => {
+    assert.equal(path, "/test-suites/root/report?scope=round&round_id=round&case_id=CT005&preview=true");
+    preview.closed = true;
+    return { text() { assert.fail("Do not encode a large report after its tab was closed"); } };
+  }, options);
 });
 
 test("offers an optional focused exploration scope", async () => {

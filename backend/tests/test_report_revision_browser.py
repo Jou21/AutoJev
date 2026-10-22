@@ -320,7 +320,7 @@ async def test_execution_timeline_switches_owned_evidence_without_changing_lates
             await expect(page.locator("#case-editor")).to_be_visible()
             assert await page.evaluate("window.__opened") == []
             await page.locator("#case-editor-rerun").click()
-            assert await page.evaluate("window.__opened") == [[ORIGIN + "/#/reexecutar/old-rerun/CT001", "_blank", "noopener,noreferrer"]]
+            assert await page.evaluate("window.__opened") == [[ORIGIN + "/#/planejar/old-rerun/CT001", "_blank", "noopener,noreferrer"]]
             await page.locator("#case-editor-close").click()
             await page.locator('#case-execution-list [data-execution-version="3"]').click()
             await expect(page.locator("#case-selected-execution")).to_contain_text("Cancelada")
@@ -539,7 +539,7 @@ async def test_connected_focus_refreshes_latest_report_in_same_blob_and_hash(tmp
             assert await page.evaluate("window.__opened") == []
             await page.locator("#case-editor-rerun").click()
             opened = await page.evaluate("window.__opened")
-            assert opened == [[ORIGIN + "/#/reexecutar/latest-rerun/CT001", "_blank", "noopener,noreferrer"]]
+            assert opened == [[ORIGIN + "/#/planejar/latest-rerun/CT001", "_blank", "noopener,noreferrer"]]
             await page.locator("#case-editor-close").click()
             async with page.expect_download() as pending:
                 await page.locator("#download-report").click()

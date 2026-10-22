@@ -16,6 +16,9 @@ from autojev.config import settings as default_settings
 from autojev.services.exploration import ExplorationManager
 from autojev.services.visual_review_resume import VisualReviewResumeService
 from autojev.services.scenario_rerun import ScenarioRerunService
+from autojev.services.test_suites import TestSuiteService
+from autojev.api.test_suites import router as test_suites_router
+from autojev.services.planning_assistant import PlanningRecorder
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -44,7 +47,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.visual_review_resume_service = review_resume
         reruns = ScenarioRerunService(manager, runtime_settings)
         app.state.scenario_rerun_service = reruns
+        suites = TestSuiteService(repository, reruns)
+        app.state.test_suite_service = suites
+        recorder = PlanningRecorder(runtime_settings, suites)
+        app.state.planning_recorder = recorder
         yield
+        await recorder.shutdown()
+        await suites.shutdown()
         await reruns.shutdown()
         await review_resume.shutdown()
         await manager.shutdown()
@@ -63,6 +72,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_headers=["Content-Type", "Authorization"],
     )
     app.include_router(router)
+    app.include_router(test_suites_router)
 
     @app.exception_handler(RequestValidationError)
     async def safe_validation_error(request, exc: RequestValidationError) -> JSONResponse:
