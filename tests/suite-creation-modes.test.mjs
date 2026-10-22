@@ -14,7 +14,7 @@ async function compiled(path) {
 }
 const source = await compiled("../app/components/TestSuitesWorkspace.tsx");
 const dependencies = {};
-for (const name of ["suite-planning-chat", "suite-capture-plan", "suite-execution-history", "functional-flows"]) {
+for (const name of ["suite-planning-chat", "suite-capture-plan", "suite-execution-history", "suite-horizontal-rail", "functional-flows"]) {
   const compiledModule = { exports: {} };
   new Function("module", "exports", await compiled(`../app/components/${name}.ts`))(compiledModule, compiledModule.exports);
   dependencies[`./${name}`] = compiledModule.exports;
@@ -104,7 +104,7 @@ async function workspace(t, providedSuite, onReport, initialProps = {}) {
     };
     if (path === "/test-suites/root-fixture/recordings" && options.method === "POST") return { id: "rec-fixture", steps: [], status: "recording", url: suite.app_url };
     if (path === "/test-suites/recordings/rec-fixture/finish" && options.method === "POST") return { id: "rec-fixture", steps: ["Abrir carrinho"], status: "completed", url: suite.app_url };
-    if (path === "/test-suites/root-fixture/assistant" && options.method === "POST") return { reply: "Revise o rascunho.", selected_case_ids: [], new_cases: [{ title: "Carrinho vazio", url: suite.app_url, description: "Proposta", preconditions: [], steps: ["Abrir carrinho"], expected_result: "Vazio" }], usage: {} };
+    if (path === "/test-suites/root-fixture/assistant" && options.method === "POST") return initialProps.assistantReply || { reply: "Revise o rascunho.", selected_case_ids: [], new_cases: [{ title: "Carrinho vazio", url: suite.app_url, description: "Proposta", preconditions: [], steps: ["Abrir carrinho"], expected_result: "Vazio" }], usage: {} };
     if (path === "/test-suites/root-fixture/cases" && options.method === "POST") {
       const id = "CT" + String(Math.max(...suite.cases.map(item => Number(item.id.slice(2))), 0) + 1).padStart(3, "0");
       const item = { ...JSON.parse(options.body), id, mode: "manual", revision: 1 };
@@ -583,6 +583,68 @@ test("opening and finishing CT selection preserves order, filters and existing c
   assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
 });
 
+test("the script has two independent horizontal rails and long explanations are collapsed", async t => {
+  const suite = suiteFixture();
+  suite.cases.push({ ...suite.cases[0], id: "CT003", title: "Consultar produto", steps: ["Abrir detalhe", "Conferir produto"] });
+  const view = await workspace(t, suite, undefined, { initialCaseId: "CT001" });
+  await view.chat().props.onSend("Adicione CT003", null); await view.settle();
+  assert.equal(view.all().filter(node => node.props.className?.includes("suite-horizontal-rail")).length, 2);
+  assert.equal(view.find(node => node.props["aria-label"] === "Testes selecionados, rolagem horizontal").props.tabIndex, 0);
+  assert.equal(view.button("Ver etapas de CT001: Ordenar produtos").props["aria-pressed"], true);
+  await view.click("Ver etapas de CT003: Consultar produto");
+  assert.equal(view.button("Ver etapas de CT003: Consultar produto").props["aria-pressed"], true);
+  assert.equal(view.all().some(node => node.props["aria-label"] === "Etapas de CT003, rolagem horizontal"), true);
+  const details = view.find(node => node.type === "details" && node.props.className === "suite-rail-details");
+  assert.ok(!details.props.open);
+  assert.match(text(details), /Lista ordenada/);
+  const plan = view.find(node => node.props.className === "panel suite-case-plan suite-flow-lane");
+  assert.equal([...elements(plan)].some(node => node.props.className === "section-kicker"), false);
+  assert.equal([...elements(plan)].some(node => node.props.className === "suite-print-palette"), false);
+  assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
+});
+
+test("horizontal order controls and removing the active card keep the remaining test and its print plan", async t => {
+  const suite = suiteFixture();
+  suite.cases.push({ ...suite.cases[0], id: "CT003", title: "Consultar produto" });
+  const capture = { version: 1, checkpoints: [{ id: "keep-print", gap: 0, order: 0 }] };
+  const view = await workspace(t, suite, undefined, { initialCaseId: "CT001", initialCapturePlan: capture });
+  await view.chat().props.onSend("Adicione CT003", null); await view.settle();
+  await view.click("Mover CT003 para esquerda");
+  assert.deepEqual(plannedIds(view), ["CT003", "CT001"]);
+  await view.click("Mover CT003 para direita");
+  assert.deepEqual(plannedIds(view), ["CT001", "CT003"]);
+  await view.click("Ver etapas de CT003: Consultar produto");
+  await view.click("Retirar CT003 desta execução");
+  assert.deepEqual(plannedIds(view), ["CT001"]);
+  assert.equal(view.button("Ver etapas de CT001: Ordenar produtos").props["aria-pressed"], true);
+  assert.equal(view.all().some(node => node.props["data-checkpoint-id"] === "keep-print"), true);
+  assert.equal(view.calls.some(call => call.method !== "GET"), false);
+});
+
+test("square step cards keep a plus before and after each pause and persist the exact insertion order", async t => {
+  const view = await workspace(t, suiteFixture(), undefined, { initialCaseId: "CT001" });
+  await view.click("Adicionar print na posição 0");
+  await view.click("Adicionar print após pausa db-1");
+  assert.equal(view.all().filter(node => node.props["data-checkpoint-id"]).length, 2);
+  assert.equal(view.button("Adicionar print após pausa db-2").props["data-insertion-index"], 2);
+  assert.equal(view.button("Adicionar print na posição 1").props["data-gap"], 1);
+  await view.click("Salvar rascunho");
+  const body = view.calls.find(call => call.path.endsWith("/plans")).body;
+  assert.deepEqual(body.items[0].capture_plan.checkpoints, [{ id: "db-1", gap: 0, order: 0 }, { id: "db-2", gap: 0, order: 1 }]);
+  assert.equal(view.calls.some(call => /\/(start|cases|recordings)$/.test(call.path)), false);
+});
+
+test("manual scripts use the same lower rail without pretending to support automatic print pauses", async t => {
+  const suite = suiteFixture(); suite.cases[0].mode = "manual";
+  suite.cases[0].steps = ["Abrir o formulário", "Preencher dados de teste", "Conferir o registro salvo"];
+  const view = await workspace(t, suite, undefined, { initialCaseId: "CT001" });
+  assert.equal(view.all().filter(node => node.props.className === "suite-source-step").length, 3);
+  assert.equal(view.all().some(node => node.props["data-gap"] !== undefined), false);
+  const details = view.find(node => node.type === "details" && node.props.className === "suite-rail-details");
+  assert.ok(!details.props.open); assert.match(text(details), /Roteiro manual.*Conferir o registro salvo/);
+  assert.equal(view.calls.some(call => call.method !== "GET"), false);
+});
+
 test("narrow-screen pane switching keeps the editor, conversation, draft message and chosen model", async t => {
   const view = await workspace(t, undefined, undefined, { initialCaseId: "CT001" });
   await view.click("Adicionar teste");
@@ -625,10 +687,130 @@ test("creation and review stay inside the work pane and review requires explicit
   assert.equal(view.focus.at(-1).name, "suite-plan-review");
   assert.equal(view.scroll.at(-1).name, "suite-plan-review");
   assert.equal(view.find(node => node.props.id === "suite-case-selector").props.hidden, true);
-  assert.equal(view.button("Confirmar e executar 1 CTs").props.disabled, true);
+  assert.equal(view.button("Executar 1 teste").props.disabled, true);
   assert.deepEqual(view.calls.filter(call => call.method === "POST").map(call => call.path), ["/test-suites/root-fixture/plans", "/test-suites/rounds/plan-fixture/validate"]);
   assert.deepEqual(view.calls.find(call => call.path.endsWith("/plans")).body.items.map(item => item.case_id), ["CT001"]);
   assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
+});
+
+test("saving a draft exposes its destination without starting or changing the selected tests", async t => {
+  const navigations = [];
+  const view = await workspace(t, catalogFixture(), undefined, { initialCaseId: "CT050", navigate: hash => navigations.push(hash) });
+  await view.click("Testes"); await markCatalog(view, "CT067"); await view.click("Preparar execução (2)");
+  assert.equal(view.all().some(node => node.props.className === "suite-draft-link text-button"), false);
+  await view.click("Salvar rascunho");
+  assert.match(text(view.find(node => node.props.className === "suite-plan-state")), /Salvo em Rascunhos/);
+  assert.deepEqual(plannedIds(view), ["CT050", "CT067"]);
+  const before = view.calls.length;
+  await view.click("Ver rascunhos");
+  assert.deepEqual(navigations, ["#/execucoes-planejadas"]);
+  assert.equal(view.calls.length, before);
+  assert.deepEqual(view.calls.find(call => call.method === "POST").body.items.map(item => item.case_id), ["CT050", "CT067"]);
+  assert.equal(view.calls.some(call => /\/(start|discover|recordings)$/.test(call.path)), false);
+});
+
+test("review is a focused stage and returning to the script preserves checkpoints but clears consent", async t => {
+  const capture = { version: 1, checkpoints: [{ id: "review-print", gap: 0, order: 0 }] };
+  const view = await workspace(t, undefined, undefined, { initialCaseId: "CT001", initialCapturePlan: capture });
+  await view.click("Revisar execução");
+  assert.equal(view.has("suite-plan-review"), true);
+  assert.equal(view.all().some(node => node.props.className === "panel suite-case-plan"), false);
+  assert.equal(view.all().some(node => node.props.className === "suite-selected-list"), false);
+  assert.equal(view.all().some(node => node.type === "button" && text(node) === "Revisar execução"), false);
+  const bar = view.find(node => node.type === "header" && node.props.className === "suite-review-bar");
+  assert.equal([...elements(bar)].some(node => node.type === "button" && text(node) === "Executar 1 teste"), true);
+  assert.equal(view.all().some(node => node.props.className === "suite-plan-footer"), false);
+  assert.equal(view.all().some(node => node.props.className === "suite-detail-header"), false);
+  assert.equal(view.all().some(node => node.props.className === "suite-plan-heading suite-plan-toolbar"), false);
+  const consent = [...elements(view.find(node => node.type === "label" && text(node).startsWith("Revisei os testes")))].find(node => node.type === "input");
+  consent.props.onChange({ target: { checked: true } }); await view.settle();
+  assert.equal(view.button("Executar 1 teste").props.disabled, false);
+  await view.click("Ajustar");
+  assert.equal(view.has("suite-plan-review"), false);
+  assert.equal(view.all().some(node => node.props["data-checkpoint-id"] === "review-print"), true);
+  assert.deepEqual(plannedIds(view), ["CT001"]);
+  assert.equal(view.focus.at(-1).name, "suite-planning-heading");
+  await view.click("Revisar execução");
+  assert.equal(view.button("Executar 1 teste").props.disabled, true);
+  assert.equal(view.calls.filter(call => call.path.endsWith("/plans")).length, 1);
+  assert.equal(view.calls.filter(call => call.path.endsWith("/validate")).length, 2);
+  assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
+});
+
+test("a new test opened from review returns to editing without dropping the selection or executing", async t => {
+  const view = await workspace(t, undefined, undefined, { initialCaseId: "CT001" });
+  await view.click("Revisar execução");
+  await view.click("Ajustar"); await view.click("Adicionar teste"); await view.click("Escrever teste");
+  assert.equal(view.has("suite-plan-review"), false);
+  assert.equal(view.has("suite-case-editor"), true);
+  assert.equal(view.button("Salvar e adicionar").props.type, "submit");
+  assert.deepEqual(plannedIds(view), ["CT001"]);
+  assert.equal(view.calls.some(call => /\/(cases|start)$/.test(call.path)), false);
+});
+
+test("review uses all available width for a long exact list, with one execution action and no duplicate headers", async t => {
+  const suite = suiteFixture();
+  suite.cases = Array.from({ length: 50 }, (_, i) => ({ ...suite.cases[0], id: `CT${String(i + 1).padStart(3, "0")}`, title: `Teste ${i + 1}` }));
+  const view = await workspace(t, suite, undefined, { initialCaseId: "CT001" });
+  await view.click("Escolher testes"); await view.click("Adicionar filtrados"); await view.click("Revisar execução");
+  assert.equal(view.all().filter(node => node.props.role === "listitem" && node.props.className === "suite-review-case").length, 50);
+  assert.equal(view.all().filter(node => node.type === "button" && text(node) === "Executar 50 testes").length, 1);
+  assert.equal(view.all().some(node => node.props.className === "suite-planner-layout with-chat"), false);
+  assert.equal(view.all().some(node => node.props["aria-label"] === "Etapas de preparação"), false);
+  assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
+});
+
+test("CRUD analysis compares existing and missing tests but additions and proposals still require acceptance", async t => {
+  const proposal = { title: "Cadastrar cliente", url: "https://fixture.invalid", description: "Proposta", preconditions: [], steps: ["Cadastrar cliente"], expected_result: "Cliente persistido" };
+  const assistantReply = { reply: "Há uma referência de consulta. Revise as lacunas.", selected_case_ids: ["CT001"], new_cases: [proposal], usage: {},
+    coverage: { screen: "Clientes", operations: [
+      { operation: "read", status: "existing", case_ids: ["CT001"], new_case_indexes: [], reason: "Teste cadastrado para consulta." },
+      { operation: "create", status: "gap", case_ids: [], new_case_indexes: [0], reason: "Objetivo não encontrado no catálogo." },
+      { operation: "update", status: "uncertain", case_ids: [], new_case_indexes: [], reason: "Confirmar o comportamento." },
+      { operation: "delete", status: "not_applicable", case_ids: [], new_case_indexes: [], reason: "O usuário informou que não há exclusão." },
+    ] } };
+  const view = await workspace(t, undefined, undefined, { assistantReply });
+  await view.click("Preparar execução");
+  const llm = { provider_id: "fixture", model_id: "planner" };
+  await view.chat().props.onSend("Meu teste consiste em testar o CRUD da tela Clientes", llm); await view.settle();
+  const coverage = view.find(node => node.props["aria-label"] === "Comparação do CRUD com a base");
+  assert.match(text(coverage), /CRUD · Clientes.*Já existe.*Não encontrado.*Precisa conferir.*Não se aplica/);
+  assert.deepEqual(plannedIds(view), []);
+  const writes = view.calls.filter(call => call.method !== "GET");
+  assert.equal(writes.length, 1); assert.ok(writes[0].path.endsWith("/assistant"));
+  await view.click("Incluir na execução: 1");
+  assert.deepEqual(plannedIds(view), ["CT001"]);
+  await view.click("Revisar: Cadastrar cliente");
+  assert.equal(view.field("Título").props.value, proposal.title);
+  assert.equal(view.calls.some(call => /\/(cases|start)$/.test(call.path)), false);
+  await view.submit();
+  assert.equal(view.all().some(node => node.props["aria-label"] === "Comparação do CRUD com a base"), false, "Do not retain dangling indexes after saving a proposal");
+  assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
+});
+
+test("a failed draft save keeps the selection and never advertises a successful save", async t => {
+  const view = await workspace(t, undefined, undefined, { initialCaseId: "CT001", rejectWrite: () => true });
+  await view.click("Salvar rascunho");
+  assert.match(text(view.find(node => node.props.role === "alert")), /alterado em outra tela/);
+  assert.deepEqual(plannedIds(view), ["CT001"]);
+  assert.equal(view.all().some(node => node.props.className === "suite-draft-link text-button"), false);
+  assert.match(text(view.find(node => node.props.className === "suite-plan-state")), /Não salvo/);
+  assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
+});
+
+test("compact creation choices apply to both maintenance and preparation without hiding recording consent", async t => {
+  const css = await readFile(new URL("../app/components/TestSuitesWorkspace.css", import.meta.url), "utf8");
+  assert.match(css, /\.suite-planner-view \.suite-plan-center:has\(\.suite-case-form\) \.suite-mode-cards\s*\{\s*grid-template-columns: repeat\(3, minmax\(0, 1fr\)\)/);
+  const view = await workspace(t, undefined, undefined, { initialCaseId: "CT001" });
+  await view.click("Adicionar teste"); await view.click("Escrever teste");
+  await view.change("Título", "Minha proposta");
+  await view.click("Gravar minha navegação");
+  assert.equal(view.has("suite-case-editor"), false);
+  assert.equal(view.has("suite-record-confirmation"), true);
+  assert.match(text(view.find(node => node.props.id === "suite-record-confirmation")), /podem alterar dados.*não uma automação pronta/);
+  await view.click("Escrever teste");
+  assert.equal(view.field("Título").props.value, "Minha proposta");
+  assert.equal(view.calls.some(call => call.method !== "GET"), false);
 });
 
 test("planner responsive styles reserve space for the composer and use pane tabs instead of stacking chat below", async () => {

@@ -47,6 +47,16 @@ test("long conversations and suggested actions stay in the log without duplicati
   assert.doesNotMatch(html, /suite-chat-welcome/);
 });
 
+test("the welcome invites comparing a named screen's CRUD with the existing base without sending automatically", () => {
+  for (const purpose of ["base", "execution"]) {
+    const html = render({ purpose });
+    assert.match(html, /CRUD da tela \[nome\]/);
+    assert.match(html, /Comparo com sua base/);
+    assert.match(html, /Você revisa antes de adicionar/);
+    assert.match(html, /aria-label="Mensagem para o assistente"/);
+  }
+});
+
 test("busy, error and unsafe model text do not replace the message composer", () => {
   const html = render({ busy: true, error: "A resposta não chegou. Tente novamente.", messages: [
     { role: "assistant", content: '<script>alert("x")</script> **Revise** `CT001`' },

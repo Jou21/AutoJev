@@ -69,6 +69,16 @@
 .suite-chat .suite-suggestions > .button { width: 100%; justify-content: center; min-height: 36px; padding: 8px; border-color: #d6bd763c; border-radius: 9px; background: #d6bd7607; color: #e3ca8c; font-size: 10px; }
 .suite-chat .suite-suggested-case { border-radius: 9px; }
 .suite-chat .suite-suggestions > small { color: #98a1a9; font-size: 9px; line-height: 1.7; }
+.suite-coverage h4 { margin: 0; color: #e2e7eb; font-size: 13px; }
+.suite-coverage > p, .suite-coverage > div > p { margin: 5px 0 8px; color: #a8b3bc; font-size: 11px; line-height: 1.6; }
+.suite-coverage > div { padding: 9px 0; border-top: 1px solid #ffffff0d; }
+.suite-coverage header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 4px; font-size: 11px; }
+.suite-coverage header > span { color: #d8bb80; font-size: 10px; }
+.suite-coverage [data-coverage-status="existing"] header > span { color: #70cf9c; }
+.suite-coverage-existing { display: flex; flex-wrap: wrap; gap: 5px; }
+.suite-coverage-existing > button { display: inline-flex; align-items: center; gap: 4px; min-height: 28px; padding: 4px 7px; border: 1px solid #f2c45b45; border-radius: 6px; background: #f2c45b08; color: #e3ca8c; font-size: 11px; }
+.suite-coverage-proposal { display: flex; align-items: start; gap: 5px; width: 100%; padding: 6px 0; border: 0; background: none; color: #bdace2; font-size: 11px; line-height: 1.5; text-align: left; }
+.suite-coverage-proposal svg { flex-shrink: 0; margin-top: 2px; }
 @container planning-chat (max-height: 420px) { .suite-chat .suite-chat-welcome { gap: 7px; padding: 4px 0; } .suite-chat-welcome > span { display: none; } .suite-chat .suite-chat-welcome > strong { font-size: 17px; } .suite-chat-welcome > div > button { padding: 7px 9px; } .planning-chat-bottom > p { display: none; } }
 @container planning-chat (max-height: 260px) { .planning-chat-heading { display: none; } }
 @media (max-height: 550px) { .planning-chat-bottom { padding-top: 5px; padding-bottom: 7px; } .planning-chat-bottom > p { display: none; } }

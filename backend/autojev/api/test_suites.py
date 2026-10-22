@@ -13,7 +13,12 @@ from starlette.concurrency import run_in_threadpool
 
 from autojev.adapters.execution_plans import PlanConflict
 from autojev.adapters.repository import NotFoundError
-from autojev.api.schemas import ApiModel, ModelSelectionInput, ScenarioCapturePlanInput, ScenarioRerunInput
+from autojev.api.schemas import (
+    ApiModel,
+    ModelSelectionInput,
+    ScenarioCapturePlanInput,
+    ScenarioRerunInput,
+)
 
 router = APIRouter(prefix="/api/test-suites")
 
@@ -109,10 +114,31 @@ class AssistantInput(ApiModel):
     llm: ModelSelectionInput | None = None
 
 
+class CoverageOperation(ApiModel):
+    operation: Literal["create", "read", "update", "delete"]
+    status: Literal["existing", "gap", "uncertain", "not_applicable"]
+    case_ids: list[StrictStr] = Field(default_factory=list, max_length=50)
+    new_case_indexes: list[StrictInt] = Field(default_factory=list, max_length=8)
+    reason: StrictStr = Field(min_length=1, max_length=1200)
+
+
+class CoverageAnalysis(ApiModel):
+    screen: StrictStr = Field(min_length=1, max_length=200)
+    operations: list[CoverageOperation] = Field(min_length=4, max_length=4)
+
+    @field_validator("operations")
+    @classmethod
+    def distinct_operations(cls, values):
+        if len({value.operation for value in values}) != 4:
+            raise ValueError("Analise as quatro operações do CRUD uma vez cada.")
+        return values
+
+
 class AssistantOutput(ApiModel):
     reply: StrictStr = Field(min_length=1, max_length=8000)
     selected_case_ids: list[StrictStr] = Field(default_factory=list, max_length=500)
     new_cases: list[dict] = Field(default_factory=list, max_length=8)
+    coverage: CoverageAnalysis | None = None
 
 
 class DiscoveryInput(ScenarioRerunInput):
@@ -187,8 +213,8 @@ def suite(root_id: str, request: Request):
 
 @router.get("/{source_id}/case-context/{case_id}")
 def case_context(source_id: str, case_id: str, request: Request):
-    from autojev.services.test_suites import definition
     from autojev.services.scenario_revisions import scenario_report_origin
+    from autojev.services.test_suites import definition
     suites = service(request)
     origin = call(lambda: scenario_report_origin(suites.repository, source_id))
     catalog = call(lambda: suites.catalog(source_id))
@@ -227,6 +253,16 @@ async def assistant(root_id: str, body: AssistantInput, request: Request):
         if set(suggestion.selected_case_ids) - known:
             raise ValueError("Unknown IDs")
         new_cases = [DefinitionInput.model_validate({**value, "url": catalog["app_url"]}).model_dump() for value in suggestion.new_cases]
+        if suggestion.coverage:
+            for operation in suggestion.coverage.operations:
+                if set(operation.case_ids) - known or any(index < 0 or index >= len(new_cases) for index in operation.new_case_indexes):
+                    raise ValueError("Invalid coverage references")
+                if operation.status == "existing" and not operation.case_ids:
+                    raise ValueError("An existing test must reference the catalog")
+                if operation.status in {"gap", "not_applicable"} and operation.case_ids:
+                    raise ValueError("A gap cannot claim existing tests")
+                if operation.status == "not_applicable" and operation.new_case_indexes:
+                    raise ValueError("An inapplicable operation cannot propose tests")
         return {**suggestion.model_dump(), "new_cases": new_cases, "usage": usage, "llm": llm, "advisory_only": True}
     except Exception as exc:
         # Provider errors can include request content/headers. No raw exception
@@ -236,7 +272,11 @@ async def assistant(root_id: str, body: AssistantInput, request: Request):
 
 @router.post("/{root_id}/discover", status_code=202)
 async def discover(root_id: str, body: DiscoveryInput, request: Request):
-    from autojev.domain.models import ExplorationOptions, ExplorationRequest, ModelSelection
+    from autojev.domain.models import (
+        ExplorationOptions,
+        ExplorationRequest,
+        ModelSelection,
+    )
     trusted(request)
     suites = service(request)
     root = call(lambda: suites.root(root_id))

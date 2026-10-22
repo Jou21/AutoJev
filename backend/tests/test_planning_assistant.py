@@ -5,12 +5,13 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
-from playwright.async_api import async_playwright
-
-from test_scenario_rerun_api import runtime
+from autojev.domain.models import ProviderModel
 from autojev.services.planning_assistant import RECORD_SCRIPT, public_url
 from autojev.services.test_suites import TestSuiteService as SuiteService
-from autojev.domain.models import ProviderModel
+from playwright.async_api import async_playwright
+from test_scenario_rerun_api import (
+    runtime as runtime,  # noqa: PLC0414 -- register the imported pytest fixture
+)
 
 
 def test_assistant_only_suggests_validated_cases_and_does_not_save_or_dispatch(runtime):
@@ -49,6 +50,90 @@ def test_unknown_ids_and_unsafe_model_output_are_never_applied(runtime):
     assert response.status_code == 409
     assert "execute_sql" not in response.text
     assert not app.state.test_suite_service.store.list(root)
+
+
+def crud_proposal():
+    return {"reply": "Revise a comparação do catálogo; os rascunhos não foram executados.",
+            "selected_case_ids": ["CT001"], "new_cases": [
+                {"title": "Cadastrar cliente", "description": "Proposta", "preconditions": [],
+                 "steps": ["Criar cliente com dados de teste", "Consultar o cliente criado"], "expected_result": "Cliente persistido"}],
+            "coverage": {"screen": "Clientes", "operations": [
+                {"operation": "create", "status": "gap", "case_ids": [], "new_case_indexes": [0], "reason": "Não encontrado neste catálogo."},
+                {"operation": "read", "status": "existing", "case_ids": ["CT001"], "new_case_indexes": [], "reason": "Referência cadastrada, não comprovação de cobertura completa."},
+                {"operation": "update", "status": "uncertain", "case_ids": [], "new_case_indexes": [], "reason": "É preciso esclarecer a edição."},
+                {"operation": "delete", "status": "not_applicable", "case_ids": [], "new_case_indexes": [], "reason": "O usuário informou que não existe exclusão."}]}}
+
+
+def test_crud_request_has_screen_context_and_returns_references_and_gaps_without_saving(runtime):
+    app, client, root = runtime
+    captured = []
+    class Model:
+        async def chat_json(self, model, system, user, **options):
+            captured.append((system, json.loads(user)))
+            return crud_proposal()
+        def drain_usage(self): return {"total_tokens": 20}
+    app.state.exploration_manager._client_for = lambda provider: Model()
+    before = deepcopy(app.state.repository.get_exploration(root))
+    response = client.post(f"/api/test-suites/{root}/assistant", json={"messages": [
+        {"role": "user", "content": "Meu teste consiste em testar o CRUD da tela Clientes"}], "selected_case_ids": ["CT001"]})
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["coverage"]["screen"] == "Clientes"
+    assert result["coverage"]["operations"][1]["case_ids"] == ["CT001"]
+    assert result["coverage"]["operations"][0]["new_case_indexes"] == [0]
+    assert result["new_cases"][0]["url"] == "https://shop.test"
+    system, context = captured[0]
+    assert context["catalog"][0]["url"] == "https://shop.test"
+    assert context["catalog"][0]["description"] == "Registro original"
+    assert context["catalog_scope"] == {"active_count": 1, "included_count": 1, "complete": True, "archived_excluded": True}
+    assert "não comprovam o objetivo completo" in system and "sem duplicar objetivos" in system
+    assert "peça nome/URL" in system and "não encontrado neste catálogo" in system
+    assert app.state.test_suite_service.store.list(root) == []
+    assert app.state.test_suite_service.store.cases(root) == []
+    assert not app.state.scenario_rerun_service.tasks
+    after = app.state.repository.get_exploration(root)
+    assert after["scenarios"] == before["scenarios"]
+
+
+@pytest.mark.parametrize("invalid", ["unknown-id", "missing-reference", "bad-index", "negative-index", "duplicate-operation", "gap-with-id", "inapplicable-proposal"])
+def test_crud_analysis_rejects_invented_or_inconsistent_references(runtime, invalid):
+    app, client, root = runtime
+    proposal = crud_proposal()
+    operations = proposal["coverage"]["operations"]
+    if invalid == "unknown-id": operations[1]["case_ids"] = ["CT999"]
+    elif invalid == "missing-reference": operations[1]["case_ids"] = []
+    elif invalid == "bad-index": operations[0]["new_case_indexes"] = [1]
+    elif invalid == "negative-index": operations[0]["new_case_indexes"] = [-1]
+    elif invalid == "duplicate-operation": operations[3]["operation"] = "create"
+    elif invalid == "gap-with-id": operations[0]["case_ids"] = ["CT001"]
+    elif invalid == "inapplicable-proposal": operations[3]["new_case_indexes"] = [0]
+    class Model:
+        async def chat_json(self, *args, **kwargs): return proposal
+        def drain_usage(self): return {}
+    app.state.exploration_manager._client_for = lambda provider: Model()
+    response = client.post(f"/api/test-suites/{root}/assistant", json={"messages": [{"role": "user", "content": "CRUD de Clientes"}]})
+    assert response.status_code == 409
+    assert not app.state.test_suite_service.store.cases(root)
+    assert not app.state.test_suite_service.store.list(root)
+    assert not app.state.scenario_rerun_service.tasks
+
+
+@pytest.mark.asyncio
+async def test_catalog_scope_is_explicit_when_bounded_and_never_sends_archived_or_private_urls():
+    from autojev.services.planning_assistant import suggest_plan
+    cases = [{"id": f"CT{i:03}", "title": "Consulta", "description": "Descrição", "expected_result": "Lista",
+              "url": "https://shop.test/clientes?token=PRIVATE-QUERY#PRIVATE-FRAGMENT"} for i in range(501)]
+    cases.append({"id": "ARCHIVED", "title": "PRIVATE-ARCHIVED", "archived": True})
+    captured = []
+    class Model:
+        async def chat_json(self, model, system, user, **options):
+            captured.append(json.loads(user)); return {"reply": "Preciso de mais contexto", "selected_case_ids": [], "new_cases": [], "coverage": None}
+        def drain_usage(self): return {}
+    repository = SimpleNamespace(get_exploration=lambda _: {"auxiliary_llm": {"provider_id": "fixture", "model_id": "planner"}}, add_event=lambda *args: None)
+    suites = SimpleNamespace(catalog=lambda _: {"id": "root", "app_url": "https://shop.test", "cases": cases}, repository=repository)
+    await suggest_plan(SimpleNamespace(_client_for=lambda _: Model()), suites, "root", [{"role": "user", "content": "CRUD de Clientes"}], [])
+    assert captured[0]["catalog_scope"] == {"active_count": 501, "included_count": 500, "complete": False, "archived_excluded": True}
+    assert "PRIVATE-" not in json.dumps(captured)
 
 
 def test_chat_can_choose_another_provider_and_model_without_changing_the_suite(runtime):

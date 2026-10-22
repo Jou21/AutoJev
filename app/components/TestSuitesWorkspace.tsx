@@ -5,6 +5,7 @@ import { Archive, ArchiveRestore, ArrowLeft, ArrowRight, Bot, Check, ChevronDown
 import PlanningChat, { type ChatLlm, type PlanningMessage } from "./PlanningChat";
 import { caseAdditionReply, directCaseAddition } from "./suite-planning-chat";
 import { insertCaptureCheckpoint } from "./suite-capture-plan";
+import { bindHorizontalRail, moveRailItem } from "./suite-horizontal-rail";
 import { suiteExecutionHistory } from "./suite-execution-history";
 import FunctionalFlows from "./FunctionalFlows";
 import { caseFlowLabel, flowMemberships, matchesFunctionalFlow, type FlowClassification, type FunctionalFlow } from "./functional-flows";
@@ -19,7 +20,8 @@ type RoundItem = Selection & { mode: string; definition: Definition; state: stri
 type Round = { id: string; root_id: string; name: string; status: string; revision: number; created_at: string; updated_at: string; items: RoundItem[]; count: number; finished_count: number; reason?: string; summary?: Record<string, number> };
 type Suite = { id: string; app_url: string; created_at?: string; initial_count: number; cases: Case[]; functional_flows?: FunctionalFlow[]; rounds: Round[]; discoveries: { session_id: string; kind: string }[]; assistant_model?: string; assistant_llm?: ChatLlm };
 type Group = { id: string; app_url: string; created_at: string; latest_activity: string; initial_count: number; case_count: number; active_count: number; initial_status: string; rounds: Round[]; legacy_runs: { id: string; count: number; status: string; created_at: string }[] };
-type Suggestion = { reply: string; selected_case_ids: string[]; new_cases: Definition[]; llm?: ChatLlm; usage: { total_tokens?: number; cost?: number; cost_known?: boolean } };
+type CoverageOperation = { operation: "create" | "read" | "update" | "delete"; status: "existing" | "gap" | "uncertain" | "not_applicable"; case_ids: string[]; new_case_indexes: number[]; reason: string };
+type Suggestion = { reply: string; selected_case_ids: string[]; new_cases: Definition[]; coverage?: { screen: string; operations: CoverageOperation[] } | null; llm?: ChatLlm; usage: { total_tokens?: number; cost?: number; cost_known?: boolean } };
 type Validation = { revision: number; available: boolean; effects: string[]; items: { case_id: string; available: boolean; reason?: string; code?: string }[] };
 type Recording = { id: string; steps: string[]; url: string; status: string };
 type CreationMode = "write" | "ai" | "record";
@@ -70,6 +72,9 @@ export default function TestSuitesWorkspace(props: Props) {
   const stayButton = useRef<HTMLButtonElement>(null), leaveDialog = useRef<HTMLElement>(null);
   const caseEditor = useRef<HTMLFormElement>(null), caseTitle = useRef<HTMLInputElement>(null);
   const planningHeading = useRef<HTMLHeadingElement>(null), catalogSelectionHelp = useRef<HTMLParagraphElement>(null);
+  const planCenter = useRef<HTMLDivElement>(null);
+  const selectedRail = useRef<HTMLDivElement>(null), stepsRail = useRef<HTMLDivElement>(null);
+  const pendingCheckpoint = useRef<string | null>(null);
   const selectorSearch = useRef<HTMLInputElement>(null), reviewPanel = useRef<HTMLElement>(null);
   const chatComposer = useRef<HTMLTextAreaElement>(null), recordConfirmation = useRef<HTMLButtonElement>(null), recordingFinish = useRef<HTMLButtonElement>(null);
   const archiveTrigger = useRef<HTMLButtonElement | null>(null), archiveConfirmation = useRef<HTMLButtonElement>(null);
@@ -189,11 +194,26 @@ export default function TestSuitesWorkspace(props: Props) {
 
   useEffect(() => {
     if (!planningFocus) return;
+    planCenter.current?.scrollTo?.({ top: 0, behavior: "instant" });
     planningHeading.current?.scrollIntoView({ block: "start", behavior: "instant" });
     planningHeading.current?.focus({ preventScroll: true });
   }, [planningFocus]);
 
   useEffect(() => { if (selectorFocus) selectorSearch.current?.focus({ preventScroll: true }); }, [selectorFocus]);
+  useEffect(() => {
+    const cleanups = [bindHorizontalRail(selectedRail.current), bindHorizontalRail(stepsRail.current)];
+    return () => cleanups.forEach(cleanup => cleanup());
+  }, [loading, tab, validation, selectorOpen, selectedCase, maintenanceOpen, form, newMode, recording, selection.length]);
+  useEffect(() => {
+    stepsRail.current?.scrollTo?.({ left: 0, behavior: "instant" });
+    selectedRail.current?.querySelector?.<HTMLElement>("[aria-pressed='true']")?.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "instant" });
+  }, [selectedCase]);
+  useEffect(() => {
+    if (!pendingCheckpoint.current) return;
+    const point = stepsRail.current?.querySelector?.<HTMLElement>(`[data-checkpoint-id="${pendingCheckpoint.current}"]`);
+    point?.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "instant" });
+    pendingCheckpoint.current = null;
+  }, [selection]);
   useEffect(() => { if (archiveTarget) archiveConfirmation.current?.focus({ preventScroll: true }); }, [archiveTarget]);
   useEffect(() => {
     if (!validation) return;
@@ -206,6 +226,11 @@ export default function TestSuitesWorkspace(props: Props) {
     const target = creationFocus.mode === "write" ? caseTitle.current : creationFocus.mode === "ai" ? chatComposer.current : recordingFinish.current || recordConfirmation.current;
     const area = creationFocus.mode === "write" ? caseEditor.current : target;
     area?.scrollIntoView({ block: creationFocus.mode === "write" ? "start" : "center", behavior: "instant" });
+    if (creationFocus.mode === "write" && caseEditor.current) {
+      const container = caseEditor.current.closest?.<HTMLElement>(".suite-plan-center");
+      const choices = container?.querySelector<HTMLElement>(".suite-new-modes");
+      if (container && choices && choices.offsetHeight + caseEditor.current.offsetHeight + 10 <= container.clientHeight) container.scrollTo({ top: 0, behavior: "instant" });
+    }
     target?.focus({ preventScroll: true });
   }, [creationFocus]);
 
@@ -226,7 +251,7 @@ export default function TestSuitesWorkspace(props: Props) {
     }, recordingFinished);
   };
   const closeEditor = () => { setForm(null); setEditId(null); setCreationMode(null); setNewMode(false); setMaintenanceOpen(false); };
-  const openMaintenance = () => transition(() => { setMaintenanceOpen(tab !== "planner"); setNewMode(true); setCreationMode(null); setSelectorOpen(false); setMobilePane("plan"); });
+  const openMaintenance = () => transition(() => { setValidation(null); setConsent(false); setMaintenanceOpen(tab !== "planner"); setNewMode(true); setCreationMode(null); setSelectorOpen(false); setMobilePane("plan"); });
 
   const perform = async (operation: () => Promise<void>) => {
     setBusy(true); setError(""); try { await operation(); } catch (caught) { setError((caught instanceof Error ? caught.message : "Não foi possível concluir.") + " Suas alterações foram mantidas. Revise o aviso e tente novamente; nada será sobrescrito sem validação."); } finally { setBusy(false); }
@@ -240,7 +265,8 @@ export default function TestSuitesWorkspace(props: Props) {
   const openPlanning = () => {
     setNewMode(false); setCreationMode(null); setSelectorOpen(false); showPlanning();
   };
-  const openSelector = () => { setSelectorOpen(true); setMobilePane("plan"); setSelectorFocus(current => current + 1); };
+  const openSelector = () => { setValidation(null); setConsent(false); setSelectorOpen(true); setMobilePane("plan"); setSelectorFocus(current => current + 1); };
+  const returnToScript = () => { setValidation(null); setConsent(false); setSelectorOpen(false); showPlanning(); };
   const toggleChat = () => {
     if (chatOpen) { setChatOpen(false); setMobilePane("plan"); if (creationMode === "ai") setCreationMode(null); }
     else showChat();
@@ -262,7 +288,7 @@ export default function TestSuitesWorkspace(props: Props) {
     }
     return additions;
   };
-  const toggle = (id: string) => { if (selection.some(item => item.case_id === id)) { setSelection(current => current.filter(item => item.case_id !== id)); change(); } else add([id]); };
+  const toggle = (id: string) => { if (selection.some(item => item.case_id === id)) { setSelection(current => current.filter(item => item.case_id !== id)); if (selectedCase === id) setSelectedCase(selection.find(item => item.case_id !== id)?.case_id || null); change(); } else add([id]); };
   const save = async () => {
     const value = await request<Round>(saved ? `${rootPath}/plans/${encode(saved.id)}` : `${rootPath}/plans`, { method: saved ? "PUT" : "POST", body: JSON.stringify({ name, items: selection, ...(saved ? { expected_revision: saved.revision } : {}) }) });
     setSaved(value); setDirty(false); setCatalogNotice("Rascunho salvo. Você pode continuar em Rascunhos; nenhum teste foi iniciado."); return value;
@@ -283,7 +309,7 @@ export default function TestSuitesWorkspace(props: Props) {
     closeEditor();
     setCatalogNotice(`${item.id} ${editId ? "atualizado: nova versão ainda não executada" : "adicionado à base"}.${include ? " Incluído na próxima execução; nada foi iniciado." : " Nenhuma execução foi criada."}`);
     setMessages(current => [...current, { role: "assistant", content: `${item.id} salvo na base${include ? " e incluído na preparação" : " sem criar execução"}. Esta versão ainda não foi executada.` }]);
-    setSuggestion(current => current ? { ...current, new_cases: current.new_cases.filter(value => value.title !== form.title) } : null);
+    setSuggestion(current => current ? { ...current, coverage: null, new_cases: current.new_cases.filter(value => value.title !== form.title) } : null);
     if (selection.some(value => value.case_id === item.id)) change();
     if (include) {
       setSelection(current => current.some(value => value.case_id === item.id) ? current : [...current, { case_id: item.id }]);
@@ -315,6 +341,7 @@ export default function TestSuitesWorkspace(props: Props) {
     const used = new Set(selection.flatMap(item => item.capture_plan?.checkpoints.map(point => point.id) || []));
     let identity = "db-" + (++serial.current);
     while (used.has(identity)) identity = "db-" + (++serial.current);
+    pendingCheckpoint.current = identity;
     setSelection(current => current.map(item => item.case_id !== selectedCase ? item : { ...item, capture_plan: { version: 1, checkpoints: insertCaptureCheckpoint(item.capture_plan?.checkpoints || [], identity, gap, index) } })); change();
   };
   const printSlot = (gap: number, index: number, afterId?: string) => <button type="button" data-gap={gap} data-insertion-index={index} aria-label={afterId ? `Adicionar print após pausa ${afterId}` : `Adicionar print na posição ${gap}`} title="Adicionar pausa para print" onClick={() => printAt(gap, index)} onDragOver={event => { if (event.dataTransfer.types.includes("application/x-autojev-checkpoint")) event.preventDefault(); }} onDrop={event => { event.preventDefault(); if (event.dataTransfer.getData("application/x-autojev-checkpoint") === "capture") printAt(gap, index); }}><Plus size={18} /></button>;
@@ -382,8 +409,9 @@ export default function TestSuitesWorkspace(props: Props) {
   const roundCount = round?.count ?? round?.items.length ?? 0;
   const finishedCount = round?.finished_count ?? round?.items.filter(item => !!item.result).length ?? 0;
   const comparableRounds = suite.rounds.filter(item => item.id !== round?.id && item.status !== "draft");
+  const reviewing = tab === "planner" && !!validation;
   const header = <>
-    <header className="suite-detail-header">
+    {!reviewing && <header className="suite-detail-header">
       <div className="suite-detail-topline">
         <div className="suite-detail-identity">
           <button type="button" className="suite-detail-back" aria-label="Voltar para Meus testes" title="Voltar para Meus testes" onClick={() => navigate("#/exploracoes")}><ArrowLeft size={18} /></button>
@@ -412,7 +440,7 @@ export default function TestSuitesWorkspace(props: Props) {
         {[["catalog", "Testes"], ["planner", "Preparar execução"], ["rounds", "Execuções"]].map(([key, text]) => <button type="button" key={key} aria-pressed={tab === key} onClick={() => transition(() => { closeEditor(); if (key === "planner") showPlanning(); else setTab(key); })}>{text}{key === "planner" && selection.length > 0 && <span>{selection.length}</span>}</button>)}
         <button type="button" className="suite-refresh" aria-label="Atualizar conjunto" title="Atualizar conjunto" onClick={() => void perform(refresh)} disabled={busy}><RefreshCcw size={15} /></button>
       </nav>
-    </header>
+    </header>}
     {error && <p className="suite-error" role="alert">{error}</p>}
   </>;
   const search = <div className="suite-catalog-filters"><label className="suite-search"><Search size={16} /><input ref={tab === "planner" ? selectorSearch : undefined} aria-label="Buscar CTs" placeholder="Buscar teste, título ou funcionalidade…" value={query} onChange={event => setQuery(event.target.value)} /></label><select aria-label="Filtrar CTs" value={filter} onChange={event => setFilter(event.target.value)}>{[["all", "Testes ativos"], ["FAIL", "Reprovados"], ["BLOCKED", "Bloqueados"], ["PASS", "Aprovados"], ["manual", "Manuais"], ...(tab === "catalog" ? [["archived", `Arquivados (${archivedCount})`]] : [])].map(([value, text]) => <option key={value} value={value}>{text}</option>)}</select></div>;
@@ -426,7 +454,7 @@ export default function TestSuitesWorkspace(props: Props) {
     <div className="suite-section-heading"><h2>{editId ? `Editar ${editId} · nova versão` : "Novo teste manual"}</h2><button type="button" className="icon-button" aria-label="Fechar editor" disabled={busy} onClick={() => transition(closeEditor)}><X size={18} /></button></div>
     <p>{editId ? "Os resultados e prints anteriores ficam preservados. Esta nova versão só terá resultado após ser executada e avaliada." : "Salve o teste na sua base. Ele só terá resultado depois de ser executado e avaliado."}</p>
     <label>Título<input ref={caseTitle} required maxLength={300} placeholder="Ex.: Conferir o carrinho vazio" value={form.title} onChange={event => setForm({ ...form, title: event.target.value })} /></label>
-    <label>Passos (um por linha)<textarea required rows={3} placeholder={"Abrir o carrinho\nConferir a mensagem de carrinho vazio"} value={form.steps.join("\n")} onChange={event => setForm({ ...form, steps: event.target.value.split("\n") })} /></label>
+    <label>Passos (um por linha)<textarea required rows={2} placeholder={"Abrir o carrinho\nConferir a mensagem de carrinho vazio"} value={form.steps.join("\n")} onChange={event => setForm({ ...form, steps: event.target.value.split("\n") })} /></label>
     <label>Resultado esperado<textarea required rows={2} placeholder="O que precisa acontecer para este teste passar?" value={form.expected_result} onChange={event => setForm({ ...form, expected_result: event.target.value })} /></label>
     <details className="suite-case-advanced"><summary>Endereço, descrição e pré-condições</summary><div>
       <label>URL da aplicação<input required type="url" value={form.url} onInvalid={event => { const details = event.currentTarget.closest("details"); if (details) details.open = true; }} onChange={event => setForm({ ...form, url: event.target.value })} /></label>
@@ -443,11 +471,14 @@ export default function TestSuitesWorkspace(props: Props) {
   </section>;
   const recordingPanel = recording && <section id="suite-recording" className="panel suite-recording"><span className="suite-record-dot" /><strong>Gravação em andamento · {recording.steps.length} passos</strong><ol>{recording.steps.map((step, index) => <li key={index}>{step}</li>)}</ol><button type="button" ref={recordingFinish} className="button primary" disabled={busy} onClick={() => void perform(async () => { const result = await request<Recording>(`/test-suites/recordings/${encode(recording.id)}/finish`, { method: "POST" }); setRecording(null); openCaseEditor({ ...emptyDefinition(result.url), title: "Teste gravado", steps: result.steps }, null, true); })}><Square size={15} />Finalizar e revisar roteiro</button></section>;
 
+  const executeAction = validation && <button className="button primary" title={!consent ? "Marque o aceite após revisar os testes" : undefined} disabled={busy || formChanged || !!recording || !consent || !validation.available || dirty} onClick={() => void perform(async () => { if (!saved) return; const value = await request<Round>(`/test-suites/rounds/${encode(saved.id)}/start`, { method: "POST", body: JSON.stringify({ confirm: true, expected_revision: validation.revision }) }); navigate(`#/conjuntos/${encode(suite.id)}?round=${encode(value.id)}`); })}><Play size={16} />Executar {selection.length} {selection.length === 1 ? "teste" : "testes"}</button>;
+
   const chatPanel = <PlanningChat purpose={maintenanceOpen ? "base" : "execution"} id="suite-planning-chat" composerRef={chatComposer} request={request} defaultModel={suite.assistant_llm} model={chatLlm} onModelChange={setChatLlm}
         messages={messages} busy={chatBusy} value={chatText} onValueChange={setChatText} onSend={ask} error={chatError}>
         {suggestion && <div className="suite-suggestions">
+          {suggestion.coverage && <section className="suite-coverage" aria-label="Comparação do CRUD com a base"><h4>CRUD · {suggestion.coverage.screen}</h4><p>Análise dos testes cadastrados, não comprovação de cobertura completa.</p>{suggestion.coverage.operations.map(operation => <div key={operation.operation} data-coverage-status={operation.status}><header><strong>{{ create: "Criar", read: "Consultar", update: "Editar", delete: "Excluir" }[operation.operation]}</strong><span>{{ existing: "Já existe", gap: "Não encontrado", uncertain: "Precisa conferir", not_applicable: "Não se aplica" }[operation.status]}</span></header><p>{operation.reason}</p>{operation.case_ids.length > 0 && <div className="suite-coverage-existing">{operation.case_ids.map(id => <button type="button" key={id} disabled={selection.some(item => item.case_id === id)} title={suite.cases.find(item => item.id === id)?.title} onClick={() => { const added = add([id]); if (added?.length) setMessages(current => [...current, { role: "assistant", content: caseAdditionReply(added, []) }]); }}>{selection.some(item => item.case_id === id) ? <Check size={12} /> : <Plus size={12} />}{id}</button>)}</div>}{operation.new_case_indexes.map(index => suggestion.new_cases[index] && <button type="button" className="suite-coverage-proposal" key={index} onClick={() => openCaseEditor(suggestion.new_cases[index])}><FilePlus2 size={13} />Revisar: {suggestion.new_cases[index].title}</button>)}</div>)}</section>}
           {suggestedAdditions.length > 0 ? <button className="button secondary" onClick={() => { const added = add(suggestedAdditions); if (added?.length) setMessages(current => [...current, { role: "assistant", content: caseAdditionReply(added, []) }]); }}><Plus size={15} />Incluir na execução: {suggestedAdditions.length} {suggestedAdditions.length === 1 ? "CT sugerido" : "CTs sugeridos"}</button> : suggestion.selected_case_ids.length > 0 && <small>Os CTs sugeridos já estão selecionados para a execução.</small>}
-          {suggestion.new_cases.map((value, index) => <button className="suite-suggested-case" key={index} onClick={() => openCaseEditor(value)}><FilePlus2 size={16} /><span><strong>{value.title}</strong><small>Revisar e adicionar à base</small></span><ChevronRight size={15} /></button>)}
+          {suggestion.new_cases.map((value, index) => !suggestion.coverage?.operations.some(operation => operation.new_case_indexes.includes(index)) && <button className="suite-suggested-case" key={index} onClick={() => openCaseEditor(value)}><FilePlus2 size={16} /><span><strong>{value.title}</strong><small>Revisar e adicionar à base</small></span><ChevronRight size={15} /></button>)}
           <small>{suggestion.usage.total_tokens || 0} tokens · {suggestion.usage.cost_known ? `$${suggestion.usage.cost?.toFixed(6)}` : "custo não informado pelo provedor"}</small>
         </div>}
       </PlanningChat>;
@@ -487,42 +518,60 @@ export default function TestSuitesWorkspace(props: Props) {
         <div className="suite-selection-actions"><button type="button" className="button ghost" onClick={clearSelection} disabled={busy}>Limpar seleção</button><button type="button" className="button primary" onClick={openPlanning} disabled={busy}>{selectionActionLabel}<ArrowRight size={17} /></button></div>
       </section>}
     </>}
-    {tab === "planner" && <section className="suite-planner-view" data-mobile-pane={mobilePane} aria-label="Planejamento da rodada">
-<ol className="suite-preparation-steps" aria-label="Etapas de preparação"><li><button type="button" onClick={openSelector}>1. Escolher testes</button></li><li aria-current={!validation ? "step" : undefined}>2. Ajustar roteiro</li><li aria-current={validation ? "step" : undefined}>3. Revisar e confirmar</li></ol>
+    {tab === "planner" && <section className={`suite-planner-view${validation ? " suite-review-mode" : ""}`} data-mobile-pane={validation ? "plan" : mobilePane} aria-label="Planejamento da rodada">
+      {validation ? <header className="suite-review-bar"><button type="button" className="text-button" disabled={busy} onClick={returnToScript}><ArrowLeft size={16} />Ajustar</button><div><h1>Revisar execução <span>{selection.length} {selection.length === 1 ? "teste" : "testes"}</span></h1><small title={`${name} · ${host(suite.app_url)}`}>{name} · {host(suite.app_url)}</small></div>{executeAction}</header> : <>
+<ol className="suite-preparation-steps" aria-label="Etapas de preparação"><li><button type="button" onClick={openSelector}>1. Escolher testes</button></li><li aria-current="step"><button type="button" onClick={returnToScript}>2. Ajustar roteiro</button></li><li>3. Revisar e confirmar</li></ol>
       <div className="suite-plan-heading suite-plan-toolbar">
-        <div className="suite-plan-title"><h2 id="suite-planning-heading" ref={planningHeading} tabIndex={-1} className="sr-only" aria-describedby="suite-planning-guidance">Preparar execução</h2><label className="suite-plan-name">Nome da execução<input aria-label="Nome da execução" maxLength={160} value={name} onChange={event => { setName(event.target.value); change(); }} /></label><span className="suite-plan-state" role="status">{dirty ? "Não salvo" : saved ? "Salvo em Rascunhos" : "Rascunho"}</span></div>
-        <div className="suite-plan-tools"><button type="button" className="button secondary" aria-expanded={selectorOpen} aria-controls="suite-case-selector" onClick={() => selectorOpen ? setSelectorOpen(false) : openSelector()}><ClipboardList size={15} />Escolher testes <span>{selection.length}</span></button><button className="button secondary" onClick={() => { setMaintenanceOpen(false); setNewMode(!newMode); setSelectorOpen(false); setMobilePane("plan"); }}><Plus size={15} />Adicionar teste</button><button className="button ghost suite-assistant-toggle" aria-expanded={chatOpen} aria-controls="suite-planning-chat" onClick={toggleChat}><MessageSquare size={15} />Assistente</button>
+        <div className="suite-plan-title"><h2 id="suite-planning-heading" ref={planningHeading} tabIndex={-1} className="sr-only" aria-describedby="suite-planning-guidance">Preparar execução</h2><label className="suite-plan-name">Nome da execução<input aria-label="Nome da execução" maxLength={160} value={name} onChange={event => { setName(event.target.value); change(); }} /></label><span className="suite-plan-state" role="status">{dirty || formChanged ? "Não salvo" : saved ? "Salvo em Rascunhos" : "Rascunho"}</span>{saved && !dirty && <button type="button" className="suite-draft-link text-button" disabled={busy} onClick={() => navigate("#/execucoes-planejadas")}>Ver rascunhos<ArrowRight size={13} /></button>}</div>
+        <div className="suite-plan-tools"><button type="button" className="button secondary" aria-expanded={selectorOpen} aria-controls="suite-case-selector" onClick={() => selectorOpen ? setSelectorOpen(false) : openSelector()}><ClipboardList size={15} />Escolher testes <span>{selection.length}</span></button><button className="button secondary" onClick={() => { setValidation(null); setConsent(false); setMaintenanceOpen(false); setNewMode(!newMode); setSelectorOpen(false); setMobilePane("plan"); }}><Plus size={15} />Adicionar teste</button><button className="button ghost suite-assistant-toggle" aria-expanded={chatOpen} aria-controls="suite-planning-chat" onClick={toggleChat}><MessageSquare size={15} />Assistente</button>
           <details className="suite-planning-help"><summary title="Como preparar a execução"><Info size={16} /><span className="sr-only">Como funciona</span></summary><p id="suite-planning-guidance">{selection.length ? `${selection.length === 1 ? "O teste selecionado está" : `Os ${selection.length} testes selecionados estão`} na ordem abaixo. Ajuste os roteiros e clique em “Revisar execução”. A execução só começa após sua confirmação.` : "1. Escolha os testes ou peça ajuda à IA. 2. Ajuste os roteiros. 3. Revise e confirme a execução. Você também pode salvar um rascunho para continuar depois."}</p></details>
         </div>
       </div>
       <nav className="suite-planner-switch" aria-label="Painéis do planejamento"><button type="button" aria-label="Ver roteiro da rodada" aria-pressed={mobilePane === "plan"} onClick={() => setMobilePane("plan")}><ClipboardList size={15} />Roteiro <span>{selection.length}</span></button><button type="button" aria-label="Ver assistente de testes" aria-pressed={mobilePane === "chat"} onClick={showChat}><MessageSquare size={15} />Assistente</button></nav>
-      <div className={`suite-planner-layout${chatOpen ? " with-chat" : ""}`}>
+      </>}
+      <div className={`suite-planner-layout${chatOpen && !validation ? " with-chat" : ""}`}>
       <div className={`suite-planning-main${selectorOpen ? " catalog-open" : ""}`}>
       <aside id="suite-case-selector" className="panel suite-selector" hidden={!selectorOpen} aria-label="Catálogo para selecionar CTs"><div className="suite-selector-heading"><h3>Escolher testes</h3><button type="button" className="text-button" disabled={!selection.length} onClick={() => { setSelectorOpen(false); showPlanning(); }}>Ver roteiro ({selection.length})<ArrowRight size={14} /></button></div><FunctionalFlows compact flows={flows} cases={baseCases} selected={activeFlow} onSelect={setSelectedFlow} />{search}<button className="text-button" onClick={() => add(cases.map(item => item.id))}>Adicionar filtrados ({cases.length})</button><div className="suite-available-list">{cases.map(item => <div className={selectedCase === item.id ? "selected" : ""} key={item.id}><input aria-label={`Incluir ${item.id}`} type="checkbox" checked={selection.some(value => value.case_id === item.id)} onChange={() => toggle(item.id)} /><button onClick={() => { if (!selection.some(value => value.case_id === item.id)) add([item.id]); setSelectedCase(item.id); }}><small>{item.id} · {item.mode === "manual" ? "Manual" : "Automático"}</small><strong>{item.title}</strong><span className="case-flow-label" title={flowMemberships(item).map(member => member.reason).join(" | ")}>{caseFlowLabel(item)}</span><Status value={item.status} /></button></div>)}</div>{!cases.length && <p className="suite-muted" role="status">Nenhum CT corresponde aos filtros.</p>}</aside>
-      <div className="suite-plan-center" role="region" aria-label="Roteiro da rodada">{newModes}{caseForm}{recordingPanel}{archivedSelection.length > 0 && <section className="panel suite-archived-selection" role="alert"><strong>{archivedSelection.map(item => item.case_id).join(", ")}{archivedSelection.some(item => !suite.cases.some(value => value.id === item.case_id)) ? " não está disponível nesta base." : " está arquivado."}</strong><p>Confira a base para restaurar um arquivado ou retire os indisponíveis desta execução antes de continuar.</p><button type="button" className="button secondary" onClick={() => { const ids = new Set(archivedSelection.map(item => item.case_id)); setSelection(current => current.filter(item => !ids.has(item.case_id))); if (selectedCase && ids.has(selectedCase)) setSelectedCase(null); change(); }}>Retirar indisponíveis desta execução</button></section>}<section className="panel suite-selection"><div className="suite-section-heading"><h2>Testes desta execução</h2><span>{selection.length} / 500 CTs</span></div>{!selection.length && <div className="suite-plan-empty"><p className="suite-muted">Escolha testes na lista ou peça ajuda à IA.</p><button type="button" className="button secondary" onClick={openSelector}><Plus size={15} />Abrir catálogo de CTs</button></div>}<div className="suite-selected-list">{selection.map((item, index) => <div key={item.case_id} className={selectedCase === item.case_id ? "active" : ""}><button onClick={() => setSelectedCase(item.case_id)}><small>{String(index + 1).padStart(2, "0")}</small><strong>{item.case_id}</strong><span>{suite.cases.find(value => value.id === item.case_id)?.title}</span></button><button className="icon-button" aria-label={`Mover ${item.case_id} para cima`} disabled={!index} onClick={() => { const next = [...selection]; [next[index - 1], next[index]] = [next[index], next[index - 1]]; setSelection(next); change(); }}>↑</button><button className="icon-button" aria-label={`Retirar ${item.case_id} desta execução`} title="Retirar da execução não arquiva o teste na base" onClick={() => toggle(item.case_id)}><X size={15} /></button></div>)}</div></section>
-        {focusCase && focusItem && <section className="panel suite-case-plan"><div className="suite-section-heading"><div><span className="section-kicker">{focusCase.id} · ROTEIRO DA PRÓXIMA EXECUÇÃO</span><h2>{focusCase.title}</h2></div><span className="suite-status">{focusCase.mode === "manual" ? "Manual" : "Automação preservada"}</span></div><p>{focusCase.expected_result}</p>{focusCase.mode === "automatic" ? <><p className="suite-muted">As etapas são referências: editar texto não altera esta automação. Para outro roteiro, duplique como teste manual na base. Use + para incluir uma pausa e anexar uma imagem; anexar imagens não aprova o teste.</p><div className="suite-print-palette" draggable onDragStart={event => event.dataTransfer.setData("application/x-autojev-checkpoint", "capture")}><Plus size={15} />Aguardar print · arraste até um +</div><div className="suite-step-strip" onWheel={event => { const area = event.currentTarget; if (Math.abs(event.deltaY) > Math.abs(event.deltaX) && ((event.deltaY > 0 && area.scrollLeft < area.scrollWidth - area.clientWidth - 1) || (event.deltaY < 0 && area.scrollLeft > 0))) { area.scrollLeft += event.deltaY; } }}>
-          {Array.from({ length: (focusCase.recorded_steps?.length || focusCase.steps.length) + 1 }, (_, gap) => {
-            const points = (focusItem.capture_plan?.checkpoints || []).filter(point => point.gap === gap).sort((a, b) => a.order - b.order);
-            return <div className="suite-step-unit" key={gap}>
-              <div className="suite-gap">
-                {printSlot(gap, 0)}
-                {points.map((point, index) => <Fragment key={point.id}>
-                  <article className="suite-source-step suite-print-card" data-checkpoint-id={point.id}>
-                    <small>PAUSA PARA PRINT</small><strong>Aguardar print</strong><span>Pausa para anexar sua imagem</span>
-                    <button type="button" aria-label="Remover pausa" title="Remover pausa para print" onClick={() => { setSelection(current => current.map(item => item.case_id !== selectedCase ? item : { ...item, capture_plan: { version: 1, checkpoints: item.capture_plan!.checkpoints.filter(value => value.id !== point.id) } })); change(); }}><X size={14} /></button>
-                  </article>
+      <div ref={planCenter} className="suite-plan-center" role="region" aria-label="Roteiro da rodada">{!validation && <>{newModes}{caseForm}{recordingPanel}{archivedSelection.length > 0 && <section className="panel suite-archived-selection" role="alert"><strong>{archivedSelection.map(item => item.case_id).join(", ")}{archivedSelection.some(item => !suite.cases.some(value => value.id === item.case_id)) ? " não está disponível nesta base." : " está arquivado."}</strong><p>Confira a base para restaurar um arquivado ou retire os indisponíveis desta execução antes de continuar.</p><button type="button" className="button secondary" onClick={() => { const ids = new Set(archivedSelection.map(item => item.case_id)); setSelection(current => current.filter(item => !ids.has(item.case_id))); if (selectedCase && ids.has(selectedCase)) setSelectedCase(null); change(); }}>Retirar indisponíveis desta execução</button></section>}<div className="suite-flow-board">
+          <section className="panel suite-selection suite-flow-lane" aria-label="Testes desta execução">
+            <div className="suite-rail-heading"><h2>Testes <span>{selection.length}</span></h2><span className="suite-rail-hint">Role para os lados</span><div className="suite-rail-tools"><button type="button" aria-label="Ver testes anteriores" onClick={() => selectedRail.current?.scrollBy({ left: -selectedRail.current.clientWidth * .8 })}><ChevronRight className="suite-chevron-back" size={15} /></button><button type="button" aria-label="Ver próximos testes" onClick={() => selectedRail.current?.scrollBy({ left: selectedRail.current.clientWidth * .8 })}><ChevronRight size={15} /></button></div></div>
+            {!selection.length && <div className="suite-plan-empty"><p className="suite-muted">Escolha os testes para esta execução.</p><button type="button" className="button secondary" onClick={openSelector}><Plus size={15} />Escolher testes</button></div>}
+            {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- The rail supports independent keyboard scrolling. */}
+            <div ref={selectedRail} className="suite-selected-list suite-horizontal-rail" role="region" aria-label="Testes selecionados, rolagem horizontal" tabIndex={0}>{selection.map((item, index) => {
+              const testCase = suite.cases.find(value => value.id === item.case_id);
+              return <div key={item.case_id} className={selectedCase === item.case_id ? "suite-test-card active" : "suite-test-card"}>
+                <button type="button" className="suite-test-card-select" aria-pressed={selectedCase === item.case_id} aria-label={`Ver etapas de ${item.case_id}: ${testCase?.title || "Teste indisponível"}`} title={testCase?.title || item.case_id} onClick={() => setSelectedCase(item.case_id)}><span><strong>{item.case_id}</strong><small>{String(index + 1).padStart(2, "0")}</small></span><span className="suite-card-title">{testCase?.title || "Teste indisponível"}</span></button>
+                <div className="suite-test-card-actions"><button type="button" aria-label={`Mover ${item.case_id} para esquerda`} title="Executar antes" disabled={!index} onClick={() => { setSelection(current => moveRailItem(current, index, -1)); change(); }}><ArrowLeft size={13} /></button><button type="button" aria-label={`Mover ${item.case_id} para direita`} title="Executar depois" disabled={index === selection.length - 1} onClick={() => { setSelection(current => moveRailItem(current, index, 1)); change(); }}><ArrowRight size={13} /></button><button type="button" aria-label={`Retirar ${item.case_id} desta execução`} title="Retirar da execução, sem arquivar" onClick={() => toggle(item.case_id)}><X size={14} /></button></div>
+              </div>;
+            })}</div>
+          </section>
+          <section className="panel suite-case-plan suite-flow-lane" aria-label={focusCase ? `Etapas de ${focusCase.id}` : "Etapas do teste"}>
+            <div className="suite-rail-heading"><h2>Etapas{focusCase && <span>{focusCase.id}</span>}</h2>{focusCase?.mode === "automatic" && <span className="suite-rail-hint">+ Pausa para print</span>}
+              {focusCase && <details className="suite-rail-details" key={focusCase.id}><summary title="Detalhes do teste"><Info size={14} /><span className="sr-only">Detalhes do teste</span></summary><div><strong>{focusCase.title}</strong><p>{focusCase.expected_result}</p><p>{focusCase.mode === "automatic" ? "Etapas de referência: editar texto não altera a automação. Use + para incluir pausas para imagens. Anexar uma imagem não aprova o teste." : "Roteiro manual: você executa os passos e registra o resultado."}</p><ol>{(focusCase.recorded_steps?.length ? focusCase.recorded_steps.map(step => step.title) : focusCase.steps).map((step, index) => <li key={index}>{step}</li>)}</ol></div></details>}
+              <div className="suite-rail-tools"><button type="button" aria-label="Ver etapas anteriores" onClick={() => stepsRail.current?.scrollBy({ left: -stepsRail.current.clientWidth * .8 })}><ChevronRight className="suite-chevron-back" size={15} /></button><button type="button" aria-label="Ver próximas etapas" onClick={() => stepsRail.current?.scrollBy({ left: stepsRail.current.clientWidth * .8 })}><ChevronRight size={15} /></button></div>
+            </div>
+            {!focusCase && <p className="suite-lane-empty">Clique num teste acima para ver suas etapas.</p>}
+            {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- The rail supports independent keyboard scrolling. */}
+            <div ref={stepsRail} className="suite-step-strip suite-horizontal-rail" role="region" aria-label={focusCase ? `Etapas de ${focusCase.id}, rolagem horizontal` : "Etapas, rolagem horizontal"} tabIndex={0}>
+            {focusCase && focusItem && (focusCase.mode === "automatic" ? Array.from({ length: (focusCase.recorded_steps?.length || focusCase.steps.length) + 1 }, (_, gap) => {
+              const points = (focusItem.capture_plan?.checkpoints || []).filter(point => point.gap === gap).sort((a, b) => a.order - b.order);
+              return <div className="suite-step-unit" key={gap}>
+                <div className="suite-gap">{printSlot(gap, 0)}{points.map((point, index) => <Fragment key={point.id}>
+                  <article className="suite-source-step suite-print-card" data-checkpoint-id={point.id}><small>PAUSA</small><strong>Aguardar print</strong><span>Anexar imagem</span><button type="button" aria-label="Remover pausa" title="Remover pausa para print" onClick={() => { setSelection(current => current.map(item => item.case_id !== selectedCase ? item : { ...item, capture_plan: { version: 1, checkpoints: item.capture_plan!.checkpoints.filter(value => value.id !== point.id) } })); change(); }}><X size={14} /></button></article>
                   {printSlot(gap, index + 1, point.id)}
-                </Fragment>)}
-              </div>
-              {gap < (focusCase.recorded_steps?.length || focusCase.steps.length) && <article className="suite-source-step"><small>{String(gap + 1).padStart(2, "0")} · REFERÊNCIA</small><strong>{focusCase.recorded_steps?.[gap]?.title || focusCase.steps[gap]}</strong><span>Registro original preservado</span></article>}
-            </div>;
-          })}
-        </div></> : <ol className="suite-manual-steps">{focusCase.steps.map((step, index) => <li key={index}>{step}</li>)}</ol>}</section>}
-        {validation && <section id="suite-plan-review" ref={reviewPanel} tabIndex={-1} aria-label="Revisão antes de executar" className="panel suite-review"><h2>Revisão · {selection.length} {selection.length === 1 ? "teste" : "testes"}</h2><p>Somente os testes abaixo serão executados. Os demais resultados da base não mudam.</p>{validation.effects.map(effect => <p key={effect}>{effect}</p>)}{validation.items.map(item => <div className="suite-review-case" key={item.case_id}><strong>{item.case_id}</strong><span className="suite-review-identity">{suite.cases.find(value => value.id === item.case_id)?.title || item.case_id}<small>{item.available ? item.code === "manual" ? "Avaliação manual" : "Disponível para reexecução" : item.reason || "Indisponível"}</small></span>{item.available && <Check size={16} />}</div>)}<label className="suite-check"><input type="checkbox" checked={consent} onChange={event => setConsent(event.target.checked)} />Revisei os CTs e autorizo esta execução real. Entendo que ações podem modificar dados e que cada CT automático exige preparação.</label><button className="button primary" disabled={busy || formChanged || !!recording || !consent || !validation.available || dirty} onClick={() => void perform(async () => { if (!saved) return; const value = await request<Round>(`/test-suites/rounds/${encode(saved.id)}/start`, { method: "POST", body: JSON.stringify({ confirm: true, expected_revision: validation.revision }) }); navigate(`#/conjuntos/${encode(suite.id)}?round=${encode(value.id)}`); })}><Play size={16} />Confirmar e executar {selection.length} CTs</button></section>}
+                </Fragment>)}</div>
+                {gap < (focusCase.recorded_steps?.length || focusCase.steps.length) && <article className="suite-source-step" title={focusCase.recorded_steps?.[gap]?.title || focusCase.steps[gap]}><small>ETAPA {String(gap + 1).padStart(2, "0")}</small><strong>{focusCase.recorded_steps?.[gap]?.title || focusCase.steps[gap]}</strong><span>Referência</span></article>}
+              </div>;
+            }) : focusCase.steps.map((step, index) => <article className="suite-source-step" title={step} key={index}><small>ETAPA {String(index + 1).padStart(2, "0")}</small><strong>{step}</strong><span>Manual</span></article>))}
+            </div>
+          </section>
+        </div>
+        </>}
+        {validation && <section id="suite-plan-review" ref={reviewPanel} tabIndex={-1} aria-label="Revisão antes de executar" className="panel suite-review"><div className="suite-review-scope"><p>Somente estes testes serão executados. Os demais resultados não mudam.</p><details><summary>Cuidados da execução</summary>{validation.effects.map(effect => <p key={effect}>{effect}</p>)}</details></div><div className="suite-review-list" role="list" aria-label="Testes que serão executados">{validation.items.map(item => <div className="suite-review-case" role="listitem" key={item.case_id}><strong>{item.case_id}</strong><span className="suite-review-identity" title={suite.cases.find(value => value.id === item.case_id)?.title}>{suite.cases.find(value => value.id === item.case_id)?.title || item.case_id}{!item.available && <small>{item.reason || "Indisponível"}</small>}</span><span className="suite-review-availability">{item.available ? <><Check size={14} /><small>{item.code === "manual" ? "Manual" : "Pronto"}</small></> : <small>Indisponível</small>}</span></div>)}</div><label className="suite-check"><input type="checkbox" checked={consent} onChange={event => setConsent(event.target.checked)} />Revisei os testes e autorizo esta execução real. Ações podem modificar dados; cada teste automático exige preparação em navegador separado.</label></section>}
       </div>
-      <footer className="suite-plan-footer"><span role="status">{formChanged || recording ? "Salve ou finalize o novo teste antes de revisar. " : ""}{selection.length} {selection.length === 1 ? "teste" : "testes"} · {dirty ? "não salvo" : saved ? "salvo em Rascunhos" : "nenhuma execução iniciada"}</span><button className="button secondary" disabled={busy || formChanged || !!recording || !selection.length || !name.trim()} onClick={() => void perform(async () => { await save(); })}><Save size={16} />Salvar rascunho</button><button className="button primary" disabled={busy || formChanged || !!recording || !selection.length || !name.trim() || !!archivedSelection.length} onClick={() => void review()}>{busy ? <LoaderCircle className="spin" size={16} /> : <ClipboardList size={16} />}Revisar execução</button></footer>
+      {!validation && <footer className="suite-plan-footer"><span role="status">{formChanged || recording ? "Salve ou finalize o novo teste antes de revisar. " : ""}{selection.length} {selection.length === 1 ? "teste" : "testes"} · {dirty ? "não salvo" : saved ? "salvo em Rascunhos" : "nenhuma execução iniciada"}</span><button className="button secondary" disabled={busy || formChanged || !!recording || !selection.length || !name.trim()} onClick={() => void perform(async () => { await save(); })}><Save size={16} />Salvar rascunho</button><button className="button primary" disabled={busy || formChanged || !!recording || !selection.length || !name.trim() || !!archivedSelection.length} onClick={() => void review()}>{busy ? <LoaderCircle className="spin" size={16} /> : <ClipboardList size={16} />}Revisar execução</button></footer>}
       </div>
-      {chatOpen && chatPanel}
+      {chatOpen && !validation && chatPanel}
       </div>
     </section>}
     {tab === "rounds" && <div className={`suite-history-workspace${round ? " has-round" : ""}`}><section className="panel suite-round-history"><div className="suite-section-heading"><h2>Execuções</h2><span>{history.length} registradas</span></div>{historyLoading && <p className="suite-muted" role="status">Atualizando histórico…</p>}{historyError && <p className="suite-error" role="alert">{historyError}</p>}

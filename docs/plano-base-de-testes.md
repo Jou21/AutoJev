@@ -1,6 +1,6 @@
 # Plano de evolução — uma exploração, uma base de testes contínua
 
-Data: 21/10/2026. Status: implementação local e validação técnica realizadas. Aprovação de usabilidade pelo usuário ainda pendente; consulte a seção 15.
+Data: 21/10/2026. Atualizado em 22/10/2026. Status: implementação local e validação técnica realizadas. Separação dos destinos de salvamento aprovada pelo usuário; demais avaliações de usabilidade continuam pendentes.
 
 ## 1. Direção do produto
 
@@ -251,7 +251,7 @@ Não foram iniciadas execuções, explorações ou gravações reais, nem chamad
 
 O conteúdo dos relatórios HTML/blob não foi alterado nesta entrega. Os testes existentes continuam verificando abertura imediata da página local de carregamento, escopo/ID corretos e ausência de substituição silenciosa por outro teste. O item de benchmark real dos relatórios permanece desmarcado: não foram gerados nem baixados relatórios grandes para medir tempos nesta etapa, restrita às telas anteriores a eles.
 
-Foram mostradas capturas intermediárias e feita uma pergunta específica sobre **Salvar na base** versus **Salvar e incluir na execução**. Ainda não houve resposta: nenhuma tela desta entrega foi registrada como aprovada pelo usuário. O aceite com uma pessoa iniciante, sem ajuda verbal, também permanece como avaliação humana, não como resultado de teste automatizado.
+Foram mostradas capturas intermediárias e feita uma pergunta específica sobre **Salvar na base** versus **Salvar e incluir na execução**. Confirmação registrada em 22/10/2026: o usuário respondeu **“Sim, ficou clara”**. Essa aprovação refere-se à separação dos destinos, não ao aceite de todas as telas. O teste de usabilidade com uma pessoa iniciante, sem ajuda verbal, continua pendente e não é substituído por QA automatizado.
 
 ### Verificações automatizadas e estado real
 
@@ -273,3 +273,90 @@ Em `data/mcp-validation/`, ignorado pelo Git. Versões demonstrativas de rascunh
 - `base-drafts-{1920,1366,1024,390}.png`
 - `base-history-{1920,1366,1024,390}.png`
 - `base-review-1366.png` e `base-unsaved-dialog-1366.png`
+
+## 16. Continuação e revisão após feedback — 22/10/2026
+
+### Feedback registrado
+
+A separação **Salvar na base / Salvar e incluir na execução** continua aprovada. A primeira versão da revisão separada **não foi aprovada**: o usuário considerou o cabeçalho grande e rejeitou os dois botões no rodapé. Pediu mais testes visíveis e planejamento por objetivo no chat, como **“Meu teste consiste em testar o CRUD da tela X”**. A versão descrita abaixo responde a esse feedback; sua aprovação visual continua pendente.
+
+### Revisão focada na lista
+
+- Na confirmação, o cabeçalho da base, as abas, o campo de nome, as ferramentas de edição e o chat dão lugar a uma única barra: **Ajustar · Revisar execução · quantidade · Executar N testes**.
+- Retirados os dois botões grandes do rodapé nessa etapa. A ação de executar fica no topo; o aceite obrigatório permanece visível junto à lista. Sem aceite, disponibilidade e revisão válida, o botão continua bloqueado.
+- Lista ocupa a largura disponível, com ID, título e disponibilidade. Somente a lista rola; nome completo disponível no título e títulos quebráveis em telas estreitas. Avisos adicionais ficam em **Cuidados da execução**, sem retirar a informação explícita sobre modificação de dados e preparação independente do aceite.
+- **Ajustar** conserva IDs, ordem, referências e pausas para print. Retornar à revisão exige novo aceite; não duplica o salvamento nem inicia testes.
+
+| Janela | Altura da barra | Testes inteiros visíveis na revisão de 151 itens |
+| --- | --- | --- |
+| 1920 × 1080 | 48 px | 22 |
+| 1366 × 768 | 48 px | 15 |
+| 1024 × 700 | 48 px | 13 |
+| 390 × 844 | aproximadamente 64 px | 13 |
+
+Medições via Playwright com respostas simuladas de salvamento e validação. Não significam que os 151 casos estejam disponíveis no executor real. Nenhum deles foi executado. Não houve transbordamento horizontal; o último item pôde ser alcançado pela rolagem interna. Em 390 px com textos ampliados a 200%, aceite e ação continuaram dentro da janela, sem transbordamento horizontal.
+
+### Assistente por objetivo e análise de CRUD
+
+- Convite editável no chat: **“Quero testar o CRUD da tela [nome]. O que já temos e o que falta?”**. Clicar apenas preenche a mensagem; não chama o modelo automaticamente.
+- A consulta compara a solicitação com testes ativos da mesma base: IDs, títulos, descrições curtas, URLs sem query/fragmento, modo e resultado esperado. Não envia imagens, receitas do executor, credenciais ou registros completos de navegação.
+- Catálogo limitado a 500 itens, com quantidade ativa, quantidade incluída e indicação explícita de completude. Arquivados ficam de fora. Um recorte incompleto não autoriza afirmar que um objetivo não existe.
+- Resposta estruturada por **Criar / Consultar / Editar / Excluir**: **Já existe**, **Não encontrado**, **Precisa conferir** ou **Não se aplica**, com justificativa e referências. Teste existente não significa CRUD completo nem aprovação da aplicação inteira.
+- O modelo é orientado a pedir esclarecimento se a tela não estiver identificada, reutilizar os testes existentes e propor casos apenas para objetivos faltantes, sem assumir que toda tela permite CRUD. Sem observar a aplicação, não pode afirmar que descobriu campos, validou resultados ou constatou ausência de funcionalidade.
+- A API rejeita IDs inventados/arquivados, operações repetidas, referências inexistentes a propostas e classificações inconsistentes. Propostas continuam manuais e revisáveis; nem a análise nem a escolha de um modelo adicionam ou executam testes sozinhas.
+- Ações explícitas permitem incluir um existente ou abrir uma proposta no editor. Após salvar uma proposta, a comparação anterior é retirada para não apresentar índices obsoletos como se ainda descrevessem o catálogo atualizado.
+
+### Outros ajustes desta continuação
+
+- Opções de criação compactadas no preparador quando o formulário está aberto: aproximadamente **355 px → 36 px** em 1366 × 768. Formulário essencial ocupa cerca de 408 px; textos longos e opções adicionais continuam acessíveis por rolagem.
+- Após salvar, **Ver rascunhos** deixa explícito onde retomar. Falha de salvamento não mostra confirmação falsa nem elimina seleção/texto. Retomada conserva a seleção exata e as pausas para imagens.
+- Mantidos os destinos de salvamento aprovados, o arquivamento recuperável e a proteção de alterações não salvas.
+
+### Conferências e limites
+
+- **309 testes do frontend aprovados**, incluindo revisão de 50 itens sem cabeçalhos duplicados, consentimento, retorno ao roteiro e aceite explícito das propostas de CRUD.
+- **36 testes focados do backend aprovados** nos módulos de assistente e conjuntos: resposta estruturada, referências inválidas, catálogo parcial, URLs privadas e ausência de salvamento/execução implícitos. Tudo em fixtures isoladas, sem chamadas externas de IA.
+- TypeScript, ESLint, Ruff dos arquivos envolvidos, build de produção e `git diff --check` conferidos. Os avisos conhecidos do Vinext e AnyIO permanecem.
+- Playwright: catálogo, seleção, salvamento/retomada simulados, revisão, retorno, análise de CRUD simulada e compositor em telas estreitas. Capturas `ux-compact-review-{1920,1366,1024,390}.png` e `ux-crud-assistant-{1366,1024,390}.png` em `data/mcp-validation/`, ignorado pelo Git.
+- O comportamento de interpretação de um modelo real ainda depende da qualidade do modelo escolhido; os contratos e a interface foram validados com respostas simuladas, não com consumo pago. Não é uma certificação de cobertura nem substitui revisão humana.
+- Backend reiniciado de modo gracioso somente após confirmar ociosidade: 62 explorações consultadas, nenhuma ativa, nenhuma base ativa e nenhum processo-filho de navegador. Usada a autorização já fornecida; frontend e abas do usuário não foram reiniciados.
+- Conferência da API real após retirar as fixtures: **151 testes, 0 arquivados, 0 rascunhos e 0 execuções ativas**. Nenhuma execução, gravação, exploração ou chamada paga foi iniciada pelo QA. Nenhuma chave do `.env` foi lida; relatórios blob não foram modificados nem baixados.
+
+## 17. Preparação em duas faixas horizontais — 22/10/2026
+
+### Pedido e resultado local
+
+O usuário pediu para substituir a lista vertical de CTs e o bloco extenso do roteiro por **duas listas horizontais com cards quadrados**, visíveis juntas em monitores pequenos.
+
+- **Faixa superior — Testes:** ID, posição e título; o card ativo é destacado em amarelo. Clicar troca as etapas da faixa inferior. Setas no card mudam a ordem; retirar um CT não o arquiva e conserva as referências/pausas dos demais.
+- **Faixa inferior — Etapas:** cards quadrados, botões amarelos **+** nos intervalos e pausas roxas para print com o mesmo tamanho dos cards originais. Existe inserção antes e depois de cada pausa, inclusive no início e no fim do roteiro. Uma pausa nova é trazida para a área visível.
+- Título completo, resultado esperado, explicação da automação e textos integrais das etapas continuam disponíveis em **Detalhes do teste**, recolhidos por padrão. O painel cabe dentro da área de trabalho e admite rolagem própria. Não há título grande, parágrafo extenso ou paleta de print ocupando permanentemente a tela.
+- Cada faixa possui rolagem horizontal independente, setas visíveis e navegação por teclado. A roda vertical do mouse desloca apenas a faixa sob o cursor; não move a outra faixa nem o conteúdo para baixo. Gestos horizontais nativos e atalhos de zoom do navegador são preservados. Toque usa a rolagem nativa do navegador; não foi simulada uma sessão física de aparelho móvel.
+- Cards manuais usam a mesma apresentação, sem oferecer pausas automáticas não suportadas pelo executor. Salvar, revisar e confirmar continuam separados; não foi alterado o fluxo de execução nem o formato dos planos persistidos.
+
+### Espaço e telas pequenas
+
+O tamanho dos quadrados acompanha a altura disponível. Compactados o campo de nome e o rodapé nas áreas estreitas, preservando os nomes acessíveis e as ações. Em janelas baixas, a orientação repetida das três etapas é ocultada; os controles reais continuam disponíveis.
+
+| Janela | Lado do card na medição | Duas faixas visíveis, sem rolagem vertical do editor |
+| --- | --- | --- |
+| 1920 × 1080 | 160 px | Sim |
+| 1366 × 768 | 160 px | Sim |
+| 1280 × 720 | aproximadamente 160 px | Sim |
+| 1024 × 700 | aproximadamente 137 px | Sim |
+| 1024 × 600 | aproximadamente 101 px | Sim, sem corte dos controles |
+| 390 × 844 | aproximadamente 153 px | Sim; chat em painel próprio |
+| 390 × 700 | aproximadamente 94 px | Sim, sem corte dos controles |
+
+Em alturas excepcionais de até 560 px, há uma alternativa deliberada de rolagem vertical do editor para manter todos os controles alcançáveis, em vez de cortá-los. Não se promete que qualquer quantidade de conteúdo caiba sem rolagem em toda janela possível. Títulos extensos permanecem disponíveis integralmente nos detalhes e nos nomes acessíveis dos cards.
+
+### Validação
+
+- **318 testes do frontend aprovados**, incluindo o adaptador de roda/teclado, limites de rolagem, limpeza de eventos, ordem dos CTs, seleção ativa, planos de captura e cards manuais.
+- TypeScript, ESLint dos arquivos desta etapa, build de produção e `git diff --check` aprovados, sob limites de memória/tempo. Backend não foi alterado nem reiniciado nesta etapa.
+- Playwright: duas faixas em sete tamanhos de janela; setas em desktop e celular; Home/End; abertura dos detalhes com Enter; troca roteiro/chat conservando 3 CTs e uma pausa; entrada por link direto de CT após carregamento inicial.
+- Com **151 CTs selecionados somente na interface**, um giro moveu a faixa superior em 450 px, mantendo a inferior em 0. Um giro na inferior a moveu em 400 px, mantendo a superior em 450. A página e o editor continuaram em posição vertical 0. End alcançou o fim da faixa superior.
+- Inclusão de duas pausas, presença de **+** após ambas, remoção e alternância entre CTs conferidas sem escrita real. Salvamento da ordem e das posições foi validado em fixtures isoladas de componente.
+- Capturas finais: `data/mcp-validation/horizontal-rails-{1920,1366,1280,1024,390}.png`, com três CTs e uma pausa apenas na interface. Pasta ignorada pelo Git.
+- API real ao encerrar: **151 testes, 0 arquivados, 1 rascunho existente e 0 execuções ativas**. O rascunho real foi preservado; o QA não criou nem alterou rascunhos persistidos. POSTs reais do navegador de validação ficaram bloqueados. Nenhuma execução, gravação ou chamada paga foi iniciada; nenhum relatório blob foi alterado.
+- Captura da versão de 1024 × 700 apresentada ao usuário. Aprovação registrada em 22/10/2026: **“Sim, ficou mais claro”**, em resposta à pergunta sobre as duas faixas horizontais para telas pequenas. Essa aprovação refere-se à organização dos CTs e etapas nesta área, não ao aceite de todas as telas do app.
