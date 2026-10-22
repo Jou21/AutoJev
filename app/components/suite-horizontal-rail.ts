@@ -39,3 +39,15 @@ export function moveRailItem<T>(items: T[], index: number, direction: -1 | 1): T
   [result[index], result[next]] = [result[next], result[index]];
   return result;
 }
+
+// Slots are measured before removing the dragged item, including the slot after
+// the final card. Keep the objects themselves intact (recipes, pauses, sources).
+export function placeRailItem<T>(items: T[], from: number, slot: number): T[] {
+  if (!Number.isInteger(from) || !Number.isInteger(slot) || from < 0 || from >= items.length || slot < 0 || slot > items.length) return items;
+  const target = slot - (from < slot ? 1 : 0);
+  if (target === from) return items;
+  const result = [...items];
+  const [item] = result.splice(from, 1);
+  result.splice(target, 0, item);
+  return result;
+}

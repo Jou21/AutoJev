@@ -1,0 +1,1 @@
+.action-tooltip-bubble { position: fixed; z-index: 1100; box-sizing: border-box; width: 280px; max-width: calc(100vw - 24px); padding: 10px 12px; border: 1px solid #67717c; border-radius: 8px; background: #20282e; box-shadow: 0 6px 22px #0006; color: #eef1f4; font: 12px/1.6 system-ui, sans-serif; overflow-wrap: anywhere; }

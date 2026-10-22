@@ -8,13 +8,21 @@ from urllib.parse import quote, urlencode, urlsplit
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse
-from pydantic import Field, StrictBool, StrictInt, StrictStr, field_validator
+from pydantic import (
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 from starlette.concurrency import run_in_threadpool
 
 from autojev.adapters.execution_plans import PlanConflict
 from autojev.adapters.repository import NotFoundError
 from autojev.api.schemas import (
     ApiModel,
+    CaptureCheckpointInput,
     ModelSelectionInput,
     ScenarioCapturePlanInput,
     ScenarioRerunInput,
@@ -63,11 +71,23 @@ class CatalogStateInput(ApiModel):
     expected_revision: StrictInt = Field(ge=0)
 
 
+class PlannedIntegrationInput(CaptureCheckpointInput):
+    kind: Literal["sws", "sql"]
+
+
 class PlanItemInput(ApiModel):
     case_id: StrictStr = Field(min_length=1, max_length=100)
     source_exploration_id: StrictStr | None = Field(default=None, max_length=100)
     source_scenario_id: StrictStr | None = Field(default=None, max_length=100)
     capture_plan: ScenarioCapturePlanInput | None = None
+    planned_integrations: list[PlannedIntegrationInput] = Field(default_factory=list, max_length=100)
+
+    @model_validator(mode="after")
+    def distinct_additions(self):
+        points = [*(self.capture_plan.checkpoints if self.capture_plan else []), *self.planned_integrations]
+        if len(points) > 100 or len({point.id for point in points}) != len(points) or len({(point.gap, point.order) for point in points}) != len(points):
+            raise ValueError("Use até 100 etapas extras, com identificadores e posições distintos por teste.")
+        return self
 
 
 class PlanInput(ApiModel):

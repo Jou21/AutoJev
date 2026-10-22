@@ -360,3 +360,66 @@ Em alturas excepcionais de até 560 px, há uma alternativa deliberada de rolage
 - Capturas finais: `data/mcp-validation/horizontal-rails-{1920,1366,1280,1024,390}.png`, com três CTs e uma pausa apenas na interface. Pasta ignorada pelo Git.
 - API real ao encerrar: **151 testes, 0 arquivados, 1 rascunho existente e 0 execuções ativas**. O rascunho real foi preservado; o QA não criou nem alterou rascunhos persistidos. POSTs reais do navegador de validação ficaram bloqueados. Nenhuma execução, gravação ou chamada paga foi iniciada; nenhum relatório blob foi alterado.
 - Captura da versão de 1024 × 700 apresentada ao usuário. Aprovação registrada em 22/10/2026: **“Sim, ficou mais claro”**, em resposta à pergunta sobre as duas faixas horizontais para telas pequenas. Essa aprovação refere-se à organização dos CTs e etapas nesta área, não ao aceite de todas as telas do app.
+
+## 18. Dicas nos botões de ação — 22/10/2026
+
+- **Duplicar:** explica que abre uma cópia como novo teste manual para revisar e salvar; não cria nem executa um teste no clique inicial.
+- **Arquivar:** explica que abre uma confirmação para retirar da base ativa, preservando resultados e prints. O estado arquivado também tem uma dica para **Restaurar**.
+- Dicas visíveis ao passar o mouse ou focar pelo teclado, associadas ao botão por `aria-describedby`. Escape fecha; a dica permanece quando o mouse vai sobre seu texto. Renderização fora da área rolável evita cortes na primeira e na última linha, sem modificar o tamanho ou a posição dos botões.
+- Validação por Playwright em 1366 × 768 e 390 × 844: mouse, foco, Escape, bordas da janela, última linha e fechamento ao rolar. Sem clicar em ações reais de duplicação/arquivamento; escritas reais bloqueadas. Capturas `catalog-copy-tooltip-1366.png`, `catalog-archive-tooltip-1366.png` e `catalog-tooltip-390.png` em `data/mcp-validation/`.
+- Regressões de componente/SSR verificam os textos, nomes acessíveis, descrições prévias e estado desabilitado. TypeScript, lint e build conferidos; nenhuma dependência adicionada e nenhum backend reiniciado.
+
+## 19. Editor de etapas com paleta e área ampliada — 22/10/2026
+
+### Organização e interação
+
+- O pedido mais recente substitui a ideia de uma prévia com modal separado: a edição fica na própria tela, próxima ao editor dos relatórios, no tema dark da aplicação.
+- Divisão normal **30% Testes / 70% Etapas**, com mínimo para os controles superiores em janelas muito baixas. CTs ficam em cards horizontais compactos; ações de ordem e retirada não consomem uma linha adicional. As etapas ganham paleta, canvas pontilhado e rolagem horizontal independente.
+- **Aguardar print, Executar SWS e Executar SQL** podem ser arrastados aos intervalos **+**, inclusive antes da primeira etapa, depois da última e entre outros cards extras. Cards adicionados podem ser reposicionados por arraste ou pelas setas. Selecionar um tipo e clicar no intervalo oferece alternativa sem arraste; botões funcionam com teclado.
+- Originais permanecem protegidos, sem edição/remoção de automação nem alteração do resultado histórico. O limite é de 100 extras por teste. Mover preserva ID e tipo, sem duplicar; pausas reais mantêm o contrato `capture_plan` existente.
+- SWS/SQL são **somente planejamento**, sem conexão, consulta, execução ou configuração de segredos. São persistidos em `planned_integrations` por CT, retomados com posições exatas e sinalizados na paleta, cards, rodapé e revisão. Frontend **e backend** impedem executar um plano com essas integrações indisponíveis; não são ignoradas silenciosamente. Removê-las não apaga prints. CT manual continua sem etapas de automação extras.
+- Em áreas estreitas, a paleta vira uma faixa horizontal de três opções. Em áreas baixas, rótulos auxiliares são recolhidos; títulos, inserção, movimento, remoção, detalhes, salvar e revisar permanecem acessíveis. Não foram adicionados textos extensos nem um modal obrigatório ao fluxo.
+
+### Validação e limites
+
+- **326 testes do frontend** aprovados, incluindo tipos mistos, inserção, movimentos no mesmo intervalo/entre originais, IDs únicos, salvamento, retomada, remoção, arrastes inválidos e bloqueio da execução mesmo diante de uma disponibilidade incorreta do servidor.
+- **90 testes isolados** de conjuntos, reexecução e arquivamento do backend aprovados: persistência e recusa de executar integrações, payloads/posições inválidos, manutenção do contrato de prints e ausência de alterações históricas ou início implícito. Nenhuma chamada paga ou integração real foi usada.
+- TypeScript, ESLint dos componentes/helpers alterados, build de produção e `git diff --check` conferidos. Imports Python organizados; permanecem avisos preexistentes de lint em código legado/fixtures e a depreciação de AnyIO nos testes.
+- Playwright em janela isolada: arrastar os três tipos, mover um card existente sem duplicação, teclado, inserção no fim, salvamento/retomada **simulados**, bloqueio da revisão e layout de 1920 × 1080 até 390 × 700. Nas medições estabilizadas, os três tipos ficam visíveis, cards cabem na faixa e salvar/revisar ficam na janela, sem rolagem vertical do editor nem largura extra da página. Não foi simulado um aparelho físico de toque.
+- Capturas finais em `data/mcp-validation/steps-editor-final-{largura}x{altura}.png`, ignoradas pelo Git. Em alturas curtas, a proporção adapta-se ao mínimo do seletor em vez de cortar controles (aproximadamente 66% para etapas em 1024 × 600).
+- Backend recarregado de modo gracioso após checar **62 explorações, 36 bases e nenhuma ativa**, usando a autorização anterior do usuário. O único rascunho real existente foi preservado. Escritas reais do navegador de QA ficaram bloqueadas; nenhum CT foi executado, nenhum segredo foi lido e relatórios blob não foram alterados.
+- Implementação local apresentada para avaliação; ainda sem aprovação do usuário para esta nova organização.
+
+## 20. Arrastar CTs para definir a ordem de execução — 22/10/2026
+
+- O corpo dos cards da faixa **Testes** pode ser arrastado para antes/depois de outro CT ou para a área vazia após o último. Indicador amarelo mostra a posição de destino; numeração e ícone de arraste deixam a ordem explícita.
+- A lista rola horizontalmente ao arrastar nas bordas. As setas anteriores continuam disponíveis pelo teclado. Escape/cancelamento, posição equivalente, payload inválido ou arraste de outro conjunto não mudam a ordem.
+- Reordenar conserva o CT selecionado e os objetos completos de cada seleção: referência de execução, pausas para print e integrações planejadas. Não altera originais nem inicia uma execução. **Salvar rascunho** persiste a nova sequência; salvar/retomar foi conferido sem escrita real, por resposta de API simulada.
+- **331 testes frontend aprovados**, incluindo inserção nas extremidades, no-op, referências imutáveis, indicadores, cancelamento, dados inválidos e serialização da ordem exata. TypeScript, ESLint dos arquivos alterados, build e `git diff --check` conferidos.
+- Playwright em janela isolada: arraste nos dois sentidos, marcador antes/depois, Escape, setas com Enter, 151 CTs com rolagem nas bordas sem mover a faixa de etapas, retomada simulada e janela de 390 × 700 usando mouse. Sem teste de toque físico. Capturas `test-cards-drag-{1366,390}.png` e `test-cards-drag-indicator.png` em `data/mcp-validation/`.
+- Sem alterações ou reinício de backend nesta etapa; nenhuma execução real, escrita de rascunho real, chamada de IA ou leitura de segredos.
+
+## 21. Prévia em tamanho real ao arrastar etapas — 22/10/2026
+
+- Aguardar print, Executar SWS e Executar SQL mostram um card flutuante do mesmo tamanho das etapas, acompanhando o cursor. A imagem pequena nativa do botão da paleta é substituída; a prévia não intercepta cliques nem destinos de soltura.
+- Sobre um intervalo **+**, surge também o espaço de inserção em tamanho real. O + permanece ancorado para evitar que a abertura do espaço retire o alvo debaixo do cursor. Pode-se soltar sobre a própria prévia expandida.
+- Prévia é estado visual transitório, sem ID de etapa, escrita ou alteração do rascunho. Soltar confirma uma única inclusão; sair do intervalo remove o espaço. Escape, fim do arraste ou perda de foco limpam a prévia. Ao mover uma etapa existente, a origem fica atenuada e mantém sua identidade até a confirmação.
+- Roxo para print, amarelo para SWS/SQL; o rótulo de planejamento continua visível. Cards flutuantes são limitados às bordas da janela e mostram menos texto quando pequenos. A paleta permanece centralizada verticalmente, com disposição horizontal nas telas estreitas.
+- Testes isolados conferem os três tipos, tamanho, cancelamento sem marcar um rascunho salvo como alterado, inclusão única na posição exata, limites da janela e renderização de servidor sem portal. TypeScript, lint, build e regressões do frontend conferidos.
+- Playwright isolado em 1366 × 768 e 390 × 700: seguir o cursor, abrir espaço, soltar sobre a prévia, cancelar sem adicionar, medir prévia/card original (192 px e 98 px, respectivamente). Capturas `step-preview-{print,sws,sql}-held-1366.png` e `step-preview-print-held-390.png` em `data/mcp-validation/`, ignorado pelo Git. Sem teste de toque físico, gravação, IA paga ou escrita real; backend e relatórios não alterados.
+
+## 22. Correção da área de inserção durante o arraste — 22/10/2026
+
+- O retorno do usuário mostrou uma limitação da etapa anterior: o espaço só abria ao acertar o pequeno **+**. Agora todo o canvas reconhece o arraste, inclusive sobre as laterais dos cards e nas áreas vazias acima/abaixo deles. O intervalo mais próximo é escolhido pela posição horizontal.
+- A prévia ocupa espaço real entre as etapas, afastando os cards seguintes. Enquanto o cursor estiver na prévia expandida, o destino permanece estável. Eventos de entrada/saída entre filhos do canvas não apagam o destaque. O **+** continua como alternativa de inserção por clique/teclado, não como requisito para arrastar.
+- Dentro do canvas há apenas a prévia inserida na sequência: o card flutuante fica oculto para não encobrir o destino. Fora do canvas o card flutuante volta e o espaço é retirado; Escape/fim do arraste limpam ambos. Soltar confirma exatamente o intervalo destacado, mesmo que a abertura do espaço tenha deslocado o elemento sob o cursor.
+- **341 testes frontend aprovados**, incluindo novos casos de posição fora do +, estabilidade após expansão, posições com rolagem, intervalos entre extras, soltura no destino exibido, saída/cancelamento e rascunho salvo intacto antes de soltar. TypeScript, lint e build de produção conferidos.
+- Playwright isolado, com arraste nativo de mouse: print inserido sem passar no + em **1366 × 768** e **390 × 700**; SWS sobre área vazia acima dos cards e entre extras; SQL após a última etapa; movimento de SQL existente para antes/depois do primeiro original preservando ID; Escape e retorno do card flutuante ao sair do canvas. Não houve teste de toque físico.
+- Capturas `data/mcp-validation/step-canvas-preview-off-plus-{1366,390}.png` mostram a prévia durante o arraste, antes da inclusão. O backend local estava indisponível; o QA visual usou respostas de API simuladas em janela isolada, com escritas reais bloqueadas. Nenhuma execução, gravação, IA paga, alteração histórica ou reinício de backend foi feito.
+
+## 23. Prévia substitui o + durante o arraste — 22/10/2026
+
+- O intervalo ativo mostra apenas o card de prévia, sem **+** à esquerda nem espaço vazio reservado ao botão. A âncora de detecção permanece mensurável, mas invisível, fora do fluxo visual, desabilitada e fora da navegação por teclado/leitor de tela, preservando a estabilidade do arraste.
+- Depois de soltar, a prévia vira uma única etapa e reaparecem **um + antes e outro depois**. Cancelar devolve o botão original sem inserir nada. Comportamento compartilhado por print, SWS e SQL.
+- Conferido por Playwright em 1366 × 768 e 390 × 700: largura da área de prévia exatamente igual à do card (192/98 px), ausência visual/acessível do + ativo, estabilidade do destino e dois botões visíveis e habilitados depois da inserção. Capturas `step-preview-no-plus-{1366,390}.png` e `step-dropped-plus-both-{1366,390}.png` em `data/mcp-validation/`.
+- Regressões de componente verificam ocultação, desabilitação, cancelamento e restauração dos intervalos; TypeScript, lint, build e 341 testes frontend conferidos. QA visual usou GETs da base real com escritas bloqueadas e descartou apenas suas alterações temporárias. Sem salvar rascunhos, iniciar testes ou alterar backend/relatórios.

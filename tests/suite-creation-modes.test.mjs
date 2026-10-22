@@ -23,6 +23,14 @@ const flowUiModule = { exports: {} };
 new Function("require", "module", "exports", await compiled("../app/components/FunctionalFlows.tsx"))(
   name => name.endsWith(".css") ? {} : dependencies[name] || nativeRequire(name), flowUiModule, flowUiModule.exports);
 dependencies["./FunctionalFlows"] = flowUiModule.exports;
+const tooltipModule = { exports: {} };
+new Function("require", "module", "exports", await compiled("../app/components/ActionTooltip.tsx"))(
+  name => name.endsWith(".css") ? {} : nativeRequire(name), tooltipModule, tooltipModule.exports);
+dependencies["./ActionTooltip"] = tooltipModule.exports;
+const overlayModule = { exports: {} };
+new Function("require", "module", "exports", await compiled("../app/components/StepDragOverlay.tsx"))(
+  name => nativeRequire(name), overlayModule, overlayModule.exports);
+dependencies["./StepDragOverlay"] = overlayModule.exports;
 const suiteFixture = () => ({ id: "root-fixture", app_url: "https://fixture.invalid", initial_count: 1, rounds: [], discoveries: [],
   cases: [{ id: "CT001", title: "Ordenar produtos", description: "Referência", steps: ["Abrir página"], expected_result: "Lista ordenada",
     preconditions: [], url: "https://fixture.invalid", mode: "automatic", revision: 1, status: "PASS" }] });
@@ -279,6 +287,20 @@ test("selection, duplication and manual editing remain separate from opening a r
   const css = await readFile(new URL("../app/components/TestSuitesWorkspace.css", import.meta.url), "utf8");
   assert.match(css, /\.suite-case-open:not\(:disabled\)::after\s*\{[^}]*inset:\s*0;[^}]*z-index:\s*1/);
   assert.match(css, /\.suite-case-row > \.suite-check, \.suite-case-row > button:not\(\.suite-case-open\)\s*\{[^}]*z-index:\s*2/);
+});
+
+test("catalog icon hints explain duplication, archive confirmation and restoring without applying any action", async t => {
+  const suite = suiteFixture();
+  suite.cases.push({ ...suite.cases[0], id: "CT002", archived: true });
+  const view = await workspace(t, suite);
+  await view.click("Gerenciar");
+  const tips = () => view.all().filter(node => node.type === tooltipModule.exports.default).map(node => node.props.text);
+  assert.ok(tips().some(value => /Duplicar teste.*cópia.*manual.*revisar e salvar/.test(value)));
+  assert.ok(tips().some(value => /Arquivar teste.*abre uma confirmação.*sem apagar resultados e prints/.test(value)));
+  view.find(node => node.type === "select" && node.props["aria-label"] === "Filtrar CTs").props.onChange({ target: { value: "archived" } });
+  await view.settle();
+  assert.ok(tips().some(value => /Restaurar teste.*base ativa.*histórico preservado/.test(value)));
+  assert.equal(view.calls.some(call => call.method !== "GET"), false);
 });
 
 test("failed result navigation gives feedback without changing filters or selections", async t => {
@@ -621,6 +643,68 @@ test("horizontal order controls and removing the active card keep the remaining 
   assert.equal(view.calls.some(call => call.method !== "GET"), false);
 });
 
+function caseTransfer() {
+  let payload = "";
+  return { types: ["application/x-autojev-test-case"], effectAllowed: "", dropEffect: "",
+    setData(type, value) { assert.equal(type, this.types[0]); payload = value; }, getData() { return payload; } };
+}
+const draggedCard = (view, id) => view.find(node => node.props["data-case-id"] === id);
+async function beginCaseDrag(view, id, transfer) {
+  const card = draggedCard(view, id);
+  const button = [...elements(card)].find(node => node.props.className === "suite-test-card-select");
+  assert.equal(button.props.draggable, true);
+  button.props.onDragStart({ dataTransfer: transfer }); await view.settle();
+}
+async function dropCaseOn(view, id, transfer, side) {
+  const event = { dataTransfer: transfer, clientX: side === "before" ? 20 : 180,
+    currentTarget: { getBoundingClientRect: () => ({ left: 0, width: 200 }) }, preventDefault() {}, stopPropagation() {} };
+  draggedCard(view, id).props.onDragOver(event); await view.settle();
+  assert.equal(draggedCard(view, id).props["data-drop-side"], side);
+  draggedCard(view, id).props.onDrop(event); await view.settle();
+}
+
+test("dragging test cards inserts on either side, keeps the active CT and saves the exact order with its prints", async t => {
+  const suite = suiteFixture();
+  suite.cases.push({ ...suite.cases[0], id: "CT003", title: "Consultar produto" }, { ...suite.cases[0], id: "CT005", title: "Conferir carrinho" });
+  const capture = { version: 1, checkpoints: [{ id: "db-8", gap: 0, order: 0 }] };
+  const view = await workspace(t, suite, undefined, { initialCaseId: "CT001", initialCapturePlan: capture });
+  await view.chat().props.onSend("Adicione CT003 e CT005", null); await view.settle();
+  const transfer = caseTransfer();
+  await beginCaseDrag(view, "CT005", transfer); await dropCaseOn(view, "CT001", transfer, "before");
+  assert.deepEqual(plannedIds(view), ["CT005", "CT001", "CT003"]);
+  assert.equal(view.button("Ver etapas de CT001: Ordenar produtos").props["aria-pressed"], true);
+  await beginCaseDrag(view, "CT001", transfer); await dropCaseOn(view, "CT003", transfer, "after");
+  assert.deepEqual(plannedIds(view), ["CT005", "CT003", "CT001"]);
+  assert.equal(view.all().some(node => node.props["data-checkpoint-id"] === "db-8"), true);
+  assert.ok(view.all().some(node => node.props.role === "status" && /CT001 movido para a posição 3 de 3/.test(text(node))));
+  assert.equal(view.calls.some(call => call.method !== "GET"), false);
+  await view.click("Salvar rascunho");
+  const items = view.calls.find(call => call.path.endsWith("/plans")).body.items;
+  assert.deepEqual(items.map(item => item.case_id), ["CT005", "CT003", "CT001"]);
+  assert.deepEqual(items[2].capture_plan, capture);
+  assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
+});
+
+test("the empty rail area accepts the last position, while cancelling and invalid drags never change a saved order", async t => {
+  const suite = suiteFixture(); suite.cases.push({ ...suite.cases[0], id: "CT003", title: "Consultar produto" });
+  const view = await workspace(t, suite, undefined, { initialCaseId: "CT001" });
+  await view.chat().props.onSend("Adicione CT003", null); await view.settle();
+  const transfer = caseTransfer(), rail = () => view.find(node => node.props["aria-label"] === "Testes selecionados, rolagem horizontal");
+  await beginCaseDrag(view, "CT001", transfer);
+  rail().props.onDrop({ dataTransfer: transfer, preventDefault() {}, stopPropagation() {} }); await view.settle();
+  assert.deepEqual(plannedIds(view), ["CT003", "CT001"]);
+  await beginCaseDrag(view, "CT003", transfer);
+  view.button("Ver etapas de CT003: Consultar produto").props.onDragEnd(); await view.settle();
+  assert.deepEqual(plannedIds(view), ["CT003", "CT001"]);
+  assert.equal(view.all().some(node => node.props["data-drop-side"]), false);
+  for (const invalid of ["not json", JSON.stringify({ rootId: "other-suite", caseId: "CT003" }), JSON.stringify({ rootId: suite.id, caseId: "CT999" })]) {
+    await beginCaseDrag(view, "CT003", transfer); transfer.setData(transfer.types[0], invalid);
+    rail().props.onDrop({ dataTransfer: transfer, preventDefault() {}, stopPropagation() {} }); await view.settle();
+    assert.deepEqual(plannedIds(view), ["CT003", "CT001"]);
+  }
+  assert.equal(view.calls.some(call => call.method !== "GET"), false);
+});
+
 test("square step cards keep a plus before and after each pause and persist the exact insertion order", async t => {
   const view = await workspace(t, suiteFixture(), undefined, { initialCaseId: "CT001" });
   await view.click("Adicionar print na posição 0");
@@ -632,6 +716,153 @@ test("square step cards keep a plus before and after each pause and persist the 
   const body = view.calls.find(call => call.path.endsWith("/plans")).body;
   assert.deepEqual(body.items[0].capture_plan.checkpoints, [{ id: "db-1", gap: 0, order: 0 }, { id: "db-2", gap: 0, order: 1 }]);
   assert.equal(view.calls.some(call => /\/(start|cases|recordings)$/.test(call.path)), false);
+});
+
+test("all three tools can be placed and moved by keyboard-friendly controls with the same original gaps", async t => {
+  const suite = suiteFixture(), before = structuredClone(suite);
+  const view = await workspace(t, suite, undefined, { initialCaseId: "CT001" });
+  await view.click("Selecionar Executar SQL");
+  await view.click("Adicionar Executar SQL na posição 0, intervalo 1");
+  await view.click("Selecionar Aguardar print");
+  await view.click("Adicionar print na posição 0");
+  await view.click("Selecionar Executar SWS");
+  await view.click("Adicionar Executar SWS na posição 0, intervalo 2");
+  assert.equal(view.all().filter(node => node.type === "button" && node.props.draggable).length, 3);
+  assert.equal(view.all().filter(node => node.type === "article" && node.props.draggable).length, 3);
+  await view.click("Mover Executar SQL db-1 para direita");
+  await view.click("Salvar rascunho");
+  const saved = view.calls.find(call => call.path.endsWith("/plans")).body.items[0];
+  assert.deepEqual(saved.capture_plan.checkpoints, [{ id: "db-2", gap: 0, order: 0 }]);
+  assert.deepEqual(saved.planned_integrations, [{ id: "db-3", gap: 0, order: 1, kind: "sws" }, { id: "db-1", gap: 1, order: 0, kind: "sql" }]);
+  assert.match(text(view.find(node => node.props.className === "suite-plan-footer")), /2 SWS\/SQL só no rascunho/);
+  await view.click("Revisar execução");
+  assert.equal(view.button("Executar 1 teste").props.disabled, true, "Unavailable integrations can never be silently omitted even if a stale backend says ready");
+  assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
+  assert.deepEqual(suite, before);
+});
+
+test("dragging a tool and an existing card preserves its identity; foreign or malformed drags do nothing", async t => {
+  const view = await workspace(t, suiteFixture(), undefined, { initialCaseId: "CT001" });
+  let payload = "";
+  const transfer = { types: ["application/x-autojev-step"], effectAllowed: "", setData(type, value) { assert.equal(type, this.types[0]); payload = value; }, getData() { return payload; } };
+  const drag = async (source, gap, index) => {
+    source.props.onDragStart({ dataTransfer: transfer }); await view.settle();
+    const target = view.find(node => node.type === "button" && node.props["data-gap"] === gap && node.props["data-insertion-index"] === index);
+    target.props.onDrop({ dataTransfer: transfer, preventDefault() {} }); await view.settle();
+  };
+  await drag(view.button("Selecionar Executar SWS"), 0, 0);
+  assert.equal(transfer.effectAllowed, "copy");
+  await drag(view.find(node => node.type === "article" && node.props["data-checkpoint-id"] === "db-1"), 1, 0);
+  assert.equal(transfer.effectAllowed, "move");
+  const target = view.find(node => node.type === "button" && node.props["data-gap"] === 0);
+  for (const invalid of ["{broken", JSON.stringify({kind:"sql",caseId:"CT999"}), JSON.stringify({kind:"shell",caseId:"CT001"}), JSON.stringify({kind:"capture",caseId:"CT001",id:"missing"})]) {
+    payload = invalid; target.props.onDrop({ dataTransfer: transfer, preventDefault() {} }); await view.settle();
+  }
+  assert.equal(view.all().filter(node => node.props["data-checkpoint-id"]).length, 1);
+  assert.equal(view.calls.some(call => call.method !== "GET"), false);
+  await view.click("Salvar rascunho");
+  assert.deepEqual(view.calls.find(call => call.path.endsWith("/plans")).body.items[0].planned_integrations, [{ id: "db-1", gap: 1, order: 0, kind: "sws" }]);
+});
+
+test("all three tools show a full-size hover preview without adding or saving anything before drop", async t => {
+  const suite = suiteFixture();
+  suite.rounds = [{ id: "preview-draft", root_id: suite.id, status: "draft", revision: 1, name: "Roteiro salvo", items: [{ case_id: "CT001" }] }];
+  const view = await workspace(t, suite, undefined, { planId: "preview-draft" });
+  let payload = "";
+  const transfer = { types: ["application/x-autojev-step"], setData(_, value) { payload = value; }, getData() { return payload; } };
+  for (const [title, kind] of [["Aguardar print", "capture"], ["Executar SWS", "sws"], ["Executar SQL", "sql"]]) {
+    view.button(`Selecionar ${title}`).props.onDragStart({ dataTransfer: transfer, clientX: 110, clientY: 200 }); await view.settle();
+    const overlay = view.find(node => node.type === overlayModule.exports.default);
+    assert.equal(overlay.props.preview.kind, kind); assert.equal(overlay.props.preview.size, 160);
+    view.find(node => node.type === "button" && node.props["data-gap"] === 1).props.onDragOver({ dataTransfer: transfer, preventDefault() {} }); await view.settle();
+    const preview = view.find(node => node.props["data-step-insertion-preview"]);
+    assert.equal(preview.props["aria-hidden"], "true");
+    assert.equal(preview.props["data-preview-gap"], 1); assert.match(text(preview), new RegExp(title));
+    const insertion = view.find(node => node.type === "button" && node.props["data-gap"] === 1);
+    assert.equal(insertion.props["aria-hidden"], true);
+    assert.equal(insertion.props.disabled, true);
+    assert.equal(insertion.props.tabIndex, -1);
+    assert.equal(view.all().filter(node => node.props["data-checkpoint-id"]).length, 0);
+    assert.equal(view.calls.some(call => call.method !== "GET"), false);
+    assert.match(text(view.find(node => node.props.className === "suite-plan-state")), /Salvo em Rascunhos/);
+    overlay.props.onCancel(); await view.settle();
+    assert.equal(view.all().some(node => node.props["data-step-insertion-preview"]), false);
+    assert.equal(view.all().some(node => node.type === overlayModule.exports.default), false);
+    assert.equal(view.find(node => node.type === "button" && node.props["data-gap"] === 1).props["aria-hidden"], undefined);
+    assert.equal(view.find(node => node.type === "button" && node.props["data-gap"] === 1).props.disabled, false);
+  }
+});
+
+test("dropping on the expanded preview commits exactly one step at its gap and clears both previews", async t => {
+  const view = await workspace(t, suiteFixture(), undefined, { initialCaseId: "CT001" });
+  let payload;
+  const transfer = { types: ["application/x-autojev-step"], setData(_, value) { payload = value; }, getData() { return payload; } };
+  view.button("Selecionar Aguardar print").props.onDragStart({ dataTransfer: transfer }); await view.settle();
+  view.button("Adicionar print na posição 1").props.onDragOver({ dataTransfer: transfer, preventDefault() {} }); await view.settle();
+  const target = view.find(node => node.props.className === "suite-step-drop-target" && [...elements(node)].some(child => child.props["data-step-insertion-preview"]));
+  target.props.onDrop({ dataTransfer: transfer, preventDefault() {} }); await view.settle();
+  assert.equal(view.all().filter(node => node.props["data-checkpoint-id"]).length, 1);
+  assert.equal(view.all().some(node => node.props["data-step-insertion-preview"]), false);
+  assert.equal(view.all().some(node => node.type === overlayModule.exports.default), false);
+  const adjacentSlots = view.all().filter(node => node.type === "button" && node.props["data-gap"] === 1);
+  assert.deepEqual(adjacentSlots.map(node => node.props["data-insertion-index"]), [0, 1]);
+  for (const slot of adjacentSlots) { assert.equal(slot.props["aria-hidden"], undefined); assert.equal(slot.props.disabled, false); }
+  await view.click("Salvar rascunho");
+  assert.deepEqual(view.calls.find(call => call.path.endsWith("/plans")).body.items[0].capture_plan.checkpoints, [{ id: "db-1", gap: 1, order: 0 }]);
+  assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
+});
+
+test("canvas-wide hover works off + and drop commits the displayed gap even when the DOM target shifts", async t => {
+  const view = await workspace(t, suiteFixture(), undefined, { initialCaseId: "CT001" });
+  let payload;
+  const transfer = { types: ["application/x-autojev-step"], setData(_, value) { payload = value; }, getData() { return payload; } };
+  view.button("Selecionar Executar SQL").props.onDragStart({ dataTransfer: transfer }); await view.settle();
+  const rail = view.find(node => node.props.ref && node.props.className === "suite-step-strip suite-horizontal-rail");
+  rail.props.ref.current.querySelectorAll = () => [0, 1].map(gap => ({ dataset: { gap: String(gap), insertionIndex: "0" }, getBoundingClientRect: () => ({ left: 100 + gap * 240, width: 28 }) }));
+  // The pointer is on the trailing half of the original, not inside a + button.
+  const canvas = view.find(node => node.props["data-step-canvas"]);
+  assert.equal(typeof canvas.props.onDragOver, "function");
+  canvas.props.onDragEnter({ clientX: 300, clientY: 100, dataTransfer: transfer, preventDefault() {} }); await view.settle();
+  assert.equal(view.find(node => node.props["data-step-insertion-preview"]).props["data-preview-gap"], 1);
+  assert.equal(view.find(node => node.type === overlayModule.exports.default).props.hidden, true);
+  assert.equal(view.calls.some(call => call.method !== "GET"), false);
+  // Reflow can put a different button under the pointer. Never commit its gap.
+  view.find(node => node.type === "button" && node.props["data-gap"] === 0).props.onDrop({ dataTransfer: transfer, preventDefault() {} }); await view.settle();
+  await view.click("Salvar rascunho");
+  assert.deepEqual(view.calls.find(call => call.path.endsWith("/plans")).body.items[0].planned_integrations, [{ id: "db-1", gap: 1, order: 0, kind: "sql" }]);
+});
+
+test("crossing canvas children keeps the preview; leaving or cancelling removes it without changing a saved draft", async t => {
+  const suite = suiteFixture();
+  suite.rounds = [{ id: "leave-preview", root_id: suite.id, status: "draft", revision: 1, name: "Roteiro salvo", items: [{ case_id: "CT001" }] }];
+  const view = await workspace(t, suite, undefined, { planId: "leave-preview" });
+  const transfer = { types: ["application/x-autojev-step"], setData() {} };
+  view.button("Selecionar Aguardar print").props.onDragStart({ dataTransfer: transfer }); await view.settle();
+  view.button("Adicionar print na posição 1").props.onDragOver({ dataTransfer: transfer, preventDefault() {} }); await view.settle();
+  const event = { relatedTarget: null, clientX: 300, clientY: 150, currentTarget: { contains() { return false; }, getBoundingClientRect() { return { left: 100, right: 800, top: 100, bottom: 500 }; } } };
+  view.find(node => node.props["data-step-canvas"]).props.onDragLeave(event); await view.settle();
+  assert.ok(view.all().some(node => node.props["data-step-insertion-preview"]));
+  view.find(node => node.props["data-step-canvas"]).props.onDragLeave({ ...event, clientX: 90 }); await view.settle();
+  assert.equal(view.all().some(node => node.props["data-step-insertion-preview"]), false);
+  assert.equal(view.find(node => node.type === overlayModule.exports.default).props.hidden, false);
+  view.find(node => node.type === overlayModule.exports.default).props.onCancel(); await view.settle();
+  assert.equal(view.all().some(node => node.type === overlayModule.exports.default), false);
+  assert.equal(view.all().some(node => node.props["data-checkpoint-id"]), false);
+  assert.match(text(view.find(node => node.props.className === "suite-plan-state")), /Salvo em Rascunhos/);
+  assert.equal(view.calls.some(call => call.method !== "GET"), false);
+});
+
+test("reopening a draft preserves mixed steps and clearing integrations never clears real print pauses", async t => {
+  const suite = suiteFixture();
+  suite.rounds = [{ id: "mixed-draft", root_id: suite.id, status: "draft", revision: 2, name: "Meu roteiro", items: [{ case_id: "CT001", capture_plan: { version: 1, checkpoints: [{ id: "db-4", gap: 0, order: 2 }] }, planned_integrations: [{ id: "db-2", gap: 0, order: 0, kind: "sql" }, { id: "db-3", gap: 0, order: 1, kind: "sws" }] }] }];
+  const view = await workspace(t, suite, undefined, { planId: "mixed-draft" });
+  assert.deepEqual(view.all().filter(node => node.type === "article" && node.props.draggable).map(node => node.props["data-checkpoint-id"]), ["db-2", "db-3", "db-4"]);
+  await view.click("Remover Executar SQL db-2"); await view.click("Remover Executar SWS db-3");
+  assert.equal(view.all().filter(node => node.props["data-checkpoint-id"]).length, 1);
+  assert.equal(view.find(node => node.props["data-checkpoint-id"] === "db-4").props.draggable, true);
+  await view.click("Adicionar print após pausa db-4");
+  assert.ok(view.all().some(node => node.props["data-checkpoint-id"] === "db-1"), "New IDs must not collide with any saved mixed step");
+  assert.equal(view.calls.some(call => call.method !== "GET"), false);
 });
 
 test("manual scripts use the same lower rail without pretending to support automatic print pauses", async t => {

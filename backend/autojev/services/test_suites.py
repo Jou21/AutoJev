@@ -8,10 +8,16 @@ from threading import Lock
 from autojev.adapters.execution_plans import ExecutionPlanStore, PlanConflict
 from autojev.adapters.repository import NotFoundError
 from autojev.domain.models import utc_now
+from autojev.services.functional_flows import (
+    classify_case_flows,
+    group_functional_flows,
+)
 from autojev.services.rerun_projection import without_rerun_recipes
-from autojev.services.scenario_revisions import project_scenario_revisions, scenario_report_origin
+from autojev.services.scenario_revisions import (
+    project_scenario_revisions,
+    scenario_report_origin,
+)
 from autojev.services.scenario_step_order import presentation_scenario_steps
-from autojev.services.functional_flows import classify_case_flows, group_functional_flows
 
 TERMINAL = {"completed", "partial", "failed", "cancelled"}
 ACTIVE = {"running", "waiting_manual", "stopping"}
@@ -186,6 +192,8 @@ class TestSuiteService:
             source_case = request.get("source_scenario_id") or case.get("source_scenario_id")
             frozen = definition(case)
             capture_plan = request.get("capture_plan")
+            integrations = deepcopy(request.get("planned_integrations") or [])
+            step_count = len(case.get("recorded_steps") or case["steps"])
             if case["mode"] == "automatic":
                 origin = scenario_report_origin(self.repository, source_id)
                 lineage_root, lineage_case = case["lineage_exploration_id"], case["lineage_case_id"]
@@ -196,11 +204,14 @@ class TestSuiteService:
                 if stored is None:
                     raise ValueError("O CT de referência não existe.")
                 frozen = definition(stored)
-            elif capture_plan or request.get("source_exploration_id") or request.get("source_scenario_id"):
-                raise ValueError("Um CT manual não aceita receita automática nem pausas de automação.")
+                step_count = len(presentation_scenario_steps(stored.get("evidence") or {}) or frozen["steps"])
+            elif capture_plan or integrations or request.get("source_exploration_id") or request.get("source_scenario_id"):
+                raise ValueError("Um CT manual não aceita receita automática nem etapas extras de automação.")
+            if any(point["gap"] > step_count for point in integrations):
+                raise ValueError("A posição de uma integração não corresponde às etapas deste teste.")
             result.append(dict(case_id=case_id, mode=case["mode"], definition=frozen, definition_revision=case["revision"],
                                source_exploration_id=source_id, source_scenario_id=source_case,
-                               capture_plan=capture_plan, state="queued", execution_id=None, result=None, finished_at=None))
+                               capture_plan=capture_plan, planned_integrations=integrations, state="queued", execution_id=None, result=None, finished_at=None))
         return suite["id"], result
 
     def save_plan(self, identity, name, selected, plan_id=None, expected_revision=None):
@@ -220,6 +231,8 @@ class TestSuiteService:
         for item in plan["items"]:
             if item["case_id"] in archived:
                 check = {"available": False, "code": "archived", "reason": "Teste arquivado. Restaure-o na base ou remova-o desta execução."}
+            elif item.get("planned_integrations"):
+                check = {"available": False, "code": "integration_unavailable", "reason": "SWS/SQL estão apenas planejados: integração ainda indisponível. Remova essas etapas para executar este roteiro."}
             elif item["mode"] == "manual":
                 check = {"available": True, "code": "manual", "reason": "Execução e avaliação feitas pelo usuário, sem automação."}
             else:

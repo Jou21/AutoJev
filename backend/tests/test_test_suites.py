@@ -283,3 +283,52 @@ def test_suite_queries_have_indexes_for_root_lists_and_execution_context(runtime
         events = list(connection.execute("EXPLAIN QUERY PLAN SELECT payload_json FROM exploration_events WHERE exploration_id = ? AND type = 'execution_round_item' ORDER BY id DESC LIMIT 1", (root,)))
         assert any("idx_execution_plans_root" in row["detail"] for row in plans)
         assert any("idx_exploration_events" in row["detail"] for row in events)
+
+
+def test_integration_cards_are_persistent_draft_only_and_cannot_be_silently_skipped(runtime):
+    app, client, root = runtime
+    before = deepcopy(app.state.repository.get_exploration(root))
+    item = {"case_id": "CT001", "capture_plan": {"version": 1, "checkpoints": [{"id": "db-1", "gap": 0, "order": 1}]},
+            "planned_integrations": [{"id": "db-2", "gap": 0, "order": 0, "kind": "sws"}, {"id": "db-3", "gap": 0, "order": 2, "kind": "sql"}]}
+    response = client.post(f"/api/test-suites/{root}/plans", json={"name": "Fluxo misto", "items": [item]})
+    assert response.status_code == 201, response.text
+    plan = response.json()
+    loaded = client.get(f"/api/test-suites/rounds/{plan['id']}").json()
+    assert loaded["items"][0]["planned_integrations"] == item["planned_integrations"]
+    assert loaded["items"][0]["capture_plan"] == item["capture_plan"]
+    validation = client.post(f"/api/test-suites/rounds/{plan['id']}/validate").json()
+    assert validation["available"] is False and validation["items"][0]["code"] == "integration_unavailable"
+    assert client.post(f"/api/test-suites/rounds/{plan['id']}/start", json={"confirm": True, "expected_revision": 1}).status_code == 409
+    assert app.state.test_suite_service.store.get(plan["id"])["status"] == "draft"
+    assert not app.state.scenario_rerun_service.tasks and not app.state.test_suite_service.tasks
+    # Removing a placeholder never removes the real capture or its identity.
+    item["planned_integrations"] = []
+    updated = client.put(f"/api/test-suites/{root}/plans/{plan['id']}", json={"expected_revision": 1, "name": "Print real", "items": [item]})
+    assert updated.status_code == 200 and updated.json()["items"][0]["capture_plan"] == item["capture_plan"]
+    assert app.state.repository.get_exploration(root) == before
+
+
+@pytest.mark.parametrize("extra", [
+    {"id": "db-1", "gap": 0, "order": 1, "kind": "sql"},  # duplicate identity
+    {"id": "db-2", "gap": 0, "order": 0, "kind": "sws"},  # duplicate mixed position
+    {"id": "db-2", "gap": 10000, "order": 1, "kind": "sql"},  # outside original steps
+    {"id": "db-2", "gap": 0, "order": 1, "kind": "shell"},
+    {"id": "db-2", "gap": True, "order": 1, "kind": "sql"},
+    {"id": "db-2", "gap": 0, "order": 1, "kind": "sql", "query": "DELETE FROM users"},
+])
+def test_mixed_planning_rejects_invalid_positions_types_and_unsupported_payloads(runtime, extra):
+    app, client, root = runtime
+    response = client.post(f"/api/test-suites/{root}/plans", json={"name": "Inválido", "items": [{"case_id": "CT001",
+        "capture_plan": {"version": 1, "checkpoints": [{"id": "db-1", "gap": 0, "order": 0}]}, "planned_integrations": [extra]}]})
+    assert response.status_code in {409, 422}, response.text
+    assert not app.state.test_suite_service.store.list(root)
+    assert not app.state.scenario_rerun_service.tasks
+
+
+def test_manual_cases_do_not_accept_hidden_automatic_integration_steps(runtime):
+    app, client, root = runtime
+    case = new_manual(client, root)
+    response = client.post(f"/api/test-suites/{root}/plans", json={"name": "Manual", "items": [{"case_id": case["id"],
+        "planned_integrations": [{"id": "db-1", "gap": 0, "order": 0, "kind": "sql"}]}]})
+    assert response.status_code == 409
+    assert not app.state.test_suite_service.store.list(root)

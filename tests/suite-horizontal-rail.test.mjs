@@ -7,7 +7,7 @@ const source = await readFile(new URL("../app/components/suite-horizontal-rail.t
 const compiled = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS, target: ScriptTarget.ES2022 } });
 const compiledModule = { exports: {} };
 new Function("module", "exports", compiled.outputText)(compiledModule, compiledModule.exports);
-const { horizontalRailDelta, bindHorizontalRail, moveRailItem } = compiledModule.exports;
+const { horizontalRailDelta, bindHorizontalRail, moveRailItem, placeRailItem } = compiledModule.exports;
 const wheel = (changes = {}) => ({ deltaX: 0, deltaY: 100, deltaMode: 0, ctrlKey: false, shiftKey: false, altKey: false, metaKey: false, ...changes });
 
 test("vertical wheels translate to horizontal movement in pixels, lines and pages, bounded by the rail", () => {
@@ -61,10 +61,42 @@ test("reordering preserves case identities and capture-plan references without c
   assert.equal(moveRailItem(items, 1, 1), items);
 });
 
-test("both card rails use the available height and never grow into a vertical list", async () => {
+test("drag insertion supports either side and moving to the first or final slot", () => {
+  const items = ["CT001", "CT003", "CT005", "CT009"];
+  assert.deepEqual(placeRailItem(items, 2, 0), ["CT005", "CT001", "CT003", "CT009"]);
+  assert.deepEqual(placeRailItem(items, 0, 3), ["CT003", "CT005", "CT001", "CT009"]);
+  assert.deepEqual(placeRailItem(items, 0, 4), ["CT003", "CT005", "CT009", "CT001"]);
+  assert.deepEqual(placeRailItem(items, 3, 2), ["CT001", "CT003", "CT009", "CT005"]);
+  assert.deepEqual(items, ["CT001", "CT003", "CT005", "CT009"]);
+});
+
+test("dropping next to itself or using stale and invalid positions is a true no-op", () => {
+  const items = ["CT001", "CT003"];
+  for (const [from, slot] of [[0, 0], [0, 1], [1, 1], [1, 2], [-1, 0], [2, 0], [0, -1], [0, 3], [0.5, 0], [0, NaN]]) assert.equal(placeRailItem(items, from, slot), items);
+  assert.deepEqual(placeRailItem([], 0, 0), []);
+});
+
+test("dragging keeps every frozen recipe, capture plan and integration attached to the same case", () => {
+  const plan = Object.freeze({ version: 1, checkpoints: Object.freeze([{ id: "db-1", gap: 1, order: 0 }]) });
+  const points = Object.freeze([{ id: "db-2", gap: 0, order: 0, kind: "sql" }]);
+  const items = Object.freeze([Object.freeze({ case_id: "CT001", capture_plan: plan, source_exploration_id: "original" }), Object.freeze({ case_id: "CT003", planned_integrations: points })]);
+  const reordered = placeRailItem(items, 0, 2);
+  assert.equal(reordered[1], items[0]); assert.equal(reordered[0], items[1]);
+  assert.equal(reordered[1].capture_plan, plan); assert.equal(reordered[0].planned_integrations, points);
+  assert.equal(reordered[1].source_exploration_id, "original");
+});
+
+test("the editable step rail receives 70 percent of the board and keeps the test rail compact", async () => {
   const css = await readFile(new URL("../app/components/TestSuitesWorkspace.css", import.meta.url), "utf8");
-  assert.match(css, /\.suite-flow-board\s*\{[^}]*container: suite-flow \/ size;[^}]*grid-template-rows: minmax\(0, 1fr\) minmax\(0, 1fr\)/);
-  assert.match(css, /\.suite-flow-board \.suite-horizontal-rail\s*\{[^}]*50cqh[^}]*overflow-x: auto; overflow-y: hidden;/);
+  assert.match(css, /\.suite-flow-board\s*\{[^}]*container: suite-flow \/ size;[^}]*grid-template-rows: minmax\(105px, 3fr\) minmax\(0, 7fr\)/);
+  assert.match(css, /\.suite-flow-board \.suite-horizontal-rail\s*\{[^}]*70cqh[^}]*overflow-x: auto; overflow-y: hidden;/);
   assert.match(css, /\.suite-flow-board \.suite-test-card, \.suite-flow-board \.suite-source-step\s*\{[^}]*width: var\(--rail-card-size\); height: var\(--rail-card-size\)/);
   assert.match(css, /@media \(max-height: 560px\)/, "Extremely short windows retain an explicit, reachable fallback rather than clipping controls");
+  assert.match(css, /@container suite-flow \(max-width: 640px\)/, "The palette becomes horizontal when the canvas is narrow");
+});
+
+test("step tools are vertically centered without making overflowing tools or narrow horizontal palettes unreachable", async () => {
+  const css = await readFile(new URL("../app/components/TestSuitesWorkspace.css", import.meta.url), "utf8");
+  assert.match(css, /\.suite-step-palette\s*\{[^}]*flex-direction: column;[^}]*justify-content: safe center;[^}]*padding: 6px 8px 6px 0;[^}]*overflow-y: auto;/);
+  assert.match(css, /@container suite-flow \(max-width: 640px\)\s*\{[^]*?\.suite-step-palette\s*\{[^}]*flex-direction: row;[^}]*justify-content: flex-start; align-items: center;[^}]*overflow-x: auto;/);
 });
