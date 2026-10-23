@@ -423,3 +423,107 @@ Em alturas excepcionais de até 560 px, há uma alternativa deliberada de rolage
 - Depois de soltar, a prévia vira uma única etapa e reaparecem **um + antes e outro depois**. Cancelar devolve o botão original sem inserir nada. Comportamento compartilhado por print, SWS e SQL.
 - Conferido por Playwright em 1366 × 768 e 390 × 700: largura da área de prévia exatamente igual à do card (192/98 px), ausência visual/acessível do + ativo, estabilidade do destino e dois botões visíveis e habilitados depois da inserção. Capturas `step-preview-no-plus-{1366,390}.png` e `step-dropped-plus-both-{1366,390}.png` em `data/mcp-validation/`.
 - Regressões de componente verificam ocultação, desabilitação, cancelamento e restauração dos intervalos; TypeScript, lint, build e 341 testes frontend conferidos. QA visual usou GETs da base real com escritas bloqueadas e descartou apenas suas alterações temporárias. Sem salvar rascunhos, iniciar testes ou alterar backend/relatórios.
+
+## 24. Busca compacta na escolha de testes — 22/10/2026
+
+- Removido o **X** do cabeçalho do menu lateral. O controle de recolher no rodapé permanece; no celular o menu fecha pelo fundo externo, pela navegação ou por Escape, com retorno do foco ao botão de abrir.
+- No topo do seletor ficam apenas **buscar testes + ícone de filtro integrado**, em uma linha de 42 px. Resultado/tipo, funcionalidade, limpeza e inclusão dos filtrados ficam no painel do ícone; a contagem destaca filtros ativos. O catálogo principal continua com seus controles existentes.
+- O painel abre com foco no primeiro filtro e fecha por Escape, clique fora ou pelo próprio ícone, sem apagar busca/seleção. Limpar filtros mantém o texto pesquisado. **Ver roteiro** foi para o rodapé da lista, preservando uma ação clara nas telas em que o seletor ocupa o espaço do editor.
+- Playwright em 1920 × 1080, 1366 × 768 e 390 × 700: topo compacto, painel limitado à largura disponível, busca combinada com resultado/funcionalidade, seleção preservada, Escape/clique fora e fechamento do menu móvel. Capturas `compact-selector-{1920,1366,390}.png` e `compact-selector-filters-{1920,1366,390}.png` em `data/mcp-validation/`. Sem teste físico de toque.
+- **343 testes frontend aprovados**, incluindo novas regressões de filtros, inclusão em lote e teclado, além do shell sem o X. TypeScript, lint, build e diff conferidos. Escritas reais bloqueadas no navegador de QA; alterações temporárias de seleção descartadas. Sem salvar rascunhos, executar testes, chamar IA, alterar backend ou relatórios.
+
+## 25. Remoção dos controles auxiliares marcados — 22/10/2026
+
+- Retirado o estado de salvamento ao lado do nome; a informação permanece apenas no rodapé. Cabeçalhos das faixas mostram somente **Testes + quantidade** e **Etapas + CT**, sem instrução de arraste, contador de originais/extras, ícone de detalhes ou setas de navegação.
+- Removidas as duas linhas estáticas abaixo do chat. Campo de mensagem, modelo, envio, alertas e confirmação real da execução continuam disponíveis. A orientação dos atalhos fica somente na descrição acessível do campo, sem ocupar espaço visual.
+- Rolagem horizontal por mouse/trackpad e teclado, arraste e ações dentro dos cards preservados. Playwright verificou ambas as faixas, com 151 CTs selecionados só na interface; End alcançou o fim da faixa de testes e Home voltou ao início. Em 390 × 700 não houve largura extra da página e o compositor continuou acessível. Shift + Enter manteve a quebra de linha.
+- Capturas `clean-planner-1920.png`, `clean-planner-390.png` e `clean-planner-chat-390.png` em `data/mcp-validation/`. Regressões conferem os cabeçalhos simplificados, o estado de rascunho no rodapé e a descrição acessível do chat; TypeScript, lint, build e testes frontend conferidos. Escritas reais bloqueadas no navegador; seleção de QA descartada sem salvar, executar, chamar IA ou alterar resultados/relatórios.
+
+## 26. Card da base inteiro clicável — 22/10/2026
+
+- A ação **Ver testes** cobre toda a linha da base: nome, ícone, estatísticas, data e espaços vazios. Há apenas uma ação nativa de abertura por card, com indicação visual de hover/foco e uso por teclado; o nome deixou de duplicar o mesmo destino como outro botão.
+- A setinha de expandir permanece independente e acima da área de abertura. As execuções expandidas continuam com seus destinos próprios. Pressionar o card não muda a área clicável nem inicia qualquer execução.
+- Playwright em 1366 × 768: cliques em cinco regiões da linha abriram a base correta; Enter abriu a mesma base e Tab mostrou foco na linha inteira. Expansão exibiu o histórico sem sair da lista. Em 390 × 700, clique na área inferior do card e expansão por teclado funcionaram sem largura extra da página.
+- Capturas `base-card-focus-1366.png` e `base-card-clickable-390.png` em `data/mcp-validation/`. Regressões conferem abertura, ação nativa única, expansão independente, histórico e área clicável estável ao pressionar. TypeScript, lint, build e testes frontend conferidos; apenas navegação/GETs no QA, com escritas reais bloqueadas. Sem backend, relatórios ou dados alterados.
+
+## 27. Nome da execução somente na revisão — 22/10/2026
+
+- O campo **Nome da execução** saiu da preparação e passou ao cabeçalho compacto da revisão. Preparar/salvar um rascunho novo continua possível com o nome padrão; nomes existentes e os editados na revisão são mantidos ao voltar para ajustar os testes ou salvar.
+- Digitar não salva nem inicia testes, não fecha a revisão e invalida o aceite anterior. Ao confirmar a execução com um nome alterado, o rascunho é salvo e revalidado antes de iniciar, usando a revisão atual. Mudanças nas definições/condições exigem nova conferência e aceite; erros conservam o nome e impedem início sem revalidação. Um nome vazio bloqueia a execução e, ao voltar para ajustar, restaura o último nome válido para não deixar um campo oculto bloqueando o editor.
+- Playwright isolado em **1366 × 768** e **390 × 700**: campo ausente na preparação, edição somente na revisão, aceite reiniciado, seleção CT001/CT003 preservada e nome mantido após ajustar/salvar/revisar. Janela pequena sem largura extra nem rolagem vertical da página; cabeçalho da revisão medido em 56/81 px. Capturas `name-only-review-{1366,390}.png` e `name-only-review-prep-{1366,390}.png` em `data/mcp-validation/`.
+- **353 testes frontend aprovados**, incluindo salvamento do nome/revisão correta, definições atualizadas, indisponibilidade, falha de salvamento/revalidação, retomada e nome vazio. TypeScript, lint, build e diff conferidos. QA usou GETs da base real e respostas simuladas para salvar/validar; escritas reais permaneceram bloqueadas, sem executar CTs, chamar IA, alterar rascunhos reais, backend ou relatórios.
+
+## 28. Remoção da faixa numerada da preparação — 22/10/2026
+
+- Retirada a linha **1. Escolher testes / 2. Ajustar roteiro / 3. Revisar e confirmar**, junto de seus estilos exclusivos. A área antes ocupada pela faixa fica disponível para o editor; os botões de escolher testes, salvar e revisar continuam em seus locais existentes.
+- **72 testes do componente aprovados**, incluindo uma regressão que confere ausência da faixa, seleção e pausas preservadas, abertura do seletor e revisão com confirmação obrigatória. TypeScript, lint e diff conferidos. Sem alterações em backend, relatórios ou dados reais.
+
+## 29. Preparação sem faixa de ações ou títulos das faixas — 22/10/2026
+
+- Removida a faixa com Escolher testes, Adicionar teste duplicado, Assistente e ajuda. Um único botão de ícone, de 34 × 34 px, fica à direita das abas da preparação, no lugar do atualizar, e abre/fecha o seletor. Usa nome acessível, estado expandido e o componente de dica existente. Continua acessível quando o seletor ocupa o editor nas telas pequenas.
+- Retirados os títulos visuais **Testes + quantidade** e **Etapas + CT**. Os nomes acessíveis das regiões, a identificação/seleção nos cards, a ordem e as pausas continuam preservados. Adicionar teste permanece no cabeçalho principal; o assistente continua no painel e na alternância móvel. O link Ver rascunhos passou ao rodapé de um rascunho salvo.
+- Conferência visual e por cliques no navegador integrado em 1366 × 768 e 390 × 700: abertura/fechamento do seletor, busca e dois testes selecionados preservados, sem largura extra ou rolagem vertical da página. A automação desta sessão não confirmou Enter/hover; não foi feito teste físico de teclado/toque. A dica usa o componente existente e a ação é um botão HTML nativo.
+
+## 30. Nova exploração direta e paginação de bases — 22/10/2026
+
+- O botão de Meus testes passou de **Nova base de testes** para **Nova exploração** e navega diretamente para `#/nova-exploracao`, sem pergunta intermediária nem iniciar a exploração.
+- Lista paginada em **20 bases por página**, após busca/filtro e ordenação por atividade mais recente. Anterior/Próxima, página atual e faixa de resultados ficam fora da lista rolável. Busca e filtro pesquisam a lista completa e voltam à primeira página; atualização limita a página ao novo total e não deixa uma última página vazia. Listas de até 20 itens não mostram controles desnecessários.
+- A troca de página usa os dados já carregados e volta a lista ao topo. A página é conservada na memória da sessão ao abrir uma base ou Nova exploração e retornar, sem armazenar texto de formulários ou credenciais.
+- Navegador integrado com dados reais: 36 bases distribuídas em 20 + 16, retorno à página 2, busca vazia/limpeza e destino correto de Nova exploração. Em 390 × 700 a paginação ficou visível no rodapé, sem largura extra da página. Foram descartadas apenas as duas seleções temporárias do QA; nenhuma exploração, execução, gravação ou chamada de IA foi iniciada, nenhum rascunho real foi salvo e backend/relatórios não foram alterados.
+- **359 testes frontend aprovados**, com novos casos de 45 bases, limites/páginas parciais, ordenação, busca global, filtros, atualização reduzindo o total, lista vazia, navegação direta e botão de seleção compacto. TypeScript, lint e build conferidos; diff sem erros.
+
+## 31. Etapas aproveitam o espaço abaixo dos testes — 22/10/2026
+
+- A faixa superior deixou de reservar 30% da altura: agora se ajusta aos cards, com margem para a barra horizontal. O painel de etapas ocupa todo o restante da área, preservando o intervalo de 8 px entre os painéis. Tamanho dos cards de testes, arraste, chat e rodapé mantidos.
+- Conferido no navegador integrado em **1920 × 1080**, **1366 × 768** e **390 × 700**, com CT001/CT003/CT004 selecionados apenas para QA. No monitor grande, a faixa superior ficou com 166 px e as etapas com 716 px; no celular, a página permaneceu em 390 × 700 e a lista superior sem corte vertical (altura interna e conteúdo de 79 px).
+- Atualizadas as regressões que exigiam a antiga proporção rígida para conferir a altura ajustada aos cards e o preenchimento restante pelas etapas. Build e testes isolados de componente conferidos. Apenas seleção local descartada ao terminar: nenhum rascunho real salvo, teste executado ou alteração em backend/relatórios.
+
+## 32. Adicionar teste começa no assistente — 23/10/2026
+
+- **Adicionar teste** abre o chat e pergunta “Como você gostaria de realizar esse teste?”, com apenas dois cards dentro da própria mensagem: **Gravar minha navegação** e **Planejar com IA**. Retirados o seletor de três modos, o acesso direto ao formulário vazio e o bloco de descoberta desse fluxo. Repetir o clique revela a pergunta atual sem duplicá-la; conversa, texto ainda não enviado, modelo, ordem dos testes e pausas são preservados.
+- Planejar com IA pede a tela e o objetivo, incluindo a comparação do CRUD com a base, sem enviar nada automaticamente. Gravar mostra os cuidados e exige confirmação explícita antes de abrir um navegador; confirmação, andamento e finalização ficam no chat. O roteiro gravado e as propostas ainda passam pelo editor de revisão, com as opções de salvar apenas na base ou também incluir na execução. Edições não salvas e gravações em andamento continuam protegidas.
+- Na preparação, os dois painéis de cards permanecem livres do formulário de criação. Na manutenção da base, enquanto não houver um roteiro para revisar, aparece somente o assistente, sem coluna de editor vazia. Em telas pequenas, o clique abre diretamente o painel do chat. Histórico de descobertas e relatórios não foram alterados.
+- Conferência visual e por cliques no navegador integrado em **1366 × 768** e **390 × 700**: pergunta, dois cards, continuação da IA e confirmação de gravação acessíveis, sem largura extra ou rolagem vertical da página. A seleção temporária CT001/CT003 foi limpa ao final; nenhum rascunho real foi salvo e nenhuma gravação, execução ou chamada paga de IA foi iniciada.
+- **362 testes frontend aprovados**, cobrindo escolha dentro da última mensagem, ausência do bloco antigo, ausência de envios automáticos, confirmação/finalização isolada da gravação, preservação da conversa/modelo/seleção/prints e proteção do editor não salvo. TypeScript, lint, build e diff conferidos.
+
+## 33. Destaque temporário das escolhas no chat — 23/10/2026
+
+- Clicar em **Adicionar teste** inicia um brilho dourado nos dois cards do assistente: três pulsações suaves de 1,4 segundo, totalizando 4,2 segundos. Ao terminar, os cards voltam ao estilo normal. Repetir o clique reinicia apenas o destaque, sem duplicar a pergunta nem apagar a mensagem em edição; digitar não reinicia o efeito.
+- O efeito altera somente borda, fundo e sombra, sem mover ou redimensionar os cards. Com `prefers-reduced-motion`, o destaque fica estático pelo mesmo período, sem pulsações. Não foram adicionados timers nem chamadas à API.
+- Conferido no navegador integrado em **1366 × 768** e **390 × 700**: ambos os cards receberam a animação finita; após o período, a sombra voltou a `none`; novo clique voltou a produzir brilho. Página sem largura extra ou rolagem vertical. Movimento reduzido coberto por contrato CSS nos testes. Nenhuma gravação, execução, salvamento ou chamada de IA realizada no QA.
+- **363 testes frontend aprovados**, incluindo reinício do destaque apenas pelo clique explícito, preservação do texto e estilo alternativo de movimento reduzido. TypeScript, lint, build e diff conferidos.
+
+## 34. Captura da etapa no próprio editor — 23/10/2026
+
+- Os cards originais de etapas agora são botões completos. Selecionar uma etapa destaca o card, compacta as duas faixas e abre sua imagem abaixo, mantendo chat e rodapé acessíveis. Fechar restaura o espaço das etapas e devolve o foco ao card. Trocar de CT fecha a imagem; nenhuma seleção, ordem, pausa ou resultado é alterado por essa visualização.
+- A captura usa a largura do painel, com rolagem interna, zoom de 50% a 200%, ajuste a 100% e abertura do original em outra aba. Carregamento, ausência de imagem e falha de leitura têm estados próprios. Uma captura ausente nunca é substituída pela de outra etapa; isso inclui um arquivo antigo indisponível encontrado no QA.
+- Catálogo e contexto histórico passam a incluir somente o nome seguro da captura e sua execução proprietária nas etapas já existentes. A prévia de uma ação usa apenas sua referência explícita; imagens enviadas anteriormente pelo usuário seguem a mesma ordem preservada. Sem imagens embutidas, geração de relatório blob, gravação de evidência ou alteração de histórico. Referências históricas explícitas continuam usando o dono antigo, não o resultado mais recente.
+- Conferido por cliques e inspeção visual no navegador integrado em **1920 × 1080**, **1366 × 768** e **390 × 700**, com capturas reais de CT001. A imagem ocupou 501 px de altura no monitor grande; no celular, as faixas e o cabeçalho foram compactados para reservar mais espaço à captura. Página sem largura extra ou rolagem vertical nos três tamanhos; somente a imagem ampliada/conteúdo maior usa rolagem interna.
+- **371 testes frontend e 135 testes backend aprovados**: vínculo da captura à execução correta, contexto histórico, rejeição de URLs/caminhos inválidos, ausência/falha/tentativa de recarregar, zoom, troca de CT, fechamento e inserção por arraste com imagem aberta. Soltar uma ferramenta sobre a imagem não insere uma etapa. TypeScript, lint, build e diff conferidos.
+- API local atualizada após conferir que não havia execuções ativas; segue na porta 8000. Os três CTs selecionados temporariamente para QA foram desmarcados, sem salvar rascunho, executar teste, gravar navegação ou solicitar geração à IA. Relatórios blob não foram modificados.
+
+## 35. Imagem usa também a largura abaixo das ferramentas — 23/10/2026
+
+- A prévia saiu da coluna dos cards e passou a ser uma segunda linha do editor, abrangendo as duas colunas. Ferramentas e etapas ficam somente acima dela, sem coluna vazia ao lado da imagem. As ferramentas são compactadas apenas enquanto a prévia está aberta; ao fechar, o layout anterior é restaurado.
+- Na tela pequena, as linhas são ferramentas, etapas e imagem, preservando a altura restante para a captura. Zoom, troca/fechamento da imagem, chat, rodapé e inserção de etapas continuam disponíveis.
+- Navegador integrado em **1366 × 768**, **1920 × 1080** e **390 × 700**: a imagem teve exatamente a largura e o alinhamento esquerdo do editor (720, 1178 e 342 px, respectivamente), abaixo das ferramentas; sem largura extra ou rolagem vertical da página. Apenas dois CTs foram selecionados temporariamente e desmarcados ao terminar, sem salvar ou executar.
+- Regressões conferem que a prévia é irmã da paleta e da faixa de etapas, não filha da coluna direita, e ocupa todas as colunas no desktop, com três linhas no celular. **371 testes frontend aprovados**; TypeScript, lint, build e diff conferidos. Sem mudanças no backend ou nos relatórios.
+
+## 36. Arrastar a imagem para movimentá-la — 23/10/2026
+
+- A captura carregada pode ser movimentada segurando e arrastando com o botão principal do mouse ou caneta, nos dois eixos. O cursor passa de mão aberta para fechada durante o movimento. A captura do ponteiro mantém o arraste ao sair da imagem; soltar, cancelar ou perder a captura encerra o movimento. A imagem não inicia um arraste de arquivo nem interfere na ordem dos testes ou etapas.
+- O movimento usa a rolagem interna e seus limites, sem mover a página. Zoom, ajuste, fechamento, barras de rolagem e região focável continuam disponíveis. Toque permanece com rolagem e gesto de zoom nativos; botões secundários, barras, imagens indisponíveis/em carregamento e imagens sem conteúdo excedente não são interceptados.
+- Conferido com arraste real no navegador integrado em **1366 × 768** e **390 × 700**, com zoom de 125%: deslocamentos internos de 140 × 90 px e 70 × 47 px, respectivamente, e retorno ao início pelo movimento inverso. A página permaneceu sem deslocamento ou dimensões excedentes. Não foi realizado teste físico de toque/caneta. Apenas a seleção temporária CT001/CT003 foi limpa, sem salvar ou executar.
+- **374 testes frontend aprovados**, incluindo movimento, limites, captura/liberação/cancelamento e gestos ignorados. TypeScript, lint, build e diff conferidos. Sem mudanças no backend, nos relatórios ou nas imagens preservadas.
+
+## 37. Modo compacto sem instruções extras — 23/10/2026
+
+- Ao abrir a imagem da etapa, os textos **Adicionar etapa** e **Arraste entre as etapas. Use + para inserir por clique.** deixam de ocupar espaço. Fechar a imagem restaura as orientações do modo normal; ferramentas, inserção e arraste continuam disponíveis. O aviso de integração SWS/SQL apenas em rascunho é preservado quando necessário.
+- Conferido no navegador integrado em **1366 × 768** e **390 × 700**, sem largura extra ou rolagem vertical da página. A seleção temporária de CT001 foi descartada sem salvar ou executar. **100 testes focados aprovados**, incluindo ocultação/restauração das instruções e preservação dos avisos. TypeScript, lint, build e diff conferidos.
+
+## 38. Navegar pelas etapas segurando e arrastando — 23/10/2026
+
+- Segurar e arrastar horizontalmente o fundo da área de etapas ou um card original movimenta a faixa, com cursor de mão. Um limiar de 5 px distingue o arraste de um clique simples: arrastar não abre/fecha imagens nem altera a ordem das etapas; clicar continua abrindo a captura. O movimento fica limitado à faixa e não desloca a página.
+- Ferramentas, etapas extras arrastáveis, botões de inserção/remoção e a imagem não são capturados por essa rolagem. Toque, teclado, barras e gestos nativos continuam disponíveis. Liberação, cancelamento, perda de captura e desmontagem limpam os eventos e o estado do cursor; o clique gerado ao terminar um arraste é consumido sem bloquear o próximo clique intencional.
+- Navegador integrado em **1366 × 768**: arrastar sobre um card moveu a faixa em 140 px sem abrir imagem; clicar abriu a captura; arrastar o fundo no modo compacto moveu mais 200 px mantendo a mesma captura. Em **390 × 700**, arrastar moveu 70 px, sem largura extra ou rolagem da página. Inserção e remoção por clique também conferidas; não foi confirmado arraste HTML de ferramentas pela automação nem teste físico de toque/caneta.
+- **381 testes frontend aprovados**, incluindo limites, limiar, clique/teclado preservados, controles ignorados, cancelamento e limpeza. TypeScript, lint, build e diff conferidos. A pausa e a seleção temporárias de CT001/CT003 foram descartadas; nenhum rascunho salvo, CT executado ou chamada de IA realizada. Backend e relatórios não alterados.

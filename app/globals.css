@@ -623,7 +623,6 @@ a {
 }
 
 .mobile-header,
-.mobile-close,
 .nav-scrim {
   display: none;
 }
@@ -5378,7 +5377,6 @@ input::placeholder {
     padding: 11px 10px;
   }
 
-  .mobile-close,
   .mobile-header,
   .nav-scrim {
     display: flex;

@@ -132,6 +132,7 @@ class AssistantInput(ApiModel):
     messages: list[ChatMessage] = Field(min_length=1, max_length=12)
     selected_case_ids: list[StrictStr] = Field(default_factory=list, max_length=500)
     llm: ModelSelectionInput | None = None
+    draft: DefinitionInput | None = None
 
 
 class CoverageOperation(ApiModel):
@@ -234,7 +235,7 @@ def suite(root_id: str, request: Request):
 @router.get("/{source_id}/case-context/{case_id}")
 def case_context(source_id: str, case_id: str, request: Request):
     from autojev.services.scenario_revisions import scenario_report_origin
-    from autojev.services.test_suites import definition
+    from autojev.services.test_suites import definition, recorded_step_metadata
     suites = service(request)
     origin = call(lambda: scenario_report_origin(suites.repository, source_id))
     catalog = call(lambda: suites.catalog(source_id))
@@ -250,8 +251,7 @@ def case_context(source_id: str, case_id: str, request: Request):
         source_case = next((case for case in source.get("scenarios") or [] if case["id"] == case_id), None)
         if source_case is None:
             raise HTTPException(404, "A referência selecionada não contém este CT.")
-        reference = {**definition(source_case), "recorded_steps": [{"title": step.get("title") or "Registro", "kind": step.get("kind") or "observation"}
-                     for step in suites.reruns._source_timeline(source, case_id)]}
+        reference = {**definition(source_case), "recorded_steps": recorded_step_metadata(suites.reruns._source_timeline(source, case_id), source_id)}
     return {"root_id": catalog["id"], "case_id": imported["id"], "mode": imported["mode"], "reference": reference,
             "source_exploration_id": source_id, "source_scenario_id": case_id}
 
@@ -268,7 +268,8 @@ async def assistant(root_id: str, body: AssistantInput, request: Request):
     try:
         raw, usage, llm = await suggest_plan(request.app.state.exploration_manager, suites, root_id,
                                            [message.model_dump() for message in body.messages], body.selected_case_ids,
-                                           body.llm.model_dump() if body.llm else None)
+                                           body.llm.model_dump() if body.llm else None,
+                                           draft=body.draft.model_dump() if body.draft else None)
         suggestion = AssistantOutput.model_validate(raw)
         if set(suggestion.selected_case_ids) - known:
             raise ValueError("Unknown IDs")

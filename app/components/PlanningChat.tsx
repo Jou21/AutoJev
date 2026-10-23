@@ -5,7 +5,7 @@ import { ArrowDown, ArrowUp, Bot, Check, ChevronDown, Copy, LoaderCircle, Search
 import "./PlanningChat.css";
 
 export type ChatLlm = { provider_id: string; model_id: string; provider_name?: string; label?: string };
-export type PlanningMessage = { role: "user" | "assistant"; content: string; llm?: ChatLlm };
+export type PlanningMessage = { role: "user" | "assistant"; content: string; llm?: ChatLlm; kind?: "creation_prompt" };
 type ModelOption = { id: string; provider_id: string; provider_name: string; label?: string; enabled?: boolean; input_modalities?: string[]; output_modalities?: string[] };
 type Props = {
   id?: string;
@@ -21,6 +21,8 @@ type Props = {
   onSend: (text: string, model: ChatLlm | null) => Promise<void>;
   error: string;
   children?: ReactNode;
+  creationActions?: ReactNode;
+  focusRequest?: number;
   purpose?: "base" | "execution";
 };
 
@@ -32,7 +34,7 @@ function MessageContent({ content }: { content: string }) {
   return <p>{content.split(/(\*\*[^*\n]+\*\*|`[^`\n]+`)/g).map((part, index) => part.startsWith("**") && part.endsWith("**") ? <strong key={index}>{part.slice(2, -2)}</strong> : part.startsWith("`") && part.endsWith("`") ? <code key={index}>{part.slice(1, -1)}</code> : part)}</p>;
 }
 
-export default function PlanningChat({ id, composerRef, request, defaultModel, model, onModelChange, messages, busy, value, onValueChange, onSend, error, children, purpose = "execution" }: Props) {
+export default function PlanningChat({ id, composerRef, request, defaultModel, model, onModelChange, messages, busy, value, onValueChange, onSend, error, children, creationActions, focusRequest, purpose = "execution" }: Props) {
   const [models, setModels] = useState<ModelOption[]>([]), [loading, setLoading] = useState(true), [catalogError, setCatalogError] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false), [query, setQuery] = useState(""), [catalogVersion, setCatalogVersion] = useState(0);
   const [copied, setCopied] = useState<number | null>(null), [copyError, setCopyError] = useState(false), [awayFromBottom, setAwayFromBottom] = useState(false);
@@ -75,6 +77,12 @@ export default function PlanningChat({ id, composerRef, request, defaultModel, m
   useEffect(() => {
     if (following.current) transcript.current?.scrollTo({ top: transcript.current.scrollHeight, behavior: "instant" });
   }, [messages, busy, children, error]);
+
+  useEffect(() => {
+    if (!focusRequest) return;
+    following.current = true;
+    transcript.current?.scrollTo({ top: transcript.current.scrollHeight, behavior: "instant" });
+  }, [focusRequest]);
 
   useEffect(() => {
     if (composer.current) {
@@ -133,6 +141,7 @@ export default function PlanningChat({ id, composerRef, request, defaultModel, m
         {messages.map((message, index) => <article className="suite-chat-message" data-role={message.role} key={index}>
           {message.role === "assistant" && <div className="planning-chat-message-byline"><Bot size={15} /><strong>AutoJev</strong><small>{message.llm?.label || message.llm?.model_id || "Sem uso de IA"}</small></div>}
           <MessageContent content={message.content} />
+          {message.role === "assistant" && message.kind === "creation_prompt" && index === messages.length - 1 && creationActions}
           {message.role === "assistant" && <button className="planning-chat-copy" aria-label={copied === index ? "Resposta copiada" : "Copiar resposta"} title="Copiar resposta" onClick={() => void copy(message, index)}>{copied === index ? <Check size={13} /> : <Copy size={13} />}</button>}
         </article>)}
         {busy && <div className="planning-chat-thinking" role="status"><span className="planning-chat-thinking-dots"><i /><i /><i /></span><span>Organizando seus testes…</span></div>}
@@ -146,10 +155,9 @@ export default function PlanningChat({ id, composerRef, request, defaultModel, m
       {catalogError && <p className="planning-chat-catalog-error">Não consegui carregar os modelos. <button type="button" onClick={() => { setLoading(true); setCatalogVersion(version => version + 1); }}>Tentar novamente</button></p>}
       <form className="suite-chat-compose" onSubmit={event => { event.preventDefault(); if (!pickerOpen) send(); }}>
         <textarea ref={composer} maxLength={4000} rows={2} aria-label="Mensagem para o assistente" aria-describedby="planning-chat-keyboard" placeholder={purpose === "base" ? "Que teste falta na sua base?" : "Quais testes vamos preparar?"} value={value} onChange={event => onValueChange(event.target.value)} onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); send(); } }} />
+        <span id="planning-chat-keyboard" className="sr-only">Enter envia. Shift + Enter pula linha.</span>
         <div className="planning-chat-compose-actions">{modelPicker}<button className="planning-chat-send" type="submit" aria-label="Enviar" title="Enviar mensagem" disabled={busy || !value.trim()}>{busy ? <LoaderCircle className="spin" size={19} /> : <ArrowUp size={20} />}</button></div>
       </form>
-      <p id="planning-chat-keyboard">Enter envia · Shift + Enter pula linha</p>
-      <p className="planning-chat-safety">Sugestões usam tokens. Você confirma qualquer execução.</p>
     </div>
   </aside>;
 }

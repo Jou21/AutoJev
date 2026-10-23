@@ -39,6 +39,47 @@ def test_assistant_only_suggests_validated_cases_and_does_not_save_or_dispatch(r
     assert app.state.scenario_rerun_service.tasks == {}
 
 
+def test_construction_draft_is_bounded_context_for_refinement_not_a_saved_case(runtime):
+    app, client, root = runtime
+    captured = []
+    draft = {"title": "Conferir carrinho", "description": "Rascunho local", "preconditions": [],
+             "steps": ["Abrir carrinho"], "expected_result": "Itens visíveis", "url": "https://shop.test/cart?token=PRIVATE"}
+
+    class Model:
+        async def chat_json(self, model, system, user, **options):
+            captured.append((system, json.loads(user)))
+            return {"reply": "Roteiro atualizado, ainda não salvo.", "selected_case_ids": [], "new_cases": [
+                {**draft, "url": "https://shop.test", "steps": [*draft["steps"], "Remover um item"]}]}
+
+        def drain_usage(self): return {"total_tokens": 10}
+
+    app.state.exploration_manager._client_for = lambda provider: Model()
+    response = client.post(f"/api/test-suites/{root}/assistant", json={
+        "messages": [{"role": "user", "content": "Inclua remover um item"}], "draft": draft})
+    assert response.status_code == 200, response.text
+    system, context = captured[0]
+    assert context["draft_under_construction"] == {**draft, "url": "https://shop.test"}
+    assert "PRIVATE" not in json.dumps(context)
+    assert "roteiro completo atualizado como único item de new_cases" in system
+    assert response.json()["new_cases"][0]["steps"] == ["Abrir carrinho", "Remover um item"]
+    assert app.state.test_suite_service.store.cases(root) == []
+    assert app.state.test_suite_service.store.list(root) == []
+    assert not app.state.scenario_rerun_service.tasks
+
+
+@pytest.mark.parametrize("invalid", [{"title": " "}, {"steps": []}, {"url": "file:///tmp/private"}, {"case_id": "CT999"}])
+def test_invalid_construction_draft_is_rejected_before_contacting_the_model(runtime, invalid):
+    app, client, root = runtime
+    calls = []
+    app.state.exploration_manager._client_for = lambda provider: calls.append(provider)
+    draft = {"title": "Conferir carrinho", "description": "Proposta", "preconditions": [],
+             "steps": ["Abrir carrinho"], "expected_result": "Itens visíveis", "url": "https://shop.test", **invalid}
+    response = client.post(f"/api/test-suites/{root}/assistant", json={
+        "messages": [{"role": "user", "content": "Ajuste o roteiro"}], "draft": draft})
+    assert response.status_code == 422
+    assert not calls and not app.state.test_suite_service.store.cases(root)
+
+
 def test_unknown_ids_and_unsafe_model_output_are_never_applied(runtime):
     app, client, root = runtime
     class Model:

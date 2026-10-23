@@ -29,6 +29,23 @@ def definition(case):
             for key in ("title", "description", "preconditions", "steps", "expected_result", "url")}
 
 
+def recorded_step_metadata(steps, owner):
+    """Lightweight, owner-bound image references; never embed images or action data."""
+    result = []
+    for step in steps:
+        item = {"title": step.get("title") or "Registro", "kind": step.get("kind") or "observation"}
+        preview = step.get("action_preview")
+        screenshot = step.get("screenshot") or (preview.get("screenshot") if isinstance(preview, dict) else None)
+        if isinstance(screenshot, str):
+            parts = screenshot.replace("\\", "/").split("/")
+            filename = parts[-1]
+            if (owner and ".." not in parts and not any(ord(char) < 32 or char in "?#" for char in screenshot)
+                    and filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))):
+                item.update(screenshot=filename, evidence_exploration_id=owner)
+        result.append(item)
+    return result
+
+
 class TestSuiteService:
     def __init__(self, repository, reruns):
         self.repository, self.reruns = repository, reruns
@@ -114,7 +131,7 @@ class TestSuiteService:
                                 lineage_exploration_id=root, lineage_case_id=case["id"],
                                 source_exploration_id=revision.get("exploration_id", root),
                                 source_scenario_id=revision.get("scenario_id", case["id"]),
-                                recorded_steps=[{"title": step.get("title") or "Registro", "kind": step.get("kind") or "observation"} for step in presentation_scenario_steps(case.get("evidence") or {})],
+                                recorded_steps=recorded_step_metadata(presentation_scenario_steps(case.get("evidence") or {}), case.get("evidence_exploration_id") or revision.get("exploration_id", root)),
                                 status=case.get("status"), recorded_at=revision.get("recorded_at"), flow_classification=classify_case_flows(case), **definition(case)))
         plans = self.store.list(root)
         for case in self.store.cases(root):
@@ -123,7 +140,7 @@ class TestSuiteService:
                 actual = next(value for value in imported["scenarios"] if value["id"] == case["source_scenario_id"])
                 revision = actual.get("execution_revision") or {}
                 catalog.append({**case, "status": actual.get("status"), "recorded_at": revision.get("recorded_at"), "flow_classification": classify_case_flows(actual),
-                                "recorded_steps": [{"title": step.get("title") or "Registro", "kind": step.get("kind") or "observation"} for step in presentation_scenario_steps(actual.get("evidence") or {})],
+                                "recorded_steps": recorded_step_metadata(presentation_scenario_steps(actual.get("evidence") or {}), actual.get("evidence_exploration_id") or revision.get("exploration_id", case["source_exploration_id"])),
                                 "lineage_exploration_id": case["source_exploration_id"], "lineage_case_id": case["source_scenario_id"],
                                 "source_exploration_id": revision.get("exploration_id", case["source_exploration_id"]),
                                 "source_scenario_id": revision.get("scenario_id", case["source_scenario_id"])})

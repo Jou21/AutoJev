@@ -1745,6 +1745,7 @@ function ArchitectureFlow({ compact = false }: { compact?: boolean }) {
 export default function AutoJevApp() {
   const [route, setRoute] = useState<AppRoute>({ view: "dashboard" });
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const mobileMenuTrigger = useRef<HTMLButtonElement>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [providers, setProviders] = useState<Provider[]>([]);
   const [models, setModels] = useState<Model[]>([]);
@@ -1909,6 +1910,15 @@ export default function AutoJevApp() {
   }, [loadCore]);
 
   useEffect(() => {
+    if (!mobileNavOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { event.preventDefault(); setMobileNavOpen(false); mobileMenuTrigger.current?.focus(); }
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [mobileNavOpen]);
+
+  useEffect(() => {
     if (route.view !== "detail" || !route.explorationId) {
       setSelectedExploration(null);
       return;
@@ -1988,7 +1998,7 @@ export default function AutoJevApp() {
           key={[route.suiteId, route.planId, route.roundId, route.initialCaseId, route.initialSourceId, route.initialSourceCase, JSON.stringify(route.capturePlan)].join("/")}
           rootId={route.suiteId} planId={route.planId} roundId={route.roundId} initialCaseId={route.initialCaseId}
           initialSourceId={route.initialSourceId} initialSourceCase={route.initialSourceCase} initialCapturePlan={route.capturePlan}
-          request={request} navigate={navigate} openReport={(root, scope, roundId, caseId) => openTestSuiteReport(request, { root, scope, roundId, caseId, apiBase })} /></Suspense>;
+          apiBase={apiBase} request={request} navigate={navigate} openReport={(root, scope, roundId, caseId) => openTestSuiteReport(request, { root, scope, roundId, caseId, apiBase })} /></Suspense>;
       case "planned":
         return <Suspense fallback={<section className="panel" role="status">Carregando execuções planejadas…</section>}><PlannedExecutions request={request} navigate={navigate} /></Suspense>;
       case "providers":
@@ -2053,14 +2063,11 @@ export default function AutoJevApp() {
     <div className={`app-shell${sidebarCollapsed ? " sidebar-collapsed" : ""}`}>
       <a className="skip-link" href="#main-content">Pular para o conteúdo</a>
       {mobileNavOpen && <button className="nav-scrim" onClick={() => setMobileNavOpen(false)} aria-label="Fechar menu" />}
-      <aside className={`sidebar${mobileNavOpen ? " mobile-open" : ""}`}>
+      <aside id="app-sidebar" className={`sidebar${mobileNavOpen ? " mobile-open" : ""}`}>
         <div className="brand-row">
           <button className="brand" onClick={() => navigate("#/dashboard")} aria-label="Ir para o dashboard">
             <span className="brand-mark"><Bot size={22} strokeWidth={2.1} /></span>
             <span className="brand-copy"><strong>AutoJev</strong><small>Autonomous QA</small></span>
-          </button>
-          <button className="mobile-close icon-button" onClick={() => setMobileNavOpen(false)} aria-label="Fechar menu">
-            <X size={18} />
           </button>
         </div>
 
@@ -2115,7 +2122,7 @@ export default function AutoJevApp() {
 
       <div className="app-main">
         <header className="mobile-header">
-          <button className="icon-button" onClick={() => setMobileNavOpen(true)} aria-label="Abrir menu">
+          <button ref={mobileMenuTrigger} className="icon-button" onClick={() => setMobileNavOpen(true)} aria-label="Abrir menu" aria-controls="app-sidebar" aria-expanded={mobileNavOpen}>
             <Menu size={20} />
           </button>
           <button className="mobile-brand" onClick={() => navigate("#/dashboard")}><span className="brand-mark"><Bot size={19} /></span><strong>AutoJev</strong></button>

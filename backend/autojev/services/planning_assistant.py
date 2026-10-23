@@ -105,7 +105,7 @@ class PlanningRecorder:
             await self.finish(identity)
 
 
-async def suggest_plan(manager, suites, root_id, messages, selected, llm=None):
+async def suggest_plan(manager, suites, root_id, messages, selected, llm=None, *, draft=None):
     suite = suites.catalog(root_id)
     source = suites.repository.get_exploration(suite["id"])
     agent = llm or source["auxiliary_llm"]
@@ -142,6 +142,10 @@ async def suggest_plan(manager, suites, root_id, messages, selected, llm=None):
         "A lacuna significa apenas não encontrado neste catálogo. Não suponha que toda tela permite CRUD; "
         "not_applicable requer justificativa informada pelo usuário, não simples ausência de teste. "
         "Não solicite senhas/tokens e não gere código, SQL ou ações de integração. "
+        "Se houver draft_under_construction, ele é um rascunho não salvo, não um CT existente. "
+        "Use-o como contexto para os ajustes pedidos na conversa, preservando os detalhes não alterados. "
+        "Ao refiná-lo, retorne o roteiro completo atualizado como único item de new_cases. "
+        "Se precisar esclarecer algo, pergunte em reply e deixe new_cases vazio, sem apagar o rascunho. "
         "Retorne JSON com reply (texto), selected_case_ids (lista de IDs existentes) e new_cases (lista de objetos "
         "com title, description, preconditions (lista), steps (lista), expected_result). Máximo 8 casos novos. "
         "Para um pedido de CRUD com tela identificada, inclua coverage: {screen, operations:[{operation, status, "
@@ -151,6 +155,7 @@ async def suggest_plan(manager, suites, root_id, messages, selected, llm=None):
         "Em outros pedidos, ou enquanto precisar esclarecer a tela, coverage deve ser null. "
         "Para descobrir casos de fato, explique o modo de exploração com IA; para registrar interações, sugira o modo de gravação.",
         json.dumps({"application": public_url(suite["app_url"]), "catalog": context,
+                    "draft_under_construction": {**draft, "url": public_url(suite["app_url"])} if draft else None,
                     "catalog_scope": {"active_count": len(active_cases), "included_count": len(context),
                                       "complete": len(context) == len(active_cases), "archived_excluded": True},
                     "selected_case_ids": selected, "conversation": messages}, ensure_ascii=False),

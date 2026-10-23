@@ -38,6 +38,9 @@ test("server-renders the AutoJev application shell", async () => {
   assert.ok(nav);
   assert.ok(nav.indexOf("Meus testes") < nav.indexOf("Rascunhos"));
   assert.ok(nav.indexOf("Rascunhos") < nav.indexOf("Sistema"));
+  assert.doesNotMatch(html, /mobile-close/);
+  assert.match(html, /id="app-sidebar"/);
+  assert.match(html, /aria-label="Abrir menu" aria-controls="app-sidebar" aria-expanded="false"/);
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton|Your site is taking shape/i);
 });
 

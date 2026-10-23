@@ -20,6 +20,62 @@ def create_plan(client, root, ids):
     return response.json()
 
 
+def test_step_image_metadata_is_lightweight_and_does_not_borrow_from_other_steps(runtime):
+    from autojev.services.test_suites import recorded_step_metadata
+    steps = [
+        {"title": "Antes da ação", "kind": "observation", "screenshot": "/private/screenshots/before.png", "message": "private details"},
+        {"title": "Selecionar opção", "kind": "action", "action_preview": {"screenshot": "target.png"}, "target": "not needed"},
+        {"title": "Conferir seleção", "kind": "assertion", "assertion": {"actual": "not needed"}},
+        {"title": "Imagem enviada", "kind": "observation", "screenshot": "user-image.webp"},
+    ]
+    before = deepcopy(steps)
+    result = recorded_step_metadata(steps, "owner-run")
+    assert result == [
+        {"title": "Antes da ação", "kind": "observation", "screenshot": "before.png", "evidence_exploration_id": "owner-run"},
+        {"title": "Selecionar opção", "kind": "action", "screenshot": "target.png", "evidence_exploration_id": "owner-run"},
+        {"title": "Conferir seleção", "kind": "assertion"},
+        {"title": "Imagem enviada", "kind": "observation", "screenshot": "user-image.webp", "evidence_exploration_id": "owner-run"},
+    ]
+    assert steps == before
+    for filename in ["../secret.png", "shots/../secret.png", "bad.png?token=secret", "bad.png#fragment", "bad\x00.png", "not-image.html"]:
+        assert "screenshot" not in recorded_step_metadata([{"screenshot": filename}], "owner-run")[0]
+
+
+def test_step_images_keep_the_latest_owner_and_explicit_historical_context_read_only(runtime):
+    app, client, root = runtime
+    repo = app.state.repository
+    original = StoredScenario(**deepcopy(repo.get_exploration(root)["scenarios"][0]))
+    original.evidence["timeline"] = [
+        {"kind": "observation", "title": "Antes da ação", "screenshot": "original-before.png"},
+        {"kind": "action", "title": "Selecionar opção", "action_preview": {"screenshot": "original-target.png"}},
+        {"kind": "observation", "title": "Depois da ação", "screenshot": "original-after.png"},
+    ]
+    repo.add_scenario(root, 1, original)
+    child = repo.create_exploration(ExplorationRequest("https://shop.test", ModelSelection("local", "agent"), ModelSelection("local", "aux"), ExplorationOptions()))
+    rerun = deepcopy(original)
+    for step in rerun.evidence["timeline"]:
+        if "screenshot" in step:
+            step["screenshot"] = step["screenshot"].replace("original-", "new-")
+        elif "action_preview" in step:
+            step["action_preview"]["screenshot"] = "new-target.png"
+    repo.add_scenario(child, 1, rerun)
+    repo.add_event(child, "info", "scenario_rerun_source", "Source", {"source_exploration_id": root, "source_scenario_id": "CT001"})
+    repo.update_exploration(child, status="completed")
+    before = [deepcopy(repo.get_exploration(owner)) for owner in (root, child)]
+    response = client.get(f"/api/test-suites/{root}")
+    assert response.status_code == 200, response.text
+    images = [step for step in response.json()["cases"][0]["recorded_steps"] if step.get("screenshot")]
+    assert {step["screenshot"] for step in images} == {"new-before.png", "new-target.png", "new-after.png"}
+    assert {step["evidence_exploration_id"] for step in images} == {child}
+    for owner, prefix in [(root, "original-"), (child, "new-")]:
+        response = client.get(f"/api/test-suites/{owner}/case-context/CT001")
+        assert response.status_code == 200, response.text
+        reference = response.json()["reference"]["recorded_steps"]
+        assert all(step["evidence_exploration_id"] == owner and step["screenshot"].startswith(prefix) for step in reference if step.get("screenshot"))
+    assert [repo.get_exploration(owner) for owner in (root, child)] == before
+    assert not app.state.scenario_rerun_service.tasks
+
+
 def test_catalog_flows_match_export_and_are_read_only_for_manual_and_original_cts(runtime):
     from autojev.services.functional_flows import classify_case_flows
     from test_report_premium import data
