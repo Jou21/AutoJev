@@ -1,0 +1,7 @@
+{
+  "env": {
+    "CLAUDE_CODE_API_BASE": "http://localhost:11434/v1",
+    "CLAUDE_CODE_API_KEY": "ollama"
+  },
+  "model": "qwen3.6-35b-a3b:latest"
+}

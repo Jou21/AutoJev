@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="pt-BR"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gravação AutoJev</title>
+<style>
+*{box-sizing:border-box}html,body{margin:0;height:100%;background:#11191c;color:#ecf1f0;font:13px/1.5 system-ui,sans-serif}
+body{display:flex;flex-direction:column;padding:16px;gap:12px}header{display:flex;align-items:center;justify-content:space-between;gap:10px}
+small{color:#f2c45b;font-size:10px;font-weight:700;letter-spacing:.08em}h1{font-size:18px;margin:3px 0 0}#count{color:#b7c5c2;white-space:nowrap}
+#live{display:inline-block;width:7px;height:7px;border-radius:50%;background:#f28a85;margin-right:5px}p{margin:0;color:#9badaa;font-size:12px}
+ol{flex:1;min-height:0;overflow:auto;margin:0;padding:0 0 0 27px}li{padding:9px 10px;margin-bottom:6px;border:1px solid #344246;border-radius:8px;background:#192326;overflow-wrap:anywhere}
+li::marker{color:#e4bb57}button{padding:11px;border:1px solid #f2c45b;border-radius:9px;background:#f2c45b;color:#211c10;font:600 13px system-ui;cursor:pointer;flex-shrink:0}
+button:disabled{opacity:.65;cursor:default}button:focus-visible{outline:2px solid white;outline-offset:3px}#feedback{font-size:11px;overflow-wrap:anywhere}#autojev-sidepanel{display:none!important}
+</style>
+<header><div><small><span id="live"></span>AUTOJEV · GRAVANDO</small><h1>Sua navegação</h1></div><span id="count" role="status">0 passos</span></header>
+<p id="empty">Faça o teste normalmente. Seus passos aparecerão aqui.</p>
+<ol id="steps" aria-label="Passos gravados"></ol>
+<p>Senhas e valores digitados não são gravados. Nenhum teste será salvo ou executado automaticamente.</p>
+<button id="finish" type="button" disabled>Finalizar e revisar roteiro</button>
+<p id="feedback" role="status">Ao finalizar, volte ao AutoJev para revisar.</p>
+<script>
+let nonce = null, finishing = false;
+const finish = document.getElementById('finish'), steps = document.getElementById('steps');
+window.__autojevRecordingPanel = {update(data) {
+  nonce = data.nonce;
+  document.getElementById('count').textContent = `${data.steps.length} ${data.steps.length === 1 ? 'passo' : 'passos'}`;
+  document.getElementById('empty').hidden = data.steps.length > 0;
+  const wasAtEnd = steps.scrollHeight - steps.clientHeight - steps.scrollTop < 30;
+  steps.replaceChildren(...data.steps.map(step => {const li = document.createElement('li');li.textContent = step;return li;}));
+  if (wasAtEnd) steps.scrollTop = steps.scrollHeight;
+  finish.disabled = finishing || data.status !== 'recording';
+}};
+finish.addEventListener('click', async event => {
+  if (!event.isTrusted || finish.disabled || !nonce) return;
+  finishing = true; finish.disabled = true; finish.textContent = 'Finalizando…';
+  try {await window.__autojev_recording_panel({op:'finish',confirm:true,nonce});}
+  catch (_) {finishing = false;finish.disabled = false;finish.textContent = 'Finalizar e revisar roteiro';document.getElementById('feedback').textContent = 'Se esta janela continuar aberta, finalize pela aplicação AutoJev.';}
+});
+</script></html>

@@ -278,7 +278,17 @@ def test_recorder_service_lifecycle_is_explicit_scoped_and_does_not_write_execut
             self._context, self._page = Context(), Page()
         async def start(self, url): calls.append(("start", url))
         async def close(self): calls.append(("close",))
+    panels = []
+    class Panel:
+        def __init__(self, executor, origin, snapshot, finish):
+            assert origin == ("https", "shop.test")
+            self.snapshot, self.finish = snapshot, finish
+            self.started = self.closed = False
+            panels.append(self)
+        async def start(self): self.started = True
+        async def close(self): self.closed = True
     monkeypatch.setattr("autojev.services.planning_assistant.PlaywrightExecutor", Executor)
+    monkeypatch.setattr("autojev.services.planning_assistant.BrowserRecordingPanel", Panel)
     before = deepcopy(app.state.repository.get_exploration(root))
     assert client.post(f"/api/test-suites/{root}/recordings", json={"confirm": False}).status_code == 422
     response = client.post(f"/api/test-suites/{root}/recordings", json={"confirm": True})
@@ -289,8 +299,16 @@ def test_recorder_service_lifecycle_is_explicit_scoped_and_does_not_write_execut
     client.portal.call(binding, {"page": Page()}, {"step": "Clicar em produtos"})
     state = client.get(f"/api/test-suites/recordings/{identity}/state").json()
     assert state["steps"] == ["Clicar em produtos"] and state["url"] == "https://shop.test/inventory.html"
+    assert panels[0].started and panels[0].snapshot()["steps"] == state["steps"]
     assert client.post(f"/api/test-suites/{root}/recordings", json={"confirm": True}).status_code == 409
+    panel_result = client.portal.call(panels[0].finish)
+    assert panel_result["status"] == "finished" and panel_result["steps"] == state["steps"]
     finished = client.post(f"/api/test-suites/recordings/{identity}/finish")
     assert finished.status_code == 200 and finished.json()["steps"] == state["steps"]
+    assert panels[0].closed
+    assert client.get(f"/api/test-suites/recordings/{identity}/state").json()["status"] == "finished"
+    assert client.post(f"/api/test-suites/recordings/{identity}/finish").json() == finished.json()
+    recorder.completed[identity] = (0, finished.json())
+    assert client.get(f"/api/test-suites/recordings/{identity}/state").status_code == 409
     assert calls == [("start", "https://shop.test"), ("close",)] and not recorder.sessions
     assert app.state.repository.get_exploration(root) == before

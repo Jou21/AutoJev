@@ -95,6 +95,7 @@ export default function TestSuitesWorkspace(props: Props) {
   const planCenter = useRef<HTMLDivElement>(null);
   const selectedRail = useRef<HTMLDivElement>(null), stepsRail = useRef<HTMLDivElement>(null);
   const constructionCard = useRef<HTMLDivElement>(null);
+  const contextDetails = useRef<HTMLDetailsElement>(null);
   const pendingCheckpoint = useRef<string | null>(null);
   const hoveredStepSlot = useRef<StepDropPosition | null>(null);
   const draggingCase = useRef<string | null>(null);
@@ -149,6 +150,22 @@ export default function TestSuitesWorkspace(props: Props) {
     window.addEventListener?.("keydown", keys);
     return () => { window.removeEventListener?.("keydown", keys); if (previous?.isConnected) previous.focus({ preventScroll: true }); };
   }, [leavePrompt, busy]);
+  useEffect(() => {
+    const outside = (event: PointerEvent) => {
+      const details = contextDetails.current;
+      if (details?.open && !details.contains(event.target as Node)) details.open = false;
+    };
+    const escape = (event: KeyboardEvent) => {
+      const details = contextDetails.current;
+      if (event.key !== "Escape" || !details?.open) return;
+      details.open = false;
+      details.querySelector("summary")?.focus({ preventScroll: true });
+      event.preventDefault();
+    };
+    window.addEventListener("pointerdown", outside, true);
+    window.addEventListener("keydown", escape);
+    return () => { window.removeEventListener("pointerdown", outside, true); window.removeEventListener("keydown", escape); };
+  }, []);
   useEffect(() => {
     catalogContexts.set(rootId || "", { query, filter, flow: selectedFlow, scroll: catalogScroll.current, page: rootId ? undefined : basePage });
   }, [rootId, query, filter, selectedFlow, basePage]);
@@ -219,11 +236,25 @@ export default function TestSuitesWorkspace(props: Props) {
     void load(); const timer = window.setInterval(load, 2500);
     return () => { alive = false; window.clearInterval(timer); };
   }, [roundId, request]);
+  const completeRecording = useCallback((result: Recording) => {
+    const definition = { ...emptyDefinition(result.url), title: "Teste gravado", steps: result.steps };
+    setRecording(null); setForm(definition); setFormBaseline(JSON.stringify(emptyDefinition(suite?.app_url)));
+    setEditId(null); setCreationMode("write"); setSelectorOpen(false); setMobilePane("plan");
+    setConstruction(current => current ? { ...current, definition } : null);
+    if (tab === "catalog") setMaintenanceOpen(true);
+    setCreationFocus(current => ({ mode: "write", version: (current?.version || 0) + 1 }));
+  }, [suite?.app_url, tab]);
   useEffect(() => {
     if (!recording) return;
-    const timer = window.setInterval(() => request<Recording>(`/test-suites/recordings/${encode(recording.id)}/state`).then(setRecording).catch(caught => setError(caught.message)), 2000);
-    return () => window.clearInterval(timer);
-  }, [recording?.id, request]); // eslint-disable-line react-hooks/exhaustive-deps
+    let alive = true, finished = false;
+    const timer = window.setInterval(() => request<Recording>(`/test-suites/recordings/${encode(recording.id)}/state`).then(value => {
+      if (!alive || finished) return;
+      if (value.status === "finished") {
+        finished = true; completeRecording(value);
+      } else setRecording(value);
+    }).catch(caught => { if (alive && !finished) setError(caught.message); }), 2000);
+    return () => { alive = false; window.clearInterval(timer); };
+  }, [recording?.id, request, completeRecording]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!planningFocus) return;
@@ -604,7 +635,7 @@ export default function TestSuitesWorkspace(props: Props) {
           <span className="suite-detail-count" title="Testes ativos na base">{suite.cases.length - archivedCount} {suite.cases.length - archivedCount === 1 ? "teste" : "testes"}</span>
         </div>
         <div className="suite-detail-actions">
-          <details className="suite-context-details">
+          <details ref={contextDetails} className="suite-context-details">
             <summary title="Sobre o conjunto"><Info size={17} /><span className="sr-only">Sobre o conjunto</span></summary>
             <div className="suite-context-content">
               <h2>Sobre o conjunto</h2>
@@ -657,7 +688,7 @@ export default function TestSuitesWorkspace(props: Props) {
     <button type="button" disabled={busy || chatBusy} aria-controls="suite-planning-chat" onClick={() => chooseCreation("ai")}><Bot size={19} /><span><strong>Planejar com IA</strong><small>Descreva o objetivo e receba sugestões.</small></span><ArrowRight size={15} /></button>
   </div>;
   const recordingConsent = creationMode === "record" && !recording && <section id="suite-record-confirmation" className="suite-consent-box" aria-label="Confirmar gravação"><h3>Antes de abrir o navegador</h3><p>Será aberto um navegador novo e visível. Suas interações podem alterar dados da aplicação. Não capturamos senhas, valores digitados, cookies ou screenshots. A gravação dura até 15 minutos e gera um roteiro para revisão, não uma automação pronta.</p><button type="button" ref={recordConfirmation} className="button secondary" disabled={busy} onClick={() => void perform(async () => { setRecording(await request<Recording>(`${rootPath}/recordings`, { method: "POST", body: JSON.stringify({ confirm: true }) })); focusCreation("record"); })}><MousePointer2 size={16} />Confirmar e abrir navegador de gravação</button></section>;
-  const recordingPanel = recording && <section id="suite-recording" className="panel suite-recording"><span className="suite-record-dot" /><strong>Gravação em andamento · {recording.steps.length} passos</strong><ol>{recording.steps.map((step, index) => <li key={index}>{step}</li>)}</ol><button type="button" ref={recordingFinish} className="button primary" disabled={busy} onClick={() => void perform(async () => { const result = await request<Recording>(`/test-suites/recordings/${encode(recording.id)}/finish`, { method: "POST" }); setRecording(null); openCaseEditor({ ...emptyDefinition(result.url), title: "Teste gravado", steps: result.steps }, null, true); })}><Square size={15} />Finalizar e revisar roteiro</button></section>;
+  const recordingPanel = recording && <section id="suite-recording" className="panel suite-recording"><span className="suite-record-dot" /><strong>Gravação em andamento · {recording.steps.length} passos</strong><ol>{recording.steps.map((step, index) => <li key={index}>{step}</li>)}</ol><button type="button" ref={recordingFinish} className="button primary" disabled={busy} onClick={() => void perform(async () => { const result = await request<Recording>(`/test-suites/recordings/${encode(recording.id)}/finish`, { method: "POST" }); completeRecording(result); })}><Square size={15} />Finalizar e revisar roteiro</button></section>;
 
   const reviewNameChanged = !!validation && !!saved && name !== saved.name;
   const executeAction = validation && <button className="button primary" title={!name.trim() ? "Informe o nome da execução" : !consent ? "Marque o aceite após revisar os testes" : undefined} disabled={busy || formChanged || !!recording || !name.trim() || !consent || !validation.available || (dirty && !reviewNameChanged) || pendingIntegrations > 0} onClick={() => void perform(async () => {

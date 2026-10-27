@@ -50,7 +50,8 @@ async function workspace(t, providedSuite, onReport, initialProps = {}) {
   const slots = [], effects = [], calls = [], focus = [], scroll = [];
   const domRefs = new Set();
   const listeners = new Map();
-  const browser = { setInterval() { return 1; }, clearInterval() {},
+  const intervals = new Map(); let intervalId = 0;
+  const browser = { setInterval(callback) { intervals.set(++intervalId, callback); return intervalId; }, clearInterval(id) { intervals.delete(id); },
     addEventListener(name, callback) { if (!listeners.has(name)) listeners.set(name, new Set()); listeners.get(name).add(callback); },
     removeEventListener(name, callback) { listeners.get(name)?.delete(callback); } };
   const suite = providedSuite || suiteFixture();
@@ -130,6 +131,7 @@ async function workspace(t, providedSuite, onReport, initialProps = {}) {
       return { ...structuredClone(savedPlan), status: "running" };
     }
     if (path === "/test-suites/root-fixture/recordings" && options.method === "POST") return { id: "rec-fixture", steps: [], status: "recording", url: suite.app_url };
+    if (path === "/test-suites/recordings/rec-fixture/state" && !options.method) return { id: "rec-fixture", url: suite.app_url, ...initialProps.recordingStateReply };
     if (path === "/test-suites/recordings/rec-fixture/finish" && options.method === "POST") return { id: "rec-fixture", steps: ["Abrir carrinho"], status: "completed", url: suite.app_url };
     if (path === "/test-suites/root-fixture/assistant" && options.method === "POST") return typeof initialProps.assistantReply === "function" ? initialProps.assistantReply(JSON.parse(options.body)) : initialProps.assistantReply || { reply: "Revise o rascunho.", selected_case_ids: [], new_cases: [{ title: "Carrinho vazio", url: suite.app_url, description: "Proposta", preconditions: [], steps: ["Abrir carrinho"], expected_result: "Vazio" }], usage: {} };
     if (path === "/test-suites/root-fixture/cases" && options.method === "POST") {
@@ -174,6 +176,7 @@ async function workspace(t, providedSuite, onReport, initialProps = {}) {
   t.after(() => { for (const slot of slots) slot?.cleanup?.(); });
   await settle();
   return { all, find, button, field, click, change, settle, calls, focus, scroll, chat: () => find(node => node.type === ChatFixture), image: () => find(node => node.type === ImagePreviewFixture),
+    async tick() { for (const callback of [...intervals.values()]) await callback(); await settle(); },
     async windowEvent(type, event) { for (const callback of listeners.get(type) || []) callback(event); await settle(); },
     async navigate(hash) { const event = { detail: { hash }, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } }; for (const callback of listeners.get("autojev:before-navigate") || []) callback(event); await settle(); return !event.defaultPrevented; },
     unloadBlocked() { const event = { defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } }; for (const callback of listeners.get("beforeunload") || []) callback(event); return event.defaultPrevented; },
@@ -523,6 +526,34 @@ const selectionBar = view => view.find(node => node.props["aria-label"] === "Sel
 const plannedIds = view => view.all().filter(node => node.type === "button" && /^Retirar CT/.test(node.props["aria-label"] || "")).map(node => node.props["aria-label"].match(/^Retirar (CT\d+)/)[1]);
 const buildingCard = view => view.find(node => node.props["data-construction-card"]);
 
+test("About closes on outside clicks without stealing focus or cancelling the clicked action", async t => {
+  const view = await workspace(t, undefined, undefined, { initialCaseId: "CT001" });
+  const details = view.find(node => node.props.className === "suite-context-details").props.ref.current;
+  const inside = {}, focus = [];
+  details.open = true;
+  details.contains = target => target === inside;
+  details.querySelector = () => ({ focus(options) { focus.push(options); } });
+  await view.windowEvent("pointerdown", { target: inside }); assert.equal(details.open, true);
+  await view.windowEvent("pointerdown", { target: {}, preventDefault() { assert.fail("Outside actions stay usable"); } });
+  assert.equal(details.open, false); assert.deepEqual(focus, []);
+  details.open = true;
+  await view.windowEvent("pointerdown", { target: inside }); assert.equal(details.open, true);
+  assert.deepEqual(plannedIds(view), ["CT001"]);
+  assert.equal(view.calls.some(call => call.method !== "GET"), false);
+});
+
+test("Escape closes About and restores focus to its trigger only while the panel is open", async t => {
+  const view = await workspace(t);
+  const details = view.find(node => node.props.className === "suite-context-details").props.ref.current;
+  const focused = []; let prevented = 0;
+  details.open = true;
+  details.querySelector = selector => { assert.equal(selector, "summary"); return { focus(options) { focused.push(options); } }; };
+  await view.windowEvent("keydown", { key: "ArrowRight" }); assert.equal(details.open, true);
+  await view.windowEvent("keydown", { key: "Escape", preventDefault() { prevented++; } });
+  assert.equal(details.open, false); assert.deepEqual(focused, [{ preventScroll: true }]); assert.equal(prevented, 1);
+  await view.windowEvent("keydown", { key: "Escape", preventDefault() { prevented++; } }); assert.equal(prevented, 1);
+});
+
 test("Add reveals one distinct construction card without counting it as a saved or executable CT", async t => {
   const view = await workspace(t, undefined, undefined, { initialCaseId: "CT001" });
   await view.click("Ver imagem da etapa 1: Abrir página");
@@ -631,6 +662,32 @@ test("recording updates the construction card but requires explicit consent, fin
   assert.equal(view.field("Passos").props.value, "Abrir carrinho");
   assert.deepEqual(plannedIds(view), ["CT001"]);
   assert.equal(view.calls.some(call => /\/(cases|plans|start)$/.test(call.path)), false);
+});
+
+test("finishing inside J opens the recorded script for review without another finish request or save", async t => {
+  const view = await workspace(t, undefined, undefined, { initialCaseId: "CT001",
+    recordingStateReply: { status: "finished", steps: ["Abrir produtos", "Consultar carrinho"] } });
+  await view.click("Adicionar teste"); await view.click("Gravar minha navegação");
+  await view.click("Confirmar e abrir navegador de gravação");
+  assert.equal(view.has("suite-recording"), true);
+  await view.tick();
+  assert.equal(view.has("suite-recording"), false);
+  assert.equal(view.field("Título").props.value, "Teste gravado");
+  assert.equal(view.field("Passos").props.value, "Abrir produtos\nConsultar carrinho");
+  assert.match(text(buildingCard(view)), /Revise antes de salvar/);
+  assert.deepEqual(plannedIds(view), ["CT001"]);
+  assert.equal(view.calls.some(call => /\/(finish|cases|plans|start)$/.test(call.path)), false);
+  const count = view.calls.length; await view.tick(); assert.equal(view.calls.length, count);
+});
+
+test("recording progress from J updates the construction card without opening or saving a script early", async t => {
+  const view = await workspace(t, undefined, undefined, { initialCaseId: "CT001",
+    recordingStateReply: { status: "recording", steps: ["Consultar produtos"] } });
+  await view.click("Adicionar teste"); await view.click("Gravar minha navegação");
+  await view.click("Confirmar e abrir navegador de gravação"); await view.tick();
+  assert.match(text(view.find(node => node.props.id === "suite-recording")), /1 passos.*Consultar produtos/);
+  assert.equal(view.has("suite-case-editor"), false);
+  assert.equal(view.calls.some(call => /\/(finish|cases|plans|start)$/.test(call.path)), false);
 });
 
 test("a failed explicit save retains the construction card, edited definition and real selection", async t => {

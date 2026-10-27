@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
 from urllib.parse import urlsplit, urlunsplit
 
 from autojev.adapters.playwright_executor import PlaywrightExecutor
+from autojev.adapters.browser_recording_panel import BrowserRecordingPanel
 from autojev.domain.models import ExplorationOptions
 
 
@@ -16,6 +18,7 @@ def public_url(value):
 
 
 RECORD_SCRIPT = r"""(() => {
+  if (location.hostname === 'autojev-panel.invalid') return;
   if (window.__autojevPlanningRecorder) return;
   window.__autojevPlanningRecorder = true;
   const emit = (kind, target) => {
@@ -41,6 +44,8 @@ class PlanningRecorder:
     def __init__(self, settings, suites):
         self.settings, self.suites = settings, suites
         self.sessions = {}
+        # Brief, bounded handoff to the main app after finishing inside J.
+        self.completed = {}
 
     async def start(self, root_id):
         root = self.suites.root(root_id)
@@ -73,14 +78,24 @@ class PlanningRecorder:
             await executor._context.expose_binding("__autojevRecordPlanningStep", receive)
             await executor._context.add_init_script(RECORD_SCRIPT)
             await executor._page.evaluate(RECORD_SCRIPT)
+            session["panel"] = BrowserRecordingPanel(executor, (origin.scheme, origin.netloc),
+                lambda: self.get(identity), lambda: self.finish(identity))
+            await session["panel"].start()
             session["expiry"] = asyncio.create_task(self._expire(identity))
             return self.get(identity)
         except BaseException:
             self.sessions.pop(identity, None)
+            if session.get("panel"):
+                await session["panel"].close()
             await executor.close()
             raise
 
     def get(self, identity):
+        for key, (deadline, _) in list(self.completed.items()):
+            if deadline <= time.monotonic():
+                self.completed.pop(key, None)
+        if identity in self.completed:
+            return {**self.completed[identity][1], "steps": list(self.completed[identity][1]["steps"])}
         if identity not in self.sessions:
             raise ValueError("Gravação encerrada ou expirada. Inicie uma nova gravação.")
         session = self.sessions[identity]
@@ -88,12 +103,22 @@ class PlanningRecorder:
 
     async def finish(self, identity):
         value = self.get(identity)
+        if value["status"] == "finished":
+            return value
         session = self.sessions.pop(identity)
+        result = {**value, "status": "finished"}
+        self.completed[identity] = (time.monotonic() + 900, result)
+        while len(self.completed) > 20:
+            self.completed.pop(next(iter(self.completed)))
         expiry = session.get("expiry")
         if expiry and expiry is not asyncio.current_task():
             expiry.cancel()
-        await session["executor"].close()
-        return {**value, "status": "finished"}
+        try:
+            if session.get("panel"):
+                await session["panel"].close()
+        finally:
+            await session["executor"].close()
+        return result
 
     async def _expire(self, identity):
         await asyncio.sleep(900)
@@ -103,6 +128,7 @@ class PlanningRecorder:
     async def shutdown(self):
         for identity in list(self.sessions):
             await self.finish(identity)
+        self.completed.clear()
 
 
 async def suggest_plan(manager, suites, root_id, messages, selected, llm=None, *, draft=None):

@@ -1,3 +1,4 @@
 {
-    "lmstudioCode.minContextLength": 16384
+  "ollama.vlm.enabled": true,
+  "github.copilot.vision.enabled": false
 }
