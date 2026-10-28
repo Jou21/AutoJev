@@ -1,0 +1,105 @@
+- generic [ref=e2]:
+  - link "Pular para o conteúdo" [ref=e3] [cursor=pointer]:
+    - /url: "#main-content"
+  - complementary [ref=e4]:
+    - button "Ir para o dashboard" [ref=e6] [cursor=pointer]:
+      - generic [ref=e11]:
+        - strong [ref=e12]: AutoJev
+        - generic [ref=e13]: Autonomous QA
+    - navigation "Navegação principal" [ref=e14]:
+      - generic [ref=e15]: Workspace
+      - button "Dashboard" [ref=e16] [cursor=pointer]
+      - button "Nova exploração" [ref=e23] [cursor=pointer]
+      - button "Meus testes" [ref=e30] [cursor=pointer]
+      - button "Rascunhos" [ref=e36] [cursor=pointer]
+      - generic [ref=e41]: Sistema
+      - button "Provedores de IA" [ref=e42] [cursor=pointer]
+      - button "Configurações" [ref=e54] [cursor=pointer]
+    - generic [ref=e59]:
+      - 'generic "API: http://localhost:8000/api" [ref=e60]':
+        - generic [ref=e62]:
+          - strong [ref=e63]: Verificando API
+          - generic [ref=e64]: FastAPI · localhost:8000
+      - button "Recolher menu lateral" [ref=e65] [cursor=pointer]:
+        - generic [ref=e69]: Recolher menu
+  - main [ref=e71]:
+    - generic [ref=e72]:
+      - generic [ref=e73]:
+        - generic [ref=e74]:
+          - generic [ref=e75]: Centro de operações
+          - heading "Boa exploração começa com uma boa decisão." [level=1] [ref=e76]
+          - paragraph [ref=e77]: O AutoJev conduz o teste, o Playwright executa cada ação e sua LLM auxiliar interpreta as evidências — sem assumir o controle do navegador.
+        - button "Nova exploração" [ref=e79] [cursor=pointer]
+      - region "Resumo do AutoJev" [ref=e81]:
+        - article [ref=e82]:
+          - generic [ref=e83]: Explorações
+          - strong [ref=e88]: —
+          - generic [ref=e89]: Nenhuma execução ativa
+        - article [ref=e90]:
+          - generic [ref=e91]: Cenários gerados
+          - strong [ref=e98]: —
+          - generic [ref=e99]: Com evidências rastreáveis
+        - article [ref=e100]:
+          - generic [ref=e101]: Taxa de aprovação
+          - strong [ref=e107]: —
+          - generic [ref=e108]: Aguardando cenários verificados
+        - article [ref=e109]:
+          - generic [ref=e110]: Falhas
+          - strong [ref=e115]: —
+          - generic [ref=e116]: 0 exploração(ões) concluída(s)
+      - generic [ref=e117]:
+        - generic [ref=e118]:
+          - generic [ref=e119]:
+            - generic [ref=e120]: Arquitetura desacoplada
+            - heading "Planejador no comando. LLM intercambiável." [level=2] [ref=e126]
+            - paragraph [ref=e127]: O planejador do AutoJev decide as ações sem IA, percorrendo cada caminho uma vez; a LLM auxiliar recebe somente screenshot e DOM para interpretar a observação.
+          - button "Configurar modelos" [ref=e128] [cursor=pointer]
+        - generic "Arquitetura do AutoJev" [ref=e131]:
+          - generic [ref=e146]:
+            - strong [ref=e147]: Planejador
+            - generic [ref=e148]: AutoJev · decide
+          - generic [ref=e155]:
+            - strong [ref=e156]: Playwright
+            - generic [ref=e157]: Executor controlado
+          - generic [ref=e165]:
+            - strong [ref=e166]: Browser
+            - generic [ref=e167]: Aplicação real
+          - generic [ref=e173]:
+            - strong [ref=e174]: Observações
+            - generic [ref=e175]: Screenshot + DOM
+          - generic [ref=e181]:
+            - strong [ref=e182]: LLM auxiliar
+            - generic [ref=e183]: Interpreta evidências
+          - generic [ref=e190]:
+            - strong [ref=e191]: Cenários
+            - generic [ref=e192]: Testes reproduzíveis
+        - generic [ref=e197]:
+          - strong [ref=e198]: "Limite de responsabilidade:"
+          - text: somente o executor Playwright interage com o browser. Troque Claude, Gemini, modelos locais ou qualquer endpoint OpenAI-compatible sem alterar o núcleo.
+      - generic [ref=e199]:
+        - generic [ref=e200]:
+          - generic [ref=e202]:
+            - generic [ref=e203]: Atividade recente
+            - heading "Últimas explorações" [level=2] [ref=e204]
+          - generic "Carregando" [ref=e205]:
+            - emphasis [ref=e209]
+            - emphasis [ref=e213]
+            - emphasis [ref=e217]
+        - generic [ref=e218]:
+          - generic [ref=e219]:
+            - generic [ref=e220]: Preparação
+            - heading "Pronto para explorar?" [level=2] [ref=e221]
+            - paragraph [ref=e222]: Três pontos deixam sua execução reproduzível.
+          - generic [ref=e223]:
+            - button "Provedor conectado Adicione um endpoint OpenAI-compatible." [ref=e224] [cursor=pointer]:
+              - generic [ref=e226]:
+                - strong [ref=e227]: Provedor conectado
+                - generic [ref=e228]: Adicione um endpoint OpenAI-compatible.
+            - button "Modelos selecionáveis Descubra ou cadastre modelos no provedor." [ref=e231] [cursor=pointer]:
+              - generic [ref=e233]:
+                - strong [ref=e234]: Modelos selecionáveis
+                - generic [ref=e235]: Descubra ou cadastre modelos no provedor.
+            - button "Primeira execução Defina a URL e os dois papéis de IA." [ref=e238] [cursor=pointer]:
+              - generic [ref=e240]:
+                - strong [ref=e241]: Primeira execução
+                - generic [ref=e242]: Defina a URL e os dois papéis de IA.

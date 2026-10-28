@@ -288,3 +288,83 @@ def test_visual_technical_checks_are_in_full_report_without_changing_saved_evide
     assert [section.attrs["data-result"] for section in sections] == ["pass", "fail", "unknown"]
     assert 'data-status="FAIL"' in document and 'data-status="PASS"' in document
     assert run == before
+
+
+def test_failed_technical_check_names_the_request_that_tripped_it():
+    signal = {
+        "type": "http", "label": "Falha HTTP da aplicação", "method": "GET", "status_code": 404,
+        "url": "https://www.saucedemo.com/inventory.html", "affects_verdict": True,
+        "occurrence_id": "signal-1",
+    }
+    unrelated = {**signal, "occurrence_id": "signal-2", "affects_verdict": False, "url": "https://ads.example/x"}
+    entries = [
+        {"kind": "signal", "signal": signal},
+        {"kind": "signal", "signal": unrelated},
+        {"kind": "assertion", "assertion": check(network=1, passed=False)},
+    ]
+    found = StandaloneHtmlReport._failing_signals_for_assertion(entries, 2)
+    assert found == [signal]
+
+    document = StandaloneHtmlReport._assertion_detail(entries[2]["assertion"], signals=found)
+    assert "O que reprovou esta verificação" in document
+    assert "GET · HTTP 404" in document
+    assert "https://www.saucedemo.com/inventory.html" in document
+    assert "ads.example" not in document
+
+
+def test_signals_before_a_previous_technical_check_are_not_attributed_to_the_next_one():
+    earlier = {"type": "http", "affects_verdict": True, "occurrence_id": "a", "url": "https://a.test/"}
+    entries = [
+        {"kind": "signal", "signal": earlier},
+        {"kind": "assertion", "assertion": check(network=1, passed=False)},
+        {"kind": "assertion", "assertion": check(passed=True)},
+    ]
+    assert StandaloneHtmlReport._failing_signals_for_assertion(entries, 2) == []
+
+
+def test_passing_technical_check_lists_no_occurrences():
+    document = StandaloneHtmlReport._assertion_detail(check(), signals=[{"affects_verdict": True, "url": "https://a.test/"}])
+    assert "technical-occurrences" not in document
+
+
+def test_failing_signal_step_no_longer_claims_it_cannot_fail_the_test():
+    entry = {"kind": "signal", "signal": {"affects_verdict": True}}
+    _, outcome, description = StandaloneHtmlReport._step_presentation(entry, "signal")
+    assert outcome == "Falha técnica registrada" and "reprova a verificação técnica" in description
+    _, outcome, description = StandaloneHtmlReport._step_presentation({"kind": "signal", "signal": {"affects_verdict": False}}, "signal")
+    assert outcome == "Ocorrência registrada" and "não reprova o teste" in description
+
+
+def test_www_and_bare_domain_are_the_same_application_origin():
+    from autojev.services.technical_signals import classify_signal
+
+    issue = {"type": "http", "status_code": 404, "url": "https://www.saucedemo.com/inventory.html", "message": "GET returned HTTP 404"}
+    for app_url in ("https://saucedemo.com/", "https://www.saucedemo.com/"):
+        assert classify_signal(issue, app_url)["affects_verdict"] is True
+    external = classify_signal({**issue, "url": "https://www.other.com/x"}, "https://saucedemo.com/")
+    assert external["affects_verdict"] is False and external["classification"] == "external_dependency"
+
+
+def test_before_and_after_captures_name_the_action_they_frame():
+    entries = [
+        {"kind": "observation", "title": "Antes da ação"},
+        {"kind": "action", "title": "Navegar"},
+        {"kind": "observation", "title": "Depois da ação"},
+        {"kind": "assertion", "title": "Ausência de novas falhas técnicas da aplicação"},
+    ]
+    title = StandaloneHtmlReport._action_aware_title
+    assert title(entries, 0) == "Antes de navegar"
+    assert title(entries, 2) == "Depois de navegar"
+    assert title(entries, 1) is None and title(entries, 3) is None
+
+
+def test_capture_titles_do_not_cross_into_another_attempt_or_invent_an_action():
+    title = StandaloneHtmlReport._action_aware_title
+    assert title([{"kind": "observation", "title": "Antes da ação"}], 0) is None
+    two_attempts = [
+        {"kind": "observation", "title": "Antes da ação"},
+        {"kind": "observation", "title": "Antes da ação"},
+        {"kind": "action", "title": "Clicar"},
+    ]
+    assert title(two_attempts, 0) is None and title(two_attempts, 1) == "Antes de clicar"
+    assert title([{"kind": "action", "title": ""}, {"kind": "observation", "title": "Depois da ação"}], 1) is None

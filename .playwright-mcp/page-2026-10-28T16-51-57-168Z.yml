@@ -1,0 +1,152 @@
+- generic [active] [ref=e1]:
+  - complementary [ref=e2]:
+    - generic [ref=e8]:
+      - strong [ref=e9]: AUTOJEV
+      - generic [ref=e10]: Relatório exploratório
+    - navigation "Seções do relatório" [ref=e11]:
+      - button "Visão geral" [ref=e12] [cursor=pointer]
+      - button "Testes 9" [ref=e17] [cursor=pointer]:
+        - generic [ref=e20]: Testes
+        - generic [ref=e21]: "9"
+      - button "Resultados" [ref=e22] [cursor=pointer]
+      - button "Jornada observada" [ref=e27] [cursor=pointer]
+      - button "Evidências" [ref=e33] [cursor=pointer]
+      - button "Linha do tempo" [ref=e39] [cursor=pointer]
+      - button "Regras e cobertura" [ref=e44] [cursor=pointer]
+      - button "Configurações" [ref=e49] [cursor=pointer]
+    - generic [ref=e55]:
+      - text: Relatório local e independente
+      - generic [ref=e57]: Dados preservados · sem chamadas de IA
+  - main [ref=e58]:
+    - region "Resultados" [ref=e59]:
+      - generic [ref=e60]:
+        - generic [ref=e61]:
+          - generic [ref=e62]:
+            - button "Voltar para testes" [ref=e63] [cursor=pointer]: Resultados
+            - generic [aria-hidden] [ref=e64]: /
+            - strong [ref=e65]: CT008
+            - generic [aria-hidden] [ref=e66]: ›
+          - heading "Resultado do teste" [level=1] [ref=e67]
+        - button "Baixar relatório" [ref=e71] [cursor=pointer]
+        - generic [ref=e74]:
+          - 'heading "Explorar: navegar em «Swag Labs»" [level=2] [ref=e75]'
+          - generic [ref=e76]: Reprovado
+      - region [ref=e77]:
+        - heading "Histórico de execuções" [level=2] [ref=e79]
+        - list "Selecionar execução deste teste. Role horizontalmente para ver todas as execuções." [ref=e84]:
+          - listitem [ref=e85]:
+            - button "Execução 1, 28/10/2026, 12:14:34 BRT, Reprovado, mais recente, selecionada" [pressed] [ref=e86] [cursor=pointer]:
+              - strong [ref=e87]: "Execução #1"
+              - generic [ref=e88]: Mais recente
+              - time [ref=e89]: ▦28 de out., 12:14
+              - generic "Resultado do teste e duração da ação registrada" [ref=e90]:
+                - generic [ref=e91]: ×
+                - generic [ref=e92]: Reprovado
+                - generic [ref=e93]: ·00:00:02
+      - group [ref=e95]:
+        - generic [ref=e97]:
+          - complementary "Passos e evidências do CT" [ref=e98]:
+            - generic [ref=e99]:
+              - heading "Passos e evidências" [level=3] [ref=e100]
+              - generic [ref=e101]: 5 registros na linha do tempo
+              - generic "5 de 5 etapas registradas visíveis" [ref=e103]: 5 / 5
+            - group "Selecionar passo do teste" [ref=e104]:
+              - 'button "Resumo do teste. Veja o motivo da reprovação e as conferências deste caso. Resultado: Reprovado." [ref=e105] [cursor=pointer]':
+                - generic [ref=e106]:
+                  - generic [ref=e107]: Resumo do teste
+                  - generic "Veja o motivo da reprovação e as conferências deste caso." [ref=e108]
+                  - generic [aria-hidden] [ref=e109]: Veja o motivo da reprovação e as conferências deste caso.
+                  - generic [aria-hidden] [ref=e111]: ×
+              - 'button "Etapa 1: Antes de navegar. Captura salva; não é uma conferência do teste. Resultado: Captura registrada." [pressed] [ref=e112] [cursor=pointer]':
+                - generic [ref=e113]: "01"
+                - generic [ref=e114]:
+                  - generic [ref=e115]: Antes de navegar
+                  - generic "Captura salva; não é uma conferência do teste." [ref=e116]
+                  - generic [aria-hidden] [ref=e117]: Captura da página antes de navegar.
+                  - generic [aria-hidden] [ref=e119]: ▣
+                - generic [ref=e120]: Selecionado
+              - 'button "Etapa 2: Navegar. A ação foi executada; isso, sozinho, não confirma o resultado esperado. Resultado: Ação concluída." [ref=e121] [cursor=pointer]':
+                - generic [ref=e122]: "02"
+                - generic [ref=e123]:
+                  - generic [ref=e124]: Navegar
+                  - generic "A ação foi executada; isso, sozinho, não confirma o resultado esperado." [ref=e125]
+                  - generic [aria-hidden] [ref=e126]: "Ação: navegar."
+                  - generic [aria-hidden] [ref=e128]: ✓
+              - 'button "Etapa 3: Falha HTTP da aplicação. Falha técnica da aplicação; reprova a verificação técnica deste CT, mas não confirma sozinha um defeito funcional. Resultado: Falha técnica registrada." [ref=e129] [cursor=pointer]':
+                - generic [ref=e130]: "03"
+                - generic [ref=e131]:
+                  - generic [ref=e132]: Falha HTTP da aplicação
+                  - generic "Falha técnica da aplicação; reprova a verificação técnica deste CT, mas não confirma sozinha um defeito funcional." [ref=e133]
+                  - generic [aria-hidden] [ref=e134]: Falha técnica da aplicação; reprova a verificação técnica deste CT, mas não confirma sozinha um defeito funcional.
+                  - generic [aria-hidden] [ref=e136]: "!"
+              - 'button "Etapa 4: Depois de navegar. Captura salva; não é uma conferência do teste. Resultado: Captura registrada." [ref=e137] [cursor=pointer]':
+                - generic [ref=e138]: "04"
+                - generic [ref=e139]:
+                  - generic [ref=e140]: Depois de navegar
+                  - generic "Captura salva; não é uma conferência do teste." [ref=e141]
+                  - generic [aria-hidden] [ref=e142]: Captura da página depois de navegar.
+                  - generic [aria-hidden] [ref=e144]: ▣
+              - 'button "Etapa 5: Erros durante «Navegar». Conferir novos erros atribuídos à aplicação durante a ação. Resultado: Reprovada." [ref=e145] [cursor=pointer]':
+                - generic [ref=e146]: "05"
+                - generic [ref=e147]:
+                  - generic [ref=e148]: Erros durante «Navegar»
+                  - generic "Conferir novos erros atribuídos à aplicação durante a ação." [ref=e149]
+                  - generic [aria-hidden] [ref=e150]: Resultado diferente do esperado.
+                  - generic [aria-hidden] [ref=e152]: ×
+          - region "Antes de navegar" [ref=e153]:
+            - generic [ref=e154]:
+              - generic [ref=e155]:
+                - button "Passo anterior" [ref=e156] [cursor=pointer]
+                - button "Próximo passo" [ref=e160] [cursor=pointer]
+              - generic [ref=e164]:
+                - heading "Detalhes da etapa" [level=3] [ref=e165]
+                - generic [ref=e166]: Etapa 1 de 5 · Captura da página
+              - status [ref=e168]: Captura registrada
+            - generic "Detalhes e evidências do passo selecionado" [ref=e169]:
+              - list [ref=e170]:
+                - listitem [ref=e171]:
+                  - generic [ref=e173]:
+                    - region "Visualizador da evidência" [ref=e174]:
+                      - generic [ref=e175]:
+                        - generic "Imagem da evidência; com zoom, segure o botão esquerdo e arraste para mover, ou use as barras de rolagem" [ref=e176]:
+                          - figure "021-go-back.jpg" [ref=e178]:
+                            - button "Ampliar captura 021-go-back.jpg" [ref=e179]:
+                              - img "Captura de evidência" [ref=e180]
+                        - group "Controles da imagem":
+                          - generic:
+                            - button "Diminuir zoom"
+                            - button "Restaurar zoom para 100%": 100%
+                            - button "Aumentar zoom"
+                          - button "Ampliar evidência"
+                    - complementary [ref=e181]:
+                      - generic [ref=e182]:
+                        - heading "Informações da evidência" [level=4] [ref=e183]
+                        - generic [ref=e189]:
+                          - generic [ref=e190]:
+                            - term [ref=e191]: Tipo
+                            - definition [ref=e192]: Captura de tela
+                          - generic [ref=e193]:
+                            - term [ref=e194]: Nome do arquivo
+                            - definition [ref=e195]:
+                              - generic [ref=e196]: 021-go-back.jpg
+                              - button "Copiar nome do arquivo" [ref=e197] [cursor=pointer]
+                          - generic [ref=e202]:
+                            - term [ref=e203]: Data e hora
+                            - definition [ref=e204]: 28/10/2026, 12:14:34 BRT
+                          - generic [ref=e205]:
+                            - term [ref=e206]: URL da página
+                            - definition [ref=e207]:
+                              - link "https://www.saucedemo.com/inventory.html" [ref=e208] [cursor=pointer]:
+                                - /url: https://www.saucedemo.com/inventory.html
+                              - button "Copiar URL" [ref=e209] [cursor=pointer]
+                          - generic [ref=e214]:
+                            - term [ref=e215]: Resolução
+                            - definition [ref=e216]: 1804 × 1190 px
+                          - generic [ref=e217]:
+                            - term [ref=e218]: Tamanho
+                            - definition [ref=e219]: 180,3 KB
+                        - generic [ref=e220]:
+                          - heading "Antes de navegar" [level=3] [ref=e221]
+                          - paragraph [ref=e222]: Estado observado antes de executar o controle.
+                      - link "Baixar imagem" [ref=e223] [cursor=pointer]:
+                        - /url: data:image/jpeg;base64,…

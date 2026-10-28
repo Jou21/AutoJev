@@ -68,6 +68,8 @@ CHECK_LABELS = {
 # diagnostic containing "select" must retain its original spelling.
 TEXT = {
     "Observed": "Condição observada",
+    "An application technical check failed during this action; a business defect is not automatically confirmed":
+        "Uma verificação técnica da aplicação falhou durante esta ação; um defeito de negócio não é confirmado automaticamente",
     "0 attributable application runtime, HTTP or network failures": "Nenhuma falha de execução, HTTP ou rede atribuível à aplicação",
     "Expected evidence was not observed": "A evidência esperada não foi observada",
     "Expected evidence is observed": "A evidência esperada deve ser observada",

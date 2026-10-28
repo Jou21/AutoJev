@@ -59,7 +59,7 @@ def test_report_embeds_image_at_each_selected_slot_with_real_timestamp_and_no_mu
     assert len(steps) == 7
     assert steps[gap][2] == "Imagem anexada pelo usuário"
     assert [title for _id, _kind, title in steps if title != "Imagem anexada pelo usuário"] == [
-        "Antes da ação", "Selecionar opção", "Depois da ação", "Opção selecionada", "Ordenação dos produtos", "Erros durante a ação",
+        "Antes de selecionar opção", "Selecionar opção", "Depois de selecionar opção", "Opção selecionada", "Ordenação dos produtos", "Erros durante a ação",
     ]
     assert 'data-step-order="planned"' in document
     assert 'data-image-source="user_upload"' in document
@@ -89,7 +89,7 @@ def test_report_multiple_attachments_share_saved_gap_order_and_never_duplicate(t
     timeline.insert(6, second)
     _report, document = render(tmp_path, run)
     assert [title for _id, _kind, title in native_steps(document)][1:5] == [
-        "Selecionar opção", "Imagem anexada pelo usuário", "Segundo anexo", "Depois da ação",
+        "Selecionar opção", "Imagem anexada pelo usuário", "Segundo anexo", "Depois de selecionar opção",
     ]
 
 

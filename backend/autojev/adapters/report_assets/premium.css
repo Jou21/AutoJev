@@ -382,6 +382,10 @@ dialog.case-history-dialog::backdrop { background: #02070cd9; backdrop-filter: b
 .technical-channel[data-state="unverified"] .technical-pair-icon { border-style: dashed; }
 .technical-channel .technical-channel-caption { margin: 12px 0 0; color: var(--channel-tone); font-size: 11px; line-height: 1.5; }
 .technical-verification .technical-verification-note { margin: 14px 0 0; color: var(--muted); font-size: 11px; line-height: 1.55; }
+.technical-occurrences { margin-top: 14px; padding: 12px 14px; border: 1px solid var(--fail, #e5566d); border-radius: 10px; }
+.technical-occurrences h5 { margin: 0 0 8px; font-size: 12px; }
+.technical-occurrences ul { margin: 0; padding-left: 18px; font-size: 12px; line-height: 1.55; }
+.technical-occurrences .url { overflow-wrap: anywhere; }
 .technical-raw { margin-top: 12px; padding-top: 9px; border-top: 1px solid var(--line-soft); }
 .technical-raw > summary { width: fit-content; max-width: 100%; padding: 4px 0; color: var(--muted); font-size: 11px; cursor: pointer; }
 .technical-raw > summary:hover { color: var(--text); }
@@ -1042,11 +1046,14 @@ body[data-theme="light"] .dialog-toolbar, body[data-theme="light"] dialog.eviden
   body[data-view="results"] .case-step-button[data-recorded-index] .step-description { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
   body[data-view="results"] .step-status { position: static; grid-column: 1; grid-row: 1 / span 2; align-self: center; width: 18px; height: 18px; margin: 0; padding: 0; border: 0; background: none; }
   body[data-view="results"] .step-status-icon { position: relative; display: grid; place-items: center; flex: 0 0 18px; width: 18px; height: 18px; aspect-ratio: 1; border: 0; border-radius: 50%; background: var(--step-tone); color: var(--surface); font-size: 12px; font-weight: 800; line-height: 1; }
-  body[data-view="results"] .active .step-status { --step-tone: var(--accent); }
-  body[data-view="results"] .step-status:is([data-step-state="pass"], [data-step-state="recorded"]) .step-status-icon { font-size: 0; }
-  body[data-view="results"] .step-status:is([data-step-state="pass"], [data-step-state="recorded"]) .step-status-icon::before { position: absolute; inset: 3px; background: currentColor; mask: var(--step-icon) center / contain no-repeat; content: ""; }
+  body[data-view="results"] .step-status:is([data-step-state="pass"], [data-step-state="recorded"], [data-step-state="fail"], [data-step-state="warning"], [data-step-state="info"], [data-step-state="unknown"]) .step-status-icon { font-size: 0; }
+  body[data-view="results"] .step-status:is([data-step-state="pass"], [data-step-state="recorded"], [data-step-state="fail"], [data-step-state="warning"], [data-step-state="info"], [data-step-state="unknown"]) .step-status-icon::before { position: absolute; inset: 3px; background: currentColor; mask: var(--step-icon) center / contain no-repeat; content: ""; }
   body[data-view="results"] .step-status[data-step-state="pass"] { --step-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='m3.5 8 3 3 6-6' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); }
   body[data-view="results"] .step-status[data-step-state="recorded"] { --step-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M2.5 4.5h3l1-2h3l1 2h3v9h-11z' fill='none' stroke='black' stroke-width='1.4' stroke-linejoin='round'/%3E%3Ccircle cx='8' cy='8.5' r='2.3' fill='none' stroke='black' stroke-width='1.4'/%3E%3C/svg%3E"); }
+  body[data-view="results"] .step-status[data-step-state="fail"] { --step-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='m4.5 4.5 7 7m0-7-7 7' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E"); }
+  body[data-view="results"] .step-status[data-step-state="warning"] { --step-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 3v6' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'/%3E%3Ccircle cx='8' cy='12.2' r='1.2' fill='black'/%3E%3C/svg%3E"); }
+  body[data-view="results"] .step-status[data-step-state="info"] { --step-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='3.8' r='1.2' fill='black'/%3E%3Cpath d='M8 7v6' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E"); }
+  body[data-view="results"] .step-status[data-step-state="unknown"] { --step-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M5.8 6a2.3 2.3 0 1 1 3.4 2c-.8.5-1.2.9-1.2 1.8' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round'/%3E%3Ccircle cx='8' cy='12.4' r='1.1' fill='black'/%3E%3C/svg%3E"); }
   body[data-view="results"] .step-status-label { display: none; }
   .step-selected-tag { display: none; }
   body[data-view="results"] .active > .step-selected-tag { position: absolute; right: 12px; top: 50%; display: block; transform: translateY(-50%); padding: 3px 9px; border-radius: 14px; background: var(--accent); color: #241b0a; font-size: 9px; font-weight: 650; line-height: 1.5; }

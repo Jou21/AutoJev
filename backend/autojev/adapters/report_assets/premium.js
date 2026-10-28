@@ -1234,6 +1234,7 @@
         signal: "Registro técnico para análise; não reprova o caso por si só.",
         observation: "Estado da página registrado; não é uma aprovação do teste.",
       };
+      let lastActionTitle = "";
       [{ node: summary, kind: "summary", title: "Resumo do teste" }, ...entries.map((node) => ({
         node, kind: Object.keys(labels).find((kind) => node.classList.contains(kind)) || "observation",
         title: (node.querySelector("h3") || {}).textContent || "Registro da execução",
@@ -1252,8 +1253,9 @@
         const description = result.description || (item.node.dataset.stepDescription || "").trim() || fallbackDescriptions[item.kind];
         const kindLabel = item.node.dataset.imageSource === "user_upload" ? "Imagem do usuário"
           : item.kind === "observation" && item.node.querySelector(".shots img") ? "Captura da página" : labels[item.kind];
+        if (item.kind === "action") lastActionTitle = (item.title || "").trim();
         const sidebarTitle = item.kind === "assertion" && item.title === "Ausência de novas falhas técnicas da aplicação"
-          ? "Erros durante a ação" : item.title;
+          ? (lastActionTitle ? "Erros durante «" + lastActionTitle + "»" : "Erros durante a ação") : item.title;
         const originalItem = { ...item, key: "original:" + index, originalIndex: index, kindLabel, state: result.state, outcome };
         const control = button("", () => selectCaseStep(model, model.items.indexOf(originalItem)), "case-step-button");
         control.dataset.stepIndex = String(index);
@@ -1273,14 +1275,17 @@
         descriptionNode.setAttribute("title", description);
         let caption = description;
         if (item.kind === "observation" && item.node.dataset.imageSource === "user_upload") caption = "Imagem escolhida pelo usuário.";
-        else if (item.kind === "observation" && result.state === "recorded") caption = /^Antes/i.test(item.title)
+        else if (item.kind === "observation" && result.state === "recorded") caption = /^Antes de /i.test(item.title)
+          ? "Captura da página antes de " + item.title.replace(/^Antes de /i, "") + "."
+          : /^Depois de /i.test(item.title) ? "Captura da página depois de " + item.title.replace(/^Depois de /i, "") + "."
+          : /^Antes/i.test(item.title)
           ? "Captura da página antes da ação." : /^Depois/i.test(item.title) ? "Captura da página após a ação." : "Captura da página registrada.";
         else if (item.kind === "action") caption = "Ação: " + item.title.charAt(0).toLocaleLowerCase("pt-BR") + item.title.slice(1) + ".";
         else if (item.kind === "assertion") caption = result.state === "fail" ? "Resultado diferente do esperado."
           : result.state === "unknown" ? "Conferência sem resultado registrado."
+          : /^erros/i.test(sidebarTitle) ? "Verificação de erros da aplicação."
           : /opção/i.test(sidebarTitle) ? "Confirmação da opção escolhida."
-          : /ordena/i.test(sidebarTitle) ? "Conferência da ordem dos produtos."
-          : /erros/i.test(sidebarTitle) ? "Verificação de erros da aplicação." : "Conferência do resultado registrado.";
+          : /ordena/i.test(sidebarTitle) ? "Conferência da ordem dos produtos." : "Conferência do resultado registrado.";
         const compact = make("small", "step-caption", caption);
         compact.setAttribute("aria-hidden", "true");
         compact.setAttribute("title", description);

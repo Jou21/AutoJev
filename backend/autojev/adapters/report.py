@@ -1002,7 +1002,9 @@ class StandaloneHtmlReport:
         )
 
     @staticmethod
-    def _technical_assertion_detail(assertion: dict[str, Any]) -> str:
+    def _technical_assertion_detail(
+        assertion: dict[str, Any], signals: list[dict[str, Any]] | None = None,
+    ) -> str:
         """Explain recorded technical counters without changing their verdict or scope."""
         passed = assertion.get("passed")
         result = "pass" if passed is True else "fail" if passed is False else "unknown"
@@ -1105,6 +1107,30 @@ class StandaloneHtmlReport:
             notes.append("As contagens são zero, mas o resultado registrado é reprovado. Não alteramos essa reprovação apenas pelas quantidades.")
         if not isinstance(actual, dict):
             notes.append("O registro não separa as contagens por tipo. Nenhum valor foi estimado a partir dos dados antigos.")
+        occurrences = ""
+        if result == "fail" and signals:
+            items = []
+            for signal in signals:
+                request = " · ".join(
+                    str(value) for value in (
+                        signal.get("method"),
+                        f'HTTP {signal.get("status_code")}' if signal.get("status_code") else None,
+                    ) if value
+                )
+                address = signal.get("url")
+                items.append(
+                    '<li><strong>' + _h(signal.get("label") or "Falha técnica") + '</strong>'
+                    + (f' · {_h(request)}' if request else '')
+                    + (f'<div class="url">{_h(StandaloneHtmlReport._public_issue_url(address))}</div>' if address else '')
+                    + '</li>'
+                )
+            occurrences = (
+                '<div class="technical-occurrences"><h5>O que reprovou esta verificação</h5><ul>'
+                + ''.join(items) + '</ul>'
+                '<p class="technical-verification-note">A aplicação respondeu com erro durante a ação. '
+                'É uma falha técnica da requisição acima; ela não prova, sozinha, que a funcionalidade '
+                'testada está com defeito.</p></div>'
+            )
         technical = {key: assertion[key] for key in ("kind", "expected", "actual", "passed", "message") if key in assertion}
         expected_display = assertion.get("expected_display")
         detail = f'<p><span class="muted">Esperado (descrição): </span>{_h(expected_display)}</p>' if isinstance(expected_display, str) and expected_display else ""
@@ -1114,6 +1140,7 @@ class StandaloneHtmlReport:
             '<div class="technical-outcome">' + icon(state, "technical-state-icon")
             + f'<div><h4>{title}</h4><p>{description}</p></div></div>'
             + '<div class="technical-channels">' + ''.join(cards) + '</div>'
+            + occurrences
             + ''.join(f'<p class="technical-verification-note">{note}</p>' for note in notes)
             + '<p class="technical-verification-note">As contagens se referem a esta verificação e dependem da captura configurada. '
             'Uma falha técnica não confirma, sozinha, um defeito funcional. O resultado desta verificação foi preservado.</p>'
@@ -1121,9 +1148,60 @@ class StandaloneHtmlReport:
             + f'<pre>{_h(json.dumps(technical, ensure_ascii=False, indent=2))}</pre></details></section>'
         )
 
+    @staticmethod
+    def _action_aware_title(entries: list[dict[str, Any]], index: int) -> str | None:
+        """Display name for a before/after capture: say which action it frames.
+
+        Only the rendered heading changes; the recorded titles stay as they are
+        because other services use them as step identifiers.
+        """
+        boundaries = {"Antes da ação": "Antes de ", "Depois da ação": "Depois de "}
+        entry = entries[index]
+        prefix = boundaries.get(str(entry.get("title")))
+        if entry.get("kind") != "observation" or prefix is None:
+            return None
+        neighbours = (
+            entries[index + 1:] if prefix == "Antes de " else reversed(entries[:index])
+        )
+        for item in neighbours:
+            if item.get("kind") == "action":
+                name = str(item.get("title") or "").strip()
+                return prefix + name[0].lower() + name[1:] if name else None
+            # Another capture of the same side belongs to a different attempt.
+            if item.get("kind") == "observation" and item.get("title") == entry.get("title"):
+                return None
+        return None
+
+    @staticmethod
+    def _failing_signals_for_assertion(
+        entries: list[dict[str, Any]], index: int,
+    ) -> list[dict[str, Any]]:
+        """Signals that tripped this technical check: those recorded since the
+        previous technical check of the same CT, never another action's."""
+        technical = {"no_new_browser_errors", "no_new_application_errors"}
+        if (entries[index].get("assertion") or {}).get("kind") not in technical:
+            return []
+        start = 0
+        for position in range(index - 1, -1, -1):
+            if (entries[position].get("assertion") or {}).get("kind") in technical:
+                start = position + 1
+                break
+        found: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in entries[start:index]:
+            signal = item.get("signal")
+            if item.get("kind") != "signal" or not isinstance(signal, dict) or signal.get("affects_verdict") is not True:
+                continue
+            key = str(signal.get("occurrence_id") or id(signal))
+            if key not in seen:
+                seen.add(key)
+                found.append(signal)
+        return found
+
     @classmethod
     def _assertion_detail(
         cls, assertion: dict[str, Any], *, selection: dict[str, Any] | None = None,
+        signals: list[dict[str, Any]] | None = None,
     ) -> str:
         kind = str(assertion.get("kind") or "Verificação observada")
         if kind == "selection_matches":
@@ -1131,7 +1209,7 @@ class StandaloneHtmlReport:
         if kind == "product_sort_order":
             return cls._sort_assertion_detail(assertion)
         if kind in {"no_new_browser_errors", "no_new_application_errors"}:
-            return cls._technical_assertion_detail(assertion)
+            return cls._technical_assertion_detail(assertion, signals)
         visual = kind == "visual_model"
         label = "Indício visual da LLM" if visual else "Verificação observada"
         note = (
@@ -1248,6 +1326,13 @@ class StandaloneHtmlReport:
                 return "fail", "Não concluída", "A automação não concluiu a ação; isso não confirma um defeito no site."
             return "unknown", "Sem confirmação", "Não há confirmação registrada da conclusão desta ação."
         if kind == "signal":
+            signal = entry.get("signal")
+            if isinstance(signal, dict) and signal.get("affects_verdict") is True:
+                return (
+                    "warning", "Falha técnica registrada",
+                    "Falha técnica da aplicação; reprova a verificação técnica deste CT, "
+                    "mas não confirma sozinha um defeito funcional.",
+                )
             return "warning", "Ocorrência registrada", "Ocorrência técnica; sozinha, não reprova o teste."
         if capture_exists:
             if entry.get("image_source") == "user_upload":
@@ -1334,6 +1419,7 @@ class StandaloneHtmlReport:
             if isinstance(entry.get("assertion"), dict):
                 detail += self._assertion_detail(
                     entry["assertion"], selection=self._selection_for_assertion(entries, index),
+                    signals=self._failing_signals_for_assertion(entries, index),
                 )
             user_image = entry.get("image_source") == "user_upload"
             timestamp = (entry.get("attached_at") or entry.get("occurred_at")) if user_image else entry.get("occurred_at")
@@ -1346,6 +1432,8 @@ class StandaloneHtmlReport:
                 placement_note = '<p class="muted attachment-position-note">Não foi possível vincular com segurança a posição planejada deste anexo. Ele aparece separado dos passos, sem posição atribuída e com seu horário real.</p>'
             title = (
                 provenance.get("summary") if observation else None
+            ) or (
+                None if observation else self._action_aware_title(entries, index)
             ) or entry.get("title") or labels[kind]
             phase = provenance.get("phase")
             if observation:
@@ -1398,7 +1486,7 @@ class StandaloneHtmlReport:
                 + placement_note
                 + action_meta
                 + observation_meta
-                + (f'<p>{_h(entry.get("message"))}</p>' if entry.get("message") else "")
+                + (f'<p>{_h(report_text(entry.get("message")))}</p>' if entry.get("message") else "")
                 + (f'<div class="url">{_h(self._public_issue_url(entry_url))}</div>' if entry_url else "")
                 + detail
                 + (self._action_preview(

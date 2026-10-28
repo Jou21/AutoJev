@@ -50,7 +50,13 @@ def _origin(value: Any) -> tuple[str, str, int | None] | None:
         if not parsed.hostname or parsed.scheme not in {"http", "https"}:
             return None
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        return parsed.scheme.casefold(), parsed.hostname.casefold(), port
+        host = parsed.hostname.casefold()
+        # example.com and www.example.com are the same application: a start URL
+        # without "www." is routinely redirected to it, and the run and the
+        # report must classify the same request identically.
+        if host.startswith("www.") and host.count(".") >= 2:
+            host = host[4:]
+        return parsed.scheme.casefold(), host, port
     except (TypeError, ValueError):
         return None
 

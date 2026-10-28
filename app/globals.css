@@ -3877,7 +3877,7 @@ input::placeholder {
   place-items: center;
   border: 1px solid #3c454a;
   border-radius: 50%;
-  font: 600 9px var(--font-geist-mono), monospace;
+  font: 600 9px var(--font-geist-mono, ui-monospace, "Cascadia Mono", Consolas, monospace);
 }
 
 .phase-step > div {
@@ -4019,7 +4019,7 @@ input::placeholder {
   border-radius: 10px;
   background: #282f33;
   color: #a4adb1;
-  font: 600 8px var(--font-geist-mono), monospace;
+  font: 600 8px var(--font-geist-mono, ui-monospace, "Cascadia Mono", Consolas, monospace);
 }
 
 .detail-tab-content {
@@ -4446,7 +4446,7 @@ input::placeholder {
 
 .scenario-case-heading > span {
   color: var(--amber);
-  font: 600 10px var(--font-geist-mono), monospace;
+  font: 600 10px var(--font-geist-mono, ui-monospace, "Cascadia Mono", Consolas, monospace);
   letter-spacing: .06em;
 }
 
@@ -4703,13 +4703,13 @@ input::placeholder {
 
 .scenario-http-code {
   color: #e5c283;
-  font: 600 11px var(--font-geist-mono), monospace;
+  font: 600 11px var(--font-geist-mono, ui-monospace, "Cascadia Mono", Consolas, monospace);
 }
 
 .scenario-event-url {
   margin-top: 8px;
   color: #8399a4;
-  font: 10px var(--font-geist-mono), monospace;
+  font: 10px var(--font-geist-mono, ui-monospace, "Cascadia Mono", Consolas, monospace);
   line-height: 1.6;
   overflow-wrap: anywhere;
 }

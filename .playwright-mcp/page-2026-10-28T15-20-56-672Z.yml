@@ -1,0 +1,193 @@
+- generic [ref=e2]:
+  - link "Pular para o conteúdo" [ref=e3] [cursor=pointer]:
+    - /url: "#main-content"
+  - complementary [ref=e4]:
+    - button "Ir para o dashboard" [ref=e6] [cursor=pointer]:
+      - generic [ref=e11]:
+        - strong [ref=e12]: AutoJev
+        - generic [ref=e13]: Autonomous QA
+    - navigation "Navegação principal" [ref=e14]:
+      - generic [ref=e15]: Workspace
+      - button "Dashboard" [ref=e16] [cursor=pointer]
+      - button "Nova exploração" [ref=e23] [cursor=pointer]
+      - button "Meus testes" [ref=e30] [cursor=pointer]
+      - button "Rascunhos" [ref=e36] [cursor=pointer]
+      - generic [ref=e41]: Sistema
+      - button "Provedores de IA" [ref=e42] [cursor=pointer]
+      - button "Configurações" [ref=e54] [cursor=pointer]
+    - generic [ref=e59]:
+      - 'generic "API: http://localhost:8000/api" [ref=e60]':
+        - generic [ref=e62]:
+          - strong [ref=e63]: API conectada
+          - generic [ref=e64]: FastAPI · operacional
+      - button "Recolher menu lateral" [ref=e65] [cursor=pointer]:
+        - generic [ref=e69]: Recolher menu
+  - main [ref=e71]:
+    - generic [ref=e245]:
+      - generic [ref=e246]:
+        - button "Meus testes" [ref=e247] [cursor=pointer]
+        - generic [ref=e252]: saucedemo.com
+      - generic [ref=e253]:
+        - generic [ref=e261]:
+          - generic [ref=e262]:
+            - heading "saucedemo.com" [level=1] [ref=e263]
+            - generic [ref=e264]: Concluída com restrições
+          - link "https://saucedemo.com/" [ref=e266] [cursor=pointer]:
+            - /url: https://saucedemo.com/
+        - generic [ref=e271]:
+          - button "Ver testes da aplicação" [ref=e272] [cursor=pointer]
+          - button "Atualizar" [ref=e277] [cursor=pointer]
+          - button "Abrir relatório" [ref=e283] [cursor=pointer]
+      - generic [ref=e287]:
+        - generic [ref=e288]:
+          - generic [ref=e293]:
+            - generic [ref=e294]: Resultado da execução
+            - heading "Exploração concluída com restrições" [level=2] [ref=e295]
+            - paragraph [ref=e296]: A cobertura alcançável terminou. As verificações que não puderam ser concluídas foram preservadas com suas evidências e restrições, sem serem contadas como testes aprovados.
+          - generic [ref=e297]:
+            - strong [ref=e298]: 100%
+            - generic [ref=e299]: processamento
+        - generic "Fases da execução" [ref=e302]:
+          - generic [ref=e307]:
+            - strong [ref=e308]: Explorar
+            - generic [ref=e309]: 12 ações
+          - generic [ref=e314]:
+            - strong [ref=e315]: CTs e evidências
+            - generic [ref=e316]: 9 casos
+          - generic [ref=e321]:
+            - strong [ref=e322]: Relatório
+            - generic [ref=e323]: pronto
+        - generic [ref=e324]:
+          - generic [ref=e325]:
+            - strong [ref=e331]: "3"
+            - generic [ref=e332]: páginas
+          - generic [ref=e333]:
+            - strong [ref=e336]: "12"
+            - generic [ref=e337]: ações
+          - generic [ref=e338]:
+            - strong [ref=e341]: "10"
+            - generic [ref=e342]: sinais técnicos
+          - generic [ref=e343]:
+            - strong [ref=e348]: "9"
+            - generic [ref=e349]: CTs
+          - generic [ref=e350]:
+            - strong [ref=e354]: "50.484"
+            - generic [ref=e355]: tokens
+          - generic [ref=e356]:
+            - strong [ref=e360]: 1m 1s
+            - generic [ref=e361]: duração total
+        - group "Custos da execução em dólares americanos" [ref=e362]:
+          - generic [ref=e363]:
+            - generic [ref=e367]: Custo LLM
+            - strong [ref=e368]: $0.005852
+          - generic [ref=e369]:
+            - generic [ref=e373]: Custo total
+            - strong [ref=e374]: $0.005852
+      - region "Força das verificações" [ref=e375]:
+        - generic [ref=e376]: O que foi realmente verificado
+        - generic [ref=e377]:
+          - generic [ref=e378]:
+            - strong [ref=e379]: "4"
+            - text: Negócio verificado
+          - generic [ref=e380]:
+            - strong [ref=e381]: "3"
+            - text: Só interação técnica
+          - generic [ref=e382]:
+            - strong [ref=e383]: "0"
+            - text: Verificação de negócio falhou
+          - generic [ref=e384]:
+            - strong [ref=e385]: "0"
+            - text: Automação não concluiu a ação
+          - generic [ref=e386]:
+            - strong [ref=e387]: "1"
+            - text: Verificação técnica falhou
+          - generic [ref=e388]:
+            - strong [ref=e389]: "0"
+            - text: Indício visual a revisar
+          - generic [ref=e390]:
+            - strong [ref=e391]: "1"
+            - text: Interação sem resultado esperado
+        - paragraph [ref=e392]: 100% significa processamento concluído, não todos os cenários possíveis. Uma aprovação sem asserção de negócio confirma somente a interação. A cobertura depende do usuário, dos estados alcançados, do tamanho da tela e das restrições.
+      - region "Resultado da análise visual" [ref=e393]:
+        - generic [ref=e397]:
+          - strong [ref=e398]: Capturas analisadas
+          - paragraph [ref=e399]: 9 de 9 CTs receberam uma análise visual válida · 0 em análise · 0 indisponíveis.
+          - paragraph [ref=e400]: "Limite local registrado: 300 chamadas auxiliares · 10 realizadas. É um limite de requisições HTTP, não de CTs."
+          - text: Os resultados de aprovação ou reprovação das verificações locais continuam válidos. Análise visual indisponível não significa aprovação visual; ausência de indícios não garante cobertura visual completa.
+      - generic [ref=e401]:
+        - tablist "Detalhes da exploração" [ref=e402]:
+          - tab "Visão geral" [selected] [ref=e403] [cursor=pointer]
+          - tab "Casos de teste 9" [ref=e407] [cursor=pointer]:
+            - text: Casos de teste
+            - generic [ref=e412]: "9"
+          - tab "Cobertura e restrições 16" [ref=e413] [cursor=pointer]:
+            - text: Cobertura e restrições
+            - generic [ref=e420]: "16"
+          - tab "Atividade 95" [ref=e421] [cursor=pointer]:
+            - text: Atividade
+            - generic [ref=e424]: "95"
+          - tab "Evidência" [ref=e425] [cursor=pointer]
+          - tab "Configuração" [ref=e429] [cursor=pointer]
+        - tabpanel [ref=e433]:
+          - generic [ref=e434]:
+            - generic [ref=e435]:
+              - generic [ref=e436]: Leitura rápida
+              - heading "Exploração concluída com restrições" [level=2] [ref=e437]
+              - paragraph [ref=e438]: A cobertura alcançável terminou. As verificações que não puderam ser concluídas foram preservadas com suas evidências e restrições, sem serem contadas como testes aprovados.
+              - generic [ref=e442]:
+                - strong [ref=e443]: Concluída com restrições
+                - generic [ref=e444]: 16 verificação(ões) não puderam ser concluídas. Isso não significa a mesma quantidade de telas ou defeitos.
+                - button "Examinar as restrições" [ref=e445] [cursor=pointer]
+              - generic [ref=e452]:
+                - strong [ref=e453]: Sinais técnicos dentro da evidência
+                - generic [ref=e454]: Cada ocorrência aparece na linha do tempo do CT correspondente. Registros sem vínculo com um CT ficam nas observações da execução, com a página e o momento registrados. Um sinal de console ou rede não confirma sozinho um defeito funcional.
+                - button "Examinar os casos de teste" [ref=e455] [cursor=pointer]
+              - generic [ref=e458]:
+                - generic [ref=e459]:
+                  - generic [ref=e460]: Estado da cobertura
+                  - strong [ref=e461]: Concluída com restrições
+                - generic [ref=e462]:
+                  - generic [ref=e463]: Estados descobertos
+                  - strong [ref=e464]: "5"
+                - generic [ref=e465]:
+                  - generic [ref=e466]: Revisões visuais válidas
+                  - strong [ref=e467]: "9"
+                - generic [ref=e468]:
+                  - generic [ref=e469]: CTs com evidência local
+                  - strong [ref=e470]: "0"
+            - generic [ref=e471]:
+              - generic [ref=e472]:
+                - generic [ref=e473]:
+                  - generic [ref=e474]: Última evidência
+                  - heading "Onde a navegação terminou" [level=2] [ref=e478]
+                - button "Ver maior" [ref=e479] [cursor=pointer]
+              - generic [ref=e482]:
+                - generic [ref=e483]: https://saucedemo.com/
+                - img "Último screenshot de saucedemo.com" [ref=e497]
+            - generic [ref=e498]:
+              - generic [ref=e499]:
+                - generic [ref=e500]:
+                  - generic [ref=e501]: Últimas mudanças
+                  - heading "O que acabou de acontecer" [level=2] [ref=e502]
+                - button "Ver tudo" [ref=e503] [cursor=pointer]
+              - generic [ref=e506]:
+                - generic [ref=e511]:
+                  - strong [ref=e512]: Relatório pronto
+                  - paragraph [ref=e513]: O relatório completo já pode ser aberto.
+                  - generic [ref=e514]: 28 de out., 12:14
+                - generic [ref=e519]:
+                  - strong [ref=e520]: Montando o relatório
+                  - paragraph [ref=e521]: Casos de teste prontos; montando o relatório final
+                  - generic [ref=e522]: 28 de out., 12:14
+                - generic [ref=e527]:
+                  - strong [ref=e528]: Casos de teste finalizados
+                  - paragraph [ref=e529]: "Casos finalizados: 9 aprimorados pela LLM e 0 preservados com evidência do navegador"
+                  - generic [ref=e530]: 28 de out., 12:14
+                - generic [ref=e535]:
+                  - strong [ref=e536]: CT007 aprimorado
+                  - paragraph [ref=e537]: Documentado pela LLM auxiliar a partir da evidência capturada.
+                  - generic [ref=e538]: 28 de out., 12:14
+                - generic [ref=e543]:
+                  - strong [ref=e544]: CT004 aprimorado
+                  - paragraph [ref=e545]: Documentado pela LLM auxiliar a partir da evidência capturada.
+                  - generic [ref=e546]: 28 de out., 12:14
