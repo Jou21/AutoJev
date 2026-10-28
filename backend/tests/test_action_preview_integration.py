@@ -282,8 +282,9 @@ async def test_real_executor_action_previews_survive_scenario_and_standalone_rep
                 assert preview["box"] == expected_preview["box"]
                 assert preview["target"] == expected_preview["target"]
                 filename = expected_preview["screenshot"]
-                png = (shots / filename).read_bytes()
-                assert struct.unpack(">II", png[16:24]) == (1440, 900)
+                from PIL import Image
+                with Image.open(shots / filename) as image:  # JPEG capture
+                    assert image.size == (1440, 900)
                 assert filename in document
             assert digests == {
                 path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in shots.glob("*.png")

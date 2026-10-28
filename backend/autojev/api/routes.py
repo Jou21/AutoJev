@@ -654,18 +654,6 @@ async def discover_models(provider_id: str, request: Request) -> dict[str, Any]:
             request.app.state.settings.http_timeout_seconds,
         )
         discovered = await client.list_models()
-        if "openrouter.ai" in provider.base_url.lower():
-            discovered = [
-                *discovered,
-                {
-                    "id": "typesafe/jev-1.13",
-                    "label": "TypeSafe: Jev 1.13",
-                    "input_modalities": ["text"],
-                    "output_modalities": ["text"],
-                    "supports_vision": False,
-                    "capabilities_known": True,
-                },
-            ]
         discovered_by_id = {model["id"]: model for model in discovered}
         merged: list[ProviderModel] = []
         seen: set[str] = set()
@@ -822,9 +810,14 @@ async def create_exploration(
     body: ExplorationCreate, request: Request
 ) -> dict[str, Any]:
     repository = _repository(request)
-    agent = ModelSelection(
-        provider_id=body.agent.provider_id, model_id=body.agent.model_id
-    )
+    if body.agent is not None and (
+        body.agent.provider_id, body.agent.model_id
+    ) != (LOCAL_AGENT_PROVIDER_ID, DETERMINISTIC_AGENT_MODEL):
+        raise HTTPException(
+            status_code=422,
+            detail="O agente JEV foi removido; o AutoJev decide as ações com o planejador determinístico. Escolha apenas a LLM auxiliar.",
+        )
+    agent = ModelSelection(provider_id=LOCAL_AGENT_PROVIDER_ID, model_id=DETERMINISTIC_AGENT_MODEL)
     auxiliary = ModelSelection(
         provider_id=body.auxiliary_llm.provider_id,
         model_id=body.auxiliary_llm.model_id,

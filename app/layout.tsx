@@ -36,11 +36,11 @@ export async function generateMetadata(): Promise<Metadata> {
     description:
       "Agente autônomo de QA para explorar aplicações web, registrar evidências e transformar descobertas em cenários de teste.",
     applicationName: "AutoJev",
-    keywords: ["QA", "testes", "Playwright", "automação", "JEV"],
+    keywords: ["QA", "testes", "Playwright", "automação", "exploratório"],
     openGraph: {
       title: "AutoJev — QA autônomo, evidência real",
       description:
-        "JEV decide. Playwright executa. Sua LLM auxiliar interpreta as evidências.",
+        "O AutoJev decide. Playwright executa. Sua LLM auxiliar interpreta as evidências.",
       type: "website",
       locale: "pt_BR",
       images: [
@@ -51,7 +51,7 @@ export async function generateMetadata(): Promise<Metadata> {
       card: "summary_large_image",
       title: "AutoJev — QA autônomo, evidência real",
       description:
-        "JEV decide. Playwright executa. Sua LLM auxiliar interpreta as evidências.",
+        "O AutoJev decide. Playwright executa. Sua LLM auxiliar interpreta as evidências.",
       images: [socialImage],
     },
     icons: {

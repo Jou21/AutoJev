@@ -263,8 +263,11 @@ async def test_preparation_observe_masks_anonymous_login_but_not_checkout_fields
                 int(checkout_box["x"] + checkout_box["width"] / 2),
                 int(checkout_box["y"] + checkout_box["height"] / 2),
             ))
-        assert login_pixel == (16, 20, 22)
-        assert checkout_pixel != (16, 20, 22)
+        # JPEG capture: the mask colour survives within a small lossy margin.
+        def near_mask(pixel):
+            return max(abs(a - b) for a, b in zip(pixel, (16, 20, 22))) <= 4
+        assert near_mask(login_pixel)
+        assert not near_mask(checkout_pixel)
     finally:
         await executor.close()
 

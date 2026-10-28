@@ -306,13 +306,13 @@ async def discover(root_id: str, body: DiscoveryInput, request: Request):
         raise HTTPException(422, "Descoberta não aceita um plano de capturas de reexecução.")
     manager = request.app.state.exploration_manager
     try:
-        from autojev.adapters.openai_compatible import LOCAL_AGENT_PROVIDER_ID
-        if source["agent"]["provider_id"] != LOCAL_AGENT_PROVIDER_ID:
-            manager._client_for(source["agent"]["provider_id"])
         manager._client_for(source["auxiliary_llm"]["provider_id"])
     except Exception as exc:
         raise HTTPException(409, "Configure os provedores deste conjunto antes de iniciar a descoberta.") from exc
-    identity = suites.repository.create_exploration(ExplorationRequest(source["app_url"], ModelSelection(**source["agent"]),
+    from autojev.adapters.openai_compatible import DETERMINISTIC_AGENT_MODEL, LOCAL_AGENT_PROVIDER_ID
+    # Even a suite recorded with the removed JEV agent is rediscovered by the planner.
+    planner = ModelSelection(LOCAL_AGENT_PROVIDER_ID, DETERMINISTIC_AGENT_MODEL)
+    identity = suites.repository.create_exploration(ExplorationRequest(source["app_url"], planner,
         ModelSelection(**source["auxiliary_llm"]), ExplorationOptions(focus_area=body.focus, max_steps=body.max_steps,
         max_duration_seconds=300, auxiliary_max_requests=body.max_steps, auxiliary_evidence_mode="text")))
     suites.store.register_session(identity, root, "discovery")

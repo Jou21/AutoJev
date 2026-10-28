@@ -181,7 +181,7 @@ def _line(text: str) -> str:
     if match and match[1] in ACTION_LABELS:
         reason = {"conventional_form": "formulário convencional", "known_navigation": "navegação conhecida",
                   "single_clear_control": "controle único identificado", "clear_safe_frontier": "opções seguras identificadas"}.get(match[2], match[2])
-        return f"A política local do AutoJev selecionou a próxima ação segura ainda não testada: {action_label(match[1]).lower()}, sem chamar o JEV ({reason})."
+        return f"A política local do AutoJev selecionou a próxima ação segura ainda não testada: {action_label(match[1]).lower()} ({reason})."
     match = re.fullmatch(r"Playwright executed (\w+) successfully(.*)", text)
     if match and match[1] in ACTION_LABELS:
         suffix = match[2]

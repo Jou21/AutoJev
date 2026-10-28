@@ -238,28 +238,18 @@ def _catalog_modalities(
     return [], output_modalities, False, output_known
 
 
-def _is_jev_model(model: str) -> bool:
-    return model.removeprefix("~").startswith("typesafe/jev-")
-
-
 LOCAL_AGENT_PROVIDER_ID = "autojev-local"
 DETERMINISTIC_AGENT_MODEL = "autojev/deterministic"
 
 
 def _is_decision_model(model: str) -> bool:
-    """Models that answer typed ``choice``/``noul`` questions instead of chatting.
+    """The built-in planner answers typed ``choice``/``noul`` move questions."""
 
-    JEV (OpenRouter) and the local Laya service (``laya_service/``) share the
-    ``/api/alpha/decisions`` contract; the built-in deterministic agent answers
-    the same questions without any model.
-    """
-
-    return (_is_jev_model(model) or model.startswith("convaiinnovations/laya")
-            or model == DETERMINISTIC_AGENT_MODEL)
+    return model == DETERMINISTIC_AGENT_MODEL
 
 
 class DeterministicDecisionClient:
-    """Answers JEV's typed questions without a model, network or cost.
+    """Answers the agent's typed move questions without a model, network or cost.
 
     The coverage planner already orders ``candidate_moves`` by its own
     priority (current screen first, then frontier), and only offers back /
@@ -856,58 +846,11 @@ class OpenAICompatibleClient:
             )
         return extract_json(str(content))
 
-    async def decisions(
-        self,
-        model: str,
-        state: dict[str, Any],
-        questions: dict[str, dict[str, Any]],
-    ) -> dict[str, Any]:
-        payload = {"model": model, "state": state, "questions": questions}
-        request_started = False
-        usage_recorded = False
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
-                request_started = True
-                response = await client.post(
-                    f"{self.base_url.split('/api/')[0]}/api/alpha/decisions",
-                    headers=_headers(self.api_key),
-                    json=payload,
-                )
-                response.raise_for_status()
-                body = response.json()
-                self._record_usage(body)
-                usage_recorded = True
-        except (httpx.HTTPError, ValueError, TypeError) as exc:
-            raise ProviderConnectionError(_safe_error(exc, [self.api_key or ""])) from exc
-        finally:
-            if request_started and not usage_recorded:
-                self._record_usage({})
-        answers = body.get("answers") if isinstance(body, dict) else None
-        if not isinstance(answers, dict):
-            # The transport succeeded, but the model payload was malformed.
-            # Classify this as a recoverable model response so the exploration
-            # loop can ask JEV again instead of aborting the whole run.
-            raise ModelResponseError("JEV returned no typed decisions")
-        return answers
-
     async def test(self, model_id: str | None = None) -> dict[str, Any]:
         started = time.perf_counter()
         if model_id:
             await self.validate_credentials()
-        if model_id and _is_decision_model(model_id):
-            answers = await self.decisions(
-                model_id,
-                {"connection_check": True},
-                {"ok": {"type": "noul", "instructions": "Is this a connection check?"}},
-            )
-            probability = answers.get("ok", {}).get("noul")
-            if not isinstance(probability, (int, float)) or isinstance(probability, bool):
-                raise ProviderConnectionError("Decision model returned no typed noul probability")
-            # Only JEV is trained to answer this probe; an un-tuned Laya base
-            # checkpoint is near chance, so its value says nothing about health.
-            if _is_jev_model(model_id) and probability < 0.5:
-                raise ProviderConnectionError("JEV failed the typed decision capability check")
-        elif model_id:
+        if model_id:
             result = await self.chat_json(
                 model_id,
                 "Return JSON only.",
@@ -1207,13 +1150,8 @@ Write rationale and human-readable scenario_hint fields in Brazilian Portuguese 
                             "expected": str(href) if expected_route == "/" else expected_route,
                         }
                     )
-            decider = (
-                "AutoJev deterministic planner" if self.model == DETERMINISTIC_AGENT_MODEL
-                else "Laya" if self.model.startswith("convaiinnovations/laya")
-                else "TypeSafe JEV"
-            )
             rationale = report_text(
-                f"{decider} selected {selected['action']} for {selected['name']} "
+                f"AutoJev deterministic planner selected {selected['action']} for {selected['name']} "
                 f"to maximize safe untested coverage ({'; '.join(signals)})."
             )
             raw_payload = {

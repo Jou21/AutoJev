@@ -1721,10 +1721,6 @@ class ExplorationManager:
         )
 
     @staticmethod
-    def _is_jev_model(model_id: str) -> bool:
-        return model_id.removeprefix("~").startswith("typesafe/jev-")
-
-    @staticmethod
     def _issue_timestamp(issue: dict[str, Any]) -> float | None:
         value = issue.get("occurred_at")
         if not value:
@@ -2607,7 +2603,7 @@ class ExplorationManager:
                     exploration_id,
                     auxiliary,
                     auxiliary_client,
-                    use_local_evidence=self._is_jev_model(auxiliary_model_id),
+                    use_local_evidence=False,
                     executor=executor,
                     options=options,
                     secret_values=secret_values,
@@ -2659,7 +2655,7 @@ class ExplorationManager:
                 exploration_id,
                 "info",
                 "jev_invocation_policy",
-                "JEV is reserved for ambiguity, complex states and stalled progress",
+                "Clear actions are routed locally; ambiguous states follow the planner's frontier priority",
                 {
                     "local_actions": [
                         "clear_control",
@@ -2931,7 +2927,7 @@ class ExplorationManager:
                             exploration_id,
                             "info",
                             "decision_routed_locally",
-                            "Playwright received an unambiguous action without calling JEV",
+                            "Playwright received an unambiguous action from the local policy",
                             {
                                 "reason": routing_reason,
                                 "action": decision.action,
@@ -2951,7 +2947,7 @@ class ExplorationManager:
                             exploration_id,
                             "info",
                             "jev_consulted",
-                            "JEV was called because the local policy required QA judgment",
+                            "The planner chose by frontier priority because the local policy found the state ambiguous",
                             {
                                 "reason": routing_reason,
                                 "state_key": coverage_state.get("state_key"),

@@ -305,7 +305,9 @@ class ExplorationCreate(ApiModel):
         max_length=2000,
         validation_alias=AliasChoices("app_url", "appUrl", "application_url", "applicationUrl"),
     )
-    agent: ModelSelectionInput
+    # Kept optional for older clients; every exploration now uses the built-in
+    # AutoJev planner and only the auxiliary LLM is chosen.
+    agent: ModelSelectionInput | None = None
     auxiliary_llm: ModelSelectionInput = Field(
         validation_alias=AliasChoices("auxiliary_llm", "auxiliaryLLM")
     )

@@ -206,7 +206,7 @@ async def test_failed_usage_persistence_is_retried_without_losing_or_duplicating
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("method", ["chat_json", "decisions"])
+@pytest.mark.parametrize("method", ["chat_json"])
 async def test_provider_timeout_is_persisted_as_uncertain_billing(monkeypatch, ledger, method):
     class Client:
         async def __aenter__(self):
@@ -221,12 +221,9 @@ async def test_provider_timeout_is_persisted_as_uncertain_billing(monkeypatch, l
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: Client())
     client = OpenAICompatibleClient("https://provider.test/v1", None)
     with pytest.raises(ProviderConnectionError):
-        if method == "chat_json":
-            await client.chat_json("same-model", "system", "user")
-        else:
-            await client.decisions("same-model", {}, {})
+        await client.chat_json("same-model", "system", "user")
     manager, repository, run_id = ledger
-    role = "jev" if method == "decisions" else "auxiliary"
+    role = "auxiliary"
     await manager._record_model_usage(run_id, [client], None, role)
     usage = repository.get_exploration(run_id, include_details=False)["usage"]
     assert usage["cost_known"] is False

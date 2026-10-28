@@ -420,10 +420,6 @@ def test_visual_exploration_rejects_auxiliary_model_without_image_support(tmp_pa
             "/api/explorations",
             json={
                 "app_url": "http://localhost:3000",
-                "agent": {
-                    "provider_id": provider["id"],
-                    "model_id": "text-model",
-                },
                 "auxiliary_llm": {
                     "provider_id": provider["id"],
                     "model_id": "text-model",
@@ -485,7 +481,6 @@ def test_provider_edits_preserve_image_only_output_and_unknown_capabilities(tmp_
             "/api/explorations",
             json={
                 "app_url": "http://localhost:3000",
-                "agent": {"provider_id": provider["id"], "model_id": "unknown-model"},
                 "auxiliary_llm": {
                     "provider_id": provider["id"],
                     "model_id": "image-generator",
@@ -515,7 +510,6 @@ def test_exploration_request_does_not_echo_credentials(tmp_path):
             "/api/explorations",
             json={
                 "app_url": "http://localhost:3000",
-                "agent": {"provider_id": provider["id"], "model_id": "model"},
                 "auxiliary_llm": {
                     "provider_id": provider["id"],
                     "model_id": "model",
@@ -557,7 +551,6 @@ def test_exploration_accepts_optional_focused_scope_alias(tmp_path):
             "/api/explorations",
             json={
                 "app_url": "http://localhost:3000",
-                "agent": {"provider_id": provider["id"], "model_id": "model"},
                 "auxiliary_llm": {
                     "provider_id": provider["id"],
                     "model_id": "model",
@@ -593,7 +586,6 @@ def test_exploration_defaults_to_coverage_driven_without_fixed_limits(tmp_path):
             "/api/explorations",
             json={
                 "app_url": "http://localhost:3000",
-                "agent": {"provider_id": provider["id"], "model_id": "model"},
                 "auxiliary_llm": {
                     "provider_id": provider["id"],
                     "model_id": "model",
@@ -627,7 +619,7 @@ def test_exploration_rejects_invalid_provider_key_before_browser_login(
                 "name": "Provider",
                 "base_url": "https://provider.example/v1",
                 "api_key": "sk-or-invalid",
-                "models": [{"id": "typesafe/jev-1.13"}],
+                "models": [{"id": "aux-model"}],
             },
         ).json()
 
@@ -647,13 +639,9 @@ def test_exploration_rejects_invalid_provider_key_before_browser_login(
             "/api/explorations",
             json={
                 "app_url": "https://example.test",
-                "agent": {
-                    "provider_id": provider["id"],
-                    "model_id": "typesafe/jev-1.13",
-                },
                 "auxiliary_llm": {
                     "provider_id": provider["id"],
-                    "model_id": "typesafe/jev-1.13",
+                    "model_id": "aux-model",
                 },
             },
         )

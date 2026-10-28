@@ -3,6 +3,7 @@ import pytest
 from PIL import Image
 
 from autojev.adapters.openai_compatible import (
+    DETERMINISTIC_AGENT_MODEL,
     ModelResponseError,
     OpenAIAuxiliaryScenarioGenerator,
     OpenAICompatibleClient,
@@ -523,107 +524,7 @@ async def test_chat_json_captures_and_drains_provider_usage(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_openrouter_jev_uses_native_decisions_endpoint_and_usage(monkeypatch):
-    captured = {}
-
-    class FakeResponse:
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {
-                "answers": {
-                    "next_move": {
-                        "type": "choice",
-                        "choice": "move_001",
-                        "confidence": 1.0,
-                    }
-                },
-                "usage": {
-                    "input_tokens": 120,
-                    "output_tokens": 16,
-                    "cost": 0.00001,
-                },
-            }
-
-    class FakeClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return None
-
-        async def post(self, url, **kwargs):
-            captured["url"] = url
-            captured["json"] = kwargs["json"]
-            return FakeResponse()
-
-    monkeypatch.setattr("httpx.AsyncClient", lambda **kwargs: FakeClient())
-    client = OpenAICompatibleClient("https://openrouter.ai/api/v1", "sk-or-test")
-
-    answers = await client.decisions(
-        "typesafe/jev-1.13",
-        {"page": "state"},
-        {
-            "next_move": {
-                "type": "choice",
-                "instructions": "Choose",
-                "criteria": {"move_001": "Move", "move_finish": "Finish"},
-            }
-        },
-    )
-
-    assert captured["url"] == "https://openrouter.ai/api/alpha/decisions"
-    assert captured["json"]["model"] == "typesafe/jev-1.13"
-    assert answers["next_move"]["choice"] == "move_001"
-    assert client.drain_usage() == {
-        "prompt_tokens": 120,
-        "completion_tokens": 16,
-        "total_tokens": 136,
-        "cost": 0.00001,
-        "cost_known": True,
-        "cost_complete": True,
-        "usage_records": 1,
-        "cost_reported_records": 1,
-    }
-
-
 @pytest.mark.asyncio
-async def test_decisions_without_answers_is_a_recoverable_model_error(monkeypatch):
-    class FakeResponse:
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {"id": "decision-without-answers"}
-
-    class FakeClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return None
-
-        async def post(self, *args, **kwargs):
-            return FakeResponse()
-
-    monkeypatch.setattr("httpx.AsyncClient", lambda **kwargs: FakeClient())
-    client = OpenAICompatibleClient("https://openrouter.ai/api/v1", "sk-or-test")
-
-    with pytest.raises(ModelResponseError, match="no typed decisions"):
-        await client.decisions(
-            "typesafe/jev-1.13",
-            {"page": "state"},
-            {
-                "next_move": {
-                    "type": "choice",
-                    "instructions": "Choose",
-                    "criteria": {"move_finish": "Finish"},
-                }
-            },
-        )
-
-
 def test_extract_json_accepts_fenced_object_but_rejects_prose():
     assert extract_json('```json\n{"action":"finish"}\n```')["action"] == "finish"
     with pytest.raises(ModelResponseError):
@@ -683,7 +584,7 @@ async def test_malformed_agent_json_becomes_recoverable_model_error():
 
 
 @pytest.mark.asyncio
-async def test_typesafe_agent_only_sees_current_frontier_targets():
+async def test_planner_agent_only_sees_current_frontier_targets():
     class FakeClient:
         def __init__(self):
             self.state = None
@@ -703,7 +604,7 @@ async def test_typesafe_agent_only_sees_current_frontier_targets():
             }
 
     client = FakeClient()
-    agent = OpenAIJevAgent(client, "typesafe/jev-1.13")
+    agent = OpenAIJevAgent(client, DETERMINISTIC_AGENT_MODEL)
     observation = Observation(
         url="https://example.test",
         title="Page",
@@ -803,57 +704,8 @@ async def test_litellm_model_info_declares_vision_capability(monkeypatch, info_s
 
 
 @pytest.mark.asyncio
-async def test_laya_agent_uses_the_typed_move_contract_without_optional_scores():
-    class FakeClient:
-        async def decisions(self, _model, state, questions):
-            assert set(state["candidate_moves"]) == {"move_001"}
-            return {
-                "next_move": {"choice": "move_001"},
-                "qa_focus": {"choice": "not_a_known_lens"},
-                "issue_visible": {"noul": 0.4},
-            }
-
-    agent = OpenAIJevAgent(FakeClient(), "convaiinnovations/laya")
-    observation = Observation(
-        url="https://example.test",
-        title="Page",
-        text="Page",
-        interactive_elements=[{"ref": "e2", "tag": "button", "name": "Open", "in_viewport": True}],
-    )
-
-    decision = await agent.decide(
-        observation, [], [], {"current_untried": [{"ref": "e2"}], "scope": "entire application"}
-    )
-
-    assert (decision.action, decision.target) == ("click", "e2")
-
-
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("model", "noul", "passes"),
-    [
-        ("convaiinnovations/laya", 0.1, True),  # untuned base: value is not a health signal
-        ("typesafe/jev-1.13", 0.1, False),
-        ("typesafe/jev-1.13", 0.9, True),
-    ],
-)
-async def test_connection_check_for_decision_models(model, noul, passes):
-    client = OpenAICompatibleClient("http://127.0.0.1:8100", None)
-
-    async def fake_decisions(_model, _state, _questions):
-        return {"ok": {"noul": noul}}
-
-    client.decisions = fake_decisions
-
-    if passes:
-        assert (await client.test(model))["ok"] is True
-    else:
-        with pytest.raises(ProviderConnectionError, match="capability check"):
-            await client.test(model)
-
-
-@pytest.mark.asyncio
-async def test_typesafe_agent_only_offers_finish_at_an_exhausted_root():
+async def test_planner_agent_only_offers_finish_at_an_exhausted_root():
     class FakeClient:
         async def decisions(self, _model, state, questions):
             assert set(questions["next_move"]["criteria"]) == {"move_finish"}
@@ -864,7 +716,7 @@ async def test_typesafe_agent_only_offers_finish_at_an_exhausted_root():
                 "issue_visible": {"noul": 0.0},
             }
 
-    agent = OpenAIJevAgent(FakeClient(), "typesafe/jev-1.13")
+    agent = OpenAIJevAgent(FakeClient(), DETERMINISTIC_AGENT_MODEL)
     observation = Observation(
         url="https://example.test",
         title="Root",
@@ -889,7 +741,7 @@ async def test_typesafe_agent_only_offers_finish_at_an_exhausted_root():
 
 
 @pytest.mark.asyncio
-async def test_typesafe_agent_uses_atomic_backtrack_move_when_frontier_is_empty():
+async def test_planner_agent_uses_atomic_backtrack_move_when_frontier_is_empty():
     class FakeClient:
         async def decisions(self, _model, _state, questions):
             assert set(questions["next_move"]["criteria"]) == {
@@ -902,7 +754,7 @@ async def test_typesafe_agent_uses_atomic_backtrack_move_when_frontier_is_empty(
                 "issue_visible": {"noul": 0.0},
             }
 
-    agent = OpenAIJevAgent(FakeClient(), "typesafe/jev-1.13")
+    agent = OpenAIJevAgent(FakeClient(), DETERMINISTIC_AGENT_MODEL)
     observation = Observation(
         url="https://example.test/child",
         title="Child",
@@ -927,7 +779,7 @@ async def test_typesafe_agent_uses_atomic_backtrack_move_when_frontier_is_empty(
 
 
 @pytest.mark.asyncio
-async def test_typesafe_agent_returns_prevalidated_fill_move_with_safe_value():
+async def test_planner_agent_returns_prevalidated_fill_move_with_safe_value():
     class FakeClient:
         async def decisions(self, _model, state, _questions):
             assert state["candidate_moves"]["move_001"]["action"] == "fill"
@@ -938,7 +790,7 @@ async def test_typesafe_agent_returns_prevalidated_fill_move_with_safe_value():
                 "issue_visible": {"noul": 0.0},
             }
 
-    agent = OpenAIJevAgent(FakeClient(), "typesafe/jev-1.13")
+    agent = OpenAIJevAgent(FakeClient(), DETERMINISTIC_AGENT_MODEL)
     observation = Observation(
         url="https://example.test/search",
         title="Search",
@@ -980,7 +832,7 @@ async def test_typesafe_agent_returns_prevalidated_fill_move_with_safe_value():
 
 
 @pytest.mark.asyncio
-async def test_typesafe_agent_receives_distinct_menu_and_select_move_variants():
+async def test_planner_agent_receives_distinct_menu_and_select_move_variants():
     class FakeClient:
         async def decisions(self, _model, state, questions):
             moves = state["candidate_moves"]
@@ -1002,7 +854,7 @@ async def test_typesafe_agent_receives_distinct_menu_and_select_move_variants():
                 "issue_visible": {"noul": 0.0},
             }
 
-    agent = OpenAIJevAgent(FakeClient(), "typesafe/jev-1.13")
+    agent = OpenAIJevAgent(FakeClient(), DETERMINISTIC_AGENT_MODEL)
     observed = Observation(
         url="https://example.test/settings",
         title="Settings",
@@ -1055,12 +907,12 @@ async def test_typesafe_agent_receives_distinct_menu_and_select_move_variants():
 
 
 @pytest.mark.asyncio
-async def test_typesafe_agent_rejects_malformed_or_unknown_atomic_move():
+async def test_planner_agent_rejects_malformed_or_unknown_atomic_move():
     class FakeClient:
         async def decisions(self, *_args):
             return {"next_move": {"choice": {"not": "a move id"}}}
 
-    agent = OpenAIJevAgent(FakeClient(), "typesafe/jev-1.13")
+    agent = OpenAIJevAgent(FakeClient(), DETERMINISTIC_AGENT_MODEL)
     observation = Observation(
         url="https://example.test",
         title="Page",

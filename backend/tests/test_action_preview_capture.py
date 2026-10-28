@@ -122,6 +122,13 @@ class SelectPreviewTarget(PreviewTarget):
         self.matches = True
 
 
+
+def _image_size(path):
+    """Captures are JPEG; read the real bitmap size, not a PNG header."""
+    from PIL import Image
+    with Image.open(path) as image:
+        return image.size
+
 def preview_fixture(tmp_path: Path):
     events = []
     executor = PlaywrightExecutor(tmp_path, ExplorationOptions())
@@ -167,7 +174,7 @@ async def test_preview_records_css_viewport_target_before_action_and_redacts_url
     assert preview["target"] == "e2"
     assert preview["action"] == "select"
     assert preview["captured_at"].endswith("+00:00")
-    assert preview["screenshot"] == "001-before-select-target.png"
+    assert preview["screenshot"] == "001-before-select-target.jpg"
     assert "private-token" not in preview["url"]
     assert "fixture-secret" not in json.dumps(preview)
     assert events == ["scroll", "viewport", "box", "capture", "box", "viewport"]
@@ -565,10 +572,9 @@ async def test_real_preview_is_css_sized_scrolls_and_never_mutates_application(t
         assert preview["box"]["y"] >= 0
         assert preview["box"]["y"] + preview["box"]["height"] <= 360
         assert preview["image"] == {"width": 640, "height": 360}
-        # The PNG itself is viewport-sized in CSS pixels, not 2x device pixels
-        # or the tall full document normally captured in headless runs.
-        data = (tmp_path / preview["screenshot"]).read_bytes()
-        assert struct.unpack(">II", data[16:24]) == (640, 360)
+        # The capture itself is viewport-sized in CSS pixels, not 2x device
+        # pixels or the tall full document normally captured in headless runs.
+        assert _image_size(tmp_path / preview["screenshot"]) == (640, 360)
         password_box = await page.locator('input').bounding_box()
         coordinates = {
             "password": [
@@ -577,15 +583,19 @@ async def test_real_preview_is_css_sized_scrolls_and_never_mutates_application(t
             ],
             "target": [int(preview["box"]["x"] + 10), int(preview["box"]["y"] + 10)],
         }
+        data = (tmp_path / preview["screenshot"]).read_bytes()
         pixels = await page.evaluate("""async ({data,coordinates}) => {
-            const image=new Image();image.src=`data:image/png;base64,${data}`;await image.decode();
+            const image=new Image();image.src=`data:image/jpeg;base64,${data}`;await image.decode();
             const canvas=document.createElement('canvas');canvas.width=image.width;canvas.height=image.height;
             const context=canvas.getContext('2d');context.drawImage(image,0,0);
             return Object.fromEntries(Object.entries(coordinates).map(([name,[x,y]])=>
                 [name,Array.from(context.getImageData(x,y,1,1).data)]));
         }""", {"data": base64.b64encode(data).decode(), "coordinates": coordinates})
-        assert pixels["password"] == [16, 20, 22, 255]
-        assert pixels["target"] == [45, 212, 191, 255]
+        # JPEG capture: compare colours within a small lossy margin.
+        def near(pixel, colour):
+            return max(abs(a - b) for a, b in zip(pixel[:3], colour)) <= 4
+        assert near(pixels["password"], (16, 20, 22))
+        assert near(pixels["target"], (45, 212, 191))
         assert await page.evaluate("window.fixtureMutations") == []
         assert await page.locator('input').input_value() == "fixture-private"
         assert not await page.locator('[data-autojev-action-marker]').count()

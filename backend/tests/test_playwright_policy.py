@@ -829,7 +829,7 @@ async def test_capture_never_mutates_live_panel_visibility(tmp_path: Path):
 
     filename = await executor._capture("painel estavel")
 
-    assert filename == "001-painel-estavel.png"
+    assert filename == "001-painel-estavel.jpg"
     assert page.screenshot_options["full_page"] is False
     assert page.screenshot_options["mask"] == []
     assert page.screenshot_options["caret"] == "initial"
@@ -910,7 +910,7 @@ async def test_real_capture_masks_manual_credentials_without_changing_panel_or_i
             pixels = await page.evaluate(
                 """async ({data,coordinates}) => {
                   const image = new Image();
-                  image.src = `data:image/png;base64,${data}`;
+                  image.src = `data:image/jpeg;base64,${data}`;
                   await image.decode();
                   const canvas = document.createElement('canvas');
                   canvas.width=image.width; canvas.height=image.height;
@@ -923,12 +923,12 @@ async def test_real_capture_masks_manual_credentials_without_changing_panel_or_i
                     "coordinates": coordinates,
                 },
             )
-            assert all(
-                pixels[element_id] == [16, 20, 22, 255]
-                for element_id in sensitive_ids
-            )
-            assert pixels["ordinary"] != [16, 20, 22, 255]
-            assert pixels["autojev-sidepanel"] == [20, 184, 166, 255]
+            # JPEG capture: compare colours within a small lossy margin.
+            def near(pixel, colour):
+                return max(abs(a - b) for a, b in zip(pixel[:3], colour)) <= 4
+            assert all(near(pixels[element_id], (16, 20, 22)) for element_id in sensitive_ids)
+            assert not near(pixels["ordinary"], (16, 20, 22))
+            assert near(pixels["autojev-sidepanel"], (20, 184, 166))
     finally:
         if browser is not None:
             await browser.close()

@@ -707,32 +707,24 @@ const FREE_MODEL_PREFERENCE = [
   "google/gemma-4-31b-it:free",
 ];
 
-// Built into the backend: the coverage planner decides every move without a
-// model, key or network (it consulted JEV/Laya in ~1% of steps anyway).
+// Every exploration's moves are decided by the backend's built-in coverage
+// planner; this entry only names it for runs that recorded it.
 const LOCAL_AGENT_PROVIDER: Provider = {
   id: "autojev-local",
-  name: "AutoJev (sem IA)",
+  name: "AutoJev",
   base_url: "",
   enabled: true,
   models: [{ id: "autojev/deterministic", label: "Planejador determinístico", enabled: true }],
 };
 
-const JEV_MODEL_PREFERENCE = ["typesafe/jev-1.13", "typesafe/jev-latest"];
 const AUXILIARY_MODEL_PREFERENCE = ["google/gemini-2.5-flash-lite"];
 
-function defaultModel(models: Model[], role: "agent" | "auxiliary") {
-  if (role === "agent") {
-    const jevModel = JEV_MODEL_PREFERENCE.find((preferred) =>
-      models.some((model) => modelValue(model) === preferred),
-    );
-    if (jevModel) return jevModel;
-  } else {
-    // Explicit default requested by the user, not a paid fallback on failure.
-    const preferredModel = AUXILIARY_MODEL_PREFERENCE.find((preferred) =>
-      models.some((model) => modelValue(model) === preferred),
-    );
-    if (preferredModel) return preferredModel;
-  }
+function defaultModel(models: Model[]) {
+  // Explicit default requested by the user, not a paid fallback on failure.
+  const preferredModel = AUXILIARY_MODEL_PREFERENCE.find((preferred) =>
+    models.some((model) => modelValue(model) === preferred),
+  );
+  if (preferredModel) return preferredModel;
   const freeModels = models.filter((model) => modelValue(model).endsWith(":free"));
   if (!freeModels.length) return models[0] ? modelValue(models[0]) : "";
   return (
@@ -1081,8 +1073,11 @@ function formatCost(usage?: UsageBucket) {
 }
 
 export function CostBreakdown({ usage }: { usage?: Exploration["usage"] }) {
+  const jev = usage?.by_role?.jev;
+  // The JEV agent was removed; its cost only matters for older runs that used it.
+  const usedJev = !!jev && ((jev.cost || 0) > 0 || (jev.total_tokens || 0) > 0);
   const costs = [
-    { key: "jev", label: "Custo JEV", icon: BrainCircuit, bucket: usage?.by_role?.jev },
+    ...(usedJev ? [{ key: "jev", label: "Custo JEV", icon: BrainCircuit, bucket: jev }] : []),
     { key: "auxiliary", label: "Custo LLM", icon: Sparkles, bucket: usage?.by_role?.auxiliary },
     { key: "total", label: "Custo total", icon: CircleDollarSign, bucket: usage },
   ];
@@ -1591,18 +1586,18 @@ function activityCopy(event: ExplorationEvent) {
     action_requires_jev_judgment: "ação que exige julgamento de QA",
   };
   const fallback: Record<string, { title: string; detail?: string }> = {
-    started: { title: "Exploração iniciada", detail: "O navegador foi preparado para o JEV." },
+    started: { title: "Exploração iniciada", detail: "O navegador foi preparado para o AutoJev." },
     browser_launched: { title: "Aplicação aberta no navegador" },
     coverage_scope: { title: "Escopo de cobertura definido" },
     auxiliary_evidence_mode: { title: "Modo de evidência configurado", detail: payload.mode === "visual" ? "A LLM auxiliar receberá texto + screenshot." : "A LLM auxiliar receberá somente texto estruturado; screenshots ficam locais." },
-    jev_invocation_policy: { title: "Política econômica do JEV ativada", detail: "Ações óbvias serão resolvidas localmente; ambiguidades e falta de progresso escalam para o JEV." },
-    decision_routed_locally: { title: "Ação resolvida sem chamar o JEV", detail: routingLabels[routingReason] || event.message },
-    jev_consulted: { title: "JEV acionado para uma decisão de QA", detail: routingLabels[routingReason] || event.message },
+    jev_invocation_policy: { title: "Política de decisão ativada", detail: "Ações óbvias são resolvidas localmente; casos ambíguos seguem a prioridade do planejador." },
+    decision_routed_locally: { title: "Ação resolvida pela política local", detail: routingLabels[routingReason] || event.message },
+    jev_consulted: { title: "Planejador decidiu um caso ambíguo", detail: routingLabels[routingReason] || event.message },
     action_started: { title: `Executando ação ${String(payload.step || "")}`.trim(), detail: String(payload.action || event.message || "") },
     action_completed: { title: `Ação ${String(payload.step || "")} concluída`.trim(), detail: event.message },
     waiting_input: { title: "Aguardando uma ação sua", detail: event.message },
     limit_reached: { title: "Limite de ações atingido", detail: "A execução foi preservada com cobertura parcial." },
-    coverage_complete: { title: "Cobertura concluída", detail: "O JEV esgotou as opções alcançáveis." },
+    coverage_complete: { title: "Cobertura concluída", detail: "O AutoJev esgotou as opções alcançáveis." },
     coverage_complete_with_restrictions: { title: "Cobertura alcançável concluída", detail: "As verificações que não puderam ser concluídas foram documentadas com suas limitações." },
     coverage_stalled: { title: "Exploração bloqueada", detail: event.message },
     scenario_parallel_started: { title: "CTs ativados em paralelo", detail: "Cada evidência válida já começa a virar caso de teste enquanto o navegador continua." },
@@ -1721,7 +1716,7 @@ function ArchitectureFlow({ compact = false }: { compact?: boolean }) {
     <div className={`architecture-flow${compact ? " compact" : ""}`} aria-label="Arquitetura do AutoJev">
       <div className="architecture-node node-primary">
         <span className="node-icon"><BrainCircuit size={20} /></span>
-        <div><strong>JEV</strong><small>Agente QA · decide</small></div>
+        <div><strong>Planejador</strong><small>AutoJev · decide</small></div>
       </div>
       <span className="flow-arrow"><ArrowRight size={17} /></span>
       <div className="architecture-node">
@@ -1826,10 +1821,7 @@ export default function AutoJevApp() {
         (provider.has_api_key || provider.api_key_configured)
         && isOpenRouterUrl(provider.base_url)
         && !modelCatalogRefreshes.current.has(provider.id)
-        && (
-          !provider.models?.some((model) => modelValue(model) === "typesafe/jev-1.13")
-          || provider.models?.some((model) => !modelInputCapabilitiesKnown(model))
-        )
+        && provider.models?.some((model) => !modelInputCapabilitiesKnown(model))
       );
       if (openRouterProviders.length) {
         openRouterProviders.forEach((provider) => modelCatalogRefreshes.current.add(provider.id));
@@ -2330,7 +2322,7 @@ function DashboardView({
       <PageHeader
         eyebrow="Centro de operações"
         title="Boa exploração começa com uma boa decisão."
-        description="O JEV conduz o teste, o Playwright executa cada ação e sua LLM auxiliar interpreta as evidências — sem assumir o controle do navegador."
+        description="O AutoJev conduz o teste, o Playwright executa cada ação e sua LLM auxiliar interpreta as evidências — sem assumir o controle do navegador."
         actions={<button className="button primary" onClick={() => navigate("#/nova-exploracao")}><Plus size={17} />Nova exploração</button>}
       />
 
@@ -2345,8 +2337,8 @@ function DashboardView({
         <div className="panel-heading architecture-heading">
           <div>
             <span className="section-kicker"><Network size={15} />Arquitetura desacoplada</span>
-            <h2>JEV no comando. Modelos intercambiáveis.</h2>
-            <p>A decisão permanece no núcleo do agente; a LLM auxiliar recebe somente screenshot e DOM para interpretar a observação.</p>
+            <h2>Planejador no comando. LLM intercambiável.</h2>
+            <p>O planejador do AutoJev decide as ações sem IA, percorrendo cada caminho uma vez; a LLM auxiliar recebe somente screenshot e DOM para interpretar a observação.</p>
           </div>
           <button className="text-button" onClick={() => navigate("#/provedores")}>Configurar modelos <ArrowRight size={15} /></button>
         </div>
@@ -2439,12 +2431,9 @@ function NewExplorationView({
   onCreated: (exploration: Exploration) => void;
 }) {
   const enabledProviders = providers.filter(providerIsEnabled);
-  const agentProviders = [LOCAL_AGENT_PROVIDER, ...enabledProviders];
   const [url, setUrl] = useState("");
   const [focusMode, setFocusMode] = useState<"all" | "focused">("all");
   const [focusArea, setFocusArea] = useState("");
-  const [agentProvider, setAgentProvider] = useState("");
-  const [agentModel, setAgentModel] = useState("");
   const [auxProvider, setAuxProvider] = useState("");
   const [auxModel, setAuxModel] = useState("");
   const [viewport, setViewport] = useState("1440x900");
@@ -2460,7 +2449,7 @@ function NewExplorationView({
   const visualDiscoveryAttempted = useRef(new Set<string>());
 
   const modelsFor = useCallback((providerId: string) => {
-    const provider = [LOCAL_AGENT_PROVIDER, ...providers].find((item) => item.id === providerId);
+    const provider = providers.find((item) => item.id === providerId);
     const nested = provider?.models || [];
     const flat = models.filter((model) => model.provider_id === providerId);
     const source = nested.length > 0 ? nested : flat;
@@ -2475,18 +2464,12 @@ function NewExplorationView({
   }, [auxiliaryEvidenceMode, modelsFor]);
 
   useEffect(() => {
-    if (!agentProvider) setAgentProvider(LOCAL_AGENT_PROVIDER.id);
     if (!auxProvider && enabledProviders[0]) setAuxProvider(enabledProviders[0].id);
-  }, [enabledProviders, agentProvider, auxProvider]);
-
-  useEffect(() => {
-    const available = modelsFor(agentProvider);
-    if (!available.some((model) => modelValue(model) === agentModel)) setAgentModel(defaultModel(available, "agent"));
-  }, [agentProvider, agentModel, modelsFor]);
+  }, [enabledProviders, auxProvider]);
 
   useEffect(() => {
     const available = auxiliaryModelsFor(auxProvider);
-    if (!available.some((model) => modelValue(model) === auxModel)) setAuxModel(defaultModel(available, "auxiliary"));
+    if (!available.some((model) => modelValue(model) === auxModel)) setAuxModel(defaultModel(available));
   }, [auxProvider, auxModel, auxiliaryModelsFor]);
 
   useEffect(() => {
@@ -2527,11 +2510,11 @@ function NewExplorationView({
       toast("Informe um domínio ou URL válida.", "error");
       return;
     }
-    if (!targetUrl || !agentProvider || !agentModel || !auxProvider || !auxModel) {
+    if (!targetUrl || !auxProvider || !auxModel) {
       toast(
         auxiliaryEvidenceMode === "visual" && auxProvider && availableAuxiliaryModels.length === 0
           ? "O modo visual exige uma LLM auxiliar que aceite imagens. Escolha outro provedor ou use o modo econômico."
-          : "Preencha a URL e selecione os dois modelos.",
+          : "Preencha a URL e selecione a LLM auxiliar.",
         "error",
       );
       return;
@@ -2577,7 +2560,6 @@ function NewExplorationView({
       if (normalizedFocusArea) explorationOptions.focus_area = normalizedFocusArea;
       const body: Record<string, unknown> = {
         app_url: targetUrl,
-        agent: { provider_id: agentProvider, model_id: agentModel },
         auxiliary_llm: { provider_id: auxProvider, model_id: auxModel },
         options: explorationOptions,
       };
@@ -2586,7 +2568,7 @@ function NewExplorationView({
       if (username || password) body.credentials = { username: username.trim(), password };
       const created = await request<Exploration>("/explorations", { method: "POST", body: JSON.stringify(body) });
       onCreated(created);
-      toast("Exploração iniciada. O JEV já está preparando o navegador.", "success");
+      toast("Exploração iniciada. O AutoJev já está preparando o navegador.", "success");
       navigate(`#/exploracoes/${encodeURIComponent(created.id)}`);
     } catch (error) {
       toast(errorMessage(error), "error");
@@ -2599,7 +2581,7 @@ function NewExplorationView({
 
   return (
     <div className="view-stack new-view">
-      <PageHeader eyebrow="Nova execução" title="Prepare a exploração" description="Defina o alvo e escolha, de forma independente, quem decide e quem interpreta as evidências." />
+      <PageHeader eyebrow="Nova execução" title="Prepare a exploração" description="Defina o alvo e escolha a LLM auxiliar que interpreta as evidências. O AutoJev decide as ações sozinho." />
       {noModels && (
         <div className="callout warning-callout"><AlertCircle size={19} /><div><strong>Você precisa de um modelo ativo.</strong><span>Conecte um provedor e cadastre ou descubra seus modelos antes de iniciar.</span></div><button className="button secondary small" onClick={() => navigate("#/provedores")}>Configurar provedores</button></div>
       )}
@@ -2608,13 +2590,13 @@ function NewExplorationView({
           <section className="panel form-section">
             <div className="section-number">01</div>
             <div className="form-section-content">
-              <div className="form-section-heading"><div><h2>Aplicação alvo</h2><p>Informe a URL inicial. O JEV descobrirá as rotas durante a navegação.</p></div><Globe2 size={21} /></div>
+              <div className="form-section-heading"><div><h2>Aplicação alvo</h2><p>Informe a URL inicial. O AutoJev descobrirá as rotas durante a navegação.</p></div><Globe2 size={21} /></div>
               <label className="field-label" htmlFor="target-url">URL da aplicação</label>
               <div className="input-with-icon"><Globe2 size={17} /><input id="target-url" type="text" inputMode="url" required placeholder="https://app.exemplo.com ou www.exemplo.com" value={url} onChange={(event) => setUrl(event.target.value)} onBlur={() => setUrl(normalizeTargetUrl(url))} autoComplete="url" /></div>
               <span className="field-hint">A aplicação deve estar acessível pelo servidor que executa o Playwright.</span>
               <fieldset className="focus-area-field">
                 <legend>Tela, menu ou submenu <em>opcional</em></legend>
-                <p>Escolha se o JEV deve percorrer toda a aplicação ou esgotar primeiro um recorte funcional.</p>
+                <p>Escolha se o AutoJev deve percorrer toda a aplicação ou esgotar primeiro um recorte funcional.</p>
                 <div className="scope-mode-grid">
                   <label className={focusMode === "all" ? "selected" : ""}>
                     <input type="radio" name="exploration-scope" value="all" checked={focusMode === "all"} onChange={() => setFocusMode("all")} />
@@ -2631,7 +2613,7 @@ function NewExplorationView({
                   <div className="focus-area-input">
                     <label className="field-label" htmlFor="focus-area">Qual área deve ser explorada?</label>
                     <div className="input-with-icon"><Focus size={17} /><input id="focus-area" type="text" required maxLength={500} placeholder="Ex.: Configurações > Usuários > Permissões" value={focusArea} onChange={(event) => setFocusArea(event.target.value)} aria-describedby="focus-area-hint" /></div>
-                    <span className="field-hint" id="focus-area-hint">Informe o caminho visível dos menus ou descreva a funcionalidade. O JEV poderá navegar para frente e voltar entre telas dentro deste escopo.</span>
+                    <span className="field-hint" id="focus-area-hint">Informe o caminho visível dos menus ou descreva a funcionalidade. O AutoJev poderá navegar para frente e voltar entre telas dentro deste escopo.</span>
                   </div>
                 )}
               </fieldset>
@@ -2641,20 +2623,8 @@ function NewExplorationView({
           <section className="panel form-section model-section">
             <div className="section-number">02</div>
             <div className="form-section-content">
-              <div className="form-section-heading"><div><h2>Inteligência da exploração</h2><p>Um modelo conduz o raciocínio; o outro transforma observações em contexto útil.</p></div><BrainCircuit size={21} /></div>
-              <div className="model-choice-grid">
-                <ModelRoleCard
-                  roleTitle="JEV · Agente QA"
-                  description="Decide a próxima ação e mantém o objetivo da exploração."
-                  icon={<BrainCircuit size={20} />}
-                  accent="amber"
-                  providers={agentProviders}
-                  providerValue={agentProvider}
-                  modelValueSelected={agentModel}
-                  onProvider={setAgentProvider}
-                  onModel={setAgentModel}
-                  modelsFor={modelsFor}
-                />
+              <div className="form-section-heading"><div><h2>Inteligência da exploração</h2><p>O AutoJev decide as ações percorrendo cada caminho uma vez; a LLM auxiliar transforma as evidências em CTs.</p></div><BrainCircuit size={21} /></div>
+              <div className="model-choice-grid single">
                 <ModelRoleCard
                   roleTitle="LLM auxiliar"
                   description="Documenta as evidências; não controla o navegador."
@@ -2706,7 +2676,7 @@ function NewExplorationView({
           <section className="panel form-section">
             <div className="section-number">03</div>
             <div className="form-section-content">
-              <div className="form-section-heading"><div><h2>Parâmetros de execução</h2><p>A exploração termina pela cobertura: o JEV continua até esgotar as opções alcançáveis do escopo.</p></div><Gauge size={21} /></div>
+              <div className="form-section-heading"><div><h2>Parâmetros de execução</h2><p>A exploração termina pela cobertura: o AutoJev continua até esgotar as opções alcançáveis do escopo.</p></div><Gauge size={21} /></div>
               <div className="coverage-mode-note"><CheckCircle2 size={19} /><div><strong>Sem teto fixo de ações ou duração</strong><span>Você pode cancelar quando quiser. O AutoJev só conclui normalmente depois de percorrer toda a cobertura alcançável.</span></div></div>
               <div className="field-grid two-columns">
                 <label className="field-group"><span>Viewport</span><select value={viewport} onChange={(event) => setViewport(event.target.value)}><option value="1440x900">Desktop · 1440 × 900</option><option value="1280x720">Notebook · 1280 × 720</option><option value="390x844">Mobile · 390 × 844</option></select></label>
@@ -2748,7 +2718,7 @@ function NewExplorationView({
           <span className="section-kicker">Resumo da execução</span>
           <h2>{url ? hostFromUrl(url) : "Aplicação não definida"}</h2>
           <div className="launch-summary">
-            <SummaryRow label="Agente JEV" value={agentModel || "Selecione um modelo"} />
+            <SummaryRow label="Decisão das ações" value="Planejador do AutoJev" />
             <SummaryRow label="LLM auxiliar" value={auxModel || "Selecione um modelo"} />
             <SummaryRow label="Evidência da LLM" value={auxiliaryEvidenceMode === "visual" ? "Visual · texto + imagem" : "Econômico · somente texto"} />
             <SummaryRow label="Chamadas auxiliares" value={`Até ${auxiliaryMaxRequests || "—"} · 3 tentativas/revisão`} />
@@ -2759,7 +2729,7 @@ function NewExplorationView({
           </div>
           <div className="launch-route"><BrainCircuit size={17} /><span /><Code2 size={17} /><span /><Globe2 size={17} /><span /><Sparkles size={17} /></div>
           <button type="submit" className="button primary launch-button" disabled={submitting || noModels || visualAuxiliaryModelMissing}>{submitting ? <><Spinner />Iniciando exploração…</> : <><Play size={17} fill="currentColor" />Iniciar exploração</>}</button>
-          <p className="launch-hint"><ShieldCheck size={14} />O JEV não enviará ações diretamente à LLM auxiliar.</p>
+          <p className="launch-hint"><ShieldCheck size={14} />A LLM auxiliar só documenta; ela nunca controla o navegador.</p>
         </aside>
       </form>
     </div>
@@ -2903,7 +2873,7 @@ export function ExplorationsView({ explorations, loading, navigate }: { explorat
           </div>
         </div>
         {loading ? <ListSkeleton rows={5} /> : explorations.length === 0 ? (
-          <EmptyState icon={MonitorPlay} title="Nenhuma exploração registrada" description="Quando o JEV explorar sua primeira aplicação, a execução aparecerá aqui com status e evidências." action={<button className="button primary" onClick={() => navigate("#/nova-exploracao")}><Rocket size={16} />Começar agora</button>} />
+          <EmptyState icon={MonitorPlay} title="Nenhuma exploração registrada" description="Quando o AutoJev explorar sua primeira aplicação, a execução aparecerá aqui com status e evidências." action={<button className="button primary" onClick={() => navigate("#/nova-exploracao")}><Rocket size={16} />Começar agora</button>} />
         ) : filtered.length === 0 ? (
           <EmptyState icon={Search} title="Nenhum resultado" description="Tente outro termo ou remova o filtro de status." action={<button className="button ghost" onClick={() => { setQuery(""); setFilter("all"); }}>Limpar filtros</button>} />
         ) : (
@@ -2952,8 +2922,8 @@ function ProvidersView({
 }) {
   return (
     <div className="view-stack providers-view">
-      <PageHeader eyebrow="OpenAI-compatible endpoints" title="Provedores de IA" description="Conecte endpoints e disponibilize modelos diferentes para o agente JEV e para a interpretação auxiliar." actions={<button className="button primary" onClick={onAdd}><Plus size={17} />Adicionar endpoint</button>} />
-      <div className="provider-intro callout"><Network size={20} /><div><strong>Uma conexão, múltiplos papéis.</strong><span>O mesmo provedor pode expor vários modelos. A escolha de JEV e LLM auxiliar acontece por exploração.</span></div></div>
+      <PageHeader eyebrow="OpenAI-compatible endpoints" title="Provedores de IA" description="Conecte endpoints e disponibilize os modelos da LLM auxiliar, que interpreta as evidências." actions={<button className="button primary" onClick={onAdd}><Plus size={17} />Adicionar endpoint</button>} />
+      <div className="provider-intro callout"><Network size={20} /><div><strong>Uma conexão, múltiplos papéis.</strong><span>O mesmo provedor pode expor vários modelos. A LLM auxiliar é escolhida em cada exploração.</span></div></div>
       {loading ? <div className="provider-stack"><div className="provider-skeleton" /><div className="provider-skeleton" /></div> : providers.length === 0 ? (
         <section className="panel"><EmptyState icon={CloudCog} title="Nenhum provedor conectado" description="Adicione LiteLLM, Ollama ou qualquer endpoint compatível com a API da OpenAI." action={<button className="button primary" onClick={onAdd}><Plus size={16} />Adicionar primeiro endpoint</button>} /></section>
       ) : (
@@ -3624,8 +3594,8 @@ export function ExplorationDetailView({
             <section className="configuration-card configuration-wide">
               <div className="panel-heading"><span className="section-kicker">Modelos da execução</span><h2>Configuração usada</h2></div>
               <div className="configuration-grid">
-                <div className="exploration-scope"><span className="model-role-icon"><Focus size={18} /></span><div><small>Escopo da exploração</small><strong>{explorationFocusArea(exploration.options) || "Aplicação inteira"}</strong><em>{explorationFocusArea(exploration.options) ? "O JEV prioriza e esgota este recorte funcional." : "O JEV explora todos os recursos que conseguir descobrir."}</em></div></div>
-                <div className="config-model"><span className="model-role-icon amber"><BrainCircuit size={18} /></span><div><small>JEV · agente QA</small><strong>{exploration.agent?.model_id || exploration.agent?.model || "—"}</strong><em>{providerName(exploration.agent?.provider_id || exploration.agent?.provider)}</em></div></div>
+                <div className="exploration-scope"><span className="model-role-icon"><Focus size={18} /></span><div><small>Escopo da exploração</small><strong>{explorationFocusArea(exploration.options) || "Aplicação inteira"}</strong><em>{explorationFocusArea(exploration.options) ? "O AutoJev prioriza e esgota este recorte funcional." : "O AutoJev explora todos os recursos que conseguir descobrir."}</em></div></div>
+                <div className="config-model"><span className="model-role-icon amber"><BrainCircuit size={18} /></span><div><small>Decisão das ações</small><strong>{exploration.agent?.model_id || exploration.agent?.model || "—"}</strong><em>{providerName(exploration.agent?.provider_id || exploration.agent?.provider)}</em></div></div>
                 <div className="config-model"><span className="model-role-icon teal"><Sparkles size={18} /></span><div><small>LLM auxiliar</small><strong>{exploration.auxiliary_llm?.model_id || exploration.auxiliary_llm?.model || "—"}</strong><em>{providerName(exploration.auxiliary_llm?.provider_id || exploration.auxiliary_llm?.provider)}</em></div></div>
                 <div className="config-model"><span className="model-role-icon teal">{explorationEvidenceMode(exploration.options) === "visual" ? <Eye size={18} /> : <Code2 size={18} />}</span><div><small>Evidência da LLM auxiliar</small><strong>{explorationEvidenceMode(exploration.options) === "visual" ? "Visual · texto + imagem" : "Econômico · somente texto"}</strong><em>O screenshot permanece salvo localmente nos dois modos.</em></div></div>
               </div>
@@ -3954,7 +3924,7 @@ function SettingsView({ apiBase, apiState, pollInterval, setPollInterval }: { ap
         <section className="panel settings-card wide-card">
           <div className="settings-card-head"><span className="settings-icon"><ShieldCheck size={20} /></span><div><h2>Separação de responsabilidades</h2><p>A arquitetura permanece portátil entre provedores e modelos.</p></div></div>
           <ArchitectureFlow compact />
-          <div className="security-grid"><div><KeyRound size={17} /><span><strong>Segredos no servidor</strong><small>As chaves nunca precisam chegar ao browser.</small></span></div><div><Code2 size={17} /><span><strong>Execução determinística</strong><small>Somente o Playwright executa ações reais.</small></span></div><div><Boxes size={17} /><span><strong>Modelos substituíveis</strong><small>JEV e auxiliar são configurados separadamente.</small></span></div></div>
+          <div className="security-grid"><div><KeyRound size={17} /><span><strong>Segredos no servidor</strong><small>As chaves nunca precisam chegar ao browser.</small></span></div><div><Code2 size={17} /><span><strong>Execução determinística</strong><small>Somente o Playwright executa ações reais.</small></span></div><div><Boxes size={17} /><span><strong>LLM substituível</strong><small>A LLM auxiliar pode ser trocada a cada exploração.</small></span></div></div>
         </section>
       </div>
     </div>

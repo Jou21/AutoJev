@@ -1673,6 +1673,10 @@ input::placeholder {
   gap: 12px;
 }
 
+.model-choice-grid.single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .auxiliary-evidence-field {
   margin: 16px 0 0;
   padding: 0;
