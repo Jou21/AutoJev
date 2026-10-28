@@ -43,6 +43,7 @@ yarn-error.log*
 
 # Python / FastAPI
 backend/.venv/
+laya_service/.venv/
 backend/data/
 /data/
 backend/.pytest_cache/

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import json
+import time
 from dataclasses import asdict
 from inspect import getfile
 from pathlib import Path
@@ -7,6 +10,7 @@ from tempfile import NamedTemporaryFile
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, HTMLResponse
 from starlette.concurrency import run_in_threadpool
 
@@ -861,33 +865,89 @@ async def list_explorations(
     ]
 
 
+def _exploration_detail_body(request: Request, exploration_id: str) -> tuple[bytes, bool]:
+    """Build and serialise the whole exploration detail.
+
+    This is several MB of pure CPU work that grows with the run (every CT
+    carries its full history).  It must never execute on the event loop: the
+    same loop drives Playwright, so a UI poll would stall the browser run.
+    """
+
+    rerun = request.app.state.scenario_rerun_service.state_for(exploration_id)
+    item = _repository(request).get_exploration(exploration_id)
+    # The original workspace follows latest CT versions. A rerun's live
+    # workspace still describes its own action/progress, never a child run.
+    # Older snapshots may preserve the parent link without a state event.
+    own_rerun = rerun.get("source_exploration_id") or any(
+        event.get("type") == "scenario_rerun_source" for event in item.get("events") or [])
+    display = item if own_rerun else project_scenario_revisions(_repository(request), item)
+    result = _exploration_payload(display)
+    result["visual_review_resume"] = request.app.state.visual_review_resume_service.state_for(exploration_id, item)
+    if rerun.get("source_exploration_id"):
+        _attach_rerun_state(result, rerun, _repository(request))
+    suites = request.app.state.test_suite_service
+    round_context = suites.store.execution_context(exploration_id)
+    if round_context:
+        result["suite_round"] = round_context
+        if result.get("rerun"):
+            result["rerun"].update(report_exploration_id=round_context["root_id"], report_scenario_id=round_context["case_id"])
+    # The payload is plain JSON types; jsonable_encoder walking ~400k keys cost
+    # three times json.dumps. It stays as the fallback for anything else.
+    body = json.dumps(
+        result, ensure_ascii=False, allow_nan=False, separators=(",", ":"),
+        default=jsonable_encoder,
+    ).encode("utf-8")
+    return body, result.get("status") in _LIVE_STATUSES
+
+
+_LIVE_STATUSES = {"queued", "running", "waiting_input", "postprocessing"}
+
+# One build per exploration at a time: the UI polls every few seconds and a
+# build can take longer than that, so queued polls share the running build
+# instead of piling up CPU-bound work behind it.
+_detail_builds: dict[str, "asyncio.Future[tuple[bytes, bool]]"] = {}
+# Last build of a live run: (finished_at, build_seconds, body). Building runs in
+# the same Python process as the browser run, and every build measured here
+# slowed the run's actions ~3x while it lasted; reusing it for a while caps the
+# share of CPU that watching an exploration can take from running it.
+_detail_cache: dict[str, tuple[float, float, bytes]] = {}
+
+
+def _live_detail_ttl(build_seconds: float) -> float:
+    return max(5.0, 3.0 * build_seconds)
+
+
+def clear_detail_cache() -> None:
+    _detail_cache.clear()
+
+
+async def _build_detail(request: Request, exploration_id: str) -> bytes:
+    started = time.monotonic()
+    body, live = await run_in_threadpool(_exploration_detail_body, request, exploration_id)
+    if live:
+        _detail_cache[exploration_id] = (time.monotonic(), time.monotonic() - started, body)
+    else:
+        _detail_cache.pop(exploration_id, None)
+    return body
+
+
 @router.get("/explorations/{exploration_id}")
-async def get_exploration(
-    exploration_id: str, request: Request
-) -> dict[str, Any]:
+async def get_exploration(exploration_id: str, request: Request) -> Response:
+    cached = _detail_cache.get(exploration_id)
+    if cached is not None:
+        built_at, build_seconds, body = cached
+        if time.monotonic() - built_at < _live_detail_ttl(build_seconds):
+            return Response(content=body, media_type="application/json")
+    build = _detail_builds.get(exploration_id)
+    if build is None:
+        build = asyncio.ensure_future(_build_detail(request, exploration_id))
+        _detail_builds[exploration_id] = build
+        build.add_done_callback(lambda _done: _detail_builds.pop(exploration_id, None))
     try:
-        rerun = request.app.state.scenario_rerun_service.state_for(exploration_id)
-        item = _repository(request).get_exploration(exploration_id)
-        # The original workspace follows latest CT versions. A rerun's live
-        # workspace still describes its own action/progress, never a child run.
-        # Older snapshots may preserve the parent link without a state event.
-        own_rerun = rerun.get("source_exploration_id") or any(
-            event.get("type") == "scenario_rerun_source" for event in item.get("events") or [])
-        display = (item if own_rerun else
-                   await run_in_threadpool(project_scenario_revisions, _repository(request), item))
-        result = _exploration_payload(display)
-        result["visual_review_resume"] = request.app.state.visual_review_resume_service.state_for(exploration_id, item)
-        if rerun.get("source_exploration_id"):
-            _attach_rerun_state(result, rerun, _repository(request))
-        suites = request.app.state.test_suite_service
-        round_context = suites.store.execution_context(exploration_id)
-        if round_context:
-            result["suite_round"] = round_context
-            if result.get("rerun"):
-                result["rerun"].update(report_exploration_id=round_context["root_id"], report_scenario_id=round_context["case_id"])
-        return result
+        body = await asyncio.shield(build)
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return Response(content=body, media_type="application/json")
 
 
 @router.get("/explorations/{exploration_id}/scenario-revisions")

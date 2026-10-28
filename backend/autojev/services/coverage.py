@@ -310,6 +310,10 @@ class CoveragePlanner:
         self._failed_cart_toggle_prerequisites: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         self.verified_document_urls: set[str] = set()
         self.failed_document_urls: set[str] = set()
+        # Sign-in pages seen during the run (initially, or after a Logout
+        # control). They are gates, never parents: restoring "back" to one only
+        # logs the user out and asks for another manual login.
+        self.entry_gate_keys: set[str] = set()
         self.synthetic_form_values: dict[tuple[str, str], tuple[str, str]] = {}
         self.form_probes_completed: set[tuple[str, str, str]] = set()
         self.form_happy_paths_completed: set[tuple[str, str]] = set()
@@ -1426,6 +1430,8 @@ class CoveragePlanner:
             # stale control and can create a false FAIL. Coverage memory lives
             # in attempted/inherited/blocked; candidate metadata is refreshed.
             state.candidates = candidates
+        if key in self.entry_gate_keys:
+            state.attempted.update(candidates)
         state.visits += 1
         self.current_key = key
         if not self.path:
@@ -2028,9 +2034,38 @@ class CoveragePlanner:
                 paths.append(path)
         return min(paths, key=len) if paths else None
 
+    def mark_entry_gate(self, observation: Observation) -> None:
+        """Exclude an observed sign-in page from restoration, backtracking and frontier.
+
+        Marked per DOM state, not per URL: some apps serve both the sign-in
+        form and the authenticated home at ``/``.
+        """
+
+        key = self.state_key(observation)
+        self.entry_gate_keys.add(key)
+        state = self.states.get(key)
+        if state is not None:
+            # Its username/password/login controls are the authentication
+            # step itself, not application coverage still owed.
+            state.attempted.update(state.candidates)
+        self.path = [item for item in self.path if item not in self.entry_gate_keys] or self.path[-1:]
+        if self.restoration_target in self.entry_gate_keys:
+            self.restoration_target = None
+            self.restoration_steps = 0
+            self._issued_restore_step = None
+
+    def _is_gate_url(self, url: str) -> bool:
+        """A URL that, as far as observed, only ever served a sign-in page."""
+
+        gate_urls = {self.states[key].url for key in self.entry_gate_keys if key in self.states}
+        return url in gate_urls and not any(
+            state.url == url and key not in self.entry_gate_keys for key, state in self.states.items()
+        )
+
     def _url_restorable(self, state_key: str) -> bool:
         state = self.states[state_key]
-        if state.url in self.failed_document_urls:
+        if (state.url in self.failed_document_urls or state_key in self.entry_gate_keys
+                or self._is_gate_url(state.url)):
             return False
         if state_key == self.focus_root and self.focus_entry_anchor is not None:
             return False

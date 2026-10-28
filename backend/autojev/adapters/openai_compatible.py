@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -239,6 +240,16 @@ def _catalog_modalities(
 
 def _is_jev_model(model: str) -> bool:
     return model.removeprefix("~").startswith("typesafe/jev-")
+
+
+def _is_decision_model(model: str) -> bool:
+    """Models that answer typed ``choice``/``noul`` questions instead of chatting.
+
+    JEV (OpenRouter) and the local Laya service (``laya_service/``) share the
+    ``/api/alpha/decisions`` contract.
+    """
+
+    return _is_jev_model(model) or model.startswith("convaiinnovations/laya")
 
 
 def _safe_error(exc: Exception, secrets: list[str] | None = None) -> str:
@@ -561,6 +572,7 @@ class OpenAICompatibleClient:
         except (httpx.HTTPError, ValueError) as exc:
             raise ProviderConnectionError(_safe_error(exc, [self.api_key or ""])) from exc
         raw_models = payload.get("data", payload.get("models", [])) if isinstance(payload, dict) else []
+        raw_models = await self._with_litellm_capabilities(raw_models)
         self._remember_model_capabilities(raw_models)
         result: list[dict[str, Any]] = []
         for item in raw_models:
@@ -607,6 +619,55 @@ class OpenAICompatibleClient:
                     }
                 )
         return sorted(result, key=lambda model: model["label"].lower())
+
+    async def _with_litellm_capabilities(self, models: Any) -> Any:
+        """Add modalities from a LiteLLM proxy's ``/model/info``.
+
+        LiteLLM's ``/v1/models`` lists names only, so no model could be offered
+        for image evidence.  ``/model/info`` carries ``supports_vision``.  This is
+        best effort: any failure, or a gateway without that endpoint, leaves the
+        plain catalog untouched.
+        """
+
+        if not isinstance(models, list) or self._is_openrouter():
+            return models
+        base = self.base_url.rstrip("/")
+        base = base[: -len("/v1")] if base.endswith("/v1") else base
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+                response = await client.get(f"{base}/model/info", headers=_headers(self.api_key))
+                response.raise_for_status()
+                payload = response.json()
+        except (httpx.HTTPError, ValueError):
+            return models
+        entries = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(entries, list):
+            return models
+        vision: dict[str, bool] = {}
+        chat: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("model_name"), str):
+                continue
+            info = entry.get("model_info")
+            if not isinstance(info, dict):
+                continue
+            name = entry["model_name"]
+            # Several deployments can share a name; one vision-capable is enough.
+            if isinstance(info.get("supports_vision"), bool):
+                vision[name] = vision.get(name, False) or info["supports_vision"]
+            if info.get("mode") == "chat":
+                chat.add(name)
+        enriched: list[Any] = []
+        for item in models:
+            model_id = item.get("id") if isinstance(item, dict) else None
+            if model_id in vision and "input_modalities" not in item:
+                item = {
+                    **item,
+                    "input_modalities": ["text", "image"] if vision[model_id] else ["text"],
+                    **({"output_modalities": ["text"]} if model_id in chat else {}),
+                }
+            enriched.append(item)
+        return enriched
 
     @staticmethod
     def _structured_output_models(models: Any) -> set[str]:
@@ -791,13 +852,18 @@ class OpenAICompatibleClient:
         started = time.perf_counter()
         if model_id:
             await self.validate_credentials()
-        if model_id and _is_jev_model(model_id):
+        if model_id and _is_decision_model(model_id):
             answers = await self.decisions(
                 model_id,
                 {"connection_check": True},
                 {"ok": {"type": "noul", "instructions": "Is this a connection check?"}},
             )
-            if answers.get("ok", {}).get("noul", 0) < 0.5:
+            probability = answers.get("ok", {}).get("noul")
+            if not isinstance(probability, (int, float)) or isinstance(probability, bool):
+                raise ProviderConnectionError("Decision model returned no typed noul probability")
+            # Only JEV is trained to answer this probe; an un-tuned Laya base
+            # checkpoint is near chance, so its value says nothing about health.
+            if _is_jev_model(model_id) and probability < 0.5:
                 raise ProviderConnectionError("JEV failed the typed decision capability check")
         elif model_id:
             result = await self.chat_json(
@@ -888,7 +954,7 @@ Write rationale and human-readable scenario_hint fields in Brazilian Portuguese 
             ),
             "coverage_state": coverage_context or {},
         }
-        if _is_jev_model(self.model):
+        if _is_decision_model(self.model):
             # Jev is a decision model: give it complete, atomic moves rather
             # than asking for an action and a target independently. The old
             # split allowed incompatible pairs and forced the integration to
@@ -1452,7 +1518,11 @@ Never return a status or browser command."""
             text_content = json.dumps(user, ensure_ascii=False)
             content: str | list[dict[str, Any]] = text_content
             if visual_requested and (cache_only or not self._vision_rejected):
-                content, images = self._visual_content(observation, evidence, text_content)
+                # PNG decode + resize + JPEG encode costs ~80 ms per image; off
+                # the event loop so it never stalls the live browser run.
+                content, images = await asyncio.to_thread(
+                    self._visual_content, observation, evidence, text_content
+                )
                 user["supplied_images"] = images
                 user["before_visible_text"] = str(evidence.get("before_text") or "")[:3500]
                 text_content = json.dumps(user, ensure_ascii=False)

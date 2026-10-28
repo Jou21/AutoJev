@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from autojev.adapters.report import StandaloneHtmlReport
 from autojev.adapters.repository import SQLiteRepository
 from autojev.adapters.secrets import EphemeralCredentialVault, SecretCipher
-from autojev.api.routes import router
+from autojev.api.routes import clear_detail_cache, router
 from autojev.config import Settings
 from autojev.config import settings as default_settings
 from autojev.services.exploration import ExplorationManager
@@ -73,6 +73,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.include_router(router)
     app.include_router(test_suites_router)
+
+    @app.middleware("http")
+    async def invalidate_live_detail_cache(request, call_next):
+        # A user edit, cancel or rerun must show on the next poll, not after
+        # the live-detail reuse window. Any write invalidates every entry.
+        response = await call_next(request)
+        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+            clear_detail_cache()
+        return response
 
     @app.exception_handler(RequestValidationError)
     async def safe_validation_error(request, exc: RequestValidationError) -> JSONResponse:

@@ -368,8 +368,12 @@ def render_premium_report(renderer: Any, exploration: dict[str, Any], scenarios:
     head = legacy_document.split('</head>', 1)[0]
     head = head.replace('<html lang="pt-BR"', f'<html data-report-layout="{REPORT_LAYOUT_VERSION}" lang="pt-BR"', 1)
     head = head.replace('<html ', f'<html data-report-flows="{FLOW_VERSION}" ', 1)
-    css = (ASSETS / "premium.css").read_text() + '\n' + (ASSETS / "journey.css").read_text()
-    js = (ASSETS / "premium.js").read_text()
+    css = (
+        (ASSETS / "premium.css").read_text(encoding="utf-8")
+        + '\n'
+        + (ASSETS / "journey.css").read_text(encoding="utf-8")
+    )
+    js = (ASSETS / "premium.js").read_text(encoding="utf-8")
     data = _case_history_dialog() + _case_editor() + _step_picker() + data + '<script id="report-drafts" type="application/json">{"version":1,"cases":{}}</script>'
     return head + f'<style>{css}</style></head><body class="report-premium" data-view="overview" data-theme="dark" data-density="comfortable" data-report-schema="ct-timeline-v1"><aside class="report-sidebar"><div class="report-brand"><span class="brand-mark">{_icon("robot")}</span><div><strong class="brand-name">AUTOJEV</strong><span class="brand-caption">Relatório exploratório</span></div></div><nav aria-label="Seções do relatório">{nav}</nav><div class="sidebar-footer"><span class="legend-dot"></span>Relatório local e independente<small>Dados preservados · sem chamadas de IA</small></div></aside><main class="report-main"><header class="report-topbar"><div><span class="page-kicker">{_h(app_name)} / RELATÓRIO</span><h1 id="view-title" tabindex="-1">Visão geral</h1><p id="view-subtitle">Uma visão clara dos testes, resultados e evidências da execução.</p></div><div class="toolbar"><button id="print-report" class="button button-ghost">Imprimir</button><button id="download-report" class="button button-primary">{_icon("download")}Baixar relatório</button></div></header>{views}<noscript><style>.report-view[hidden],#scenarios .scenario[hidden]{{display:block!important}}.report-sidebar,.report-tools,.result-navigation,.toolbar{{display:none!important}}</style><p>JavaScript está desativado. Todas as seções são exibidas para leitura; abra os casos para ver suas evidências.</p></noscript></main><dialog id="evidence-dialog" class="evidence-dialog"><div class="dialog-toolbar"><strong id="evidence-caption">Captura registrada</strong><a id="download-evidence" class="button button-ghost" download>Baixar captura</a><button id="close-evidence" class="button button-ghost" aria-label="Fechar captura">Fechar ✕</button></div><div class="dialog-content"><img id="evidence-preview" alt="Captura de evidência ampliada"></div></dialog>{data}<script>{js}</script></body></html>'
 

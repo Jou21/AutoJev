@@ -903,3 +903,94 @@ def test_phase_payload_explicit_resolution_snapshot_survives_history_without_eve
     assert payload["completion"]["restrictions"] == []
     assert payload["completion"]["blocked_candidates"] == 0
     assert payload["completion"]["resolved_restrictions"] == [item]
+
+
+@pytest.mark.asyncio
+async def test_exploration_detail_builds_off_the_event_loop_and_shares_concurrent_polls(monkeypatch):
+    import asyncio
+    import time
+
+    from autojev.api import routes
+
+    calls = []
+
+    def slow_body(_request, exploration_id):
+        calls.append(exploration_id)
+        time.sleep(0.4)  # stands for the multi-MB CPU build
+        return b'{"id":"exp"}', False
+
+    monkeypatch.setattr(routes, "_exploration_detail_body", slow_body)
+    routes.clear_detail_cache()
+    ticks = 0
+
+    async def ticker():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.02)
+            ticks += 1
+
+    task = asyncio.create_task(ticker())
+    responses = await asyncio.gather(*(routes.get_exploration("exp", None) for _ in range(3)))
+    task.cancel()
+
+    assert calls == ["exp"]  # three polls, one build
+    assert ticks >= 8  # the loop kept running while the build was in progress
+    assert all(response.body == b'{"id":"exp"}' for response in responses)
+    assert routes._detail_builds == {}
+
+
+@pytest.mark.asyncio
+async def test_live_exploration_detail_is_reused_for_a_bounded_window_and_writes_invalidate_it(monkeypatch):
+    from autojev.api import routes
+
+    builds = []
+    clock = [100.0]
+    monkeypatch.setattr(routes.time, "monotonic", lambda: clock[0])
+
+    def body(_request, exploration_id):
+        builds.append(exploration_id)
+        return f'{{"build":{len(builds)}}}'.encode(), True  # a running exploration
+
+    monkeypatch.setattr(routes, "_exploration_detail_body", body)
+    routes.clear_detail_cache()
+
+    first = await routes.get_exploration("live", None)
+    clock[0] += 4.0  # inside the 5 s minimum window
+    second = await routes.get_exploration("live", None)
+    assert builds == ["live"] and second.body == first.body
+
+    clock[0] += 2.0  # window elapsed
+    third = await routes.get_exploration("live", None)
+    assert len(builds) == 2 and third.body != first.body
+
+    routes.clear_detail_cache()  # what the write middleware does
+    await routes.get_exploration("live", None)
+    assert len(builds) == 3
+
+
+@pytest.mark.asyncio
+async def test_finished_exploration_detail_is_never_served_from_the_live_cache(monkeypatch):
+    from autojev.api import routes
+
+    builds = []
+
+    def body(_request, exploration_id):
+        builds.append(exploration_id)
+        return b'{"status":"completed"}', False
+
+    monkeypatch.setattr(routes, "_exploration_detail_body", body)
+    routes.clear_detail_cache()
+
+    await routes.get_exploration("done", None)
+    await routes.get_exploration("done", None)
+    assert len(builds) == 2
+
+
+def test_writes_clear_the_live_detail_cache(tmp_path):
+    from autojev.api import routes
+
+    routes._detail_cache["exp"] = (0.0, 0.0, b"{}")
+    app = create_app(settings(tmp_path))
+    with TestClient(app) as client:
+        client.post("/api/providers", json={})  # rejected input still counts as a write attempt
+    assert routes._detail_cache == {}

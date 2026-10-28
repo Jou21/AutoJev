@@ -750,6 +750,109 @@ async def test_typesafe_agent_only_sees_current_frontier_targets():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("info_status", [200, 404])
+async def test_litellm_model_info_declares_vision_capability(monkeypatch, info_status):
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, url):
+            self.url = url
+            self.status_code = info_status if url.endswith("/model/info") else 200
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise httpx.HTTPStatusError("nope", request=None, response=self)
+
+        def json(self):
+            if self.url.endswith("/model/info"):
+                return {
+                    "data": [
+                        {"model_name": "claude-sonnet", "model_info": {"supports_vision": True, "mode": "chat"}},
+                        {"model_name": "claude-sonnet", "model_info": {"supports_vision": False}},
+                        {"model_name": "titan-embed", "model_info": {"supports_vision": False, "mode": "embedding"}},
+                        {"model_name": "unknown", "model_info": {"supports_vision": None}},
+                    ]
+                }
+            return {"data": [{"id": "claude-sonnet"}, {"id": "titan-embed"}, {"id": "unknown"}]}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, **kwargs):
+            calls.append(url)
+            return FakeResponse(url)
+
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kwargs: FakeClient())
+    client = OpenAICompatibleClient("https://litellm.example.test", "sk-test")
+
+    models = {model["id"]: model for model in await client.list_models()}
+
+    assert "https://litellm.example.test/model/info" in calls
+    if info_status == 200:
+        assert models["claude-sonnet"]["supports_vision"] is True
+        assert models["claude-sonnet"]["capabilities_known"] is True
+        assert models["titan-embed"]["supports_vision"] is False
+        assert models["titan-embed"]["capabilities_known"] is True
+        assert models["unknown"]["capabilities_known"] is False  # null is not "no vision"
+    else:  # a gateway without /model/info keeps the plain catalog
+        assert all(not model["capabilities_known"] for model in models.values())
+
+
+@pytest.mark.asyncio
+async def test_laya_agent_uses_the_typed_move_contract_without_optional_scores():
+    class FakeClient:
+        async def decisions(self, _model, state, questions):
+            assert set(state["candidate_moves"]) == {"move_001"}
+            return {
+                "next_move": {"choice": "move_001"},
+                "qa_focus": {"choice": "not_a_known_lens"},
+                "issue_visible": {"noul": 0.4},
+            }
+
+    agent = OpenAIJevAgent(FakeClient(), "convaiinnovations/laya")
+    observation = Observation(
+        url="https://example.test",
+        title="Page",
+        text="Page",
+        interactive_elements=[{"ref": "e2", "tag": "button", "name": "Open", "in_viewport": True}],
+    )
+
+    decision = await agent.decide(
+        observation, [], [], {"current_untried": [{"ref": "e2"}], "scope": "entire application"}
+    )
+
+    assert (decision.action, decision.target) == ("click", "e2")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "noul", "passes"),
+    [
+        ("convaiinnovations/laya", 0.1, True),  # untuned base: value is not a health signal
+        ("typesafe/jev-1.13", 0.1, False),
+        ("typesafe/jev-1.13", 0.9, True),
+    ],
+)
+async def test_connection_check_for_decision_models(model, noul, passes):
+    client = OpenAICompatibleClient("http://127.0.0.1:8100", None)
+
+    async def fake_decisions(_model, _state, _questions):
+        return {"ok": {"noul": noul}}
+
+    client.decisions = fake_decisions
+
+    if passes:
+        assert (await client.test(model))["ok"] is True
+    else:
+        with pytest.raises(ProviderConnectionError, match="capability check"):
+            await client.test(model)
+
+
+@pytest.mark.asyncio
 async def test_typesafe_agent_only_offers_finish_at_an_exhausted_root():
     class FakeClient:
         async def decisions(self, _model, state, questions):

@@ -933,3 +933,39 @@ async def test_real_capture_masks_manual_credentials_without_changing_panel_or_i
         if browser is not None:
             await browser.close()
         await playwright.stop()
+
+
+@pytest.mark.parametrize(
+    ("requested", "landed", "adopted"),
+    [
+        ("https://saucedemo.com/", "https://www.saucedemo.com/", True),
+        ("https://www.app.test/", "https://app.test/login", True),
+        ("http://app.test/", "https://www.app.test/", True),
+        ("https://app.test/", "https://app.test/home", False),  # same origin: nothing to adopt
+        ("https://app.test/", "https://sso.other.test/", False),
+        ("https://app.test/", "https://evil-app.test/", False),
+        ("https://app.test/", "http://app.test/", False),  # never downgrade
+        ("https://app.test/", "https://app.test:8443/", False),
+    ],
+)
+def test_initial_load_only_adopts_canonical_host_redirects(requested, landed, adopted):
+    origin = PlaywrightExecutor._origin
+    assert PlaywrightExecutor._is_canonical_redirect(origin(requested), origin(landed)) is adopted
+
+
+def test_canonical_entry_url_keeps_the_coverage_planner_on_the_served_origin():
+    from autojev.services.coverage import CoveragePlanner
+
+    link = {"ref": "e1", "tag": "a", "role": "link", "name": "Cart",
+            "href": "https://www.saucedemo.com/cart.html", "interactable": True}
+    executor = PlaywrightExecutor(Path("."), ExplorationOptions())
+    executor.entry_url = "https://saucedemo.com/"
+    landed = executor._origin("https://www.saucedemo.com/inventory.html")
+    assert executor._is_canonical_redirect(executor._origin(executor.entry_url), landed)
+
+    from urllib.parse import urlsplit, urlunsplit
+    canonical = urlunsplit(urlsplit(executor.entry_url)._replace(netloc=landed[1]))
+    stale, served = CoveragePlanner(executor.entry_url), CoveragePlanner(canonical)
+
+    assert stale._safe_candidate(link, stale.origin) is False  # the bug: www read as off-origin
+    assert served._safe_candidate(link, served.origin) is True

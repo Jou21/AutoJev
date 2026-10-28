@@ -163,6 +163,7 @@ class PlaywrightExecutor:
         self._sidepanel_init_installed = False
         self._rerun_panel: BrowserRerunPanel | None = None
         self._automatic_login_attempted = False
+        self._automatic_login_succeeded = False
         # Per-run opaque tokens compare field contents without storing PII.
         self._field_token_key = secrets.token_bytes(32)
         self._field_semantics: dict[str, dict[str, Any]] = {}
@@ -300,6 +301,9 @@ class PlaywrightExecutor:
     async def start(self, url: str) -> Observation:
         self._validate_url(url)
         self._allowed_origin = self._origin(url)
+        # The supplied URL on the origin actually served; the coverage planner
+        # derives its own origin and root from this, so the two must agree.
+        self.entry_url = url
         self._inactive_event.clear()
         self._authenticated_history_root_url = None
         try:
@@ -356,6 +360,15 @@ class PlaywrightExecutor:
                 await self._page.wait_for_load_state("load", timeout=5_000)
             except Exception:
                 pass
+            # Server redirects on the first load are not routed, so a site that
+            # canonicalises saucedemo.com -> www.saucedemo.com would otherwise
+            # leave every later action "outside the authorized origin".
+            landed = self._origin(self._page.url)
+            if self._is_canonical_redirect(self._allowed_origin, landed):
+                self._allowed_origin = landed
+                scheme, host, port = landed
+                netloc = host if port == (443 if scheme == "https" else 80) else f"{host}:{port}"
+                self.entry_url = urlunsplit(urlsplit(url)._replace(scheme=scheme, netloc=netloc))
             # Give hydrated SPAs one short frame budget to attach click
             # handlers before the first observed refs can be executed.
             await self._page.wait_for_timeout(250)
@@ -904,7 +917,25 @@ class PlaywrightExecutor:
         if self._automatic_login_attempted:
             return LoginAttempt("manual_required", "already_attempted")
         self._automatic_login_attempted = True
-        return await self._attempt_guarded_login(credentials, observation)
+        result = await self._attempt_guarded_login(credentials, observation)
+        self._automatic_login_succeeded = result.status == "success"
+        return result
+
+    async def attempt_session_relogin(
+        self, credentials: dict[str, str], observation: Observation | None = None
+    ) -> LoginAttempt:
+        """Sign in again after the site ended a session this run confirmed.
+
+        Only the success of the previous automatic login authorises it, and it
+        is claimed before submitting: a rejection, challenge or timeout leaves
+        every later return to the sign-in page to the user, as before.
+        """
+        if not self._automatic_login_succeeded:
+            return LoginAttempt("manual_required", "already_attempted")
+        self._automatic_login_succeeded = False
+        result = await self._attempt_guarded_login(credentials, observation)
+        self._automatic_login_succeeded = result.status == "success"
+        return result
 
     async def attempt_filled_login(self, observation: Observation | None = None) -> LoginAttempt:
         """Submit an already-filled login only after an explicit Continue click.
@@ -1275,6 +1306,25 @@ class PlaywrightExecutor:
         parsed = urlparse(url)
         default_port = 443 if parsed.scheme.lower() == "https" else 80
         return (parsed.scheme.lower(), (parsed.hostname or "").lower(), parsed.port or default_port)
+
+    @staticmethod
+    def _is_canonical_redirect(
+        requested: tuple[str, str, int] | None, landed: tuple[str, str, int],
+    ) -> bool:
+        """Same host up to a ``www.`` prefix, optionally upgraded to https.
+
+        Anything broader (another domain, an SSO page, a port change on the
+        same scheme) stays outside the scope the user authorised.
+        """
+
+        if requested is None or requested == landed:
+            return False
+        (old_scheme, old_host, old_port), (new_scheme, new_host, new_port) = requested, landed
+        if old_host.removeprefix("www.") != new_host.removeprefix("www."):
+            return False
+        if (old_scheme, old_port) == (new_scheme, new_port):
+            return True
+        return (old_scheme, old_port, new_scheme, new_port) == ("http", 80, "https", 443)
 
     async def _guard_navigation(self, route: Any, request: Any) -> None:
         if self._rerun_panel is not None and await self._rerun_panel.route(route, request):
@@ -1698,7 +1748,9 @@ class PlaywrightExecutor:
             return None
         self._screenshot_number += 1
         safe_label = "".join(char if char.isalnum() else "-" for char in label.lower()).strip("-")
-        filename = f"{self._screenshot_number:03d}-{safe_label[:60] or 'page'}.png"
+        # JPEG q80: two captures per action, and PNG encoding (~0.14 s each)
+        # was the largest browser-side cost. Page text stays legible at q80.
+        filename = f"{self._screenshot_number:03d}-{safe_label[:60] or 'page'}.jpg"
         path = self.artifact_dir / filename
         masks = []
         if self.secret_values:
@@ -1756,6 +1808,8 @@ class PlaywrightExecutor:
             # mutation observers. Sensitive contents are already masked.
             caret="initial",
             timeout=20_000,
+            type="jpeg",
+            quality=80,
             **screenshot_options,
         )
         return filename
@@ -2612,9 +2666,46 @@ class PlaywrightExecutor:
             await self._page.wait_for_timeout(50)
         return True
 
-    async def _wait_for_dom_settle(self, timeout_ms: int = 1_200) -> None:
-        """Wait for a short stable DOM window after an action, bounded by timeout."""
+    async def _wait_for_dom_settle(self, timeout_ms: int = 1_200, quiet_ms: int = 150) -> None:
+        """Wait for a short stable DOM window after an action, bounded by timeout.
 
+        A MutationObserver resolves as soon as the document has been quiet for
+        ``quiet_ms``. The former sampling loop needed three identical snapshots
+        150 ms apart, so even an already-stable page paid ~0.5 s per action.
+        """
+
+        if not self._page:
+            return
+        try:
+            await self._page.evaluate(
+                """([quietMs, timeoutMs, ownPanels]) => new Promise((resolve) => {
+                  let quiet = 0;
+                  const finish = () => { observer.disconnect(); clearTimeout(quiet); clearTimeout(hard); resolve(); };
+                  // AutoJev's own live panels tick inside the page; they are
+                  // not the application settling and must not extend the wait.
+                  const ours = (node) => {
+                    const el = node && (node.nodeType === 1 ? node : node.parentElement);
+                    return !!(el && el.closest && el.closest(ownPanels));
+                  };
+                  const observer = new MutationObserver((records) => {
+                    if (records.every((record) => ours(record.target))) return;
+                    clearTimeout(quiet);
+                    quiet = setTimeout(finish, quietMs);
+                  });
+                  observer.observe(document, {subtree: true, childList: true, attributes: true, characterData: true});
+                  quiet = setTimeout(finish, quietMs);
+                  const hard = setTimeout(finish, timeoutMs);
+                })""",
+                [quiet_ms, timeout_ms, self.PANEL_SELECTOR],
+            )
+            return
+        except Exception:
+            # A navigation destroyed the execution context mid-wait; fall back
+            # to sampling the new document for the remaining stable window.
+            pass
+        await self._sample_dom_settle(timeout_ms)
+
+    async def _sample_dom_settle(self, timeout_ms: int) -> None:
         if not self._page:
             return
         stable_samples = 0
@@ -2766,6 +2857,16 @@ class PlaywrightExecutor:
         execution_evidence: dict[str, Any] = {}
         select_preview_context: tuple[Any, str, Any, dict[str, Any]] | None = None
         action_started_monotonic = time.monotonic()
+        # Wall-clock milliseconds per phase, so a slow action can be attributed
+        # (browser vs. settle waits vs. capture) from its evidence alone.
+        phase_times: dict[str, int] = {}
+        phase_clock = [action_started_monotonic]
+
+        def phase_mark(name: str) -> None:
+            now = time.monotonic()
+            phase_times[name] = phase_times.get(name, 0) + round((now - phase_clock[0]) * 1000)
+            phase_clock[0] = now
+
         self._blocked_navigation_url = None
         await self._set_sidepanel_automation(True)
         try:
@@ -2972,10 +3073,12 @@ class PlaywrightExecutor:
                 pass
             else:
                 raise ValueError(f"Unsupported executor action: {action}")
+            phase_mark("dispatch")
             try:
                 await self._page.wait_for_load_state("domcontentloaded", timeout=3_000)
             except Exception:
                 pass
+            phase_mark("load_state")
             # SPA/API updates often land after the action promise resolves.
             # Observe only after a short stable DOM window so late controls are
             # not missed and refs do not point into a transient render.
@@ -2987,7 +3090,9 @@ class PlaywrightExecutor:
                         "timeout_ms": 5_000,
                         "message": "Application API work remained pending at observation time.",
                     }
+                phase_mark("api_wait")
                 await self._wait_for_dom_settle()
+                phase_mark("dom_settle")
             if self._origin(self._page.url) != self._allowed_origin:
                 raise PermissionError("PolicyBlocked: action navigated to another origin")
             if self._blocked_navigation_url:
@@ -3015,6 +3120,7 @@ class PlaywrightExecutor:
             message = self._redact_text(f"{exc.__class__.__name__}: {exc}")[:2000]
         finally:
             await self._set_sidepanel_automation(False)
+            phase_mark("checks")
 
         assertion_results = await self._evaluate_assertions(decision.assertions)
         cart_intent = None
@@ -3026,7 +3132,10 @@ class PlaywrightExecutor:
             cart_intent = self._remember_cart_action(decision)
             if cart_intent:
                 execution_evidence["business_cart_intent"] = cart_intent
+        phase_mark("assertions")
         observation = await self.observe(decision.action)
+        phase_mark("observe")
+        execution_evidence["phase_ms"] = phase_times
         if cart_intent and previous_cart_expectation is not None and previous_cart_state is not None:
             self._retain_cart_baseline_for_noop(
                 cart_intent, previous_cart_expectation, previous_cart_state, observation.page_state,

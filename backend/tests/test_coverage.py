@@ -2654,3 +2654,47 @@ def test_required_checkout_probe_is_scoped_to_each_cart_lane_happy_path():
     # The distinct empty lane probe was not silently classified by this one.
     planner.observe(empty)
     assert planner._form_probe_action(planner.states[planner.current_key]) is not None
+
+
+def _login_page():
+    return observation("https://shop.test/", [
+        {"ref": "e0", "tag": "input", "type": "text", "name": "Username"},
+        {"ref": "e1", "tag": "input", "type": "password", "name": "Password"},
+        {"ref": "e2", "tag": "input", "type": "submit", "name": "Login"},
+    ], title="Login")
+
+
+def test_sign_in_page_reached_by_logout_is_never_a_restore_target():
+    planner = CoveragePlanner("https://shop.test/")
+    home = observation("https://shop.test/inventory.html", [
+        {"ref": "e0", "tag": "button", "name": "Add to cart"},
+        {"ref": "e1", "tag": "a", "name": "Logout", "href": "#"},
+    ], title="Products")
+    planner.observe(home)
+    gate_key = planner.observe(_login_page())  # a Logout landed on the sign-in page
+    planner.path.append(gate_key)
+    # The run detected login here and the user signed in again.
+    planner.mark_entry_gate(_login_page())
+    planner.observe(home)
+
+    assert gate_key not in planner.path
+    assert not planner._remaining(planner.states[gate_key])  # its fields are not owed coverage
+    assert planner._url_restorable(gate_key) is False  # no navigate back to the login page
+
+
+def test_sign_in_gate_does_not_block_an_authenticated_home_on_the_same_url():
+    planner = CoveragePlanner("https://app.test/")
+    gate = observation("https://app.test/", [
+        {"ref": "e0", "tag": "input", "type": "password", "name": "Password"},
+    ], title="Sign in")
+    planner.observe(gate)
+    planner.mark_entry_gate(gate)
+    dashboard_key = planner.observe(observation("https://app.test/", [
+        {"ref": "e0", "tag": "a", "name": "Reports", "href": "/reports"},
+    ], title="Dashboard"))
+    planner.verified_document_urls.add("https://app.test/")
+
+    assert planner._is_gate_url("https://app.test/") is False
+    dashboard = planner.states[dashboard_key]
+    assert not dashboard.attempted and dashboard_key not in planner.entry_gate_keys
+    assert planner._url_restorable(dashboard_key) is True

@@ -1121,6 +1121,7 @@ class ExplorationManager:
         )
         return has_password and has_login_copy
 
+    MAX_SESSION_RELOGINS = 5
     LOGIN_PANEL_MESSAGE = (
         "Preencha usuário e senha na página e clique em Continuar exploração abaixo. "
         "O AutoJev tentará entrar usando os campos preenchidos, sem enviar credenciais à IA. "
@@ -2579,6 +2580,9 @@ class ExplorationManager:
             self.repository.update_exploration(
                 exploration_id, current_url=observation.url
             )
+            # saucedemo.com -> www.saucedemo.com: plan coverage on the origin
+            # the browser actually serves, or every link reads as off-origin.
+            entry_url = getattr(executor, "entry_url", None) or item["app_url"]
             self._record_screenshot(exploration_id, observation, "Initial page")
             self.repository.add_event(
                 exploration_id,
@@ -2612,6 +2616,11 @@ class ExplorationManager:
             login_retried = False
             login_feedback_message = ""
             automatic_login_attempted = False
+            # A site can end the session mid-run (saucedemo: 10 minutes). Only
+            # after a confirmed automatic login may it be repeated, bounded,
+            # and never after a rejection.
+            last_automatic_login_succeeded = False
+            session_relogins = 0
             authentication_boundary_crossed = False
             actions_executed = 0
             consecutive_loop_rejections = 0
@@ -2627,7 +2636,7 @@ class ExplorationManager:
             # Teto de teimosia: após N rejeições seguidas sem nenhuma ação
             # nova, encerra (o resto é fumaça do modelo, não exploração).
             MAX_CONSECUTIVE_LOOP_REJECTIONS = 3
-            coverage = CoveragePlanner(item["app_url"], options.focus_area)
+            coverage = CoveragePlanner(entry_url, options.focus_area)
             coverage.observe(observation)
             self.repository.add_event(
                 exploration_id,
@@ -2690,24 +2699,45 @@ class ExplorationManager:
                     )
                     break
                 if self._needs_login(observation):
+                    # After a Logout control the sign-in page enters the
+                    # coverage graph; mark it so no later backtrack "restores"
+                    # it and asks the user to log in yet again.
+                    coverage.mark_entry_gate(observation)
                     panel_message = None
-                    if credentials and not automatic_login_attempted:
+                    session_relogin = bool(
+                        automatic_login_attempted
+                        and last_automatic_login_succeeded
+                        and authentication_boundary_crossed
+                        and session_relogins < self.MAX_SESSION_RELOGINS
+                    )
+                    if credentials and (not automatic_login_attempted or session_relogin):
                         # Claim the attempt before awaiting: rejection, timeout
                         # and later returns to login must never cause resubmits.
                         automatic_login_attempted = True
-                        self.repository.add_event(
-                            exploration_id, "info", "automatic_login_started",
-                            "Tentando login automaticamente pelo Playwright, sem enviar credenciais à IA",
-                        )
+                        last_automatic_login_succeeded = False
+                        if session_relogin:
+                            session_relogins += 1
+                            self.repository.add_event(
+                                exploration_id, "info", "automatic_relogin_started",
+                                "O site encerrou a sessão; entrando de novo automaticamente pelo Playwright, sem enviar credenciais à IA",
+                                {"attempt": session_relogins, "max_attempts": self.MAX_SESSION_RELOGINS},
+                            )
+                        else:
+                            self.repository.add_event(
+                                exploration_id, "info", "automatic_login_started",
+                                "Tentando login automaticamente pelo Playwright, sem enviar credenciais à IA",
+                            )
                         await executor.update_live_panel("Autenticando", "Tentativa local de login · sem chamadas à IA")
                         try:
                             login = await asyncio.wait_for(
-                                executor.attempt_login(credentials, observation),
+                                (executor.attempt_session_relogin if session_relogin
+                                 else executor.attempt_login)(credentials, observation),
                                 timeout=min(25, self._operation_timeout(deadline)),
                             )
                         except asyncio.TimeoutError:
                             login = None
                         if login and login.status == "success" and login.observation:
+                            last_automatic_login_succeeded = True
                             observation = login.observation
                             self._record_screenshot(exploration_id, observation, "After automatic login")
                             self.repository.update_exploration(exploration_id, current_url=observation.url)
@@ -2824,7 +2854,7 @@ class ExplorationManager:
                         # Retain the supplied document entry URL. Login may
                         # reach a SPA route via pushState; moving the logical
                         # root there must not silently certify a GET deep link.
-                        coverage = CoveragePlanner(item["app_url"], options.focus_area)
+                        coverage = CoveragePlanner(entry_url, options.focus_area)
                         coverage.observe(observation)
                         authentication_boundary_crossed = True
                         self.repository.add_event(
@@ -3192,7 +3222,7 @@ class ExplorationManager:
                 # Private replay metadata is persisted only on the action,
                 # never passed to auxiliary models or copied into CT evidence.
                 rerun_recipe = build_rerun_recipe(
-                    observation, decision, item["app_url"], secret_values=secret_values,
+                    observation, decision, entry_url, secret_values=secret_values,
                 )
                 result, next_observation = await asyncio.wait_for(
                     executor.execute(decision, credentials),
@@ -3556,9 +3586,11 @@ class ExplorationManager:
                 error_message,
                 {"reason": "backend_shutdown"},
             )
-        except BrowserUnavailableError:
+        except BrowserUnavailableError as exc:
             terminal = ExplorationStatus.CANCELLED
             error_message = None
+            # Launch and navigation failures raise the same error as a closed
+            # window; keep the cause so they can be told apart.
             self.repository.add_event(
                 exploration_id,
                 "warning",
@@ -3568,6 +3600,7 @@ class ExplorationManager:
                     "encerrada sem novas chamadas ao JEV e os resultados "
                     "capturados foram preservados."
                 ),
+                {"detail": str(exc)[:500]},
             )
             self.repository.add_event(
                 exploration_id,

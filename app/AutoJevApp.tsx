@@ -1928,15 +1928,23 @@ export default function AutoJevApp() {
 
   useEffect(() => {
     if (route.view !== "detail" || !route.explorationId || !explorationDetailState(route.explorationId, selectedExploration, detailLoading, settledExplorationId).shouldPoll) return;
-    const timer = window.setInterval(async () => {
-      if (!explorationDetailState(route.explorationId, selectedExploration, detailLoading, settledExplorationId).shouldPoll) {
-        window.clearInterval(timer);
-        return;
-      }
+    // Schedule the next poll only after the previous one answered, and back off
+    // when the detail takes longer than the interval: a fixed setInterval kept
+    // stacking multi-MB requests on a busy backend during long explorations.
+    let stopped = false;
+    let timer = 0;
+    const poll = async () => {
+      if (stopped || !explorationDetailState(route.explorationId, selectedExploration, detailLoading, settledExplorationId).shouldPoll) return;
+      const started = performance.now();
       const data = await loadExploration(route.explorationId as string, true);
       if (data && !isLive(data.status)) void loadCore(true);
-    }, pollInterval);
-    return () => window.clearInterval(timer);
+      if (!stopped) timer = window.setTimeout(() => void poll(), Math.max(pollInterval, 2 * (performance.now() - started)));
+    };
+    timer = window.setTimeout(() => void poll(), pollInterval);
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
   }, [route, pollInterval, loadExploration, loadCore, selectedExploration, detailLoading, settledExplorationId]);
 
   useEffect(() => {

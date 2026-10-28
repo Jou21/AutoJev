@@ -43,6 +43,10 @@ playwright install chromium
 AUTOJEV_HEADLESS=false uvicorn autojev.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
+On Windows, drop `--reload`: uvicorn then selects an asyncio loop without
+subprocess support and Playwright cannot start the browser (the exploration is
+cancelled as "browser closed" with an empty `NotImplementedError`).
+
 Start the React interface in a second terminal:
 
 ```bash

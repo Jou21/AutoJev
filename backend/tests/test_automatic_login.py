@@ -335,13 +335,15 @@ async def test_manager_login_gate_and_authenticated_history_are_safe(tmp_path, m
         # The authenticated logical root alone must not license a GET reload.
         assert not planners[-1].initial_root_url_restorable
     elif login_mode == "expired_session":
-        assert len(interventions) == 1
-        assert "já foi realizada" in interventions[0]
+        # The site ending a confirmed session is re-entered automatically,
+        # through the separate bounded relogin path, never attempt_login.
+        relogins = event_types.count("automatic_relogin_started")
+        assert 1 <= relogins <= ExplorationManager.MAX_SESSION_RELOGINS
         assert event_types.count("automatic_login_started") == 1
-        assert event_types.count("automatic_login_succeeded") == 1
+        assert event_types.count("automatic_login_succeeded") == 1 + relogins
         assert instances[0].automatic_attempts == 1
         assert instances[0].authenticated_root.endswith('/inventory.html')
-        assert run["status"] == "cancelled"
+        assert run["status"] in {"completed", "partial", "cancelled"}
     else:
         assert len(interventions) == 1
         assert not instances[0]._protect_authenticated_history
@@ -440,5 +442,42 @@ async def test_same_origin_native_post_login_is_supported(tmp_path):
         assert result.status == "success", result.reason
         assert len([method for method, _ in executor.requests if method == 'POST']) == 1
         assert all(USER not in url and PASSWORD.strip() not in url for _, url in executor.requests)
+    finally:
+        await executor.close()
+
+
+async def test_session_relogin_follows_only_a_confirmed_login(tmp_path):
+    executor, observation = await fixture_executor(tmp_path)
+    try:
+        credentials = {"username": USER, "password": PASSWORD}
+        never = await executor.attempt_session_relogin(credentials, observation)
+        assert never.reason == "already_attempted"  # no confirmed login yet
+        first = await executor.attempt_login(credentials, observation)
+        assert first.status == "success", first.reason
+        # The site ends the session: the run is back on the sign-in page.
+        await executor._page.goto("http://login.fixture.test/")
+        expired = await executor.observe("session-expired")
+        again = await executor.attempt_session_relogin(credentials, expired)
+        assert again.status == "success", again.reason
+        assert again.observation.url.endswith("/inventory.html")
+        assert USER not in json.dumps(asdict(again.observation))
+    finally:
+        await executor.close()
+
+
+async def test_rejected_session_relogin_is_never_retried(tmp_path):
+    executor, observation = await fixture_executor(tmp_path)
+    try:
+        first = await executor.attempt_login({"username": USER, "password": PASSWORD}, observation)
+        assert first.status == "success", first.reason
+        await executor._page.goto("http://login.fixture.test/")
+        expired = await executor.observe("session-expired")
+        wrong = {"username": USER, "password": "fixture-wrong-password"}
+        rejected = await executor.attempt_session_relogin(wrong, expired)
+        assert rejected.status != "success"
+        submissions = await executor._page.evaluate("window.loginSubmissions")
+        retry = await executor.attempt_session_relogin({"username": USER, "password": PASSWORD}, expired)
+        assert retry.reason == "already_attempted"
+        assert await executor._page.evaluate("window.loginSubmissions") == submissions
     finally:
         await executor.close()
