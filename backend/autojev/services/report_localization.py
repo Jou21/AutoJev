@@ -160,10 +160,13 @@ def _line(text: str) -> str:
     for prefix in ("Confirmada: ", "Não confirmada: ", "Verificar: "):
         if text.startswith(prefix):
             return prefix + _line(text[len(prefix):])
-    match = re.fullmatch(r"TypeSafe JEV selected (\w+) for (.+) to maximize (safe untested|unsafe and untested) coverage \((.+)\)\.", text)
-    if match and match[1] in ACTION_LABELS:
+    match = re.fullmatch(r"(TypeSafe JEV|Laya|AutoJev deterministic planner) selected (\w+) for (.+) to maximize (safe untested|unsafe and untested) coverage \((.+)\)\.", text)
+    if match and match[2] in ACTION_LABELS:
+        decider, action, control, coverage_kind, signal_text = match.groups()
+        decider = {"TypeSafe JEV": "O TypeSafe JEV", "Laya": "O Laya",
+                   "AutoJev deterministic planner": "O planejador determinístico do AutoJev"}[decider]
         signals = []
-        for part in match[4].split("; "):
+        for part in signal_text.split("; "):
             key, _, value = part.partition(": ")
             label = {"QA focus": "foco de qualidade", "move probability": "probabilidade da ação",
                      "choice confidence": "confiança na escolha", "observed-issue probability": "probabilidade de problema observado"}.get(key)
@@ -172,8 +175,8 @@ def _line(text: str) -> str:
             if key == "QA focus":
                 value = QA_FOCUS_LABELS.get(value.replace(" ", "_"), value)
             signals.append(f"{label}: {value}")
-        coverage = "segura ainda não testada" if match[3] == "safe untested" else "insegura e ainda não testada"
-        return f"O TypeSafe JEV escolheu a ação {action_label(match[1]).lower()} no controle «{match[2]}» para ampliar a cobertura {coverage} ({'; '.join(signals)})."
+        coverage = "segura ainda não testada" if coverage_kind == "safe untested" else "insegura e ainda não testada"
+        return f"{decider} escolheu a ação {action_label(action).lower()} no controle «{control}» para ampliar a cobertura {coverage} ({'; '.join(signals)})."
     match = re.fullmatch(r"AutoJev's deterministic invocation policy selected the next safe, untried (\w+) without a JEV call \((\w+)\)\.", text)
     if match and match[1] in ACTION_LABELS:
         reason = {"conventional_form": "formulário convencional", "known_navigation": "navegação conhecida",

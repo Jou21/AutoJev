@@ -1496,3 +1496,31 @@ async def test_auxiliary_prompt_omits_repeated_signals_but_preserves_them_locall
     )
     assert scenario.evidence["technical_signals"][0]["occurrence_id"] == "signal-recurring"
     assert any(entry["kind"] == "signal" for entry in scenario.evidence["timeline"])
+
+
+@pytest.mark.asyncio
+async def test_deterministic_agent_walks_the_planner_frontier_in_order_without_a_model():
+    from autojev.adapters.openai_compatible import (
+        DETERMINISTIC_AGENT_MODEL,
+        DeterministicDecisionClient,
+    )
+    from autojev.services.report_localization import report_text
+
+    client = DeterministicDecisionClient()
+    agent = OpenAIJevAgent(client, DETERMINISTIC_AGENT_MODEL)
+    observation = Observation(
+        url="https://shop.test/inventory.html", title="Products", text="Products",
+        interactive_elements=[
+            {"ref": "e1", "tag": "button", "name": "Add to cart", "in_viewport": True},
+            {"ref": "e2", "tag": "a", "name": "Cart", "href": "https://shop.test/cart.html", "in_viewport": True},
+        ],
+    )
+
+    first = await agent.decide(observation, [], [], {"current_untried": [{"ref": "e2"}, {"ref": "e1"}]})
+    assert (first.action, first.target) == ("click", "e2")  # the planner's first priority, not the DOM order
+    assert "planejador determinístico do AutoJev" in report_text(first.rationale)
+    assert {"kind": "url_contains", "expected": "/cart.html"} in first.assertions
+
+    done = await agent.decide(observation, [], [], {"current_untried": [], "path_depth": 1})
+    assert done.action == "finish"
+    assert client.drain_usage()["cost_known"] is True and client.drain_usage()["cost"] == 0.0

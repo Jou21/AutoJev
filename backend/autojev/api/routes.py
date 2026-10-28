@@ -16,6 +16,8 @@ from starlette.concurrency import run_in_threadpool
 
 from autojev import __version__
 from autojev.adapters.openai_compatible import (
+    DETERMINISTIC_AGENT_MODEL,
+    LOCAL_AGENT_PROVIDER_ID,
     OpenAICompatibleClient,
     ProviderConnectionError,
 )
@@ -762,6 +764,12 @@ def _validate_selection(
     *,
     require_vision: bool = False,
 ) -> None:
+    if selection.provider_id == LOCAL_AGENT_PROVIDER_ID:
+        # Built in, needs no provider record, key or network. Only the JEV role
+        # can use it: it decides moves, it cannot write documentation.
+        if role != "JEV" or selection.model_id != DETERMINISTIC_AGENT_MODEL:
+            raise HTTPException(status_code=422, detail=f"{role} cannot use the built-in AutoJev planner")
+        return
     try:
         provider = repository.get_provider(selection.provider_id)
     except NotFoundError as exc:
@@ -797,7 +805,7 @@ async def _validate_exploration_credentials(
 
     checked: set[str] = set()
     for selection in selections:
-        if selection.provider_id in checked:
+        if selection.provider_id in checked or selection.provider_id == LOCAL_AGENT_PROVIDER_ID:
             continue
         checked.add(selection.provider_id)
         provider = repository.get_provider(selection.provider_id)

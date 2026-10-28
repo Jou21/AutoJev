@@ -153,7 +153,9 @@ def decide(
         "answers": {
             key: normalise_answer(question, raw_answers.get(key))
             for key, question in condensed.items()
-        }
+        },
+        # Local inference: report a known zero cost instead of "unknown".
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cost": 0.0},
     }
 
 

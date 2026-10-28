@@ -994,3 +994,27 @@ def test_writes_clear_the_live_detail_cache(tmp_path):
     with TestClient(app) as client:
         client.post("/api/providers", json={})  # rejected input still counts as a write attempt
     assert routes._detail_cache == {}
+
+
+def test_exploration_can_use_the_built_in_planner_instead_of_a_jev_provider(tmp_path, monkeypatch):
+    from autojev.services.exploration import ExplorationManager
+
+    monkeypatch.setattr(ExplorationManager, "submit", lambda self, exploration_id: None)
+    app = create_app(settings(tmp_path))
+    with TestClient(app) as client:
+        aux = client.post("/api/providers", json={
+            "name": "Aux", "base_url": "http://aux.invalid", "enabled": True,
+            "models": [{"id": "aux-model", "label": "Aux"}],
+        }).json()
+        body = {"app_url": "https://shop.test/", "auxiliary_llm": {"provider_id": aux["id"], "model_id": "aux-model"},
+                "options": {"auxiliary_evidence_mode": "text"}}
+        created = client.post("/api/explorations", json={
+            **body, "agent": {"provider_id": "autojev-local", "model_id": "autojev/deterministic"}})
+        assert created.status_code == 202, created.text
+        assert created.json()["agent"] == {"provider_id": "autojev-local", "model_id": "autojev/deterministic"}
+
+        # The built-in planner only decides moves; it cannot document CTs.
+        refused = client.post("/api/explorations", json={
+            **body, "agent": {"provider_id": "autojev-local", "model_id": "autojev/deterministic"},
+            "auxiliary_llm": {"provider_id": "autojev-local", "model_id": "autojev/deterministic"}})
+        assert refused.status_code == 422

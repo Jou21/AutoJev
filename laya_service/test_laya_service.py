@@ -77,7 +77,8 @@ def test_minimal_connection_check_state_is_accepted() -> None:
         json={"model": svc.MODEL_ID, "state": {"connection_check": True}, "questions": {"ok": {"type": "noul", "instructions": "Is this a connection check?"}}},
     )
 
-    assert response.json() == {"answers": {"ok": {"noul": 0.9}}}
+    assert response.json()["answers"] == {"ok": {"noul": 0.9}}
+    assert response.json()["usage"]["cost"] == 0.0
 
 
 def test_malformed_laya_output_is_a_502_not_a_fake_decision() -> None:

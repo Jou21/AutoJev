@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any
 
 from autojev.adapters.openai_compatible import (
+    LOCAL_AGENT_PROVIDER_ID,
+    DeterministicDecisionClient,
     ModelResponseError,
     OpenAIAuxiliaryScenarioGenerator,
     OpenAICompatibleClient,
@@ -2531,7 +2533,11 @@ class ExplorationManager:
                 if options.max_duration_seconds is not None
                 else None
             )
-            agent_client = self._client_for(item["agent"]["provider_id"])
+            agent_client = (
+                DeterministicDecisionClient()
+                if item["agent"]["provider_id"] == LOCAL_AGENT_PROVIDER_ID
+                else self._client_for(item["agent"]["provider_id"])
+            )
             auxiliary_client = self._client_for(item["auxiliary_llm"]["provider_id"])
             agent_model_id = item["agent"]["model_id"]
             auxiliary_model_id = item["auxiliary_llm"]["model_id"]

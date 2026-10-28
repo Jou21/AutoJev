@@ -242,14 +242,56 @@ def _is_jev_model(model: str) -> bool:
     return model.removeprefix("~").startswith("typesafe/jev-")
 
 
+LOCAL_AGENT_PROVIDER_ID = "autojev-local"
+DETERMINISTIC_AGENT_MODEL = "autojev/deterministic"
+
+
 def _is_decision_model(model: str) -> bool:
     """Models that answer typed ``choice``/``noul`` questions instead of chatting.
 
     JEV (OpenRouter) and the local Laya service (``laya_service/``) share the
-    ``/api/alpha/decisions`` contract.
+    ``/api/alpha/decisions`` contract; the built-in deterministic agent answers
+    the same questions without any model.
     """
 
-    return _is_jev_model(model) or model.startswith("convaiinnovations/laya")
+    return (_is_jev_model(model) or model.startswith("convaiinnovations/laya")
+            or model == DETERMINISTIC_AGENT_MODEL)
+
+
+class DeterministicDecisionClient:
+    """Answers JEV's typed questions without a model, network or cost.
+
+    The coverage planner already orders ``candidate_moves`` by its own
+    priority (current screen first, then frontier), and only offers back /
+    finish when nothing untried is left. Taking the first offered move is a
+    depth-first walk that visits every safe path once — the same graph a
+    model was consulted for in only ~1% of steps.
+    """
+
+    chat_request_count = 0
+
+    async def decisions(
+        self, _model: str, state: dict[str, Any], questions: dict[str, dict[str, Any]]
+    ) -> dict[str, Any]:
+        answers: dict[str, Any] = {}
+        for key, question in questions.items():
+            if question.get("type") == "noul":
+                failing = bool(state.get("console_errors") or state.get("network_errors"))
+                answers[key] = {"noul": 1.0 if failing else 0.0}
+                continue
+            options = list((question.get("criteria") or {}).keys())
+            if not options:
+                continue
+            choice = "functional_behavior" if key == "qa_focus" and "functional_behavior" in options else options[0]
+            answers[key] = {"choice": choice}
+        return answers
+
+    def drain_usage(self) -> dict[str, int | float | bool]:
+        return {
+            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+            "cost": 0.0, "cost_known": True, "cost_complete": True,
+            "usage_records": 0, "cost_reported_records": 0,
+        }
 
 
 def _safe_error(exc: Exception, secrets: list[str] | None = None) -> str:
@@ -1165,8 +1207,13 @@ Write rationale and human-readable scenario_hint fields in Brazilian Portuguese 
                             "expected": str(href) if expected_route == "/" else expected_route,
                         }
                     )
+            decider = (
+                "AutoJev deterministic planner" if self.model == DETERMINISTIC_AGENT_MODEL
+                else "Laya" if self.model.startswith("convaiinnovations/laya")
+                else "TypeSafe JEV"
+            )
             rationale = report_text(
-                f"TypeSafe JEV selected {selected['action']} for {selected['name']} "
+                f"{decider} selected {selected['action']} for {selected['name']} "
                 f"to maximize safe untested coverage ({'; '.join(signals)})."
             )
             raw_payload = {

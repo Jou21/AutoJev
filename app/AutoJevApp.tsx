@@ -707,6 +707,16 @@ const FREE_MODEL_PREFERENCE = [
   "google/gemma-4-31b-it:free",
 ];
 
+// Built into the backend: the coverage planner decides every move without a
+// model, key or network (it consulted JEV/Laya in ~1% of steps anyway).
+const LOCAL_AGENT_PROVIDER: Provider = {
+  id: "autojev-local",
+  name: "AutoJev (sem IA)",
+  base_url: "",
+  enabled: true,
+  models: [{ id: "autojev/deterministic", label: "Planejador determinístico", enabled: true }],
+};
+
 const JEV_MODEL_PREFERENCE = ["typesafe/jev-1.13", "typesafe/jev-latest"];
 const AUXILIARY_MODEL_PREFERENCE = ["google/gemini-2.5-flash-lite"];
 
@@ -2429,6 +2439,7 @@ function NewExplorationView({
   onCreated: (exploration: Exploration) => void;
 }) {
   const enabledProviders = providers.filter(providerIsEnabled);
+  const agentProviders = [LOCAL_AGENT_PROVIDER, ...enabledProviders];
   const [url, setUrl] = useState("");
   const [focusMode, setFocusMode] = useState<"all" | "focused">("all");
   const [focusArea, setFocusArea] = useState("");
@@ -2449,7 +2460,7 @@ function NewExplorationView({
   const visualDiscoveryAttempted = useRef(new Set<string>());
 
   const modelsFor = useCallback((providerId: string) => {
-    const provider = providers.find((item) => item.id === providerId);
+    const provider = [LOCAL_AGENT_PROVIDER, ...providers].find((item) => item.id === providerId);
     const nested = provider?.models || [];
     const flat = models.filter((model) => model.provider_id === providerId);
     const source = nested.length > 0 ? nested : flat;
@@ -2464,7 +2475,7 @@ function NewExplorationView({
   }, [auxiliaryEvidenceMode, modelsFor]);
 
   useEffect(() => {
-    if (!agentProvider && enabledProviders[0]) setAgentProvider(enabledProviders[0].id);
+    if (!agentProvider) setAgentProvider(LOCAL_AGENT_PROVIDER.id);
     if (!auxProvider && enabledProviders[0]) setAuxProvider(enabledProviders[0].id);
   }, [enabledProviders, agentProvider, auxProvider]);
 
@@ -2637,7 +2648,7 @@ function NewExplorationView({
                   description="Decide a próxima ação e mantém o objetivo da exploração."
                   icon={<BrainCircuit size={20} />}
                   accent="amber"
-                  providers={enabledProviders}
+                  providers={agentProviders}
                   providerValue={agentProvider}
                   modelValueSelected={agentModel}
                   onProvider={setAgentProvider}
@@ -3244,7 +3255,7 @@ export function ExplorationDetailView({
   const waitingForInput = exploration.status.toLowerCase() === "waiting_input";
   const waitingEvent = [...events].reverse().find((event) => event.type === "waiting_input");
   const screenshot = resolveAssetUrl(exploration.screenshot_url);
-  const providerName = (id?: string) => providers.find((provider) => provider.id === id)?.name || id || "—";
+  const providerName = (id?: string) => [LOCAL_AGENT_PROVIDER, ...providers].find((provider) => provider.id === id)?.name || id || "—";
   const counters = {
     pages: exploration.counters?.pages_visited || exploration.counters?.pages || exploration.pages_visited || 0,
     actions: exploration.counters?.actions || exploration.actions_count || 0,

@@ -306,7 +306,9 @@ async def discover(root_id: str, body: DiscoveryInput, request: Request):
         raise HTTPException(422, "Descoberta não aceita um plano de capturas de reexecução.")
     manager = request.app.state.exploration_manager
     try:
-        manager._client_for(source["agent"]["provider_id"])
+        from autojev.adapters.openai_compatible import LOCAL_AGENT_PROVIDER_ID
+        if source["agent"]["provider_id"] != LOCAL_AGENT_PROVIDER_ID:
+            manager._client_for(source["agent"]["provider_id"])
         manager._client_for(source["auxiliary_llm"]["provider_id"])
     except Exception as exc:
         raise HTTPException(409, "Configure os provedores deste conjunto antes de iniciar a descoberta.") from exc
