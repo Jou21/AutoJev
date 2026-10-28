@@ -2007,6 +2007,33 @@ test("an action marker is validated after image loading and remains percentage-a
   assert.equal(canvas.querySelector(".action-target-overlay"), null, "a different-sized image must invalidate the recorded geometry");
 });
 
+test("an action marker survives a uniformly scaled screenshot (display scaling)", () => {
+  const { actionFigures, actionImages } = fixture({ actionPreview: true, naturalImageSize: { width: 1800, height: 1125 } });
+  const marker = actionFigures[0].querySelector(".action-preview-canvas .action-target-box");
+  assert.ok(marker, "a 1.25x bitmap of the recorded viewport must keep its marker");
+  assert.deepEqual(["left", "top", "width", "height"].map((name) => marker.style.getPropertyValue(name)), ["75%", "10%", "15%", "5%"]);
+  assert.ok(actionImages[0]);
+});
+
+for (const [width, height] of [[1440, 900], [1280, 720], [390, 844], [1000, 1000], [768, 1024], [2560, 1080], [1443, 952]]) {
+  for (const scale of [1, 1.25, 1.5, 2]) {
+    test(`an action marker is drawn for a ${width}x${height} viewport captured at ${scale}x`, () => {
+      const metadata = {
+        ...actionMetadata, image: { width, height },
+        box: { x: width * 0.5, y: height * 0.1, width: width * 0.2, height: height * 0.05 },
+      };
+      const { actionFigures } = fixture({
+        actionPreview: true, actionPreviewMetadata: metadata,
+        naturalImageSize: { width: Math.round(width * scale), height: Math.round(height * scale) },
+      });
+      const marker = actionFigures[0].querySelector(".action-target-box");
+      assert.ok(marker);
+      const percents = ["left", "top", "width", "height"].map((name) => parseFloat(marker.style.getPropertyValue(name)));
+      [50, 10, 20, 5].forEach((expected, index) => assert.ok(Math.abs(percents[index] - expected) < 1e-6));
+    });
+  }
+}
+
 test("action overlays follow screenshot visibility preferences and preserve the CT verdict", () => {
   const { document, cards, actionImages } = fixture({ actionPreview: true });
   cards[0].querySelectorAll(".case-step-button")[2].click();

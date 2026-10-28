@@ -545,7 +545,7 @@ class OpenAICompatibleClient:
                 _safe_error(exc, [self.api_key])
             ) from exc
 
-    def _record_usage(self, body: dict[str, Any]) -> None:
+    def _record_usage(self, body: dict[str, Any], headers: Any = None) -> None:
         body = body if isinstance(body, dict) else {}
         usage = body.get("usage")
         if not isinstance(usage, dict):
@@ -561,6 +561,15 @@ class OpenAICompatibleClient:
         completion = token_count(usage.get("completion_tokens") or usage.get("output_tokens"))
         total = token_count(usage.get("total_tokens") or prompt + completion)
         raw_cost = usage.get("cost", body.get("cost"))
+        if raw_cost is None and headers is not None:
+            # LiteLLM proxies (e.g. CodeAI) report the per-call price in a
+            # response header instead of the JSON body.
+            try:
+                raw_cost = headers.get("x-litellm-response-cost")
+            except AttributeError:
+                raw_cost = None
+            if raw_cost is not None and not str(raw_cost).strip():
+                raw_cost = None
         try:
             cost = float(raw_cost) if raw_cost is not None else 0.0
             cost_known = raw_cost is not None and not isinstance(raw_cost, bool) and math.isfinite(cost) and cost >= 0
@@ -826,7 +835,7 @@ class OpenAICompatibleClient:
                     )
                 response.raise_for_status()
                 body = response.json()
-                self._record_usage(body)
+                self._record_usage(body, getattr(response, "headers", None))
                 usage_recorded = True
                 content = body["choices"][0]["message"]["content"]
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:

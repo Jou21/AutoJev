@@ -524,6 +524,42 @@ async def test_chat_json_captures_and_drains_provider_usage(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("headers", "body_cost", "expected_cost", "known"),
+    [
+        ({"x-litellm-response-cost": "0.00123"}, None, 0.00123, True),
+        ({"x-litellm-response-cost": "0.00123"}, 0.5, 0.5, True),
+        ({"x-litellm-response-cost": ""}, None, 0.0, False),
+        ({"x-litellm-response-cost": "abc"}, None, 0.0, False),
+        ({}, None, 0.0, False),
+    ],
+)
+async def test_chat_json_reads_litellm_cost_header(monkeypatch, headers, body_cost, expected_cost, known):
+    usage = {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+    if body_cost is not None:
+        usage["cost"] = body_cost
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"ok": true}'}}], "usage": usage},
+            headers=headers,
+        )
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "httpx.AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    client = OpenAICompatibleClient("https://litellm.example.test", "sk-test")
+    assert await client.chat_json("gpt-x", "system", "user") == {"ok": True}
+    drained = client.drain_usage()
+    assert drained["cost"] == pytest.approx(expected_cost)
+    assert drained["cost_known"] is known
+    assert drained["cost_complete"] is known
+
+
+@pytest.mark.asyncio
 @pytest.mark.asyncio
 def test_extract_json_accepts_fenced_object_but_rejects_prose():
     assert extract_json('```json\n{"action":"finish"}\n```')["action"] == "finish"

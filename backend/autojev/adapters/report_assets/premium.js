@@ -866,7 +866,12 @@
       const value = actionPreviewMetadata(canvas);
       if (!value || !(image.naturalWidth > 0 && image.naturalHeight > 0)) return;
       // Geometry belongs to this exact viewport capture, never to another image.
-      if (image.naturalWidth !== value.image.width || image.naturalHeight !== value.image.height) return;
+      // The bitmap may be a uniform multiple of the recorded CSS viewport (for
+      // example 125% Windows display scaling); the box is percentage-based, so
+      // only a different aspect ratio invalidates it.
+      const scaleX = image.naturalWidth / value.image.width;
+      const scaleY = image.naturalHeight / value.image.height;
+      if (Math.abs(scaleX - scaleY) > 0.005 * Math.max(scaleX, scaleY)) return;
       const percent = (number, dimension) => (number / dimension * 100) + "%";
       const overlay = document.createElement("span");
       overlay.className = "action-target-overlay";
