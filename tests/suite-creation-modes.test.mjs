@@ -1319,8 +1319,53 @@ test("revalidation after renaming never starts a newly unavailable test", async 
   assert.equal(view.has("suite-plan-review"), true);
   assert.equal(view.field("Nome da execução").props.value, "Minha execução");
 
-  assert.equal(view.button("Executar 1 teste").props.disabled, true);
+  assert.equal(view.button("Executar 1 teste").props.disabled, false);
+  await view.click("Executar 1 teste");
+  assert.ok(view.all().some(node => node.type === "dialog" && node.props["aria-labelledby"] === "suite-unavailable-title"));
   assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
+});
+
+test("review checkboxes and unavailable dialog require explicit removal before starting a fresh subset", async t => {
+  const suite = suiteFixture(); suite.cases.push({...suite.cases[0],id:"CT002",title:"Unavailable"});
+  let navigation = 0;
+  const view = await workspace(t, suite, undefined, { navigate(){navigation++;}, validationReply: checked => ({...checked, available: !checked.items.some(item=>item.case_id==="CT002"), items:checked.items.map(item=>item.case_id==="CT002"?{...item,available:false,reason:"Receita incompleta",code:"incomplete"}:item)}) });
+  await view.click("Marcar todos"); await view.click("Revisar execução");
+  const checkbox = name => view.find(node=>node.type==="input" && node.props["aria-label"]===name);
+  assert.equal(checkbox("Selecionar todos os testes da revisão").props.checked,true);
+  checkbox("Selecionar todos os testes da revisão").props.onChange(); await view.settle();
+  assert.equal(view.button("Executar 0 testes").props.disabled,true);
+  checkbox("Selecionar todos os testes da revisão").props.onChange(); await view.settle();
+  assert.equal(view.button("Executar 2 testes").props.disabled,false);
+  await view.click("Executar 2 testes");
+  assert.equal(view.button("Executar selecionados").props.disabled,true);
+  assert.equal(view.calls.some(call=>call.path.endsWith("/start")),false);
+  await view.click("Desmarcar indisponíveis");
+  assert.equal(checkbox("Executar CT002").props.checked,false);
+  assert.equal(view.button("Executar selecionados").props.disabled,false);
+  await view.click("Executar selecionados");
+  const update=view.calls.find(call=>call.method==="PUT" && call.path.includes("/plans/"));
+  assert.deepEqual(update.body.items.map(item=>item.case_id),["CT001"]);
+  assert.equal(view.calls.filter(call=>call.path.endsWith("/validate")).length,2);
+  assert.equal(view.calls.filter(call=>call.path.endsWith("/start")).length,1);
+  assert.equal(navigation,1);
+});
+
+test("subset revalidation cannot start a newly unavailable remaining test", async t => {
+  const suite=suiteFixture(); suite.cases.push({...suite.cases[0],id:"CT002",title:"Unavailable"});
+  let checks=0;
+  const view=await workspace(t,suite,undefined,{validationReply:checked=>{checks++;return {...checked,available:false,items:checked.items.map(item=>({...item,available:checks===1 && item.case_id==="CT001",code:"incomplete"}))};}});
+  await view.click("Marcar todos"); await view.click("Revisar execução"); await view.click("Executar 2 testes");
+  await view.click("Desmarcar indisponíveis"); await view.click("Executar selecionados");
+  assert.equal(checks,2);
+  assert.equal(view.button("Executar selecionados").props.disabled,true);
+  assert.equal(view.calls.some(call=>call.path.endsWith("/start")),false);
+});
+
+test("all unavailable tests leave modal execution disabled after unchecking", async t => {
+ const view=await workspace(t,undefined,undefined,{initialCaseId:"CT001",validationReply:checked=>({...checked,available:false,items:checked.items.map(item=>({...item,available:false,code:"incomplete"}))})});
+ await view.click("Revisar execução"); await view.click("Executar 1 teste"); await view.click("Desmarcar indisponíveis");
+ assert.equal(view.button("Executar selecionados").props.disabled,true);
+ assert.equal(view.calls.some(call=>call.path.endsWith("/start")),false);
 });
 
 test("failed name saves retain review and allow an explicit execution retry", async t => {
@@ -1791,6 +1836,20 @@ test("selector cards drag vertically with numbered execution order and persist t
  await view.click("Salvar rascunho");
  assert.deepEqual(view.calls.find(call=>call.path.endsWith("/plans") && call.method==="POST").body.items.map(item=>item.case_id),["CT001","CT002"]);
  assert.equal(view.calls.some(call=>call.path.endsWith("/start")),false);
+});
+
+test("selecting a checkbox restarts the review button glow but unchecking does not", async t => {
+ const view = await workspace(t);
+ assert.equal(view.button("Revisar execução").props.className.includes("suite-review-highlight"), false);
+ const toggle = async () => { view.find(node => node.props["aria-label"] === "Incluir CT001").props.onChange(); await view.settle(); };
+ await toggle();
+ assert.equal(view.button("Revisar execução").props.className.includes("suite-review-highlight"), true);
+ const firstKey = view.button("Revisar execução").key;
+ await toggle();
+ assert.equal(view.button("Revisar execução").key, firstKey);
+ await toggle();
+ assert.notEqual(view.button("Revisar execução").key, firstKey);
+ assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
 });
 
 test("unselected selector cards can be dragged before selecting tests", async t => {

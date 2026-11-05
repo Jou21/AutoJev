@@ -126,9 +126,16 @@
 .suite-workspace .suite-selector { padding: 14px 10px; }
 .suite-selector .suite-catalog-filters { grid-template-columns: minmax(0, 1fr); gap: 8px; padding: 0 4px; }
 .suite-selector .text-button { margin: 0 4px 8px; font-size: 11px; }
-.suite-selector-bulk { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 5px 8px 9px; }
-.suite-selector-bulk .text-button { font-size: 11px; }
-.suite-available-list { display: grid; max-height: 650px; overflow: auto; scrollbar-width: thin; }
+.suite-selector-bulk { display: flex; align-items: center; gap: 8px; padding: 0; margin-bottom: -4px; }
+.suite-selector-bulk .button { flex: 1; min-height: 30px; padding: 6px 8px; font-size: 11px; }
+.suite-available-list { display: grid; max-height: 650px; overflow: auto; scrollbar-width: thin; scrollbar-color: #ffffff24 transparent; }
+.suite-available-list:hover, .suite-available-list:focus-within { scrollbar-color: #ffffff40 transparent; }
+.suite-available-list::-webkit-scrollbar { width: 5px; height: 5px; }
+.suite-available-list::-webkit-scrollbar-track { background: transparent; }
+.suite-available-list::-webkit-scrollbar-thumb { background: #ffffff24; border-radius: 999px; }
+.suite-available-list:hover::-webkit-scrollbar-thumb, .suite-available-list:focus-within::-webkit-scrollbar-thumb { background: #ffffff40; }
+.suite-available-list::-webkit-scrollbar-button { display: none; }
+.suite-available-list::-webkit-scrollbar-corner { background: transparent; }
 .suite-available-list > div { display: flex; align-items: center; gap: 9px; padding: 11px 8px; border-radius: 8px; }
 .suite-available-list > div.selected { background: #f2c45b0a; }
 .suite-selector-position { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; width: 26px; height: 26px; border-radius: 50%; background: var(--suite-accent); color: #171a1d; font-size: 10px; font-weight: 700; }
@@ -193,6 +200,8 @@
 .suite-recording ol { flex-basis: 100%; max-height: 200px; overflow: auto; color: var(--muted); font-size: 12px; line-height: 1.8; }
 .suite-record-dot { width: 9px; height: 9px; border-radius: 50%; background: #ee8585; box-shadow: 0 0 0 5px #ee858512; }
 .suite-review p { color: var(--muted); font-size: 12px; line-height: 1.7; }
+.suite-review-check { display: inline-flex; align-items: center; gap: 8px; font-size: 11px; }
+.suite-review-check input, .suite-review-case > input { flex: 0 0 16px; width: 16px; height: 16px; accent-color: var(--suite-accent); }
 .suite-review-case { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--suite-line); font-size: 12px; }
 .suite-review-case span { flex: 1; color: var(--muted); }
 .suite-review-case svg { color: #70cf9c; }
@@ -262,7 +271,13 @@
 .suite-selector-filter-actions > span { color: var(--muted); font-size: 10px; }
 .suite-selector .suite-selector-filters .text-button { margin: 0; text-align: left; }
 .suite-selector .suite-selector-filters > .button { justify-content: center; min-height: 32px; padding: 6px; font-size: 10px; white-space: normal; }
+@keyframes suite-review-glow { 0%, 100% { box-shadow: 0 0 0 0 #f2c45b00; } 50% { box-shadow: 0 0 0 4px #f2c45b25, 0 0 24px #f2c45b80; } }
+.suite-workspace .suite-review-highlight:not(:disabled) { animation: suite-review-glow 0.9s ease-in-out 3; }
+@media (prefers-reduced-motion: reduce) { .suite-workspace .suite-review-highlight:not(:disabled) { animation: none; } }
 .suite-selector-footer { flex-shrink: 0; padding-top: 6px; border-top: 1px solid var(--suite-line); }
+.suite-selector .suite-selector-footer .suite-add-test { background: transparent; border-color: #f2c45b55; color: var(--text-primary); }
+.suite-selector .suite-selector-footer .suite-add-test svg { color: var(--suite-accent); }
+.suite-selector .suite-selector-footer .suite-add-test:hover:not(:disabled) { background: #f2c45b0c; border-color: #f2c45b88; }
 .suite-selector .suite-selector-footer .button { display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%; min-height: 34px; margin: 0; padding: 6px; font-size: 11px; }
 .suite-planner-view .suite-available-list { flex: 1; min-height: 0; max-height: none; overflow: auto; overscroll-behavior: contain; }
 .suite-planner-view .suite-available-list > div { padding: 8px 5px; }
@@ -591,6 +606,16 @@
 .suite-editor-actions .button { min-height: 36px; font-size: 12px; }
 .suite-catalog-empty { padding: 25px 10px; color: var(--muted); font-size: 12px; text-align: center; }
 .suite-catalog-empty strong { color: var(--text); font-size: 14px; }
+.suite-workspace .suite-unavailable-dialog { position: fixed; inset: 0; margin: auto; width: min(580px, calc(100vw - 40px)); max-height: calc(100dvh - 48px); overflow: auto; padding: 28px; border: 1px solid var(--suite-line); border-radius: 20px; background: var(--suite-panel); color: var(--text-primary); box-shadow: 0 24px 90px #0009; }
+.suite-unavailable-dialog::backdrop { background: #0009; backdrop-filter: blur(4px); }
+.suite-unavailable-dialog h2 { margin: 0 0 12px; font-size: 21px; font-weight: 650; }
+.suite-unavailable-dialog p { margin: 0 0 20px; color: var(--muted); font-size: 13px; line-height: 1.7; }
+.suite-unavailable-dialog ul { display: grid; gap: 8px; max-height: 35dvh; overflow: auto; margin: 0 0 24px; padding: 0; list-style: none; }
+.suite-unavailable-dialog li { padding: 12px 14px; border: 1px solid #f2c45b30; border-radius: 10px; background: #f2c45b08; color: var(--text-primary); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.suite-unavailable-dialog .suite-heading-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.suite-unavailable-dialog .button { min-height: 38px; border-radius: 9px; font-size: 12px; }
+.suite-unavailable-dialog p[role="status"] { margin: 16px 0 0; }
+@media (max-width: 540px) { .suite-workspace .suite-unavailable-dialog { padding: 20px; } .suite-unavailable-dialog .suite-heading-actions .button { width: 100%; } }
 .suite-dialog-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; overflow: auto; padding: 20px; background: #000a; }
 .suite-workspace .suite-leave-dialog { width: min(520px, 100%); box-shadow: 0 20px 80px #0008; }
 .suite-leave-dialog p { color: var(--muted); font-size: 13px; line-height: 1.7; }

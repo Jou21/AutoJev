@@ -559,7 +559,12 @@ is needed to check a saved script.
 Opening an execution review immediately displays the selected tests with a pending
 check indicator. Saving and validation must finish before the Execute button can
 start an execution; clicking Execute is the explicit authorization, without an
-additional review checkbox. The suite workspace opens directly in preparation,
+additional authorization checkbox. Review rows have inclusion checkboxes and a
+select-all checkbox. After recipe checks finish, Execute remains available even
+when some checked tests are unavailable; a modal requires explicitly unchecking
+those tests before its Execute button is enabled. An edited subset is saved and
+validated again before starting, and empty or newly unavailable subsets never
+start. The suite workspace opens directly in preparation,
 without separate catalog/history tabs or a duplicate selected-test strip. The
 sidebar retains selection, execution numbering and drag ordering; execution
 monitoring remains available inside the same workspace. Review and start use fresh request-scoped snapshots: each source
