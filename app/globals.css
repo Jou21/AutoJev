@@ -572,6 +572,17 @@ a {
   margin-left: 72px;
 }
 
+.app-shell.suite-fullscreen > .sidebar,
+.app-shell.suite-fullscreen > .nav-scrim,
+.app-shell.suite-fullscreen .mobile-header {
+  display: none;
+}
+
+.app-shell.suite-fullscreen > .app-main {
+  margin-left: 0;
+  transition: none;
+}
+
 .sidebar-collapsed .brand-row {
   padding: 0 16px;
 }

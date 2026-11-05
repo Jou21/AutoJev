@@ -59,7 +59,7 @@ test("suite and report planning routes preserve stable identity and capture plan
     assert.deepEqual(parseAppHash("#/planejar-lote/root?itens=" + encodeURIComponent(JSON.stringify(bad))), { view: "explorations" }, JSON.stringify(bad));
   }
   assert.deepEqual(parseAppHash("#/planejar-lote/root?itens=%5B&start=1"), { view: "explorations" }, "Unknown parameters never authorize anything");
-  assert.deepEqual(parseAppHash("#/planejar/child/CT001"), { view: "explorations", suiteId: "child", initialCaseId: "CT001", initialSourceId: "child", initialSourceCase: "CT001" });
+  assert.deepEqual(parseAppHash("#/planejar/child/CT001"), { view: "explorations", suiteId: "child", initialTab: "planner", initialCaseId: "CT001", initialSourceId: "child", initialSourceCase: "CT001" });
   assert.deepEqual(parseAppHash("#/planejar/child/CT001?capture_plan=" + encodeURIComponent(JSON.stringify(plan))).capturePlan, plan);
   assert.deepEqual(parseAppHash("#/planejar/%E0%A4%A/CT001"), { view: "explorations" });
 });
@@ -413,7 +413,7 @@ test("manual capture consent makes pauses and their positions explicit without e
   const invalid = renderToStaticMarkup(createElement(ScenarioRerunConsent, { ...properties, error: "Plano de prints inválido" }));
   assert.match(invalid, /role="alert">Plano de prints inválido/);
   assert.match(invalid, /class="button primary"[^>]*disabled/);
-  assert.doesNotMatch(invalid, /type="checkbox"/);
+  assert.match(invalid, /type="checkbox"/, "retain the consent form after an error so private inputs can be corrected");
 });
 
 test("capture confirmation is scoped to the current paused checkpoint and never uses generic resume", async () => {
@@ -706,10 +706,10 @@ test("labels known partial costs instead of presenting them as complete totals",
       auxiliary: { cost: null, cost_known: false, cost_complete: false },
     } },
   }));
-  assert.match(html, /Custo JEV<\/span><strong>\$0\.010000 \(parcial\)/);
-  assert.match(html, /Custo total<\/span><strong>\$0\.010000 \(parcial\)/);
+  assert.match(html, /Custo JEV registrado<\/span><strong>\$0\.010000/);
+  assert.match(html, /Custo total registrado<\/span><strong>\$0\.010000/);
   assert.match(html, /Custo LLM<\/span><strong>—/);
-  assert.equal((html.match(/Valor parcial: há chamadas sem custo informado/g) || []).length, 2);
+  assert.equal((html.match(/Subtotal informado pelo provedor; o valor final pode ser maior/g) || []).length, 2);
 });
 
 test("renders each CT timeline with its captures, assertions and technical signals", async () => {
@@ -1136,4 +1136,51 @@ test("screenshot preview keeps originals intact and changes only HTTP cache-bust
   assert.match(empty, /Aguardando captura/);
   const config = await readFile(new URL("../vite.config.ts", import.meta.url), "utf8");
   assert.match(config, /forwardConsole: false/);
+});
+
+test("complete rerun journeys explain automatic preparation and preserve incomplete gaps", async () => {
+  const { ScenarioRerunConsent } = await timelineComponents();
+  const props = { loading: false, error: "", busy: false, consent: true, onConsent() {}, onConfirm() {}, onClose() {} };
+  const html = renderToStaticMarkup(createElement(ScenarioRerunConsent, { ...props, preflight: {
+    available: true, automatic_preparation: true, recipe_steps: 4, completeness: { complete: true, gaps: [] },
+  } }));
+  assert.match(html, /Preparação automática/);
+  assert.match(html, /4 etapas da receita/);
+  assert.match(html, /preparação e todas as ações salvas serão executadas automaticamente/);
+  assert.doesNotMatch(html, /Recrie as pré-condições|preencha usuário e senha no novo navegador/);
+  const incomplete = renderToStaticMarkup(createElement(ScenarioRerunConsent, { ...props, preflight: {
+    available: true, completeness: { complete: false, gaps: [{ step_number: 2, reason: "missing_or_invalid_recipe" }, "Login não registrado"] },
+  } }));
+  assert.match(incomplete, /Jornada incompleta/);
+  assert.match(incomplete, /Etapa 2: missing_or_invalid_recipe/);
+  assert.match(incomplete, /Login não registrado/);
+  assert.match(incomplete, /class="button primary"[^>]*disabled/);
+  assert.doesNotMatch(incomplete, /Recrie as pré-condições|type="checkbox"/);
+});
+
+test("rerun requests private inputs before submission and sends only ephemeral credentials", async () => {
+  const { ScenarioRerunConsent, scenarioRerunRequiredInputs, confirmScenarioRerun } = await timelineComponents();
+  const preflight = { available: true, automatic_preparation: true, required_inputs: ["username", "password", "username"] };
+  const required = scenarioRerunRequiredInputs(preflight);
+  assert.deepEqual(required, [{ key: "username", label: "username" }, { key: "password", label: "password" }]);
+  const props = { preflight, loading: false, error: "", busy: false, consent: true, onConsent() {}, onConfirm() {}, onClose() {}, onCredentials() {} };
+  const empty = renderToStaticMarkup(createElement(ScenarioRerunConsent, props));
+  assert.equal((empty.match(/type="password"/g) || []).length, 2);
+  assert.match(empty, /password/);
+  assert.match(empty, /autoComplete="off"/);
+  assert.match(empty, /class="button primary"[^>]*disabled/);
+  const credentials = { username: "test-user", password: "transient-value" };
+  const ready = renderToStaticMarkup(createElement(ScenarioRerunConsent, { ...props, credentials }));
+  assert.doesNotMatch(ready, /class="button primary"[^>]*disabled/);
+  const calls = [];
+  const request = async (...args) => { calls.push(args); return { id: "new" }; };
+  await assert.rejects(confirmScenarioRerun(request, "source", "CT001", true, true, undefined, {}, required), /dados privados/);
+  assert.equal(calls.length, 0);
+  await confirmScenarioRerun(request, "source", "CT001", true, true, undefined, credentials, required);
+  assert.equal(calls[0][0], "/explorations/source/scenarios/CT001/rerun");
+  assert.deepEqual(JSON.parse(calls[0][1].body), { confirm: true, credentials });
+  const source = await readFile(new URL("../app/AutoJevApp.tsx", import.meta.url), "utf8");
+  const dialog = source.slice(source.indexOf("export function ScenarioRerunDialog"), source.indexOf("function PageHeader"));
+  assert.match(dialog, /finally \{ setCredentials\(\{\}\)/);
+  assert.doesNotMatch(dialog, /localStorage|sessionStorage|history\./);
 });

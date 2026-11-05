@@ -260,3 +260,52 @@ async def test_cancelled_request_drains_missing_price_once(monkeypatch, ledger):
     assert repository.get_exploration(run_id, include_details=False)["usage"] == once
     assert once["by_role"]["auxiliary"]["usage_records"] == 1
     assert once["cost_complete"] is False
+
+
+def test_null_usage_cost_falls_back_to_top_level_price():
+    client = OpenAICompatibleClient("https://provider.test/v1", None)
+    client._record_usage({"usage": {"cost": None}, "cost": 0.012})
+    usage = client.drain_usage()
+    assert usage["cost"] == pytest.approx(0.012)
+    assert usage["cost_complete"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("price_source", ["body", "header"])
+async def test_failed_http_response_preserves_reported_price(monkeypatch, price_source):
+    transport = httpx.MockTransport(lambda request: httpx.Response(
+        502,
+        json={"error": "upstream failed", "usage": {"cost": 0.02}} if price_source == "body" else {"error": "upstream failed"},
+        headers={"x-litellm-response-cost": "0.02"} if price_source == "header" else {},
+    ))
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(transport=transport, **kwargs))
+    client = OpenAICompatibleClient("https://provider.test/v1", None)
+    with pytest.raises(ProviderConnectionError):
+        await client.chat_json("model", "system", "user")
+    usage = client.drain_usage()
+    assert usage["cost"] == pytest.approx(0.02)
+    assert usage["cost_complete"] is True
+    assert usage["usage_records"] == 1
+
+
+@pytest.mark.asyncio
+async def test_format_retry_accounts_for_both_response_prices(monkeypatch):
+    calls = 0
+
+    def respond(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(400, json={"error": "response_format unsupported", "cost": 0.001})
+        return httpx.Response(200, json={"usage": {"cost": 0.002}, "choices": [{"message": {"content": '{"ok":true}'}}]})
+
+    original = httpx.AsyncClient
+    transport = httpx.MockTransport(respond)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(transport=transport, **kwargs))
+    client = OpenAICompatibleClient("https://provider.test/v1", None)
+    assert await client.chat_json("model", "system", "user") == {"ok": True}
+    usage = client.drain_usage()
+    assert usage["cost"] == pytest.approx(0.003)
+    assert usage["cost_complete"] is True
+    assert usage["usage_records"] == 2

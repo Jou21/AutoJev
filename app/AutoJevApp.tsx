@@ -110,6 +110,10 @@ type ScenarioRerunPreflight = {
   checks?: string[];
   effects?: string[];
   manual_preparation_required?: boolean;
+  automatic_preparation?: boolean;
+  recipe_steps?: number;
+  completeness?: { complete: boolean; gaps: (string | { reason?: string; message?: string; step_number?: number })[] };
+  required_inputs?: string[];
   timeline_count?: number;
   action_index?: number;
   scope?: { local_checks?: boolean; visual_review?: boolean; database_steps?: boolean; missing_visual_checks?: boolean; visual_review_omitted?: boolean };
@@ -1110,7 +1114,7 @@ function formatTokens(value?: number) {
 
 function formatCost(usage?: UsageBucket) {
   if (!usage?.cost_known || typeof usage.cost !== "number" || !Number.isFinite(usage.cost) || usage.cost < 0) return "—";
-  return `$${usage.cost.toFixed(6)}${usage.cost_complete === false ? " (parcial)" : ""}`;
+  return `$${usage.cost.toFixed(6)}`;
 }
 
 export function CostBreakdown({ usage }: { usage?: Exploration["usage"] }) {
@@ -1130,10 +1134,10 @@ export function CostBreakdown({ usage }: { usage?: Exploration["usage"] }) {
         : value === "—"
           ? "Custo não informado pelo provedor."
           : bucket?.cost_complete === false
-            ? "Valor parcial: há chamadas sem custo informado."
+            ? "Subtotal informado pelo provedor; o valor final pode ser maior."
             : "";
       return <div className="cost-breakdown-item" key={key}>
-        <Icon size={17} aria-hidden="true" /><span>{label}</span><strong>{value}</strong>
+        <Icon size={17} aria-hidden="true" /><span>{bucket?.cost_complete === false && value !== "—" ? `${label} registrado` : label}</span><strong>{value}</strong>
         {note && <small>{note}</small>}
       </div>;
     })}
@@ -1191,7 +1195,7 @@ export function parseAppHash(hash: string): AppRoute {
     try {
       const source = decodeURIComponent(planning[1]), scenario = decodeURIComponent(planning[2]);
       const parameters = new URLSearchParams(planning[3] || "");
-      return { view: "explorations", suiteId: source, initialCaseId: scenario, initialSourceId: source, initialSourceCase: scenario,
+      return { view: "explorations", suiteId: source, initialTab: "planner", initialCaseId: scenario, initialSourceId: source, initialSourceCase: scenario,
         ...(parameters.has("capture_plan") ? { capturePlan: validateScenarioCapturePlan(JSON.parse(parameters.get("capture_plan")!)) } : {}) };
     } catch { return { view: "explorations" }; }
   }
@@ -1280,11 +1284,16 @@ export async function openTestSuiteReport(request: ApiRequest, options: { root: 
   }
 }
 
-export async function confirmScenarioRerun(request: ApiRequest, sourceId: string, scenarioId: string, consent: boolean, available: boolean, capturePlan?: ScenarioCapturePlan) {
+export function scenarioRerunRequiredInputs(preflight: ScenarioRerunPreflight | null) {
+  return [...new Set(preflight?.required_inputs || [])].map((key) => ({ key, label: key }));
+}
+
+export async function confirmScenarioRerun(request: ApiRequest, sourceId: string, scenarioId: string, consent: boolean, available: boolean, capturePlan?: ScenarioCapturePlan, credentials: Record<string, string> = {}, requiredInputs: { key: string }[] = []) {
   if (!consent || !available) throw new Error("Confirme os efeitos da reexecução antes de iniciar.");
+  if (requiredInputs.some(({ key }) => !Object.hasOwn(credentials, key) || !credentials[key]?.trim())) throw new Error("Informe os dados privados solicitados antes de iniciar.");
   const plan = capturePlan === undefined ? undefined : validateScenarioCapturePlan(capturePlan);
   return request<Exploration>(`/explorations/${encodeURIComponent(sourceId)}/scenarios/${encodeURIComponent(scenarioId)}/rerun`, {
-    method: "POST", body: JSON.stringify({ confirm: true, ...(plan ? { capture_plan: plan } : {}) }),
+    method: "POST", body: JSON.stringify({ confirm: true, ...(plan ? { capture_plan: plan } : {}), ...(Object.keys(credentials).length ? { credentials } : {}) }),
   });
 }
 
@@ -2145,7 +2154,7 @@ export default function AutoJevApp() {
   };
 
   return (
-    <div className={`app-shell${sidebarCollapsed ? " sidebar-collapsed" : ""}`}>
+    <div className={`app-shell${sidebarCollapsed ? " sidebar-collapsed" : ""}${route.view === "explorations" && route.suiteId ? " suite-fullscreen" : ""}`}>
       <a className="skip-link" href="#main-content">Pular para o conteúdo</a>
       {mobileNavOpen && <button className="nav-scrim" onClick={() => setMobileNavOpen(false)} aria-label="Fechar menu" />}
       <aside id="app-sidebar" className={`sidebar${mobileNavOpen ? " mobile-open" : ""}`}>
@@ -2275,37 +2284,44 @@ export default function AutoJevApp() {
   );
 }
 
-export function ScenarioRerunConsent({ preflight, loading, error, busy, consent, capturePlan, onConsent, onConfirm, onClose }: {
+export function ScenarioRerunConsent({ preflight, loading, error, busy, consent, capturePlan, credentials = {}, onCredentials, onConsent, onConfirm, onClose }: {
   preflight: ScenarioRerunPreflight | null;
   loading: boolean;
   error: string;
   busy: boolean;
   consent: boolean;
   capturePlan?: ScenarioCapturePlan;
+  credentials?: Record<string, string>;
+  onCredentials?: (key: string, value: string) => void;
   onConsent: (value: boolean) => void;
   onConfirm: () => void;
   onClose: () => void;
 }) {
+  const requiredInputs = scenarioRerunRequiredInputs(preflight);
+  const incomplete = preflight?.completeness?.complete === false;
+  const missingInputs = requiredInputs.some(({ key }) => !Object.hasOwn(credentials, key) || !credentials[key]?.trim());
   const checkpointCount = capturePlan?.checkpoints.length || 0;
   return <div className="modal-form rerun-confirmation">
-    {loading ? <p className="rerun-loading" role="status"><Spinner />Verificando se o CT pode ser reexecutado…</p> : error ? <p className="rerun-error" role="alert">{error}</p> : preflight && <>
+    {error && <p className="rerun-error" role="alert">{error}</p>}
+    {loading ? <p className="rerun-loading" role="status"><Spinner />Verificando se o CT pode ser reexecutado…</p> : preflight && <>
       <div className="rerun-case"><span className="section-kicker">{preflight.scenario_id || "Caso de teste original"}</span><strong>{preflight.title || "Reexecução de um CT"}</strong>{preflight.url && <span>{preflight.url}</span>}</div>
-      {!preflight.available ? <div className="rerun-unavailable" role="status"><AlertCircle size={20} /><div><strong>Reexecução indisponível para este CT</strong><p>{preflight.reason || "Esta execução não preservou uma receita segura para repetir a ação. Execute uma nova exploração para registrar receitas de reexecução."}</p></div></div> : <>
-        <div className="rerun-effects"><strong>Antes de confirmar</strong><p>A ação original será repetida uma única vez e pode alterar dados na aplicação testada. Não é uma simulação.</p>
-          <ul>{(preflight.effects?.length ? preflight.effects : ["Um novo navegador será aberto para preparar o teste.", "Somente a ação original deste CT será repetida.", "Um novo resultado e novas evidências serão registrados, preservando a execução original."]).map((effect, index) => <li key={index}>{effect}</li>)}</ul>
+      {!preflight.available || incomplete ? <div className="rerun-unavailable" role="status"><AlertCircle size={20} /><div><strong>{incomplete ? "Jornada incompleta — reexecução bloqueada" : "Reexecução indisponível para este CT"}</strong><p>{preflight.reason || "Esta execução não preservou uma receita segura para repetir a ação. Execute uma nova exploração para registrar receitas de reexecução."}</p>{incomplete && <ul aria-label="Lacunas da jornada">{preflight.completeness!.gaps.map((gap, index) => <li key={index}>{typeof gap === "string" ? gap : `${gap.step_number !== undefined ? `Etapa ${gap.step_number}: ` : ""}${gap.message || gap.reason || "Etapa sem receita completa"}`}</li>)}</ul>}</div></div> : <>
+        <div className="rerun-effects"><strong>Antes de confirmar</strong><p>{preflight.automatic_preparation ? "A preparação e todas as ações salvas serão executadas automaticamente e podem alterar dados na aplicação testada. Não é uma simulação." : "A ação original será repetida uma única vez e pode alterar dados na aplicação testada. Não é uma simulação."}</p>
+          <ul>{(preflight.effects?.length ? preflight.effects : [preflight.automatic_preparation ? "Um novo navegador executará a jornada salva, incluindo preparação e ações." : "Um novo navegador será aberto para preparar o teste.", preflight.automatic_preparation ? `${preflight.recipe_steps ?? "Todas as"} etapas da receita serão executadas na ordem salva.` : "Somente a ação original deste CT será repetida.", "Um novo resultado e novas evidências serão registrados, preservando a execução original."]).map((effect, index) => <li key={index}>{effect}</li>)}</ul>
         </div>
         <p className="rerun-local-note"><ShieldCheck size={17} />As verificações locais salvas serão repetidas, sem chamadas à LLM. {checkpointCount ? "Somente as pausas para print serão aplicadas. SWS e SQL continuam bloqueados e não serão executados." : "Nenhuma pausa para print foi incluída. SWS e SQL não serão executados."}</p>
         {checkpointCount > 0 && <div className="rerun-capture-plan"><span className="rerun-capture-plan-icon"><ImagePlus size={22} /></span><div><strong>{checkpointCount} {checkpointCount === 1 ? "pausa para print" : "pausas para print"} nesta reexecução</strong><p>Em cada pausa, adicione a imagem que você quiser na aplicação Test Lab: cole com Ctrl + V, arraste um arquivo ou escolha uma imagem PNG, JPG ou WEBP de até 10 MB. Pode ser de qualquer tela ou aplicativo; não há captura automática do navegador. Confira a prévia e clique em «Anexar print e continuar». A confirmação ocorre somente na aplicação Test Lab, nunca pela página testada. O print não aprova nem reprova o teste.</p><p>As pausas planejadas antes da ação ocorrem antes dela; as demais acontecem após a ação e suas conferências locais. A posição no rascunho fica registrada, sem interromper cada conferência individual.</p><p>Prazo de confirmação: até 15 minutos por pausa, com limite de 1 hora somando todas as pausas. Ao esgotar o prazo, a execução termina sem anexar ou continuar automaticamente.</p><ol>{[...capturePlan!.checkpoints].sort((left, right) => left.gap - right.gap || left.order - right.order).map((item) => <li key={item.id}><span>Aguardar print</span><small>Posição planejada: {item.gap === 0 ? "antes da primeira etapa" : `após a etapa ${item.gap}`}</small></li>)}</ol></div></div>}
         {preflight.scope?.missing_visual_checks ? <p className="rerun-local-note">Nem todas as conferências originais poderão ser repetidas: a conferência visual da LLM ficará pendente. A reexecução não confirmará essa parte do teste.</p> : preflight.scope?.visual_review_omitted && <p className="rerun-local-note">A revisão visual auxiliar não será repetida. As verificações locais podem ser concluídas normalmente; isso não equivale a uma aprovação visual.</p>}
-        <div className="rerun-preparation"><strong>Preencha o login e continue pelo Test Lab</strong><p>Se precisar entrar, preencha usuário e senha no novo navegador. Ao clicar em «Continuar reexecução», o Test Lab tentará enviar um formulário de login preenchido e seguro. Se já estiver conectado, apenas conferirá a preparação. Recrie as pré-condições do CT e abra a página esperada; a ação original só será executada após essa conferência.</p></div>
-        <label className="rerun-consent"><input type="checkbox" checked={consent} disabled={busy} onChange={(event) => onConsent(event.target.checked)} /><span>Entendo que esta reexecução é real, pode tentar entrar com o login que eu preencher e pode modificar dados da aplicação{checkpointCount ? " e aguardará minha confirmação para cada print; SWS e SQL não serão executados." : " e não executará SWS ou SQL."}</span></label>
+        {preflight.automatic_preparation ? <div className="rerun-preparation"><strong>Preparação automática</strong><p>O Test Lab executará as pré-condições e as ações da jornada salva, conferindo o estado em cada passo. Não é necessário preparar o navegador manualmente.</p></div> : <div className="rerun-preparation"><strong>Preencha o login e continue pelo Test Lab</strong><p>Se precisar entrar, preencha usuário e senha no novo navegador. Ao clicar em «Continuar reexecução», o Test Lab tentará enviar um formulário de login preenchido e seguro. Se já estiver conectado, apenas conferirá a preparação. Recrie as pré-condições do CT e abra a página esperada; a ação original só será executada após essa conferência.</p></div>}
+        {requiredInputs.length > 0 && <fieldset disabled={busy} className="rerun-private-inputs"><legend>Dados privados necessários para esta reexecução</legend><p>Informe novamente os valores solicitados. Serão enviados somente para esta execução e mantidos no cofre temporário; não serão salvos no histórico nem neste navegador.</p>{requiredInputs.map(({ key, label }, index) => <label key={key} htmlFor={`rerun-private-${index}`}>{label}<input id={`rerun-private-${index}`} type="password" autoComplete="off" required maxLength={8000} value={Object.hasOwn(credentials, key) ? credentials[key] : ""} onChange={(event) => onCredentials?.(key, event.target.value)} /></label>)}</fieldset>}
+        <label className="rerun-consent"><input type="checkbox" checked={consent} disabled={busy} onChange={(event) => onConsent(event.target.checked)} /><span>Entendo que esta reexecução é real, {preflight.automatic_preparation ? "executará a preparação e as ações salvas com os dados privados fornecidos" : "pode tentar entrar com o login que eu preencher"} e pode modificar dados da aplicação{checkpointCount ? " e aguardará minha confirmação para cada print; SWS e SQL não serão executados." : " e não executará SWS ou SQL."}</span></label>
       </>}
     </>}
-    <div className="modal-actions"><button type="button" className="button ghost" disabled={busy} onClick={onClose}>Voltar sem reexecutar</button><button type="button" className="button primary" disabled={loading || busy || !!error || !preflight?.available || !consent} onClick={onConfirm}>{busy ? <Spinner /> : <Play size={16} />}{busy ? "Criando execução…" : "Confirmar reexecução real"}</button></div>
+    <div className="modal-actions"><button type="button" className="button ghost" disabled={busy} onClick={onClose}>Voltar sem reexecutar</button><button type="button" className="button primary" disabled={loading || busy || !!error || !preflight?.available || incomplete || missingInputs || !consent} onClick={onConfirm}>{busy ? <Spinner /> : <Play size={16} />}{busy ? "Criando execução…" : "Confirmar reexecução real"}</button></div>
   </div>;
 }
 
-function ScenarioRerunDialog({ sourceId, scenarioId, capturePlan, capturePlanError, request, onClose, onCreated }: {
+export function ScenarioRerunDialog({ sourceId, scenarioId, capturePlan, capturePlanError, request, onClose, onCreated }: {
   sourceId: string;
   scenarioId: string;
   capturePlan?: ScenarioCapturePlan;
@@ -2320,6 +2336,8 @@ function ScenarioRerunDialog({ sourceId, scenarioId, capturePlan, capturePlanErr
   const [consent, setConsent] = useState(false);
   const [busy, setBusy] = useState(false);
   const confirming = useRef(false);
+  const [credentials, setCredentials] = useState<Record<string, string>>({});
+  const requiredInputs = scenarioRerunRequiredInputs(preflight);
   const planError = capturePlanError || (!loading && preflight ? validateCapturePlanForPreflight(capturePlan, preflight) : "");
   useEffect(() => {
     const controller = new AbortController();
@@ -2330,19 +2348,20 @@ function ScenarioRerunDialog({ sourceId, scenarioId, capturePlan, capturePlanErr
     return () => controller.abort();
   }, [request, sourceId, scenarioId]);
   const confirm = async () => {
-    if (confirming.current || !consent || !preflight?.available || loading || error || planError) return;
+    if (confirming.current || !consent || !preflight?.available || preflight.completeness?.complete === false || requiredInputs.some(({ key }) => !Object.hasOwn(credentials, key) || !credentials[key]?.trim()) || loading || error || planError) return;
     confirming.current = true;
     setBusy(true);
     setError("");
     try {
-      const created = await confirmScenarioRerun(request, sourceId, scenarioId, consent, preflight.available, capturePlan);
+      const created = await confirmScenarioRerun(request, sourceId, scenarioId, consent, preflight.available, capturePlan, credentials, requiredInputs);
+      setCredentials({});
       if (!created || typeof created.id !== "string" || !created.id) throw new Error("A API não informou a nova execução. Atualize o histórico antes de tentar novamente.");
       onCreated(created);
     } catch (caught) { setError(errorMessage(caught)); }
-    finally { confirming.current = false; setBusy(false); }
+    finally { setCredentials({}); confirming.current = false; setBusy(false); }
   };
   return <Modal title="Reexecutar um caso de teste" description="Nova execução isolada. As versões anteriores e suas evidências ficam preservadas no histórico do teste; o relatório de origem mostra o resultado mais recente." onClose={() => { if (!confirming.current) onClose(); }}>
-    <ScenarioRerunConsent preflight={preflight} loading={loading} error={planError || error} busy={busy} consent={consent} capturePlan={capturePlan} onConsent={setConsent} onConfirm={() => void confirm()} onClose={onClose} />
+    <ScenarioRerunConsent preflight={preflight} loading={loading} error={planError || error} busy={busy} consent={consent} capturePlan={capturePlan} credentials={credentials} onCredentials={(key, value) => { setError(""); setCredentials((previous) => ({ ...previous, [key]: value })); }} onConsent={(value) => { setError(""); setConsent(value); }} onConfirm={() => void confirm()} onClose={onClose} />
   </Modal>;
 }
 

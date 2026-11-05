@@ -66,10 +66,11 @@ def test_named_functional_flows_preserve_case_identity_evidence_and_results(tmp_
     assert document.count('<details class="scenario"') == 5
     assert 'id="crud-filter"' not in document
     assert 'data-case-focus="primary"' not in document
-    assert 'data-select-flow="unclassified"' in document
+    assert '<option value="unclassified">Não classificados (1)</option>' in document
     for name in flows:
         assert name in document
-    assert 'class="functional-flow-card"' in document
+    assert 'class="functional-flow-card"' not in document
+    assert 'id="flow-filter" aria-label="Filtrar por fluxo funcional"' in document
     assert "não representam cobertura" in document
     assert run == before
 
@@ -86,8 +87,8 @@ def test_flow_classification_is_present_in_all_export_scopes_and_safe_for_empty_
     empty = render(tmp_path, run)
     assert data(empty)["cases"] == []
     assert data(empty)["functional_flows"] == []
-    assert "Nenhum fluxo identificado" in empty
-    assert 'data-flow-unclassified-count>0</span>' in empty
+    assert '<option value="all">Todos os fluxos (0)</option>' in empty
+    assert '<option value="unclassified">Não classificados (0)</option>' in empty
 
 
 @pytest.mark.parametrize("scope", ["initial", "consolidated", "round"])

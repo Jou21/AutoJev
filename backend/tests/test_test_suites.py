@@ -189,7 +189,7 @@ def test_manual_round_is_sequential_explicit_idempotent_and_preserves_snapshots(
 def test_auto_round_uses_individual_executor_once_and_retains_real_evidence_owner(runtime):
     app, client, root = runtime
     service = app.state.scenario_rerun_service
-    service.preflight = lambda run, case: {"available": True, "timeline_count": 2, "action_index": 1}
+    service.preflight = lambda run, case, **kwargs: {"available": True, "timeline_count": 2, "action_index": 1}
     calls = []
     def submit(run, case, **options):
         calls.append((run, case, options))
@@ -388,3 +388,180 @@ def test_manual_cases_do_not_accept_hidden_automatic_integration_steps(runtime):
         "planned_integrations": [{"id": "db-1", "gap": 0, "order": 0, "kind": "sql"}]}]})
     assert response.status_code == 409
     assert not app.state.test_suite_service.store.list(root)
+
+
+def test_saving_many_cases_loads_each_source_and_lineage_once(runtime, monkeypatch):
+    from autojev.services import test_suites
+    app, _, root = runtime
+    service = app.state.test_suite_service
+    repo = app.state.repository
+    source = repo.get_exploration(root)
+    original = source["scenarios"][0]
+    cases = []
+    for index in range(152):
+        case = deepcopy(original)
+        case["id"] = f"CT{index + 1:03}"
+        source["scenarios"].append(case) if index else None
+        cases.append({**case, "mode": "automatic", "revision": 1,
+                      "lineage_exploration_id": root, "lineage_case_id": case["id"],
+                      "source_exploration_id": root, "source_scenario_id": case["id"]})
+    monkeypatch.setattr(service, "catalog", lambda _: {"id": root, "cases": cases})
+    loads, origins = [], []
+    def load(identity):
+        loads.append(identity)
+        return source
+    def origin(repository, identity):
+        origins.append(identity)
+        return {"report_exploration_id": root, "report_scenario_id": None}
+    monkeypatch.setattr(repo, "get_exploration", load)
+    monkeypatch.setattr(test_suites, "scenario_report_origin", origin)
+    plan = service.save_plan(root, "152 testes", [{"case_id": case["id"]} for case in cases])
+    assert len(plan["items"]) == 152
+    assert loads == [root]
+    assert origins == [root]
+
+
+def test_review_batches_source_loading_and_keeps_checks_fresh(runtime, monkeypatch):
+    from autojev.services import scenario_rerun
+    app, client, root = runtime
+    repo = app.state.repository
+    plan = create_plan(client, root, ["CT001"])
+    service = app.state.scenario_rerun_service
+    original_load = repo.get_exploration
+    original_prepare = scenario_rerun.prepare_scenario_timelines
+    loads, preparations = [], []
+    def load(identity, *args, **kwargs):
+        loads.append(identity)
+        return original_load(identity, *args, **kwargs)
+    def prepare(item):
+        preparations.append(item["id"])
+        if len(preparations) == 1:
+            assert "events" not in item
+            assert all("rerun_journey" not in case.get("evidence", {}) for case in item["scenarios"])
+        return original_prepare(item)
+    monkeypatch.setattr(repo, "get_exploration", load)
+    monkeypatch.setattr(scenario_rerun, "prepare_scenario_timelines", prepare)
+    checks = service.preflight_many([(root, "CT001")] * 152)
+    assert len(checks) == 152
+    assert all(check == checks[0] for check in checks)
+    assert loads == [root]
+    assert preparations == [root]
+    assert checks[0] == service.preflight(root, "CT001")
+    repo.update_exploration(root, status="running")
+    assert service.preflight_many([(root, "CT001")])[0]["code"] == "source_running"
+    missing = service.preflight_many([(root, "missing"), ("missing", "CT001")])
+    assert all(not check["available"] for check in missing)
+
+
+def test_round_private_inputs_require_explicit_values_use_vault_and_never_persist(runtime):
+    import json
+    app, client, root = runtime
+    reruns = app.state.scenario_rerun_service
+    vault = reruns.manager.credential_vault
+    reruns.preflight = lambda run, case, **kwargs: {
+        "available": True, "timeline_count": 2, "action_index": 1,
+        "automatic_preparation": True, "required_inputs": ["login_alias"],
+    }
+    plan = create_plan(client, root, ["CT001"])
+    path = f"/api/test-suites/rounds/{plan['id']}"
+    validation = client.post(path + "/validate").json()
+    assert validation["available"] is True
+    assert validation["required_inputs"] == ["login_alias"]
+    assert validation["items"][0]["required_inputs"] == ["login_alias"]
+    calls = []
+
+    def submit(run, case, **options):
+        assert vault.get(plan["id"]) == {"login_alias": "private-round-value"}
+        calls.append(options)
+        repo = app.state.repository
+        child = repo.create_exploration(ExplorationRequest("https://shop.test", ModelSelection("local", "agent"), ModelSelection("local", "aux"), ExplorationOptions()))
+        repo.add_scenario(child, 1, StoredScenario(**repo.get_exploration(root)["scenarios"][0]))
+        repo.update_exploration(child, status="completed")
+        return child
+
+    reruns.submit = submit
+    for credentials in [{}, {"login_alias": ""}, {"login_alias": "   "}, {"different": "private-round-value"}]:
+        response = client.post(path + "/start", json={"confirm": True, "expected_revision": 1, "credentials": credentials})
+        assert response.status_code == 409, response.text
+        assert app.state.test_suite_service.store.get(plan["id"])["status"] == "draft"
+        assert vault.get(plan["id"]) == {}
+    assert calls == []
+    response = client.post(path + "/start", json={"confirm": True, "expected_revision": 1,
+        "credentials": {"login_alias": "private-round-value", "unused": "not-dispatched"}})
+    assert response.status_code == 202, response.text
+    final = round_state(client, plan["id"], "completed")
+    assert calls == [{"capture_plan": None, "credentials": {"login_alias": "private-round-value"}}]
+    assert vault.get(plan["id"]) == {}
+    persisted = json.dumps(app.state.test_suite_service.store.get(plan["id"]))
+    assert "private-round-value" not in persisted and "not-dispatched" not in persisted
+    assert "credentials" not in persisted
+    assert "private-round-value" not in json.dumps(final)
+    # Accepted starts are idempotent and cannot replace the already-discarded vault.
+    assert client.post(path + "/start", json={"confirm": True, "expected_revision": 1,
+        "credentials": {"login_alias": "replacement"}}).status_code == 202
+    assert len(calls) == 1 and vault.get(plan["id"]) == {}
+
+
+def test_round_private_vault_is_discarded_when_dispatch_fails(runtime):
+    app, client, root = runtime
+    reruns = app.state.scenario_rerun_service
+    reruns.preflight = lambda *args, **kwargs: {"available": True, "timeline_count": 2, "action_index": 1, "required_inputs": ["private_alias"]}
+    plan = create_plan(client, root, ["CT001"])
+    def fail(*args, **kwargs):
+        raise ValueError("Dispatch failed")
+    reruns.submit = fail
+    response = client.post(f"/api/test-suites/rounds/{plan['id']}/start", json={"confirm": True, "expected_revision": 1,
+        "credentials": {"private_alias": "one-round-only"}})
+    assert response.status_code == 202
+    round_state(client, plan["id"], "interrupted")
+    assert reruns.manager.credential_vault.get(plan["id"]) == {}
+
+
+@pytest.mark.parametrize("credentials", [{"": "value"}, {"x" * 101: "value"}, {"alias": "x" * 8001}])
+def test_round_start_rejects_invalid_private_input_schema(runtime, credentials):
+    app, client, root = runtime
+    plan = create_plan(client, root, ["CT001"])
+    response = client.post(f"/api/test-suites/rounds/{plan['id']}/start", json={"confirm": True, "expected_revision": 1, "credentials": credentials})
+    assert response.status_code == 422
+    assert app.state.test_suite_service.store.get(plan["id"])["status"] == "draft"
+
+
+def test_round_shutdown_discards_private_vault_even_before_task_starts(runtime):
+    app, client, root = runtime
+    service = app.state.test_suite_service
+    manual = new_manual(client, root)
+    plan = create_plan(client, root, [manual["id"]])
+    vault = service.reruns.manager.credential_vault
+    async def start_and_shutdown():
+        service.start(plan["id"], 1)
+        vault.put(plan["id"], {"private_alias": "shutdown-only"})
+        await service.shutdown()
+        assert vault.get(plan["id"]) == {}
+    client.portal.call(start_and_shutdown)
+    assert service.store.get(plan["id"])["status"] == "interrupted"
+
+
+def test_review_does_not_copy_large_events_or_private_journeys(runtime, monkeypatch):
+    app, client, root = runtime
+    service = app.state.scenario_rerun_service
+    snapshot = app.state.repository.get_exploration(root)
+
+    class NoCopy(dict):
+        def __deepcopy__(self, memo):
+            raise AssertionError("Readiness must not copy replay contracts or event logs")
+
+    snapshot["events"] = [NoCopy(large="event")]
+    for case in snapshot["scenarios"]:
+        case.setdefault("evidence", {})["rerun_journey"] = NoCopy(private="contract")
+    monkeypatch.setattr(app.state.repository, "get_exploration", lambda _: snapshot)
+    checked = []
+
+    def preflight(exploration_id, scenario_id, *, _item, _timeline):
+        checked.append(_item)
+        assert _item is snapshot
+        assert isinstance(_item["scenarios"][0]["evidence"]["rerun_journey"], NoCopy)
+        return {"available": True}
+
+    monkeypatch.setattr(service, "preflight", preflight)
+    assert len(service.preflight_many([(root, "CT001")] * 151)) == 151
+    assert len(checked) == 151

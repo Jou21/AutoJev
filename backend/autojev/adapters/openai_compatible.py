@@ -560,7 +560,9 @@ class OpenAICompatibleClient:
         prompt = token_count(usage.get("prompt_tokens") or usage.get("input_tokens"))
         completion = token_count(usage.get("completion_tokens") or usage.get("output_tokens"))
         total = token_count(usage.get("total_tokens") or prompt + completion)
-        raw_cost = usage.get("cost", body.get("cost"))
+        raw_cost = usage.get("cost")
+        if raw_cost is None:
+            raw_cost = body.get("cost")
         if raw_cost is None and headers is not None:
             # LiteLLM proxies (e.g. CodeAI) report the per-call price in a
             # response header instead of the JSON body.
@@ -826,17 +828,29 @@ class OpenAICompatibleClient:
                     # One compatibility retry only for explicit format rejection;
                     # malformed requests, 429, auth and strict schema errors must
                     # not be silently retried or downgrade visual guarantees.
+                    try:
+                        rejected_body = response.json()
+                    except ValueError:
+                        rejected_body = {}
+                    self._record_usage(rejected_body, getattr(response, "headers", None))
+                    usage_recorded = True
                     payload.pop("response_format", None)
                     self._claim_chat_request()
+                    usage_recorded = False
                     response = await client.post(
                         _api_url(self.base_url, "chat/completions"),
                         headers=_headers(self.api_key),
                         json=payload,
                     )
-                response.raise_for_status()
-                body = response.json()
+                # Failed responses may still carry billed usage (for example
+                # a gateway failure after inference). Account before raising.
+                try:
+                    body = response.json()
+                except ValueError:
+                    body = {}
                 self._record_usage(body, getattr(response, "headers", None))
                 usage_recorded = True
+                response.raise_for_status()
                 content = body["choices"][0]["message"]["content"]
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
             raise ProviderConnectionError(

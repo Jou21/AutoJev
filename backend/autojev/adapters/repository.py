@@ -548,6 +548,73 @@ class SQLiteRepository:
             for key, value in asdict(scenario).items()
         }
         with self._lock, self._connect() as connection:
+            # Capture the entire dispatched prefix atomically with the CT. No
+            # browser refs, cookies, or private field values are reconstructed.
+            step = (data.get("evidence") or {}).get("action_step")
+            if type(step) is int and step > 0:
+                rows = connection.execute(
+                    "SELECT step_number, result_json FROM actions WHERE exploration_id = ? AND step_number <= ? ORDER BY step_number, id",
+                    (exploration_id, step),
+                ).fetchall()
+                actions = [{"step_number": row["step_number"], "result": json.loads(row["result_json"])} for row in rows]
+                if any(((action["result"].get("evidence") or {}).get("rerun_recipe") or {}).get("journey_capture") is True for action in actions):
+                    from autojev.services.rerun_journey import build_rerun_journey
+                    owner = connection.execute("SELECT app_url FROM explorations WHERE id = ?", (exploration_id,)).fetchone()
+                    checks = data["evidence"].get("assertions") or []
+                    previous = connection.execute(
+                        "SELECT data_json FROM scenarios WHERE exploration_id = ? AND sequence = ?",
+                        (exploration_id, sequence),
+                    ).fetchone()
+                    if previous:
+                        prior = json.loads(previous["data_json"]).get("evidence") or {}
+                        prior_checks = [check for check in prior.get("assertions") or [] if check.get("kind") != "visual_model"]
+                        local_checks = [check for check in checks if check.get("kind") != "visual_model"]
+                        # Auxiliary enrichment must not replace a captured local
+                        # replay contract with a new, non-replayable model opinion.
+                        if (prior.get("action_step") == step and prior.get("rerun_journey", {}).get("complete") is True
+                                and local_checks == prior_checks):
+                            checks = prior_checks
+                    journey = build_rerun_journey(actions, step, owner["app_url"], checks)
+                    setup_rows = connection.execute(
+                        "SELECT payload_json FROM exploration_events WHERE exploration_id = ? AND type = 'rerun_authentication_setup' ORDER BY id",
+                        (exploration_id,),
+                    ).fetchall()
+                    setups = [json.loads(row["payload_json"]) for row in setup_rows]
+                    applicable = [entry for entry in setups if entry.get("after_step", 0) < step]
+                    if applicable:
+                        journey["authentications"] = applicable
+                        initial = [entry for entry in applicable if entry.get("after_step") == 0]
+                        if initial:
+                            journey["entry_url"] = initial[0]["setup"].get("before_url")
+                        from autojev.services.rerun_setup import validate_authentication_setup
+                        from autojev.services.rerun_recipe import RerunRecipeBlocked
+                        for entry in applicable:
+                            try:
+                                validate_authentication_setup(entry["setup"], owner["app_url"])
+                            except RerunRecipeBlocked as exc:
+                                journey["gaps"].append({"reason": exc.reason})
+                    initial_row = connection.execute(
+                        "SELECT payload_json FROM exploration_events WHERE exploration_id = ? AND type = 'rerun_initial_contract' ORDER BY id LIMIT 1",
+                        (exploration_id,),
+                    ).fetchone()
+                    if initial_row is not None and not any(entry.get("after_step") == 0 for entry in applicable):
+                        initial_contract = json.loads(initial_row["payload_json"])
+                        first = next((entry["recipe"] for entry in journey["steps"] if entry["step_number"] == 1), {})
+                        if (initial_contract.get("gap") or initial_contract.get("entry_url") != first.get("before_url")
+                                or initial_contract.get("state_digest") != first.get("before_state_digest")
+                                or initial_contract.get("effect_digest") != first.get("before_effect_digest")):
+                            journey["gaps"].append({"reason": "unrecorded_initial_preparation"})
+                    journey["complete"] = not journey["gaps"]
+                    data.setdefault("evidence", {})["rerun_journey"] = journey
+            elif connection.execute(
+                "SELECT 1 FROM exploration_events WHERE exploration_id = ? AND type = 'rerun_initial_contract' LIMIT 1",
+                (exploration_id,),
+            ).fetchone() is not None:
+                data.setdefault("evidence", {})["rerun_journey"] = {
+                    "version": "ct-journey-v1", "action_step": None, "entry_url": None,
+                    "steps": [], "checks": [], "complete": False,
+                    "gaps": [{"reason": "observation_only_without_action_recipe"}],
+                }
             connection.execute(
                 "INSERT OR REPLACE INTO scenarios VALUES (?, ?, ?, ?, ?)",
                 (

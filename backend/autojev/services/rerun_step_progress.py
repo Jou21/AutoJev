@@ -246,7 +246,9 @@ def project_step_progress(item: dict[str, Any], rerun: dict[str, Any],
             current = next((row for row in rows if row["state"] == "pending" and row.get("kind") != "capture_wait"), None)
             if current:
                 current.update(state="waiting" if phase == "waiting_preparation" else "active", label="Preparando a página",
-                               description="Conclua os pré-requisitos e confirme a continuação. Nenhuma ação do CT está concluída ainda.")
+                               description=(f"Executando a preparação salva: ação {rerun.get('setup_step', 1)} de {rerun.get('setup_total', 0)}."
+                                            if rerun.get("manual_preparation_required") is False else
+                                            "Conclua os pré-requisitos e confirme a continuação. Nenhuma ação do CT está concluída ainda."))
         elif phase == "executing":
             current = next((row for row in rows if row["state"] == "pending" and row.get("kind") == "action"), None)
             if current:

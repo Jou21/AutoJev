@@ -175,13 +175,17 @@ class ScenarioRerunService:
             if item.get("status") not in TERMINAL_STATUSES:
                 self.state_for(item["id"])
 
-    def _source(self, exploration_id: str, scenario_id: str) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None, dict[str, Any] | None]:
-        item = self.repository.get_exploration(exploration_id)
+    def _source(self, exploration_id: str, scenario_id: str, item: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None, dict[str, Any] | None]:
+        if item is None:
+            item = self.repository.get_exploration(exploration_id)
         scenario = next((s for s in item.get("scenarios", []) if s.get("id") == scenario_id), None)
         if scenario is None:
             raise NotFoundError(f"Scenario {scenario_id} was not found")
         evidence = scenario.get("evidence") or {}
         step = evidence.get("action_step")
+        timeline = self._attempt_timeline(item, scenario)
+        if timeline != evidence.get("timeline", []):
+            scenario = {**scenario, "evidence": {**evidence, "timeline": timeline}}
         matching = [a for a in item.get("actions", []) if step is not None and a.get("step_number") == step]
         action = matching[0] if len(matching) == 1 else None
         # Recipes are private browser-dispatch records, never scenario/model
@@ -189,8 +193,72 @@ class ScenarioRerunService:
         recipe = ((((action or {}).get("result") or {}).get("evidence") or {}).get("rerun_recipe"))
         return item, scenario, action, recipe if isinstance(recipe, dict) else None
 
-    def preflight(self, exploration_id: str, scenario_id: str) -> dict[str, Any]:
-        item, scenario, action, recipe = self._source(exploration_id, scenario_id)
+    @staticmethod
+    def _attempt_timeline(item: dict[str, Any], scenario: dict[str, Any]) -> list[dict[str, Any]]:
+        evidence = scenario.get("evidence") or {}
+        timeline = evidence.get("timeline") or []
+        entries = [entry for entry in timeline if entry.get("kind") == "action"]
+        step = evidence.get("action_step")
+        if len(entries) < 2 or step is None:
+            return timeline
+        actions = {action.get("step_number"): action for action in item.get("actions", [])}
+        chosen = actions.get(step)
+        if not chosen:
+            return timeline
+        def signature(action):
+            decision = action.get("decision") or {}
+            details = (action.get("result") or {}).get("evidence") or {}
+            recipe = details.get("rerun_recipe") or {}
+            identity = (details.get("business_input") or {}).get("identity") or recipe.get("target_fingerprint")
+            return (decision.get("action"), decision.get("value"), decision.get("key"), decision.get("url"), identity)
+        expected = signature(chosen)
+        # Exploration merges repeated attempts of one semantic CT. Those are
+        # history, not a multi-action script. Require durable identity equality.
+        if not expected[-1] or any(signature(actions.get(entry.get("step_number"), {})) != expected for entry in entries):
+            return timeline
+        native = ((chosen.get("result") or {}).get("evidence") or {}).get("timeline") or []
+        if sum(entry.get("kind") == "action" for entry in native) != 1:
+            return timeline
+        return native
+
+    def preflight_many(self, sources: list[tuple[str, str]]) -> list[dict[str, Any]]:
+        # Request-scoped snapshots: never reuse stale readiness across reviews.
+        snapshots, timelines, results = {}, {}, []
+        for exploration_id, scenario_id in sources:
+            try:
+                if exploration_id not in snapshots:
+                    snapshots[exploration_id] = self.repository.get_exploration(exploration_id)
+                    snapshot = snapshots[exploration_id]
+                    # Timeline rendering does not consume events or replay
+                    # journeys. Copying every growing journey for every CT
+                    # makes a local readiness check quadratic in run length.
+                    timeline_source = {
+                        key: snapshot[key] for key in
+                        ("id", "app_url", "timeline_version", "actions", "screenshots", "issues")
+                        if key in snapshot
+                    }
+                    timeline_source["scenarios"] = [
+                        {**case, "evidence": {
+                            key: value for key, value in (case.get("evidence") or {}).items()
+                            if key != "rerun_journey"
+                        }} for case in snapshot.get("scenarios", [])
+                    ]
+                    prepared = prepare_scenario_timelines(timeline_source)
+                    timelines[exploration_id] = {}
+                    for entry in prepared.get("scenarios", []):
+                        evidence = entry.get("evidence") or {}
+                        attempt = self._attempt_timeline(snapshots[exploration_id], entry)
+                        timelines[exploration_id][entry["id"]] = presentation_scenario_steps({**evidence, "timeline": attempt})
+                results.append(self.preflight(exploration_id, scenario_id,
+                    _item=snapshots[exploration_id], _timeline=timelines[exploration_id].get(scenario_id, [])))
+            except (ValueError, NotFoundError) as exc:
+                results.append({"available": False, "reason": str(exc)})
+        return results
+
+    def preflight(self, exploration_id: str, scenario_id: str, *,
+                  _item: dict[str, Any] | None = None,
+                  _timeline: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        item, scenario, action, recipe = self._source(exploration_id, scenario_id, _item)
         evidence = scenario.get("evidence") or {}
         raw_assertions = evidence.get("assertions") or []
         assertions = raw_assertions if isinstance(raw_assertions, list) else []
@@ -211,11 +279,30 @@ class ScenarioRerunService:
             "scope": {"local_checks": True, "visual_review": False, "database_steps": False,
                       "missing_visual_checks": visual, "visual_review_omitted": visual_review_omitted},
         }
-        timeline = self._source_timeline(item, scenario_id)
+        timeline = self._source_timeline(item, scenario_id) if _timeline is None else _timeline
         action_positions = [index for index, entry in enumerate(timeline) if entry.get("kind") == "action"]
         result.update(timeline_count=len(timeline), action_index=action_positions[0] if len(action_positions) == 1 else None)
         code, reason = None, None
         action_entries = [e for e in evidence.get("timeline", []) if isinstance(e, dict) and e.get("kind") == "action"]
+        journey = evidence.get("rerun_journey")
+        if isinstance(journey, dict):
+            from autojev.services.rerun_journey import validate_rerun_journey, required_journey_inputs
+            try:
+                validate_rerun_journey(journey, item["app_url"])
+                result["required_inputs"] = required_journey_inputs(journey)
+            except RerunRecipeBlocked as exc:
+                result.update(code="incomplete_journey", reason=f"Receita incompleta: {exc.reason}",
+                              completeness={"complete": False, "gaps": journey.get("gaps", [])})
+                return result
+            if str(item.get("status")) not in TERMINAL_STATUSES:
+                result.update(code="source_running", reason="Aguarde o encerramento da execução original.")
+                return result
+            result.update(available=True, code="ready", url=journey["entry_url"],
+                          reason="A preparação e as ações salvas serão executadas com conferência de estado em cada passo.",
+                          action_index=action_positions[-1] if action_positions else 0,
+                          completeness={"complete": True, "gaps": []},
+                          automatic_preparation=True, recipe_steps=len(journey["steps"]))
+            return result
         if str(item.get("status")) not in TERMINAL_STATUSES:
             code, reason = "source_running", "Aguarde o encerramento da execução original."
         elif len(action_entries) > 1:
@@ -249,6 +336,10 @@ class ScenarioRerunService:
 
     @staticmethod
     def _source_timeline(item: dict[str, Any], scenario_id: str) -> list[dict[str, Any]]:
+        original = next((entry for entry in item.get("scenarios", []) if entry.get("id") == scenario_id), {})
+        timeline = ScenarioRerunService._attempt_timeline(item, original)
+        if timeline != (original.get("evidence") or {}).get("timeline", []):
+            return presentation_scenario_steps({**(original.get("evidence") or {}), "timeline": timeline})
         prepared = prepare_scenario_timelines(item)
         scenario = next((entry for entry in prepared.get("scenarios", []) if entry.get("id") == scenario_id), {})
         # A rerun of a rerun uses the very same roteiro order as its report
@@ -285,6 +376,10 @@ class ScenarioRerunService:
         if not preflight["available"]:
             raise ValueError(preflight["reason"])
         item, scenario, action, recipe = self._source(exploration_id, scenario_id)
+        required_inputs = preflight.get("required_inputs") or []
+        if any(not isinstance((credentials or {}).get(key), str) or not (credentials or {})[key]
+               for key in required_inputs):
+            raise ValueError("Informe explicitamente os insumos privados solicitados para esta reexecução.")
         capture_plan = self._capture_plan(capture_plan, preflight["timeline_count"], preflight["action_index"])
         source_steps = self._source_timeline(item, scenario_id)
         position_anchors = {
@@ -303,7 +398,7 @@ class ScenarioRerunService:
         new_id = self.repository.create_exploration(request)
         self.manager.credential_vault.put(new_id, credentials or {})
         source = {"source_exploration_id": exploration_id, "source_scenario_id": scenario_id,
-                  "scope": preflight["scope"], "manual_preparation_required": True,
+                  "scope": preflight["scope"], "manual_preparation_required": not preflight.get("automatic_preparation", False),
                   "custom_steps_executed": False, "model_calls": False,
                   "capture_plan": capture_plan, "capture_count": len(capture_plan["checkpoints"]),
                   "captures_completed": 0, "capture_action_index": preflight["action_index"],
@@ -1068,7 +1163,8 @@ class ScenarioRerunService:
         initial_recorded = False
         capture_wait_total = 0.0
         terminal, reason = ExplorationStatus.PARTIAL, None
-        secrets = list(self.manager.credential_vault.get(exploration_id).values())
+        replay_credentials = self.manager.credential_vault.get(exploration_id)
+        secrets = list(replay_credentials.values())
         try:
             # Manual print waits have their own finite budget. They must not
             # consume the original operation/preparation budget, nor make the
@@ -1084,7 +1180,8 @@ class ScenarioRerunService:
                 def operation_timeout() -> float:
                     return min(self.operation_timeout_seconds, max(0.1, deadline - time.monotonic()))
                 executor = PlaywrightExecutor(self.settings.artifact_dir / exploration_id / "screenshots", options,
-                                               headless=False, browser_name=self.settings.browser, secret_values=secrets)
+                                               headless=False, browser_name=self.settings.browser, secret_values=secrets,
+                                               replay_credentials=replay_credentials)
                 configure_panel = getattr(executor, "configure_rerun_panel", None)
                 if callable(configure_panel):
                     async def capture_handler(checkpoint_id: str, checkpoint_version: int,
@@ -1112,7 +1209,13 @@ class ScenarioRerunService:
                     configure_consent(consent_handler)
                 self.repository.update_exploration(exploration_id, status=ExplorationStatus.RUNNING, started_at=utc_now())
                 self._persist(exploration_id, phase="preparing")
-                observation = await asyncio.wait_for(executor.start(recipe["before_url"]), operation_timeout())
+                journey = (original.get("evidence") or {}).get("rerun_journey")
+                automatic_journey = isinstance(journey, dict)
+                replay_step = 1
+                setup_assertions = []
+                setup_timeline = []
+                start_url = journey["entry_url"] if automatic_journey else recipe["before_url"]
+                observation = await asyncio.wait_for(executor.start(start_url), operation_timeout())
                 if callable(getattr(executor, "update_rerun_panel", None)):
                     browser_panel_task = asyncio.create_task(self._stream_browser_panel(exploration_id, executor, secrets))
                 self.repository.update_exploration(exploration_id, current_url=observation.url)
@@ -1121,6 +1224,70 @@ class ScenarioRerunService:
                 login_feedback = None
                 preparation_reason = self._preparation_reason(observation, recipe["before_url"])
                 decision = None
+                if automatic_journey:
+                    from autojev.services.rerun_journey import validate_rerun_journey
+                    validate_rerun_journey(journey, source["app_url"])
+                    from autojev.services.rerun_setup import execute_authentication_setup
+                    async def authenticate_after(step_number: int) -> None:
+                        nonlocal observation
+                        authentications = journey.get("authentications", [])
+                        if step_number == 0 and journey.get("setup") and "authentications" not in journey:
+                            authentications = [{"after_step": 0, "setup": journey["setup"]}, *authentications]
+                        for authentication in authentications:
+                            if authentication["after_step"] != step_number:
+                                continue
+                            attempt = await asyncio.wait_for(execute_authentication_setup(
+                                executor, authentication["setup"], observation, replay_credentials), operation_timeout())
+                            if attempt.status != "success" or attempt.observation is None:
+                                raise RerunRecipeBlocked("authentication_not_confirmed")
+                            observation = attempt.observation
+                            self.repository.add_event(exploration_id, "info", "rerun_authentication_setup",
+                                "Preparação autenticada reexecutada com insumos explícitos", authentication)
+                    await authenticate_after(0)
+                    for setup in journey["steps"][:-1]:
+                        if self.repository.is_cancel_requested(exploration_id):
+                            terminal, reason = ExplorationStatus.CANCELLED, "cancelled"
+                            return
+                        self._persist(exploration_id, phase="preparing", setup_step=replay_step,
+                                      setup_total=len(journey["steps"]) - 1)
+                        setup_recipe = setup["recipe"]
+                        setup_decision = resolve_rerun_decision(setup_recipe, observation, source["app_url"], credentials=replay_credentials)
+                        setup_result, next_observation = await asyncio.wait_for(
+                            executor.execute(setup_decision, replay_credentials), operation_timeout())
+                        setup_result.assertions.extend(check_business_outcomes(observation, setup_decision, setup_result, next_observation))
+                        setup_changed = recipe_effect_digest(observation) != recipe_effect_digest(next_observation)
+                        setup_result.evidence["action_effect"] = {"state_changed": setup_changed}
+                        setup_issues = ExplorationManager._issues_relevant_to_action(
+                            next_observation, setup_result.started_at, setup_result.finished_at)
+                        ExplorationManager._append_observable_state_evidence(
+                            setup_result, setup_decision, next_observation, state_changed=setup_changed,
+                            capture_console_errors=options.capture_console_errors,
+                            capture_network_errors=options.capture_network_errors, new_issues=setup_issues)
+                        setup_assertions.extend(setup_result.assertions)
+                        setup_timeline.extend(setup_result.evidence.get("timeline") or [])
+                        safe_setup = redact(setup_result.to_dict(), secrets)
+                        safe_setup.setdefault("evidence", {})["rerun_recipe"] = {**copy.deepcopy(setup_recipe), "journey_capture": True}
+                        self.repository.add_action(exploration_id, replay_step, redact(asdict(setup_decision), secrets), safe_setup)
+                        self.repository.update_exploration(exploration_id, steps_completed=replay_step, current_url=next_observation.url)
+                        replay_step += 1
+                        expected_outcome = setup.get("outcome")
+                        if not setup_result.success:
+                            raise RerunRecipeBlocked("setup_action_failed")
+                        if expected_outcome is None:
+                            if any(not assertion.passed for assertion in setup_result.assertions):
+                                raise RerunRecipeBlocked("setup_check_failed")
+                        else:
+                            expected_checks = Counter(json.dumps([check["kind"], check["expected"], check["passed"]],
+                                sort_keys=True, ensure_ascii=False) for check in expected_outcome["checks"])
+                            actual_checks = Counter(json.dumps([check.kind, check.expected, check.passed],
+                                sort_keys=True, ensure_ascii=False) for check in setup_result.assertions)
+                            if expected_checks - actual_checks:
+                                raise RerunRecipeBlocked("setup_checks_changed")
+                        observation = next_observation
+                        await authenticate_after(replay_step - 1)
+                    recipe = journey["steps"][-1]["recipe"]
+                    decision = resolve_rerun_decision(recipe, observation, source["app_url"], credentials=replay_credentials)
+                    reason = "ready"
                 while decision is None:
                     version += 1
                     preparation = {
@@ -1198,7 +1365,7 @@ class ScenarioRerunService:
                         raise
                     self.repository.update_exploration(exploration_id, current_url=observation.url)
                     try:
-                        decision = resolve_rerun_decision(recipe, observation, source["app_url"])
+                        decision = resolve_rerun_decision(recipe, observation, source["app_url"], credentials=replay_credentials)
                     except RerunRecipeBlocked as exc:
                         blocked_reason = str(exc)
                         if blocked_reason not in RECOVERABLE_PREPARATION_REASONS:
@@ -1237,7 +1404,7 @@ class ScenarioRerunService:
                     # Bind fresh handles and enforce every original guard
                     # again before the one and only action dispatch.
                     observation = await asyncio.wait_for(executor.observe("rerun_before_manual_print"), operation_timeout())
-                    decision = resolve_rerun_decision(recipe, observation, source["app_url"])
+                    decision = resolve_rerun_decision(recipe, observation, source["app_url"], credentials=replay_credentials)
                 initial_recorded = self._record_initial_observation(
                     exploration_id, observation, action_index, secrets) or initial_recorded
                 if time.monotonic() >= deadline:
@@ -1246,7 +1413,7 @@ class ScenarioRerunService:
                 self._persist(exploration_id, phase="executing",
                               step_check_bindings=progress_check_bindings(action, decision.assertions))
                 dispatched = True
-                result, after = await asyncio.wait_for(executor.execute(decision, {}), operation_timeout())
+                result, after = await asyncio.wait_for(executor.execute(decision, replay_credentials), operation_timeout())
                 result.assertions.extend(check_business_outcomes(observation, decision, result, after))
                 state_changed = recipe_effect_digest(observation) != recipe_effect_digest(after)
                 result.evidence["action_effect"] = {"state_changed": state_changed}
@@ -1255,9 +1422,23 @@ class ScenarioRerunService:
                     result, decision, after, state_changed=state_changed,
                     capture_console_errors=options.capture_console_errors,
                     capture_network_errors=options.capture_network_errors, new_issues=issues)
+                if automatic_journey:
+                    needed = Counter(json.dumps([check["kind"], check["expected"]], sort_keys=True, ensure_ascii=False)
+                                     for check in (original.get("evidence") or {}).get("assertions", []))
+                    final_counts = Counter(json.dumps([check.kind, check.expected], sort_keys=True, ensure_ascii=False)
+                                           for check in result.assertions)
+                    extras = []
+                    for check in reversed(setup_assertions):
+                        identity = json.dumps([check.kind, check.expected], sort_keys=True, ensure_ascii=False)
+                        if final_counts[identity] < needed[identity]:
+                            extras.append(check)
+                            final_counts[identity] += 1
+                    result.assertions = [*reversed(extras), *result.assertions]
+                if setup_timeline:
+                    result.evidence["timeline"] = [*setup_timeline, *(result.evidence.get("timeline") or [])]
                 missing = self._missing_checks(original, action, decision, result)
                 result.evidence.update(
-                    action_step=1, before_screenshot=observation.screenshot,
+                    action_step=replay_step, before_screenshot=observation.screenshot,
                     before_observed_at=observation.captured_at,
                     source_exploration_id=source["id"], source_scenario_id=original["id"],
                     rerun_scope=copy.deepcopy(self.states[exploration_id]["scope"]),
@@ -1281,14 +1462,16 @@ class ScenarioRerunService:
                 # attach the private recipe without corrupting a short hash
                 # substring that happens to equal a supplied credential.
                 safe_result["evidence"]["rerun_recipe"] = copy.deepcopy(recipe)
-                self.repository.add_action(exploration_id, 1, redact(asdict(decision), secrets), safe_result)
+                if automatic_journey:
+                    safe_result["evidence"]["rerun_recipe"]["journey_capture"] = True
+                self.repository.add_action(exploration_id, replay_step, redact(asdict(decision), secrets), safe_result)
                 self._save_capture_scenario(exploration_id, scenario, secrets)
                 scenario_saved = True
                 for shot, label in [(None if initial_recorded else observation.screenshot, "Antes da reexecução"),
                                     (after.screenshot, "Depois da reexecução")]:
                     if shot:
                         self.repository.add_screenshot(exploration_id, shot, label, scenario.id)
-                self.repository.update_exploration(exploration_id, current_url=after.url, steps_completed=1)
+                self.repository.update_exploration(exploration_id, current_url=after.url, steps_completed=replay_step)
                 terminal = ExplorationStatus.PARTIAL if missing or scenario.status in {ScenarioStatus.BLOCKED, ScenarioStatus.SKIPPED} else ExplorationStatus.COMPLETED
                 # The action and its local assertions are already durable.
                 # A cancelled/timed-out manual print cannot erase or redispatch

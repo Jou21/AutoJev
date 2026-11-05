@@ -319,7 +319,7 @@ def _fill_checks(
 ) -> list[AssertionResult]:
     fields = _items(before.page_state, "fields")
     target = next((item for item in fields if item.get("ref") == decision.target), None)
-    if not target or target.get("sensitive") or decision.credential_key:
+    if not target or target.get("sensitive"):
         return []
     identity = _identity(target)
     updated_fields = {
@@ -333,20 +333,23 @@ def _fill_checks(
         else decision.value
     )
     actual = _value(updated) if updated else None
-    # For mocks and saved observations without executor tokens, value is usable.
-    if expected is None or (
-        "value_token" in target and not evidence.get("expected_token")
-    ):
-        return []
+    if decision.credential_key:
+        bindings = getattr(after.page_state, "rerun_field_bindings", {})
+        matches = updated is not None and bindings.get(str(updated.get("ref"))) == decision.credential_key
+    else:
+        # For mocks and saved observations without executor tokens, value is usable.
+        if expected is None or ("value_token" in target and not evidence.get("expected_token")):
+            return []
+        matches = updated is not None and actual == expected
     checks = [
         _assert(
             "field_value_matches",
             {"field": target.get("label") or identity, "value_matches": True},
             {
                 "field_present": updated is not None,
-                "value_matches": updated is not None and actual == expected,
+                "value_matches": matches,
             },
-            updated is not None and actual == expected,
+            matches,
             "The filled field must retain the requested value.",
         )
     ]

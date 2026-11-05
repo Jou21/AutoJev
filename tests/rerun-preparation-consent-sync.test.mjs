@@ -315,3 +315,36 @@ test("fallback preparation copy exactly matches the backend canonical vocabulary
   for (const copy of Object.values(provided)) assert.ok(html.includes(copy), `missing canonical shared copy: ${copy}`);
   assert.doesNotMatch(html, /Continuar exploração|Preparei a página e autorizo continuar|Não usar como título/);
 });
+
+test("rerun dialog collects required private values before POST and clears them afterward", async () => {
+  const hooks = hookRunner(await import("react"));
+  const { ScenarioRerunDialog, ScenarioRerunConsent } = await loadApp(hooks.react);
+  const calls = [];
+  const created = [];
+  const props = { sourceId: "source", scenarioId: "CT001", onClose() {}, onCreated(value) { created.push(value); }, request: async (url, options) => {
+    calls.push({ url, options });
+    return options?.method === "POST" ? { id: "new-run" } : { available: true, automatic_preparation: true, required_inputs: ["private_alias"] };
+  } };
+  const render = () => {
+    const tree = hooks.render(ScenarioRerunDialog, props);
+    return find(tree, (node) => node.type === ScenarioRerunConsent).props;
+  };
+  render();
+  hooks.flush();
+  await settle();
+  let ui = render();
+  ui.onConsent(true);
+  ui = render();
+  ui.onConfirm();
+  await settle();
+  assert.equal(calls.length, 1, "no POST before private input is supplied");
+  ui.onCredentials("private_alias", "ephemeral-value");
+  ui = render();
+  assert.deepEqual(ui.credentials, { private_alias: "ephemeral-value" });
+  ui.onConfirm();
+  await settle();
+  assert.deepEqual(JSON.parse(calls[1].options.body), { confirm: true, credentials: { private_alias: "ephemeral-value" } });
+  assert.deepEqual(created, [{ id: "new-run" }]);
+  assert.deepEqual(render().credentials, {});
+  hooks.dispose();
+});

@@ -26,7 +26,7 @@ type Suite = { id: string; app_url: string; created_at?: string; initial_count: 
 type Group = { id: string; app_url: string; created_at: string; latest_activity: string; initial_count: number; case_count: number; active_count: number; initial_status: string; rounds: Round[]; legacy_runs: { id: string; count: number; status: string; created_at: string }[] };
 type CoverageOperation = { operation: "create" | "read" | "update" | "delete"; status: "existing" | "gap" | "uncertain" | "not_applicable"; case_ids: string[]; new_case_indexes: number[]; reason: string };
 type Suggestion = { reply: string; selected_case_ids: string[]; new_cases: Definition[]; coverage?: { screen: string; operations: CoverageOperation[] } | null; llm?: ChatLlm; usage: { total_tokens?: number; cost?: number; cost_known?: boolean } };
-type Validation = { revision: number; available: boolean; effects: string[]; items: { case_id: string; available: boolean; reason?: string; code?: string }[] };
+type Validation = { revision: number; available: boolean; effects: string[]; required_inputs?: string[]; items: { case_id: string; available: boolean; reason?: string; code?: string; required_inputs?: string[] }[] };
 type Recording = { id: string; steps: string[]; url: string; status: string };
 type CreationMode = "write" | "ai" | "record";
 type Construction = { definition: Definition | null; goal: string; updates: number };
@@ -61,6 +61,11 @@ export default function TestSuitesWorkspace(props: Props) {
   const [managing, setManaging] = useState(false), [archiveTarget, setArchiveTarget] = useState<Case | null>(null), [catalogNotice, setCatalogNotice] = useState("");
   const [selection, setSelection] = useState<Selection[]>(() => props.initialCaseId ? [{ case_id: props.initialCaseId, source_exploration_id: props.initialSourceId, source_scenario_id: props.initialSourceCase, capture_plan: props.initialCapturePlan }] : []), [selectedCase, setSelectedCase] = useState<string | null>(props.initialCaseId || null);
   const [saved, setSaved] = useState<Round | null>(null), [dirty, setDirty] = useState(!!props.initialCaseId), [validation, setValidation] = useState<Validation | null>(null), [consent, setConsent] = useState(false);
+  const [roundCredentials, setRoundCredentials] = useState<Record<string, string>>({});
+  // eslint-disable-next-line react-hooks/set-state-in-effect -- Private values must be discarded when the reviewed round changes.
+  useEffect(() => { setRoundCredentials({}); }, [validation, rootId, planId]);
+  const requiredRoundInputs = [...new Set(validation?.required_inputs || validation?.items.flatMap(item => item.required_inputs || []) || [])];
+  const missingRoundInputs = requiredRoundInputs.some(key => !Object.hasOwn(roundCredentials, key) || !roundCredentials[key]?.trim());
   const [round, setRound] = useState<Round | null>(null), [compare, setCompare] = useState<Round | null>(null), [compareId, setCompareId] = useState("");
   const [form, setForm] = useState<Definition | null>(null), [editId, setEditId] = useState<string | null>(null);
   const [maintenanceOpen, setMaintenanceOpen] = useState(false), [formBaseline, setFormBaseline] = useState("");
@@ -70,7 +75,7 @@ export default function TestSuitesWorkspace(props: Props) {
   const [recording, setRecording] = useState<Recording | null>(null), [creationMode, setCreationMode] = useState<CreationMode | null>(null);
   const [creationFocus, setCreationFocus] = useState<{ mode: CreationMode; version: number } | null>(null);
   const [planningFocus, setPlanningFocus] = useState(0);
-  const [selectorOpen, setSelectorOpen] = useState(!props.initialCaseId && !props.initialBatch?.length), [selectorFocus, setSelectorFocus] = useState(0);
+  const selectorOpen = !validation;
   const [selectorFiltersOpen, setSelectorFiltersOpen] = useState(false);
   const [mobilePane, setMobilePane] = useState<"plan" | "chat">("plan");
   const [stepTool, setStepTool] = useState<StepKind>("capture"), [draggingStep, setDraggingStep] = useState(false), [dropSlot, setDropSlot] = useState<string | null>(null);
@@ -227,7 +232,7 @@ export default function TestSuitesWorkspace(props: Props) {
         next.push(context.mode === "manual" ? { case_id: context.case_id }
           : { case_id: context.case_id, source_exploration_id: item.source, source_scenario_id: item.ct, ...(item.capture_plan ? { capture_plan: item.capture_plan } : {}) });
       }
-      setSelection(next); setSelectedCase(next[0]?.case_id || null); setDirty(true); setSelectorOpen(false); setTab("planner");
+      setSelection(next); setSelectedCase(next[0]?.case_id || null); setDirty(true); setTab("planner");
     }).catch(caught => { if (alive) setError(caught instanceof Error ? caught.message : "Não foi possível carregar os testes enviados pelo relatório."); })
       .finally(() => { if (alive) setRoutePending(false); });
     return () => { alive = false; };
@@ -248,7 +253,7 @@ export default function TestSuitesWorkspace(props: Props) {
       if (!alive) return;
       if (plan.status !== "draft") { navigate(`#/conjuntos/${encode(plan.root_id)}?round=${encode(plan.id)}`); return; }
       setSaved(plan); setName(plan.name); setSelection(plan.items.map(item => ({ case_id: item.case_id, source_exploration_id: item.source_exploration_id || undefined, source_scenario_id: item.source_scenario_id || undefined, capture_plan: item.capture_plan || undefined, planned_integrations: item.planned_integrations || undefined })));
-      setSelectedCase(plan.items[0]?.case_id); setDirty(false); setSelectorOpen(false); setTab("planner");
+      setSelectedCase(plan.items[0]?.case_id); setDirty(false); setTab("planner");
     }).catch(caught => { if (alive) setError(caught.message); }).finally(() => { if (alive) setRoutePending(false); });
     return () => { alive = false; };
   }, [planId, request, navigate]);
@@ -263,7 +268,7 @@ export default function TestSuitesWorkspace(props: Props) {
   const completeRecording = useCallback((result: Recording) => {
     const definition = { ...emptyDefinition(result.url), title: "Teste gravado", steps: result.steps };
     setRecording(null); setForm(definition); setFormBaseline(JSON.stringify(emptyDefinition(suite?.app_url)));
-    setEditId(null); setCreationMode("write"); setSelectorOpen(false); setMobilePane("plan");
+    setEditId(null); setCreationMode("write"); setMobilePane("plan");
     setConstruction(current => current ? { ...current, definition } : null);
     if (tab === "catalog") setMaintenanceOpen(true);
     setCreationFocus(current => ({ mode: "write", version: (current?.version || 0) + 1 }));
@@ -287,7 +292,6 @@ export default function TestSuitesWorkspace(props: Props) {
     planningHeading.current?.focus({ preventScroll: true });
   }, [planningFocus]);
 
-  useEffect(() => { if (selectorFocus) selectorSearch.current?.focus({ preventScroll: true }); }, [selectorFocus]);
   const selectorFiltersVisible = selectorFiltersOpen && selectorOpen && tab === "planner" && !validation;
   useEffect(() => {
     if (!selectorFiltersVisible) return;
@@ -346,7 +350,7 @@ export default function TestSuitesWorkspace(props: Props) {
   };
   const openCaseEditor = (definition: Definition, id: string | null = null, recordingFinished = false) => {
     transition(() => {
-      setForm(definition); setFormBaseline(id ? JSON.stringify(definition) : JSON.stringify(emptyDefinition(suite?.app_url))); setEditId(id); setCreationMode("write"); setSelectorOpen(false); setMobilePane("plan");
+      setForm(definition); setFormBaseline(id ? JSON.stringify(definition) : JSON.stringify(emptyDefinition(suite?.app_url))); setEditId(id); setCreationMode("write"); setMobilePane("plan");
       if (!id) setConstruction(current => current ? { ...current, definition } : null);
       if (tab === "catalog") setMaintenanceOpen(true);
       focusCreation("write");
@@ -358,7 +362,7 @@ export default function TestSuitesWorkspace(props: Props) {
     closeEditor();
   };
   const openMaintenance = () => transition(() => {
-    setValidation(null); setConsent(false); setChatError(""); setForm(null); setEditId(null); setMaintenanceOpen(tab !== "planner"); setNewMode(true); setCreationMode(null); setSelectorOpen(false);
+    setValidation(null); setConsent(false); setChatError(""); setForm(null); setEditId(null); setMaintenanceOpen(tab !== "planner"); setNewMode(true); setCreationMode(null);
     if (tab === "planner") setConstruction(current => current || { definition: null, goal: "", updates: 0 });
     setCreationAttention(current => current + 1);
     setMessages(current => current.at(-1)?.kind === "creation_prompt" ? current : [...current,
@@ -377,10 +381,9 @@ export default function TestSuitesWorkspace(props: Props) {
     setTab("planner"); setMobilePane("plan"); setPlanningFocus(current => current + 1);
   };
   const openPlanning = () => {
-    setNewMode(false); setCreationMode(null); setSelectorOpen(false); showPlanning();
+    setNewMode(false); setCreationMode(null); showPlanning();
   };
-  const openSelector = () => { setValidation(null); setConsent(false); setSelectorOpen(true); setSelectorFiltersOpen(false); setMobilePane("plan"); setSelectorFocus(current => current + 1); };
-  const returnToScript = () => { if (!name.trim()) setName(saved?.name || "Nova execução"); setValidation(null); setConsent(false); setSelectorOpen(false); showPlanning(); };
+  const returnToScript = () => { if (!name.trim()) setName(saved?.name || "Nova execução"); setValidation(null); setConsent(false); showPlanning(); };
   const toggleChat = () => {
     if (chatOpen) { setChatOpen(false); setMobilePane("plan"); if (creationMode === "ai") setCreationMode(null); }
     else showChat();
@@ -430,7 +433,18 @@ export default function TestSuitesWorkspace(props: Props) {
     const value = await request<Round>(saved ? `${rootPath}/plans/${encode(saved.id)}` : `${rootPath}/plans`, { method: saved ? "PUT" : "POST", body: JSON.stringify({ name, items: selection, ...(saved ? { expected_revision: saved.revision } : {}) }) });
     setSaved(value); setName(value.name); setDirty(false); setCatalogNotice("Rascunho salvo. Você pode continuar em Rascunhos; nenhum teste foi iniciado."); return value;
   };
-  const review = () => perform(async () => { const plan = dirty || !saved ? await save() : saved; setSelectorOpen(false); setMobilePane("plan"); const checked = await request<Validation>(`/test-suites/rounds/${encode(plan.id)}/validate`, { method: "POST" }); reviewedItems.current = plan.items; setValidation(checked); setConsent(false); });
+  const review = () => perform(async () => {
+    setMobilePane("plan"); setConsent(false);
+    setValidation({ revision: saved?.revision || 0, available: false, effects: [], items: selection.map(item => ({ case_id: item.case_id, available: false, code: "checking" })) });
+    try {
+      const plan = dirty || !saved ? await save() : saved;
+      const checked = await request<Validation>(`/test-suites/rounds/${encode(plan.id)}/validate`, { method: "POST" });
+      reviewedItems.current = plan.items; setValidation(checked);
+    } catch (error) {
+      setValidation(null);
+      throw error;
+    }
+  });
   const persistCase = async (include: boolean) => {
     if (!form) return;
     if (include && selection.length >= 500 && !selection.some(value => value.case_id === editId)) throw new Error("O limite é de 500 testes. Salve somente na base ou retire um teste desta execução.");
@@ -673,12 +687,12 @@ export default function TestSuitesWorkspace(props: Props) {
             </div>
           </details>
           <button type="button" className="button secondary" aria-label="Abrir relatório consolidado" title="Abrir relatório consolidado" disabled={busy} onClick={() => void perform(() => openReport(suite.id, "consolidated"))}><Download size={16} /><span>Relatório</span></button>
-          <button type="button" className="button primary" onClick={openMaintenance}><Plus size={16} />Adicionar teste</button>
+          {tab !== "planner" && <button type="button" className="button primary" onClick={openMaintenance}><Plus size={16} />Adicionar teste</button>}
         </div>
       </div>
       <nav className="suite-tabs suite-main-tabs" aria-label="Áreas da base de testes">
         {[["catalog", "Testes"], ["planner", "Preparar execução"], ["rounds", "Execuções"]].map(([key, text]) => <button type="button" key={key} aria-pressed={tab === key} onClick={() => transition(() => { closeEditor(); if (key === "planner") showPlanning(); else setTab(key); })}>{text}{key === "planner" && selection.length > 0 && <span>{selection.length}</span>}</button>)}
-        {tab === "planner" ? <ActionTooltip text={selectorOpen ? "Ocultar a lista de testes da base" : "Escolher testes da base para esta execução"}><button type="button" className="suite-refresh suite-choose-tests" aria-label="Escolher testes" aria-expanded={selectorOpen} aria-controls="suite-case-selector" onClick={() => selectorOpen ? setSelectorOpen(false) : openSelector()} disabled={busy || chatBusy}><ClipboardList size={16} /></button></ActionTooltip> : <button type="button" className="suite-refresh" aria-label="Atualizar conjunto" title="Atualizar conjunto" onClick={() => void perform(refresh)} disabled={busy}><RefreshCcw size={15} /></button>}
+        {tab !== "planner" && <button type="button" className="suite-refresh" aria-label="Atualizar conjunto" title="Atualizar conjunto" onClick={() => void perform(refresh)} disabled={busy}><RefreshCcw size={15} /></button>}
       </nav>
     </header>}
     {error && <p className="suite-error" role="alert">{error}</p>}
@@ -715,8 +729,8 @@ export default function TestSuitesWorkspace(props: Props) {
   const recordingPanel = recording && <section id="suite-recording" className="panel suite-recording"><span className="suite-record-dot" /><strong>Gravação em andamento · {recording.steps.length} passos</strong><ol>{recording.steps.map((step, index) => <li key={index}>{step}</li>)}</ol><button type="button" ref={recordingFinish} className="button primary" disabled={busy} onClick={() => void perform(async () => { const result = await request<Recording>(`/test-suites/recordings/${encode(recording.id)}/finish`, { method: "POST" }); completeRecording(result); })}><Square size={15} />Finalizar e revisar roteiro</button></section>;
 
   const reviewNameChanged = !!validation && !!saved && name !== saved.name;
-  const executeAction = validation && <button className="button primary" title={!name.trim() ? "Informe o nome da execução" : !consent ? "Marque o aceite após revisar os testes" : undefined} disabled={busy || formChanged || !!recording || !name.trim() || !consent || !validation.available || (dirty && !reviewNameChanged) || pendingIntegrations > 0} onClick={() => void perform(async () => {
-    if (!saved || pendingIntegrations) return;
+  const executeAction = validation && <button className="button primary" title={!name.trim() ? "Informe o nome da execução" : !consent ? "Marque o aceite após revisar os testes" : undefined} disabled={busy || formChanged || !!recording || !name.trim() || !consent || missingRoundInputs || !validation.available || (dirty && !reviewNameChanged) || pendingIntegrations > 0} onClick={() => void perform(async () => {
+    if (!saved || pendingIntegrations || missingRoundInputs) return;
     setConsent(false);
     let checked = validation;
     if (reviewNameChanged || saved.revision !== validation.revision) {
@@ -728,7 +742,10 @@ export default function TestSuitesWorkspace(props: Props) {
       reviewedItems.current = plan.items; setValidation(checked);
       if (changed) { setConsent(false); throw new Error("Os testes ou as condições da execução mudaram. Revise novamente e confirme antes de executar."); }
     }
-    const value = await request<Round>(`/test-suites/rounds/${encode(saved.id)}/start`, { method: "POST", body: JSON.stringify({ confirm: true, expected_revision: checked.revision }) });
+    let value: Round;
+    try {
+      value = await request<Round>(`/test-suites/rounds/${encode(saved.id)}/start`, { method: "POST", body: JSON.stringify({ confirm: true, expected_revision: checked.revision, ...(requiredRoundInputs.length ? { credentials: Object.fromEntries(requiredRoundInputs.map(key => [key, roundCredentials[key]])) } : {}) }) });
+    } finally { setRoundCredentials({}); }
     navigate(`#/conjuntos/${encode(suite.id)}?round=${encode(value.id)}`);
   })}><Play size={16} />Executar {selection.length} {selection.length === 1 ? "teste" : "testes"}</button>;
 
@@ -781,23 +798,23 @@ export default function TestSuitesWorkspace(props: Props) {
     {tab === "planner" && <section className={`suite-planner-view${validation ? " suite-review-mode" : ""}`} data-mobile-pane={validation ? "plan" : mobilePane} aria-label="Planejamento da rodada">
       {validation ? <header className="suite-review-bar"><button type="button" className="text-button" disabled={busy} onClick={returnToScript}><ArrowLeft size={16} />Ajustar</button><div><h1>Revisar execução <span>{selection.length} {selection.length === 1 ? "teste" : "testes"}</span></h1><label className="suite-review-name"><span>Nome da execução</span><input aria-label="Nome da execução" required maxLength={160} disabled={busy} value={name} placeholder="Ex.: Regressão do carrinho" aria-invalid={!name.trim() || undefined} onChange={event => { setName(event.target.value); setDirty(event.target.value !== saved?.name); setConsent(false); }} /></label></div>{executeAction}</header> : <>
       <h2 id="suite-planning-heading" ref={planningHeading} tabIndex={-1} className="sr-only" aria-describedby="suite-planning-guidance">Preparar execução</h2>
-      <p id="suite-planning-guidance" className="sr-only">{selection.length ? `${selection.length === 1 ? "O teste selecionado está" : `Os ${selection.length} testes selecionados estão`} na ordem abaixo. Ajuste os roteiros e clique em “Revisar execução”. A execução só começa após sua confirmação.` : "Escolha os testes pelo ícone de lista junto às abas ou peça ajuda à IA. Ajuste os roteiros, revise e confirme a execução. Você também pode salvar um rascunho para continuar depois."}</p>
+      <p id="suite-planning-guidance" className="sr-only">{selection.length ? `${selection.length === 1 ? "O teste selecionado está" : `Os ${selection.length} testes selecionados estão`} na ordem abaixo. Ajuste os roteiros e clique em “Revisar execução”. A execução só começa após sua confirmação.` : "Escolha os testes na lista à esquerda ou peça ajuda à IA. Ajuste os roteiros, revise e confirme a execução. Você também pode salvar um rascunho para continuar depois."}</p>
       <nav className="suite-planner-switch" aria-label="Painéis do planejamento"><button type="button" aria-label="Ver roteiro da rodada" aria-pressed={mobilePane === "plan"} onClick={() => setMobilePane("plan")}><ClipboardList size={15} />Roteiro <span>{selection.length}</span></button><button type="button" aria-label="Ver assistente de testes" aria-pressed={mobilePane === "chat"} onClick={showChat}><MessageSquare size={15} />Assistente</button></nav>
       </>}
       <div className={`suite-planner-layout${chatOpen && !validation ? " with-chat" : ""}`}>
-      <div className={`suite-planning-main${selectorOpen ? " catalog-open" : ""}`}>
-      <aside id="suite-case-selector" className="panel suite-selector" hidden={!selectorOpen} aria-label="Catálogo para selecionar CTs">
+      <div className={`suite-planning-main${!validation ? " catalog-open" : ""}`}>
+      <aside id="suite-case-selector" className="panel suite-selector" hidden={!!validation} aria-label="Catálogo para selecionar CTs">
         <div ref={selectorFilterTools} className="suite-selector-tools">
           <div className="suite-selector-searchbar"><label className="suite-search"><Search size={15} /><input ref={selectorSearch} aria-label="Buscar CTs" placeholder="Buscar testes…" value={query} onChange={event => setQuery(event.target.value)} /></label><button ref={selectorFilterTrigger} type="button" className="suite-selector-filter-toggle" aria-label="Filtros dos testes" aria-expanded={selectorFiltersVisible} aria-controls="suite-selector-filters" title={selectorFilterCount ? `Filtros · ${selectorFilterCount} ${selectorFilterCount === 1 ? "ativo" : "ativos"}` : "Filtrar testes"} data-active={selectorFilterCount > 0} onClick={() => setSelectorFiltersOpen(value => !value)}><SlidersHorizontal size={16} />{selectorFilterCount > 0 && <span aria-hidden="true">{selectorFilterCount}</span>}</button></div>
           {selectorFiltersVisible && <div ref={selectorFilterPanel} id="suite-selector-filters" className="suite-selector-filters" role="group" aria-label="Opções de filtro"><strong>Filtrar testes</strong><label>Resultado ou tipo{statusFilter}</label><FunctionalFlows compact flows={flows} cases={baseCases} selected={activeFlow} onSelect={setSelectedFlow} /><div className="suite-selector-filter-actions"><button type="button" className="text-button" disabled={!selectorFilterCount} onClick={() => { setFilter("all"); setSelectedFlow("all"); }}>Limpar filtros</button><span role="status">{cases.length} {cases.length === 1 ? "teste" : "testes"}</span></div><button type="button" className="button secondary" disabled={busy || !remainingFilteredIds.length} onClick={() => { add(remainingFilteredIds); setSelectorFiltersOpen(false); selectorSearch.current?.focus({ preventScroll: true }); }}><Plus size={14} />Adicionar filtrados ({cases.length})</button></div>}
         </div>
         <div className="suite-available-list">{cases.map(item => <div className={selectedCase === item.id ? "selected" : ""} key={item.id}><input aria-label={`Incluir ${item.id}`} type="checkbox" checked={selection.some(value => value.case_id === item.id)} onChange={() => toggle(item.id)} /><button onClick={() => { if (!selection.some(value => value.case_id === item.id)) add([item.id]); setSelectedCase(item.id); }}><small>{item.id} · {item.mode === "manual" ? "Manual" : "Automático"}</small><strong>{item.title}</strong><span className="case-flow-label" title={flowMemberships(item).map(member => member.reason).join(" | ")}>{caseFlowLabel(item)}</span><Status value={item.status} /></button></div>)}</div>{!cases.length && <p className="suite-muted" role="status">Nenhum CT corresponde aos filtros.</p>}
-        <div className="suite-selector-footer"><button type="button" className="text-button" disabled={!selection.length} onClick={() => { setSelectorFiltersOpen(false); setSelectorOpen(false); showPlanning(); }}>Ver roteiro ({selection.length})<ArrowRight size={14} /></button></div>
+        <div className="suite-selector-footer"><button type="button" className="button primary" disabled={busy} onClick={openMaintenance}><Plus size={16} />Adicionar teste</button></div>
       </aside>
       <div ref={planCenter} className="suite-plan-center" role="region" aria-label="Roteiro da rodada">{!validation && <>{caseForm}{archivedSelection.length > 0 && <section className="panel suite-archived-selection" role="alert"><strong>{archivedSelection.map(item => item.case_id).join(", ")}{archivedSelection.some(item => !suite.cases.some(value => value.id === item.case_id)) ? " não está disponível nesta base." : " está arquivado."}</strong><p>Confira a base para restaurar um arquivado ou retire os indisponíveis desta execução antes de continuar.</p><button type="button" className="button secondary" onClick={() => { const ids = new Set(archivedSelection.map(item => item.case_id)); setSelection(current => current.filter(item => !ids.has(item.case_id))); if (selectedCase && ids.has(selectedCase)) setSelectedCase(null); change(); }}>Retirar indisponíveis desta execução</button></section>}<div className="suite-flow-board">
           <section className="panel suite-selection suite-flow-lane" aria-label="Testes desta execução">
             <p id="suite-test-drag-help" className="sr-only">Arraste um teste antes ou depois de outro para definir a ordem de execução. Nas bordas, a lista rola para os lados. Você também pode usar os botões Executar antes e Executar depois de cada card. Reordenar não inicia testes.</p>
-            {!selection.length && !construction && <div className="suite-plan-empty"><p className="suite-muted">Clique no ícone de lista junto às abas para escolher os testes.</p></div>}
+            {!selection.length && !construction && <div className="suite-plan-empty"><p className="suite-muted">Selecione os testes na lista à esquerda.</p></div>}
             {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- The rail supports independent keyboard scrolling. */}
             <div ref={selectedRail} className="suite-selected-list suite-horizontal-rail" role="region" aria-label="Testes selecionados, rolagem horizontal" tabIndex={0}
               onDragOverCapture={event => {
@@ -818,7 +835,7 @@ export default function TestSuitesWorkspace(props: Props) {
               </div>;
             })}
             {construction && <div ref={constructionCard} className={`suite-test-card suite-construction-card${buildingSelected ? " active" : ""}`} data-construction-card data-version={construction.updates}>
-              <button type="button" className="suite-construction-select" aria-label="Ver teste em construção" aria-pressed={buildingSelected} aria-describedby="suite-construction-note" title={constructionDefinition?.title || "Novo teste em construção"} onClick={() => { setConstructionSelected(true); setSelectorOpen(false); setMobilePane("plan"); }}>
+              <button type="button" className="suite-construction-select" aria-label="Ver teste em construção" aria-pressed={buildingSelected} aria-describedby="suite-construction-note" title={constructionDefinition?.title || "Novo teste em construção"} onClick={() => { setConstructionSelected(true); setMobilePane("plan"); }}>
                 <span className="suite-construction-label">{chatBusy ? <LoaderCircle size={12} className="spin" aria-hidden="true" /> : <Bot size={12} aria-hidden="true" />}Em construção</span>
                 <strong>{constructionDefinition?.title || "Novo teste"}</strong>
                 <small role="status">{suggestion && suggestion.new_cases.length > 1 && !form ? `${suggestion.new_cases.length} propostas no chat` : constructionStatus}</small>
@@ -882,7 +899,7 @@ export default function TestSuitesWorkspace(props: Props) {
           </section>
         </div>
         </>}
-        {validation && <section id="suite-plan-review" ref={reviewPanel} tabIndex={-1} aria-label="Revisão antes de executar" className="panel suite-review"><div className="suite-review-scope"><p>Somente estes testes serão executados. Os demais resultados não mudam.</p><details><summary>Cuidados da execução</summary>{validation.effects.map(effect => <p key={effect}>{effect}</p>)}</details></div><div className="suite-review-list" role="list" aria-label="Testes que serão executados">{validation.items.map(item => <div className="suite-review-case" role="listitem" key={item.case_id}><strong>{item.case_id}</strong><span className="suite-review-identity" title={suite.cases.find(value => value.id === item.case_id)?.title}>{suite.cases.find(value => value.id === item.case_id)?.title || item.case_id}{!item.available && <small>{item.reason || "Indisponível"}</small>}</span><span className="suite-review-availability">{item.available ? <><Check size={14} /><small>{item.code === "manual" ? "Manual" : "Pronto"}</small></> : <small>Indisponível</small>}</span></div>)}</div><label className="suite-check"><input type="checkbox" disabled={busy} checked={consent} onChange={event => setConsent(event.target.checked)} />Revisei os testes e autorizo esta execução real. Ações podem modificar dados; cada teste automático exige preparação em navegador separado.</label></section>}
+        {validation && <section id="suite-plan-review" ref={reviewPanel} tabIndex={-1} aria-label="Revisão antes de executar" className="panel suite-review"><div className="suite-review-scope"><p>Somente estes testes serão executados. Os demais resultados não mudam.</p><details><summary>Cuidados da execução</summary>{validation.effects.map(effect => <p key={effect}>{effect}</p>)}</details></div><div className="suite-review-list" role="list" aria-label="Testes que serão executados">{validation.items.map(item => <div className="suite-review-case" role="listitem" key={item.case_id}><strong>{item.case_id}</strong><span className="suite-review-identity" title={suite.cases.find(value => value.id === item.case_id)?.title}>{suite.cases.find(value => value.id === item.case_id)?.title || item.case_id}{!item.available && item.code !== "checking" && <small>{item.reason || "Indisponível"}</small>}</span><span className="suite-review-availability">{item.available ? <><Check size={14} /><small>{item.code === "manual" ? "Manual" : "Pronto"}</small></> : item.code === "checking" ? <><LoaderCircle className="spin" size={14} /><small>Conferindo roteiro…</small></> : <small>Indisponível</small>}</span></div>)}</div>{requiredRoundInputs.length > 0 && <fieldset disabled={busy}><legend>Dados privados para esta rodada</legend><p>Informe novamente os valores necessários. Serão usados somente nesta rodada pelo cofre temporário, sem salvar no planejamento ou histórico.</p>{requiredRoundInputs.map((key, index) => <label key={key} htmlFor={`suite-private-${index}`}>{key}<input id={`suite-private-${index}`} type="password" autoComplete="off" required maxLength={8000} value={Object.hasOwn(roundCredentials, key) ? roundCredentials[key] : ""} onChange={event => setRoundCredentials(current => ({ ...current, [key]: event.target.value }))} /></label>)}</fieldset>}<label className="suite-check"><input type="checkbox" disabled={busy} checked={consent} onChange={event => setConsent(event.target.checked)} />Revisei os testes e autorizo esta execução real. Ações podem modificar dados; cada teste automático usa um navegador separado e jornadas completas executam a preparação automaticamente.</label></section>}
       </div>
       {!validation && <footer className="suite-plan-footer"><span role="status">{construction ? "Novo teste em construção · revise ou descarte para continuar. " : formChanged || recording ? "Salve ou finalize o novo teste antes de revisar. " : ""}{selection.length} {selection.length === 1 ? "teste" : "testes"} · {pendingIntegrations > 0 && <strong className="suite-integration-warning">{pendingIntegrations} SWS/SQL só no rascunho · </strong>}{dirty ? "não salvo" : saved ? "salvo em Rascunhos" : "nenhuma execução iniciada"}{saved && !dirty && <> · <button type="button" className="suite-draft-link text-button" disabled={busy} onClick={() => navigate("#/execucoes-planejadas")}>Ver rascunhos<ArrowRight size={13} /></button></>}</span><button className="button secondary" disabled={busy || formChanged || !!recording || !!construction || !selection.length || !name.trim()} onClick={() => void perform(async () => { await save(); })}><Save size={16} />Salvar rascunho</button><button className="button primary" disabled={busy || formChanged || !!recording || !!construction || !selection.length || !name.trim() || !!archivedSelection.length} onClick={() => void review()}>{busy ? <LoaderCircle className="spin" size={16} /> : <ClipboardList size={16} />}Revisar execução</button></footer>}
       </div>
@@ -893,7 +910,7 @@ export default function TestSuitesWorkspace(props: Props) {
       {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- Independent keyboard-scrollable execution list. */}
       <div className="suite-history-list" role="region" aria-label="Execuções, mais recentes primeiro" tabIndex={0}>{history.map(item => <button className={`suite-round-row${round?.id === item.id ? " active" : ""}`} key={`${item.kind}:${item.id}`} aria-current={round?.id === item.id ? "true" : undefined} onClick={() => navigate(item.href)}><ClipboardList size={16} /><span className="suite-history-identity"><strong>{item.kind === "linked" ? "Reexecução" : item.title}</strong><small>{date(item.created_at)} · {item.count} {item.count === 1 ? "teste" : "testes"}</small></span>{item.status && <Status value={item.status} />}<ChevronRight size={15} /></button>)}</div><p className="suite-history-hint">Escolha uma execução para ver o que aconteceu. <button className="text-button" onClick={() => navigate("#/execucoes-planejadas")}>Seus rascunhos ficam aqui<ArrowRight size={13} /></button></p></section>
       {!!suite.discoveries.length && <section className="panel suite-discoveries"><h2>Descobertas com IA</h2><p>Revise os casos identificados antes de adicioná-los ao catálogo. Importar não executa o teste novamente.</p>{suite.discoveries.map(item => <div key={item.session_id}><span>Descoberta {item.session_id.slice(0, 8)}</span><button className="text-button" onClick={() => navigate(`#/exploracoes/${encode(item.session_id)}`)}>Acompanhar<ArrowRight size={14} /></button><button className="button secondary" onClick={() => void perform(async () => { const value = await request<{ scenarios?: Case[] }>(`/explorations/${encode(item.session_id)}`); setDiscovered({ session: item.session_id, cases: value.scenarios || [] }); })}>Revisar CTs</button></div>)}{discovered && <div>{discovered.cases.map(item => <div key={item.id}><strong>{item.id} · {item.title}</strong><button className="button secondary" disabled={busy} onClick={() => void perform(async () => { await request(`${rootPath}/import`, { method: "POST", body: JSON.stringify({ session_id: discovered.session, case_id: item.id }) }); await refresh(); })}><Plus size={15} />Importar CT</button></div>)}</div>}</section>}
-      {round && <section className="panel suite-round-detail"><div className="suite-section-heading"><div><h2>{round.name}</h2><small className="suite-muted">{date(round.created_at)} · {finishedCount} de {roundCount} {roundCount === 1 ? "teste" : "testes"} com resultado</small></div><Status value={round.status} /></div><div className="suite-heading-actions"><button className="button secondary" onClick={() => void perform(() => openReport(suite.id, "round", round.id))}><Download size={16} />Relatório</button>{active(round.status) && <button className="button ghost" disabled={busy || round.status === "stopping"} onClick={() => void perform(async () => { setRound(await request<Round>(`/test-suites/rounds/${encode(round.id)}/stop`, { method: "POST" })); })}><Square size={15} />Parar execução</button>}<button className="button secondary" onClick={() => { setSaved(null); setName(round.name + " · nova execução"); setSelection(round.items.map(item => ({ case_id: item.case_id, source_exploration_id: item.source_exploration_id, source_scenario_id: item.source_scenario_id, capture_plan: item.capture_plan || undefined, planned_integrations: item.planned_integrations || undefined }))); change(); setSelectorOpen(false); showPlanning(); setSelectedCase(round.items[0]?.case_id || null); }}>Testar novamente<ArrowRight size={15} /></button></div><p className="suite-muted suite-round-scope">Esta execução inclui somente os {roundCount} testes abaixo, não todos os testes da aplicação.</p>{round.reason && <p className="suite-notice">{round.reason}</p>}{pending.length > 0 && !active(round.status) && <button className="text-button" onClick={() => { setSaved(null); setName("Retomar testes pendentes"); setSelection(round.items.filter(item => pending.includes(item.case_id)).map(item => ({ case_id: item.case_id, source_exploration_id: item.source_exploration_id, source_scenario_id: item.source_scenario_id, capture_plan: item.capture_plan || undefined, planned_integrations: item.planned_integrations || undefined }))); change(); setSelectorOpen(false); showPlanning(); setSelectedCase(pending[0] || null); }}>Preparar {pending.length} testes sem resultado<ArrowRight size={15} /></button>}
+      {round && <section className="panel suite-round-detail"><div className="suite-section-heading"><div><h2>{round.name}</h2><small className="suite-muted">{date(round.created_at)} · {finishedCount} de {roundCount} {roundCount === 1 ? "teste" : "testes"} com resultado</small></div><Status value={round.status} /></div><div className="suite-heading-actions"><button className="button secondary" onClick={() => void perform(() => openReport(suite.id, "round", round.id))}><Download size={16} />Relatório</button>{active(round.status) && <button className="button ghost" disabled={busy || round.status === "stopping"} onClick={() => void perform(async () => { setRound(await request<Round>(`/test-suites/rounds/${encode(round.id)}/stop`, { method: "POST" })); })}><Square size={15} />Parar execução</button>}<button className="button secondary" onClick={() => { setSaved(null); setName(round.name + " · nova execução"); setSelection(round.items.map(item => ({ case_id: item.case_id, source_exploration_id: item.source_exploration_id, source_scenario_id: item.source_scenario_id, capture_plan: item.capture_plan || undefined, planned_integrations: item.planned_integrations || undefined }))); change(); showPlanning(); setSelectedCase(round.items[0]?.case_id || null); }}>Testar novamente<ArrowRight size={15} /></button></div><p className="suite-muted suite-round-scope">Esta execução inclui somente os {roundCount} testes abaixo, não todos os testes da aplicação.</p>{round.reason && <p className="suite-notice">{round.reason}</p>}{pending.length > 0 && !active(round.status) && <button className="text-button" onClick={() => { setSaved(null); setName("Retomar testes pendentes"); setSelection(round.items.filter(item => pending.includes(item.case_id)).map(item => ({ case_id: item.case_id, source_exploration_id: item.source_exploration_id, source_scenario_id: item.source_scenario_id, capture_plan: item.capture_plan || undefined, planned_integrations: item.planned_integrations || undefined }))); change(); showPlanning(); setSelectedCase(pending[0] || null); }}>Preparar {pending.length} testes sem resultado<ArrowRight size={15} /></button>}
         <div className="suite-round-cases">{round.items.map((item, index) => <div className="suite-round-case" key={item.case_id}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{item.case_id} · {item.definition.title}</strong><small>{item.mode === "manual" ? "Teste manual" : "Teste automático"}</small>{(item.result?.actual_result || item.reason) && <details className="suite-result-explanation"><summary>O que aconteceu</summary>{item.result && <p>{item.result.actual_result}</p>}{item.reason && <p>{item.reason}</p>}</details>}</div><Status value={item.result?.status || item.state} />{item.execution_id && <button className="button secondary" onClick={() => navigate(`#/exploracoes/${encode(item.execution_id!)}/acompanhar`)}>{item.result ? "Ver execução" : "Acompanhar"}<ArrowRight size={15} /></button>}</div>)}</div>
         {manualItem && <form className="suite-manual-result" onSubmit={event => { event.preventDefault(); void perform(async () => { setRound(await request<Round>(`/test-suites/rounds/${encode(round.id)}/cases/${encode(manualItem.case_id)}/result`, { method: "POST", body: JSON.stringify({ status: manualVerdict, actual_result: manualNote, expected_revision: round.revision }) })); setManualVerdict(""); setManualNote(""); }); }}><h3>Sua vez: {manualItem.case_id} · {manualItem.definition.title}</h3><ol>{manualItem.definition.steps.map((step, index) => <li key={index}>{step}</li>)}</ol><p><strong>Esperado:</strong> {manualItem.definition.expected_result}</p><label>Resultado observado<textarea minLength={3} maxLength={4000} required value={manualNote} onChange={event => setManualNote(event.target.value)} /></label><label>Avaliação<select required value={manualVerdict} onChange={event => setManualVerdict(event.target.value)}><option value="">Escolha após executar e conferir</option>{["PASS", "FAIL", "BLOCKED", "SKIPPED"].map(value => <option key={value} value={value}>{labels[value]}</option>)}</select></label><button className="button primary" disabled={busy || !manualVerdict || manualNote.trim().length < 3}><Check size={16} />Registrar resultado e continuar</button></form>}
         {comparableRounds.length > 0 && <details className="suite-comparison"><summary>Comparar com outra execução</summary><select aria-label="Rodada para comparação" value={compareId} onChange={event => { setCompareId(event.target.value); setCompare(null); if (event.target.value) void perform(async () => setCompare(await request<Round>(`/test-suites/rounds/${encode(event.target.value)}`))); }}><option value="">Selecione uma execução</option>{comparableRounds.map(value => <option value={value.id} key={value.id}>{value.name} · {date(value.created_at)}</option>)}</select>{compare && <div className="suite-compare-table"><div><strong>CT</strong><strong>{compare.name}</strong><strong>{round.name}</strong></div>{[...new Set([...compare.items.map(item => item.case_id), ...round.items.map(item => item.case_id)])].map(id => <div key={id}><strong>{id}</strong><span>{labels[compare.items.find(item => item.case_id === id)?.result?.status || ""] || "Não executado"}</span><span>{labels[round.items.find(item => item.case_id === id)?.result?.status || ""] || "Não executado"}</span></div>)}</div>}</details>}

@@ -2725,6 +2725,15 @@ class ExplorationManager:
             # saucedemo.com -> www.saucedemo.com: plan coverage on the origin
             # the browser actually serves, or every link reads as off-origin.
             entry_url = getattr(executor, "entry_url", None) or item["app_url"]
+            from autojev.services.rerun_recipe import recipe_state_digest, recipe_effect_digest, RerunRecipeBlocked
+            try:
+                initial_contract = {"entry_url": observation.url,
+                                    "state_digest": recipe_state_digest(observation),
+                                    "effect_digest": recipe_effect_digest(observation)}
+            except RerunRecipeBlocked as exc:
+                initial_contract = {"entry_url": entry_url, "gap": exc.reason}
+            self.repository.add_event(exploration_id, "info", "rerun_initial_contract",
+                                      "Pré-condições iniciais capturadas para reexecução", initial_contract)
             self._record_screenshot(exploration_id, observation, "Initial page")
             self.repository.add_event(
                 exploration_id,
@@ -2950,6 +2959,8 @@ class ExplorationManager:
                                 "Tentando login automaticamente pelo Playwright, sem enviar credenciais à IA",
                             )
                         await executor.update_live_panel("Autenticando", "Tentativa local de login · sem chamadas à IA")
+                        from autojev.services.rerun_setup import build_authentication_setup
+                        login_setup = build_authentication_setup(observation, credentials, entry_url)
                         try:
                             login = await asyncio.wait_for(
                                 (executor.attempt_session_relogin if session_relogin
@@ -2959,6 +2970,8 @@ class ExplorationManager:
                         except asyncio.TimeoutError:
                             login = None
                         if login and login.status == "success" and login.observation:
+                            self.repository.add_event(exploration_id, "info", "rerun_authentication_setup",
+                                                      "Preparação autenticada capturada sem credenciais", {"after_step": actions_executed, "setup": login_setup})
                             last_automatic_login_succeeded = True
                             observation = login.observation
                             self._record_screenshot(exploration_id, observation, "After automatic login")
@@ -2993,6 +3006,8 @@ class ExplorationManager:
                             + self.LOGIN_PANEL_MESSAGE
                         )
                     if self._needs_login(observation):
+                        from autojev.services.rerun_setup import build_authentication_setup
+                        login_setup = build_authentication_setup(observation, credentials, entry_url)
                         outcome = await self._wait_for_user_input(
                             exploration_id,
                             observation,
@@ -3053,6 +3068,10 @@ class ExplorationManager:
                                 "Maximum exploration duration reached while confirming login; coverage is partial",
                                 {"reason": "duration_limit", **coverage.context(observation)})
                             break
+                        if not self._needs_login(observation):
+                            self.repository.add_event(exploration_id, "info", "rerun_authentication_setup",
+                                                      "Preparação autenticada capturada; novos insumos serão solicitados na reexecução",
+                                                      {"after_step": actions_executed, "setup": login_setup})
                         self._record_screenshot(exploration_id, observation, "After login")
                         self.repository.update_exploration(
                             exploration_id, current_url=observation.url
@@ -3508,7 +3527,7 @@ class ExplorationManager:
                 # Private replay metadata is persisted only on the action,
                 # never passed to auxiliary models or copied into CT evidence.
                 rerun_recipe = build_rerun_recipe(
-                    observation, decision, entry_url, secret_values=secret_values,
+                    observation, decision, entry_url, secret_values=secret_values, credentials=credentials, capture_journey=True,
                 )
                 result, next_observation = await asyncio.wait_for(
                     executor.execute(decision, credentials),

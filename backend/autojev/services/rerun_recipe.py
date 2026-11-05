@@ -11,7 +11,7 @@ import hashlib
 import json
 import re
 import unicodedata
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any
 from urllib.parse import parse_qsl, unquote, urlsplit
 
@@ -19,7 +19,7 @@ from autojev.domain.models import AgentDecision, Observation
 from autojev.services.coverage import CoveragePlanner, semantic_element_fingerprint
 
 RECIPE_VERSION = "ct-rerun-v1"
-_ACTIONS = frozenset({"click", "select", "fill", "hover", "press", "navigate", "reload"})
+_ACTIONS = frozenset({"click", "select", "fill", "hover", "press", "navigate", "reload", "go_back", "wait", "screenshot"})
 _TARGET_ACTIONS = frozenset({"click", "select", "fill", "hover", "press"})
 _PRESS_KEYS = frozenset({
     "arrowdown", "arrowleft", "arrowright", "arrowup", "enter", "escape", "space", "tab",
@@ -54,6 +54,49 @@ class RerunRecipeBlocked(ValueError):
     def __init__(self, reason: str) -> None:
         self.reason = reason
         super().__init__(reason)
+
+
+def _credential_mapping(credentials: Mapping[str, str] | None) -> dict[str, str]:
+    result = dict(credentials or {})
+    if any(not isinstance(key, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,99}", key)
+           or not isinstance(value, str) or not value for key, value in result.items()):
+        raise RerunRecipeBlocked("invalid_credentials")
+    if any(value in key for key in result for value in result.values()):
+        raise RerunRecipeBlocked("unsafe_input_reference")
+    return result
+
+
+def _input_key(decision: AgentDecision, credentials: Mapping[str, str]) -> str | None:
+    if decision.credential_key:
+        if decision.action != "fill":
+            raise RerunRecipeBlocked("credential_action")
+        if decision.credential_key not in credentials:
+            raise RerunRecipeBlocked("missing_recipe_input")
+        if decision.value is not None and decision.value != credentials[decision.credential_key]:
+            raise RerunRecipeBlocked("conflicting_recipe_input")
+        return decision.credential_key
+    if decision.action == "fill" and decision.value is not None:
+        matches = sorted(key for key, value in credentials.items() if value == decision.value)
+        return matches[0] if matches else None
+    return None
+
+
+def _check_observed_secrets(before: Observation, secrets: Iterable[str]) -> None:
+    # Hashing visible secret text would create a dictionary-attack oracle.
+    observed = json.dumps({"url": before.url, "title": before.title, "text": before.text,
+                           "elements": before.interactive_elements, "state": before.page_state},
+                          ensure_ascii=False)
+    if any(secret and secret in observed for secret in secrets):
+        raise RerunRecipeBlocked("private_observation")
+
+
+def required_recipe_inputs(recipe: dict[str, Any]) -> list[str]:
+    """Return sorted vault aliases, never values; validate enabled recipes first."""
+    if isinstance(recipe, dict) and recipe.get("enabled") is False:
+        return []
+    validate_rerun_recipe(recipe, recipe.get("origin", ""))
+    key = recipe["decision"].get("input_ref")
+    return sorted(set(([key] if key else []) + list(recipe.get("state_inputs", {}).values())))
 
 
 def _digest(value: Any) -> str:
@@ -193,7 +236,7 @@ def _portable_field_value(field: dict[str, Any], refs: dict[str, dict[str, Any]]
     if element is not None:
         public_values.update(value for action, value in CoveragePlanner._candidate_actions(element)
                              if action == "fill" and isinstance(value, str))
-    if isinstance(value, str) and value in public_values:
+    if isinstance(value, str) and (value in public_values or re.fullmatch(r"AutoJev QA [a-z ]{1,48}", value)):
         return {"public_value_digest": _digest(value)}
     if field.get("value_token"):
         # Per-executor HMAC tokens cannot be verified by a new browser. Do not
@@ -205,7 +248,10 @@ def _portable_field_value(field: dict[str, Any], refs: dict[str, dict[str, Any]]
     return None
 
 
-def recipe_state_digest(before: Observation) -> str:
+def recipe_state_digest(
+    before: Observation, *, state_inputs: Mapping[str, str] | None = None,
+    credentials: Mapping[str, str] | None = None,
+) -> str:
     """Hash complete sanitized semantic state with ref-independent bindings."""
     refs = {str(element["ref"]): element for element in before.interactive_elements
             if isinstance(element, dict) and element.get("ref")}
@@ -221,7 +267,20 @@ def recipe_state_digest(before: Observation) -> str:
                 and not (is_field and name in {"value", "value_token"})
             }
             if is_field:
-                normalized["field_value_state"] = _portable_field_value(value, refs)
+                fingerprint = identities.get(str(value.get("ref")))
+                alias = (state_inputs or {}).get(fingerprint)
+                if alias is not None:
+                    attestations = getattr(before.page_state, "rerun_field_bindings",
+                                             before.page_state.get("_rerun_field_bindings", {}))
+                    if (attestations.get(str(value.get("ref"))) != alias
+                            or value.get("has_value") is not True):
+                        raise RerunRecipeBlocked("unverified_recipe_input_state")
+                    # Executor masks alias fills as sensitive on replay even
+                    # when the original literal fill was an ordinary control.
+                    normalized.pop("sensitive", None)
+                    normalized["field_value_state"] = {"input_ref": alias}
+                else:
+                    normalized["field_value_state"] = _portable_field_value(value, refs)
             return normalized
         if isinstance(value, list):
             return [normalize(item, key) for item in value]
@@ -255,38 +314,75 @@ def recipe_effect_digest(before: Observation) -> str:
 
 def _decision_payload(
     before: Observation, decision: AgentDecision, origin: str, secrets: Iterable[str],
+    credentials: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, Any], str | None]:
-    if decision.credential_key:
-        raise RerunRecipeBlocked("credential_action")
-    if before.page_state.get("authentication_challenge") is True:
+    credentials = credentials or {}
+    input_key = _input_key(decision, credentials)
+    if (input_key is None and decision.action == "fill" and isinstance(decision.value, str)):
+        element = _by_ref(before, decision.target)
+        public = False
+        if not _is_sensitive_target(element, before):
+            try:
+                literal = _public_literal(decision.value, secrets, limit=120)
+                public = literal == "" or ("fill", literal) in CoveragePlanner._candidate_actions(element)
+            except RerunRecipeBlocked:
+                pass
+        if not public:
+            input_key = "replay_" + semantic_element_fingerprint(element)
+    if before.page_state.get("authentication_challenge") is True and input_key is None:
         raise RerunRecipeBlocked("authentication_required")
-    if isinstance(decision.scenario_hint, dict) and decision.scenario_hint.get("validation_probe"):
-        # That hint changes the meaning of business assertions, unlike prose
-        # title/description hints. Never silently turn a negative probe into a
-        # generic form submission when its durable field contract is absent.
-        raise RerunRecipeBlocked("unsupported_validation_probe")
+    probe = (decision.scenario_hint or {}).get("validation_probe")
+    probe_contract = None
+    if probe:
+        if not isinstance(probe, dict) or probe.get("kind") != "required_field" or decision.action != "click":
+            raise RerunRecipeBlocked("unsupported_validation_probe")
+        fields = [field for field in before.page_state.get("fields", [])
+                  if field.get("identity") == probe.get("field_identity")]
+        if len(fields) != 1 or fields[0].get("has_value") is not False or fields[0].get("sensitive"):
+            raise RerunRecipeBlocked("unsupported_validation_probe")
+        field = _by_ref(before, fields[0].get("ref"))
+        if _is_sensitive_target(field, before):
+            raise RerunRecipeBlocked("sensitive_target")
+        fingerprint = semantic_element_fingerprint(field)
+        _by_fingerprint(before, fingerprint)
+        probe_contract = {"kind": "required_field", "target_fingerprint": fingerprint}
     if decision.action not in _ACTIONS:
         raise RerunRecipeBlocked("unsupported_action")
     payload: dict[str, Any] = {"action": decision.action, "assertions": []}
+    if probe_contract:
+        payload["validation_probe"] = probe_contract
     fingerprint = None
     if decision.action in _TARGET_ACTIONS:
         element = _by_ref(before, decision.target)
         fingerprint = semantic_element_fingerprint(element)
         _by_fingerprint(before, fingerprint)  # Reject ambiguous captures now.
-        if _is_sensitive_target(element, before):
+        if input_key is not None:
+            # Only fill implements vault substitution in the executor. Keep this
+            # policy local: password fields must not enter the coverage frontier.
+            if (element.get("enabled") is False or element.get("read_only")
+                    or element.get("href")
+                    or not (str(element.get("tag", "")).casefold() == "textarea"
+                            or (str(element.get("tag", "")).casefold() == "input"
+                                and str(element.get("type") or "text").casefold() in {
+                                    "text", "password", "email", "tel", "search", "url", "number"}))):
+                raise RerunRecipeBlocked("unsafe_target")
+            payload["input_ref"] = input_key
+        elif _is_sensitive_target(element, before):
             raise RerunRecipeBlocked("sensitive_target")
-        if not CoveragePlanner._safe_candidate(element, urlsplit(before.url)[:2],
-                                               require_interactable=False):
+        elif not CoveragePlanner._safe_candidate(element, urlsplit(before.url)[:2],
+                                                 require_interactable=False):
             raise RerunRecipeBlocked("unsafe_target")
-        if decision.action in {"fill", "select"}:
+        if input_key is not None:
+            pass
+        elif decision.action in {"fill", "select"}:
             value = _public_literal(decision.value, secrets, limit=120)
-            if (decision.action, value) not in CoveragePlanner._candidate_actions(element):
+            if not (decision.action == "fill" and value == "") and (decision.action, value) not in CoveragePlanner._candidate_actions(element):
                 raise RerunRecipeBlocked("non_deterministic_fill" if decision.action == "fill"
                                          else "unsupported_selection")
             payload["value"] = value
         elif decision.value is not None:
             raise RerunRecipeBlocked("unexpected_action_value")
-        if decision.action == "press":
+        if decision.action == "press" or (decision.action == "fill" and decision.key is not None):
             key = _public_literal(decision.key or "Enter", secrets, limit=20)
             if key.casefold() not in _PRESS_KEYS:
                 raise RerunRecipeBlocked("unsupported_key")
@@ -296,8 +392,14 @@ def _decision_payload(
         if decision.url is not None:
             raise RerunRecipeBlocked("unexpected_action_url")
     else:
-        if decision.target is not None or decision.value is not None or decision.key is not None:
+        if (decision.target is not None or decision.key is not None
+                or (decision.value is not None and decision.action != "wait")):
             raise RerunRecipeBlocked("unexpected_action_target")
+        if decision.action == "wait":
+            value = decision.value if decision.value is not None else "500"
+            if not isinstance(value, str) or not re.fullmatch(r"[0-9]{1,4}", value) or int(value) > 5000:
+                raise RerunRecipeBlocked("unsupported_wait")
+            payload["value"] = value
         if decision.action == "navigate":
             url = _public_url(decision.url, secrets)
             if _origin(url) != origin:
@@ -328,22 +430,39 @@ def _decision_payload(
 
 def build_rerun_recipe(
     before: Observation, decision: AgentDecision, app_url: str,
-    *, secret_values: Iterable[str] = (),
+    *, secret_values: Iterable[str] = (), credentials: Mapping[str, str] | None = None,
+    capture_journey: bool = False,
 ) -> dict[str, Any]:
-    """Capture a safe action, or an explicit reason it cannot be rerun."""
+    """Capture an action using an explicit EphemeralCredentialVault.get mapping.
+
+    Only fill supports aliases. Unknown private fills get a target-derived alias;
+    no value or value-derived digest is stored. Nonempty masked fields remain
+    unportable: possession of a credential does not prove browser field content.
+    Empty sensitive fields are portable without weakening nonempty guards.
+    """
     disabled: dict[str, Any] = {"version": RECIPE_VERSION, "enabled": False}
+    if capture_journey:
+        disabled["journey_capture"] = True
     try:
-        secrets = tuple(secret_values)
+        credentials = _credential_mapping(credentials)
+        secrets = tuple(secret_values) + tuple(credentials.values())
         origin = _origin(app_url)
         before_url = _public_url(before.url, secrets)
         if _origin(before_url) != origin:
             raise RerunRecipeBlocked("cross_origin_source")
-        payload, fingerprint = _decision_payload(before, decision, origin, secrets)
+        payload, fingerprint = _decision_payload(before, decision, origin, secrets, credentials)
+        _check_observed_secrets(before, (*secrets, decision.value)
+                                if "input_ref" in payload and decision.value else secrets)
+        state_inputs = {}
+        for ref, alias in getattr(before.page_state, "rerun_field_bindings",
+                                             before.page_state.get("_rerun_field_bindings", {})).items():
+            state_inputs[semantic_element_fingerprint(_by_ref(before, ref))] = alias
         return {
-            "version": RECIPE_VERSION, "enabled": True,
+            **disabled, "enabled": True,
+            **({"state_inputs": state_inputs} if state_inputs else {}),
             "origin": origin, "before_url": before_url,
             "before_effect_digest": recipe_effect_digest(before),
-            "before_state_digest": recipe_state_digest(before),
+            "before_state_digest": recipe_state_digest(before, state_inputs=state_inputs, credentials=credentials),
             "target_fingerprint": fingerprint, "decision": payload,
         }
     except RerunRecipeBlocked as exc:
@@ -369,18 +488,41 @@ def validate_rerun_recipe(recipe: dict[str, Any], app_url: str) -> None:
         for name in ("before_effect_digest", "before_state_digest"):
             if not isinstance(recipe.get(name), str) or not _HASH.fullmatch(recipe[name]):
                 raise RerunRecipeBlocked("invalid_precondition_digest")
+        state_inputs = recipe.get("state_inputs", {})
+        if (not isinstance(state_inputs, dict) or any(
+                not isinstance(fp, str) or not _HASH.fullmatch(fp)
+                or not isinstance(alias, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,99}", alias)
+                for fp, alias in state_inputs.items())):
+            raise RerunRecipeBlocked("invalid_input_reference")
         raw = recipe.get("decision")
-        if (not isinstance(raw, dict) or set(raw) - {"action", "value", "key", "url", "assertions"}
+        if (not isinstance(raw, dict) or set(raw) - {"action", "value", "key", "url", "assertions", "validation_probe", "input_ref"}
                 or raw.get("action") not in _ACTIONS):
             raise RerunRecipeBlocked("invalid_decision")
         action = raw["action"]
+        probe = raw.get("validation_probe")
+        if probe is not None and (action != "click" or not isinstance(probe, dict)
+                or set(probe) != {"kind", "target_fingerprint"} or probe.get("kind") != "required_field"
+                or not isinstance(probe.get("target_fingerprint"), str)
+                or not _HASH.fullmatch(probe["target_fingerprint"])):
+            raise RerunRecipeBlocked("unsupported_validation_probe")
         fingerprint = recipe.get("target_fingerprint")
         if action in _TARGET_ACTIONS:
             if not isinstance(fingerprint, str) or not _HASH.fullmatch(fingerprint):
                 raise RerunRecipeBlocked("invalid_target_fingerprint")
         elif fingerprint is not None:
             raise RerunRecipeBlocked("unexpected_action_target")
-        if action in {"fill", "select"}:
+        input_ref = raw.get("input_ref")
+        if "input_ref" in raw:
+            if (action != "fill" or "value" in raw or not isinstance(input_ref, str)
+                    or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,99}", input_ref)):
+                raise RerunRecipeBlocked("invalid_input_reference")
+        if input_ref is not None:
+            pass
+        elif action == "wait":
+            if (not isinstance(raw.get("value"), str)
+                    or not re.fullmatch(r"[0-9]{1,4}", raw["value"]) or int(raw["value"]) > 5000):
+                raise RerunRecipeBlocked("unsupported_wait")
+        elif action in {"fill", "select"}:
             value = _public_literal(raw.get("value"), (), limit=120)
             if action == "fill" and value not in _PUBLIC_SYNTHETIC_VALUES and not re.fullmatch(
                 r"AutoJev QA [a-z ]{1,48}", value,
@@ -388,7 +530,7 @@ def validate_rerun_recipe(recipe: dict[str, Any], app_url: str) -> None:
                 raise RerunRecipeBlocked("non_deterministic_fill")
         elif "value" in raw:
             raise RerunRecipeBlocked("unexpected_action_value")
-        if action == "press":
+        if action == "press" or (action == "fill" and "key" in raw):
             if _public_literal(raw.get("key"), (), limit=20).casefold() not in _PRESS_KEYS:
                 raise RerunRecipeBlocked("unsupported_key")
         elif "key" in raw:
@@ -421,17 +563,27 @@ def validate_rerun_recipe(recipe: dict[str, Any], app_url: str) -> None:
 
 def resolve_rerun_decision(
     recipe: dict[str, Any], before: Observation, app_url: str | None = None,
+    *, credentials: Mapping[str, str] | None = None,
 ) -> AgentDecision:
-    """Validate exact preconditions and bind the original action to fresh refs."""
+    """Bind fresh refs and explicit per-rerun vault credentials without caching.
+
+    Input decisions carry credential_key, not plaintext; execution must receive
+    the same mapping. No login or navigation semantics are invented.
+    """
     validate_rerun_recipe(recipe, app_url or (recipe.get("origin") if isinstance(recipe, dict) else ""))
     try:
+        credentials = _credential_mapping(credentials)
+        for key in required_recipe_inputs(recipe):
+            if key not in credentials:
+                raise RerunRecipeBlocked("missing_recipe_input")
+        _check_observed_secrets(before, credentials.values())
         origin = _origin(app_url or recipe.get("origin"))
         if recipe.get("origin") != origin or _origin(before.url) != origin:
             raise RerunRecipeBlocked("cross_origin_source")
         if before.url != recipe.get("before_url"):
             raise RerunRecipeBlocked("before_url_changed")
         raw = recipe.get("decision")
-        if not isinstance(raw, dict) or set(raw) - {"action", "value", "key", "url", "assertions"}:
+        if not isinstance(raw, dict) or set(raw) - {"action", "value", "key", "url", "assertions", "validation_probe", "input_ref"}:
             raise RerunRecipeBlocked("invalid_decision")
         target = None
         if raw.get("action") in _TARGET_ACTIONS:
@@ -451,19 +603,29 @@ def resolve_rerun_decision(
                 assertions.append({"kind": "element_visible", "expected": ref})
             else:
                 assertions.append(dict(assertion))
+        scenario_hint = None
+        if raw.get("validation_probe"):
+            field = _by_fingerprint(before, raw["validation_probe"]["target_fingerprint"])
+            matches = [entry for entry in before.page_state.get("fields", []) if entry.get("ref") == field["ref"]]
+            if len(matches) != 1 or not matches[0].get("identity"):
+                raise RerunRecipeBlocked("unsupported_validation_probe")
+            scenario_hint = {"validation_probe": {"kind": "required_field",
+                "field_identity": matches[0]["identity"]}}
         decision = AgentDecision(
             action=raw.get("action"), rationale="Reexecute the original observed CT action.",
-            target=target, value=raw.get("value"), key=raw.get("key"), url=raw.get("url"),
-            assertions=assertions,
+            target=target, value=raw.get("value"), credential_key=raw.get("input_ref"),
+            key=raw.get("key"), url=raw.get("url"),
+            assertions=assertions, scenario_hint=scenario_hint,
         )
         # Reapply the same action/value/scope policy to persisted data, not just
         # to freshly captured decisions. Unknown fields/values fail closed.
-        payload, _ = _decision_payload(before, decision, origin, ())
+        payload, _ = _decision_payload(before, decision, origin, tuple(credentials.values()), credentials)
         if payload != raw:
             raise RerunRecipeBlocked("invalid_decision")
         if recipe_effect_digest(before) != recipe.get("before_effect_digest"):
             raise RerunRecipeBlocked("before_effect_changed")
-        if recipe_state_digest(before) != recipe.get("before_state_digest"):
+        if recipe_state_digest(before, state_inputs=recipe.get("state_inputs"),
+                               credentials=credentials) != recipe.get("before_state_digest"):
             raise RerunRecipeBlocked("before_state_changed")
         return decision
     except RerunRecipeBlocked:

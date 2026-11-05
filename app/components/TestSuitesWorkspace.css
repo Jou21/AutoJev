@@ -19,7 +19,15 @@
 .suite-main-tabs .suite-refresh { margin-left: auto; }
 .page-content:has(.suite-detail-workspace) { padding: 18px 24px 32px; }
 .suite-detail-workspace { gap: 12px; }
-.suite-detail-header { display: grid; gap: 10px; min-width: 0; }
+.suite-detail-header { display: grid; gap: 10px; min-width: 0; position: relative; }
+@media (min-width: 1100px) {
+  .suite-detail-topline { min-height: 42px; }
+  .suite-detail-header .suite-main-tabs { position: absolute; top: 0; left: 50%; transform: translateX(-50%); border-bottom: 0; padding-bottom: 0; justify-content: center; }
+  .suite-detail-identity { max-width: calc(50% - 180px); }
+}
+@media (max-width: 1099px) {
+  .suite-detail-header .suite-main-tabs { justify-content: center; }
+}
 .suite-detail-topline { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px 20px; }
 .suite-detail-identity { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; }
 .suite-detail-identity h1 { min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 20px; font-weight: 600; line-height: 1.4; letter-spacing: -.025em; }
@@ -246,7 +254,7 @@
 .suite-selector .suite-selector-filters .text-button { margin: 0; text-align: left; }
 .suite-selector .suite-selector-filters > .button { justify-content: center; min-height: 32px; padding: 6px; font-size: 10px; white-space: normal; }
 .suite-selector-footer { flex-shrink: 0; padding-top: 6px; border-top: 1px solid var(--suite-line); }
-.suite-selector .suite-selector-footer .text-button { display: flex; align-items: center; justify-content: space-between; gap: 6px; width: 100%; min-height: 29px; margin: 0; padding: 4px 3px; font-size: 11px; }
+.suite-selector .suite-selector-footer .button { display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%; min-height: 34px; margin: 0; padding: 6px; font-size: 11px; }
 .suite-planner-view .suite-available-list { flex: 1; min-height: 0; max-height: none; overflow: auto; overscroll-behavior: contain; }
 .suite-planner-view .suite-available-list > div { padding: 8px 5px; }
 .suite-planner-view .suite-available-list .case-flow-label { display: none; }

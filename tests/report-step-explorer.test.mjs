@@ -385,21 +385,13 @@ function fixture(options = {}) {
   make("div", "", testsView).id = "filters";
   make("button", "", testsView, "Baixar CSV").id = "download-csv";
   if (options.flowMetadata) {
-    const panel = make("div", "functional-flows-panel", testsView);
-    for (const key of ["all", "unclassified"]) {
-      const button = make("button", "", panel, key);
-      button.dataset.selectFlow = key;
-      make("span", "", button).setAttribute(key === "all" ? "data-flow-all-count" : "data-flow-unclassified-count", "");
+    const flow = make("select", "", testsView);
+    flow.id = "flow-filter";
+    for (const [value, label] of [["all", "Todos os fluxos"], ["unclassified", "Não classificados"], ["flow-boleto", "Cadastrar boleto"]]) {
+      const option = make("option", "", flow, label); option.value = value;
     }
-    const card = make("button", "functional-flow-card", panel, "Cadastrar boleto");
-    card.dataset.selectFlow = "flow-boleto";
-    for (const key of ["total", "approval", "suggestions", "failure"]) make("span", "", card).setAttribute("data-flow-" + key, "");
-    for (const status of ["PASS", "FAIL", "BLOCKED", "SKIPPED"]) make("span", "", card).dataset.flowStatus = status;
-    const active = make("div", "active-flow-filter", panel);
-    active.id = "active-flow-filter";
-    make("strong", "", active).id = "active-flow-name";
-    make("button", "", active, "Remover filtro").id = "clear-flow-filter";
-    make("p", "", panel).id = "flow-table-context";
+    Object.defineProperty(flow, "options", { get: () => flow.children });
+    make("p", "", testsView).id = "flow-table-context";
     make("button", "", testsView, "Limpar filtros").id = "clear-filters";
     make("select", "", testsView).id = "category-filter";
     make("select", "", testsView).id = "page-filter";
@@ -971,7 +963,7 @@ test("a connected blob report hands off only to same-origin app confirmation and
   insertStep(document, document.getElementById("case-editor-steps").querySelector(".case-editor-insert"));
   document.getElementById("case-editor-save").click();
   document.getElementById("case-editor-rerun").click();
-  assert.deepEqual(window.openedTabs, [["http://localhost:5173/#/planejar/source-123/CT001", "_blank", "noopener,noreferrer"]]);
+  assert.deepEqual(window.openedTabs, [["http://localhost:5173/#/conjuntos/source-123?tab=planner&ct=CT001&source=source-123&source_ct=CT001", "_blank", "noopener,noreferrer"]]);
   assert.equal(window.networkCalls, 0);
   assert.equal(cards[0].dataset.status, "PASS");
   assert.match(document.getElementById("case-editor-feedback").textContent, /Nenhuma ação foi iniciada.*passos extras.*não serão executados/);
@@ -1016,15 +1008,11 @@ const plannerConnection = {
   appRuntime: { app_url: "http://localhost:5173", source_exploration_id: "source-123" },
 };
 
-test("rerun toolbar opens a planner before a separate explicit application handoff", () => {
+test("rerun toolbar directly opens application preparation without a report modal", () => {
   const { document, window, cards } = fixture({ ...plannerConnection, visualEditor: true });
   document.getElementById("case-rerun").click();
-  assert.equal(document.getElementById("case-editor").hasAttribute("open"), true);
-  assert.equal(window.openedTabs.length, 0);
-  assert.equal(document.querySelectorAll(".case-inline-insert, .case-inline-gap").length, 0);
-  assert.deepEqual(document.querySelectorAll(".case-editor-insert").map((button) => button.textContent), ["+", "+", "+", "+"]);
-  document.getElementById("case-editor-rerun").click();
-  assert.deepEqual(window.openedTabs, [["http://localhost:5173/#/planejar/source-123/CT001", "_blank", "noopener,noreferrer"]]);
+  assert.equal(document.getElementById("case-editor").hasAttribute("open"), false);
+  assert.deepEqual(window.openedTabs, [["http://localhost:5173/#/conjuntos/source-123?tab=planner&ct=CT001&source=source-123&source_ct=CT001", "_blank", "noopener,noreferrer"]]);
   assert.equal(window.networkCalls, 0);
   assert.deepEqual(cards.map((card) => card.dataset.status), ["PASS", "FAIL"]);
 });
@@ -1300,10 +1288,8 @@ test("connected blobs keep the rerun action and its original styling after expor
   assert.equal(rerun.classList.contains("button-rerun"), true);
   assert.equal(rerun.getAttribute("aria-label"), "Reexecutar teste CT001");
   rerun.click();
-  assert.equal(window.openedTabs.length, 0);
-  document.getElementById("case-editor-rerun").click();
-  assert.deepEqual(window.openedTabs, [["http://localhost:5173/#/planejar/source-123/CT001", "_blank", "noopener,noreferrer"]]);
-  assert.equal(document.getElementById("case-editor").hasAttribute("open"), true);
+  assert.deepEqual(window.openedTabs, [["http://localhost:5173/#/conjuntos/source-123?tab=planner&ct=CT001&source=source-123&source_ct=CT001", "_blank", "noopener,noreferrer"]]);
+  assert.equal(document.getElementById("case-editor").hasAttribute("open"), false);
   document.getElementById("download-report").click();
   const html = await blobs.at(-1).text();
   assert.doesNotMatch(html, /id="case-rerun(?:-feedback)?"/);
@@ -1315,8 +1301,7 @@ test("connected blobs keep the rerun action and its original styling after expor
   assert.equal(rerun.getAttribute("aria-label"), "Reexecutar teste CT002");
   assert.equal(document.getElementById("case-rerun-feedback").hidden, true);
   rerun.click();
-  document.getElementById("case-editor-rerun").click();
-  assert.equal(window.openedTabs.at(-1)[0], "http://localhost:5173/#/planejar/source-123/CT002");
+  assert.equal(window.openedTabs.at(-1)[0], "http://localhost:5173/#/conjuntos/source-123?tab=planner&ct=CT002&source=source-123&source_ct=CT002");
   assert.equal(window.networkCalls, 0);
 });
 
@@ -1365,26 +1350,22 @@ test("named report flows compose with status, search and CSV without changing ev
   const rows = document.querySelectorAll("#case-rows tr[data-case-index]");
   const visible = () => rows.filter(row => !row.hidden).map(row => row.dataset.caseIndex);
   assert.deepEqual(visible(), ["0", "1"]);
-  const card = document.querySelector('[data-select-flow="flow-boleto"]');
-  assert.equal(card.querySelector('[data-flow-total]').textContent, "1");
-  assert.equal(card.querySelector('[data-flow-failure]').hidden, false);
-  card.click();
+  const flow = document.getElementById("flow-filter");
+  const selectFlow = value => { flow.value = value; flow.dispatch("change"); };
+  assert.equal(flow.options[2].textContent, "Cadastrar boleto (1)");
+  selectFlow("flow-boleto");
   assert.deepEqual(visible(), ["1"]);
-  assert.equal(card.getAttribute("aria-pressed"), "true");
   document.querySelector('#filters [data-status="PASS"]').click();
   assert.deepEqual(visible(), []);
-  assert.equal(card.querySelector('[data-flow-total]').textContent, "0");
-  assert.equal(card.querySelector('[data-flow-failure]').hidden, true);
-  document.getElementById("clear-flow-filter").click();
+  assert.equal(flow.options[2].textContent, "Cadastrar boleto (0)");
+  selectFlow("all");
   assert.deepEqual(visible(), ["0"], "Removing a flow retains the verdict filter");
-  card.click();
+  selectFlow("flow-boleto");
   document.querySelector('#filters [data-status="ALL"]').click();
   document.getElementById("download-csv").click();
   const csv = await blobs.at(-1).text();
-  assert.match(csv, /"Fluxos funcionais";"Confiança da associação"/);
   assert.match(csv, /"CT002"/);
   assert.doesNotMatch(csv, /"CT001"/);
-  assert.match(csv, /"Cadastrar boleto";"Cadastrar boleto: Identificado"/);
   document.getElementById("category-filter").value = "technical";
   document.getElementById("category-filter").dispatch("change");
   assert.deepEqual(visible(), []);
@@ -1396,15 +1377,15 @@ test("named report flows compose with status, search and CSV without changing ev
   assert.deepEqual(visible(), []);
   document.getElementById("page-filter").value = "";
   document.getElementById("page-filter").dispatch("change");
-  document.querySelector('[data-select-flow="unclassified"]').click();
+  selectFlow("unclassified");
   assert.deepEqual(visible(), ["0"]);
   document.getElementById("search").value = "CT002";
   document.getElementById("search").dispatch("input");
   assert.deepEqual(visible(), []);
   document.getElementById("clear-filters").click();
   assert.deepEqual(visible(), ["0", "1"]);
-  assert.equal(document.querySelector('[data-select-flow="all"]').getAttribute("aria-pressed"), "true");
-  card.click();
+  assert.equal(flow.value, "all");
+  selectFlow("flow-boleto");
   document.getElementById("download-report").click();
   const exported = await blobs.at(-1).text();
   const exportedData = JSON.parse(exported.match(/<script[^>]*id="report-data"[^>]*>(.*?)<\/script>/s)[1]);
@@ -2359,9 +2340,8 @@ test("Reexecutar testes in the tests view opens the planner with every CT includ
   const button = document.getElementById("tests-rerun");
   assert.ok(button, "The app-connected report has the tests-view action");
   button.click();
-  assert.deepEqual(pickedStates(document), ["true", "true"]);
-  assert.equal(rerunLabel(document), "Revisar e confirmar 2 testes na aplicação →");
-  assert.equal(document.getElementById("case-editor").hasAttribute("open"), true);
+  assert.deepEqual(handedCts(window), ["CT001", "CT002"]);
+  assert.equal(document.getElementById("case-editor").hasAttribute("open"), false);
 
   const offline = fixture({ visualEditor: true, runId: "source-123" });
   assert.equal(offline.document.getElementById("tests-rerun"), null, "Downloaded and offline reports never get it");
@@ -2505,7 +2485,7 @@ test("Reexecutar testes sits on the overview and tests views only, and is gone f
   const { document, window } = connectedFixture({ hash: "#view/overview" });
   window.fetch = async () => jsonResponse([]);
   document.getElementById("tests-rerun").click();
-  assert.deepEqual(pickedStates(document), ["true", "true"], "From the overview it also starts with every CT included");
+  assert.deepEqual(handedCts(window), ["CT001", "CT002"], "From the overview it also hands off every CT");
   assert.equal(document.getElementById("print-report"), null, "There is no print button");
 });
 
@@ -2715,10 +2695,9 @@ test("Reordenar lists only the CTs that will run, with arrows and Alt + arrow ke
   assert.equal(window.openedTabs.length, 0);
 });
 
-test("the tests view puts the functional flows beside the table, and Reexecutar testes mirrors the results button", () => {
-  assert.match(reportCss, /@media screen and \(min-width: 1360px\)\s*\{\s*\.report-view\[data-view="tests"\]:not\(\[hidden\]\)\s*\{[^}]*display: grid;[^}]*grid-template-columns: clamp\(280px, 22vw, 340px\) minmax\(0, 1fr\);/);
-  assert.match(reportCss, /\.report-view\[data-view="tests"\] > \.functional-flows-panel\s*\{[^}]*grid-column: 1;[^}]*position: sticky;/);
-  assert.match(reportCss, /\.report-view\[data-view="tests"\] \.functional-flow-grid\s*\{\s*grid-template-columns: minmax\(0, 1fr\);/);
+test("the tests view uses compact flows and Reexecutar testes mirrors the results button", () => {
+  assert.doesNotMatch(reportCss, /grid-template-columns: clamp\(280px, 22vw, 340px\)/);
+  assert.match(reportCss, /#flow-filter/);
   assert.match(reportCss, /\.report-topbar \.toolbar \.button\s*\{\s*min-height: 34px;\s*font-size: 11px;\s*\}/);
   const { document } = connectedFixture();
   const rerun = document.getElementById("tests-rerun");

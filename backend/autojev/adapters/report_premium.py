@@ -313,7 +313,7 @@ def render_premium_report(renderer: Any, exploration: dict[str, Any], scenarios:
     if fragments["completion_reason"]:
         overview += '<div class="completion"><strong>Motivo do encerramento:</strong>' + _h(fragments["completion_reason"]) + '</div>'
     functional_flows = group_functional_flows(cases)
-    tests = _functional_flows_panel(functional_flows, cases) + '<div class="report-tools"><input class="search" id="search" type="search" placeholder="Buscar CT, título, URL ou sinal técnico" aria-label="Buscar cenários"><button id="download-csv" class="button button-ghost">Baixar CSV</button></div><div class="report-tools"><div class="filters" id="filters"></div><select id="category-filter" aria-label="Filtrar por categoria"><option value="ALL">Todas as categorias</option>' + "".join(f'<option value="{key}">{label}</option>' for key, label in CATEGORIES.items()) + '</select><select id="page-filter" aria-label="Filtrar por página"><option value="ALL">Todas as páginas</option>' + "".join(f'<option value="{_h(page)}">{_h(page)}</option>' for page in dict.fromkeys(case["page"] for case in cases)) + '</select><button id="clear-filters" class="button button-ghost">Limpar filtros</button></div>'
+    tests = '<div id="tests-execution-history"></div><div class="report-tools"><input class="search" id="search" type="search" placeholder="Buscar CT, título, URL ou sinal técnico" aria-label="Buscar cenários"><button id="download-csv" class="button button-ghost">Baixar CSV</button></div><div class="report-tools"><div class="filters" id="filters"></div>' + _functional_flows_panel(functional_flows, cases) + '<select id="category-filter" aria-label="Filtrar por categoria"><option value="ALL">Todas as categorias</option>' + "".join(f'<option value="{key}">{label}</option>' for key, label in CATEGORIES.items()) + '</select><select id="page-filter" aria-label="Filtrar por página"><option value="ALL">Todas as páginas</option>' + "".join(f'<option value="{_h(page)}">{_h(page)}</option>' for page in dict.fromkeys(case["page"] for case in cases)) + '</select><button id="clear-filters" class="button button-ghost">Limpar filtros</button></div>'
     tests += '<div class="table-wrap"><table class="report-table"><thead><tr><th>CT</th><th>Título</th><th>Resultado</th><th>Categoria</th><th>Página</th><th>Tempo da ação</th><th>Sinais</th><th>Detalhes</th></tr></thead><tbody id="case-rows">' + "".join(_case_row(case) for case in cases) + '</tbody></table></div><div class="table-footer"><span id="table-count" role="status"></span><div class="pagination" id="pagination" aria-label="Paginação dos testes"></div><select id="page-size" aria-label="Testes por página"><option value="15">15 por página</option><option value="30">30 por página</option><option value="50">50 por página</option></select></div><p class="muted">Tempo da ação usa horários registrados pelo executor. A duração total inclui navegação, revisões auxiliares e relatório.</p>'
     results = (
         '<div class="result-navigation">'
@@ -400,35 +400,14 @@ def _focus_badge(case: dict[str, Any]) -> str:
     return f'<span class="case-flow-label associated" title="{_h(explanation)}">{_h(labels)}</span>'
 
 
-def _functional_flow_card(flow: dict[str, Any]) -> str:
-    confidence = "Identificado" if flow["confidence"] == "identified" else "Sugerido"
-    counts = "".join(f'<span class="flow-stat {status.lower()}"><b data-flow-status="{status}">{flow["counts"][status]}</b> {label}</span>'
-                     for status, label in (("PASS", "aprovados"), ("FAIL", "reprovados"), ("BLOCKED", "bloqueados"), ("SKIPPED", "sem validação")))
-    approval = (f'{flow["approval_percent"]:g}% de aprovação · {flow["evaluated"]}/{flow["total"]} CTs avaliados'
-                if flow["evaluated"] else "Sem CTs avaliados (aprovado/reprovado)")
-    return (f'<button type="button" class="functional-flow-card" data-select-flow="{_h(flow["id"])}" aria-pressed="false">'
-            f'<span class="flow-card-top"><span class="flow-confidence" data-flow-confidence="{flow["confidence"]}">{confidence}</span>'
-            f'<span class="flow-failure" data-flow-failure {"" if flow["counts"]["FAIL"] else "hidden"}>Há falhas</span></span>'
-            f'<strong class="flow-card-name">{_h(flow["name"])}</strong><span class="flow-card-description">{_h(flow["description"])}</span>'
-            f'<span class="flow-card-total"><b data-flow-total>{flow["total"]}</b> CTs relacionados</span>'
-            f'<span class="flow-card-stats">{counts}</span><span class="flow-card-approval" data-flow-approval>{_h(approval)}</span>'
-            f'<span class="flow-card-suggestions" data-flow-suggestions {"" if flow["suggested_count"] else "hidden"}>{flow["suggested_count"]} associação(ões) sugerida(s)</span></button>')
-
-
 def _functional_flows_panel(flows: list[dict[str, Any]], cases: list[dict[str, Any]]) -> str:
     unclassified = sum(not case["flow_classification"]["memberships"] for case in cases)
-    cards = [_functional_flow_card(flow) for flow in flows]
-    more = ('<details class="functional-flows-more"><summary>Ver mais fluxos (' + str(len(flows) - 6) + ')</summary>'
-            '<div class="functional-flow-grid">' + "".join(cards[6:]) + '</div></details>') if len(cards) > 6 else ""
-    grid = '<div class="functional-flow-grid">' + "".join(cards[:6]) + '</div>' if cards else _empty("Nenhum fluxo identificado com os metadados disponíveis. Todos os CTs permanecem acessíveis abaixo.")
-    return ('<section class="functional-flows-panel" aria-labelledby="functional-flows-title"><div class="functional-flows-heading"><div>'
-            '<span class="page-kicker">VISÃO FUNCIONAL</span><h2 id="functional-flows-title">Fluxos funcionais</h2>'
-            '<p>Objetivos de negócio encontrados nos registros. Selecione um fluxo para consultar seus CTs.</p></div>'
-            '<div class="functional-flows-tools"><button type="button" data-select-flow="all" aria-pressed="true">Todos os testes <span data-flow-all-count>' + str(len(cases)) + '</span></button>'
-            '<button type="button" data-select-flow="unclassified" aria-pressed="false">Não classificados <span data-flow-unclassified-count>' + str(unclassified) + '</span></button></div></div>'
-            + grid + more + '<div id="active-flow-filter" class="active-flow-filter" hidden><strong id="active-flow-name"></strong><button type="button" id="clear-flow-filter">Remover filtro de fluxo ✕</button></div>'
-            '<p id="functional-flow-count-note" class="functional-flow-note">Um CT pode pertencer a mais de um fluxo. Os cards respeitam os filtros da tabela; não representam cobertura ou uma jornada completa. Aprovação considera somente CTs aprovados/reprovados.</p>'
-            '<p id="flow-table-context" class="functional-flow-context" role="status" aria-live="polite">Todos os testes, sem filtro de fluxo.</p></section>')
+    options = [f'<option value="all">Todos os fluxos ({len(cases)})</option>',
+               f'<option value="unclassified">Não classificados ({unclassified})</option>']
+    options.extend(f'<option value="{_h(flow["id"])}">{_h(flow["name"])} ({flow["total"]})</option>' for flow in flows)
+    return ('<select id="flow-filter" aria-label="Filtrar por fluxo funcional" '
+            'title="Um CT pode pertencer a mais de um fluxo. As contagens respeitam os demais filtros; não representam cobertura ou uma jornada completa.">'
+            + "".join(options) + '</select><span id="flow-table-context" class="result-sr-only" role="status" aria-live="polite"></span>')
 
 
 def _case_history_dialog() -> str:

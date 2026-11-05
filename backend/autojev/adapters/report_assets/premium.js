@@ -380,7 +380,7 @@
         items.push({ source: owner, ct: scenario, ...(plan ? { capture_plan: plan } : {}) });
       });
       if (!items.length) { feedback("Nenhum CT selecionado tem resultado registrado. Nenhuma reexecução foi solicitada."); return; }
-      const target = reportConnection.appUrl + "/#/planejar-lote/" + encodeURIComponent(reportConnection.sourceId)
+      const target = reportConnection.appUrl + "/#/planejar-lote/" + encodeURIComponent((data.suite_context && data.suite_context.root_id) || reportConnection.sourceId)
         + "?itens=" + encodeURIComponent(JSON.stringify(items));
       window.open(target, "_blank", "noopener,noreferrer");
       feedback("Planejamento da rodada aberto na aplicação com " + items.length + " CTs. Revise e confirme lá; nenhuma ação foi iniciada por este relatório. "
@@ -403,8 +403,9 @@
       }
       if (!revision.has_result) { feedback("Esta tentativa não tem resultado registrado. Selecione uma execução com resultado para reexecutar o teste."); return; }
       const { owner, scenario, plan } = rerunSource(current, key, revision);
-      const target = reportConnection.appUrl + "/#/planejar/" + encodeURIComponent(owner) + "/" + encodeURIComponent(scenario)
-        + (plan ? "?capture_plan=" + encodeURIComponent(JSON.stringify(plan)) : "");
+      const target = reportConnection.appUrl + "/#/conjuntos/" + encodeURIComponent((data.suite_context && data.suite_context.root_id) || reportConnection.sourceId)
+        + "?tab=planner&ct=" + encodeURIComponent(String(current.id)) + "&source=" + encodeURIComponent(owner) + "&source_ct=" + encodeURIComponent(scenario)
+        + (plan ? "&capture_plan=" + encodeURIComponent(JSON.stringify(plan)) : "");
       window.open(target, "_blank", "noopener,noreferrer");
       feedback("Planejamento da rodada aberto na aplicação. Você pode incluir outros CTs e conversar com o assistente antes de confirmar. Nenhuma ação foi iniciada por este relatório. "
         + (plan ? plan.checkpoints.length + " pausa(s) para print do rascunho salvo serão apresentadas para confirmação. SWS e SQL não serão executados. Salve alterações do editor antes de reexecutar."
@@ -1664,7 +1665,7 @@
     // The overview and tests views rerun every CT with a result; a result reruns only its CT.
     // App-only: created after the export snapshot, so downloads never carry it.
     // Same markup as the single-CT button of the results view: only the arrow is a span.
-    const testsRerun = reportConnection && reportToolbar ? button(" Reexecutar testes", () => openBatchEditor(testsRerun), "button button-rerun") : null;
+    const testsRerun = reportConnection && reportToolbar ? button(" Reexecutar testes", () => requestBatchRerun(rerunnableCases(), testsRerunFeedback), "button button-rerun") : null;
     if (testsRerun) {
       testsRerun.id = "tests-rerun";
       testsRerun.hidden = true;
@@ -1673,6 +1674,18 @@
       testsRerun.prepend(icon);
       testsRerun.setAttribute("aria-label", "Reexecutar testes: planejar a reexecução de todos os CTs com resultado");
       reportToolbar.prepend(testsRerun);
+    }
+
+    function testsRerunFeedback(message) {
+      let feedback = $("tests-rerun-feedback");
+      if (!feedback) {
+        feedback = executionNode("p", "case-rerun-feedback");
+        feedback.id = "tests-rerun-feedback";
+        feedback.setAttribute("role", "status");
+        const section = document.querySelector('.report-view[data-view="tests"]');
+        if (section) section.appendChild(feedback);
+      }
+      text(feedback, message);
     }
 
     function syncResultHeader(view) {
@@ -2585,7 +2598,14 @@
         $("view-title").appendChild(accent);
       }
       text($("view-subtitle"), views[view][1]);
-      if (view === "results") updateCaseNavigation();
+      // Move the same carousel, retaining its listeners and selected execution.
+      const executionHistory = $("case-execution-history");
+      const historyDestination = view === "tests" ? $("tests-execution-history") : document.querySelector('.report-view[data-view="results"]');
+      if (executionHistory && historyDestination) {
+        if (view === "tests") historyDestination.appendChild(executionHistory);
+        else if (executionHistory.parentElement !== historyDestination) historyDestination.insertBefore(executionHistory, $("scenarios"));
+      }
+      if (view === "results" || view === "tests") updateCaseNavigation();
       if (view === "evidence" || view === "journey") {
         const section = all(".report-view[data-view]").find((item) => item.dataset.view === view);
         if (section) all("img[data-source-shot]", section).forEach(hydrateImage);
@@ -2765,7 +2785,10 @@
       if (!picked.length) { editorMessage("Marque ao menos um CT para reexecutar. Nenhuma reexecução foi solicitada."); return; }
       if (picked.length === 1) requestCaseRerun(picked[0], editorMessage); else requestBatchRerun(picked, editorMessage);
     });
-    listen("case-rerun", "click", () => openEditor(selectedCase, $("case-rerun"), true));
+    listen("case-rerun", "click", () => requestCaseRerun(selectedCase, (message) => {
+      const feedback = $("case-rerun-feedback");
+      if (feedback) { feedback.hidden = false; text(feedback, message); }
+    }));
     listen("case-history", "click", openCaseHistory);
     listen("case-compare", "click", openCaseHistory);
     listen("case-execution-list", "scroll", updateExecutionOverflow);
@@ -2834,28 +2857,15 @@
     }
 
     function updateFunctionalFlows(baseCases) {
-      all("[data-flow-all-count]").forEach((element) => text(element, baseCases.length));
-      all("[data-flow-unclassified-count]").forEach((element) => text(element, baseCases.filter((item) => !membershipsOf(item).length).length));
-      all(".functional-flow-card[data-select-flow]").forEach((card) => {
-        const flowId = card.dataset.selectFlow;
-        const related = baseCases.filter((item) => matchesFlow(item, flowId));
-        const counts = { PASS: 0, FAIL: 0, BLOCKED: 0, SKIPPED: 0 };
-        related.forEach((item) => { counts[Object.hasOwn(counts, item.status) ? item.status : "SKIPPED"] += 1; });
-        text(card.querySelector("[data-flow-total]"), related.length);
-        all("[data-flow-status]", card).forEach((element) => text(element, counts[element.dataset.flowStatus] || 0));
-        const evaluated = counts.PASS + counts.FAIL;
-        text(card.querySelector("[data-flow-approval]"), evaluated
-          ? String(Math.round(counts.PASS * 1000 / evaluated) / 10).replace(".", ",") + "% de aprovação · " + evaluated + "/" + related.length + " CTs avaliados"
-          : "Sem CTs avaliados (aprovado/reprovado)");
-        const failure = card.querySelector("[data-flow-failure]");
-        if (failure) failure.hidden = !counts.FAIL;
-        const suggested = related.filter((item) => membershipsOf(item).some((membership) => membership.id === flowId && membership.confidence === "suggested")).length;
-        const suggestions = card.querySelector("[data-flow-suggestions]");
-        if (suggestions) { text(suggestions, suggested + " associação(ões) sugerida(s)"); suggestions.hidden = !suggested; }
-      });
-      all("[data-select-flow]").forEach((control) => control.setAttribute("aria-pressed", String(control.dataset.selectFlow === selectedFlow)));
-      const active = $("active-flow-filter");
-      if (active) active.hidden = selectedFlow === "all";
+      const select = $("flow-filter");
+      if (select) {
+        Array.from(select.options).forEach((option) => {
+          const identity = option.value;
+          const label = identity === "all" ? "Todos os fluxos" : identity === "unclassified" ? "Não classificados" : (flowsById.get(identity) || {}).name;
+          option.textContent = label + " (" + baseCases.filter((item) => matchesFlow(item, identity)).length + ")";
+        });
+        select.value = selectedFlow;
+      }
       const name = selectedFlow === "unclassified" ? "Não classificados" : (flowsById.get(selectedFlow) || {}).name || "Todos os testes";
       text($("active-flow-name"), "Filtro de fluxo: " + name);
       text($("flow-table-context"), filteredCases.length + " CT(s) nos resultados · " + (selectedFlow === "all" ? "todos os testes, sem filtro de fluxo." : name + "."));
@@ -2924,14 +2934,10 @@
       });
     }
     listen("search", "input", () => filterCases());
-    all("[data-select-flow]").forEach((control) => control.addEventListener("click", () => {
-      const identity = control.dataset.selectFlow;
+    listen("flow-filter", "change", () => {
+      const identity = $("flow-filter").value;
       if (!["all", "unclassified"].includes(identity) && !flowsById.has(identity)) return;
-      selectedFlow = identity === selectedFlow ? "all" : identity;
-      filterCases();
-    }));
-    listen("clear-flow-filter", "click", () => {
-      selectedFlow = "all";
+      selectedFlow = identity;
       filterCases();
     });
     ["category-filter", "page-filter", "page-size"].forEach((id) => listen(id, "change", () => filterCases()));

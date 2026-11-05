@@ -13,6 +13,7 @@ from pydantic import (
     StrictBool,
     StrictInt,
     StrictStr,
+    SecretStr,
     field_validator,
     model_validator,
 )
@@ -108,6 +109,14 @@ class PlanUpdateInput(PlanInput):
 
 class StartInput(ScenarioRerunInput):
     expected_revision: StrictInt = Field(ge=1)
+    credentials: dict[str, SecretStr] = Field(default_factory=dict, max_length=50)
+
+    @field_validator("credentials")
+    @classmethod
+    def valid_credentials(cls, value):
+        if any(not key.strip() or len(key) > 100 or len(secret.get_secret_value()) > 8000 for key, secret in value.items()):
+            raise ValueError("Alias ou valor privado inválido.")
+        return value
 
 
 class ManualResultInput(ApiModel):
@@ -212,7 +221,7 @@ async def start_plan(plan_id: str, body: StartInput, request: Request):
     # Capture plans are accepted per CT only, never as a global ambient plan.
     if body.capture_plan is not None:
         raise HTTPException(422, "Configure os prints em cada CT.")
-    return call(lambda: service(request).start(plan_id, body.expected_revision))
+    return call(lambda: service(request).start(plan_id, body.expected_revision, {key: value.get_secret_value() for key, value in body.credentials.items()}))
 
 
 @router.post("/rounds/{plan_id}/stop")

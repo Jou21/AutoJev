@@ -127,7 +127,9 @@ async function workspace(t, providedSuite, onReport, initialProps = {}) {
       return initialProps.validationReply?.(checked) || checked;
     }
     if (path === "/test-suites/rounds/plan-fixture/start" && options.method === "POST") {
-      assert.deepEqual(JSON.parse(options.body), { confirm: true, expected_revision: savedPlan.revision });
+      const { credentials, ...body } = JSON.parse(options.body);
+      assert.deepEqual(body, { confirm: true, expected_revision: savedPlan.revision });
+      if (credentials) assert.ok(Object.values(credentials).every(value => typeof value === "string" && value.trim()));
       return { ...structuredClone(savedPlan), status: "running" };
     }
     if (path === "/test-suites/root-fixture/recordings" && options.method === "POST") return { id: "rec-fixture", steps: [], status: "recording", url: suite.app_url };
@@ -852,7 +854,7 @@ test("compact flow filters combine with verdicts and bulk planning keeps the sel
   for (const identity of ["CT001", "CT002"]) {
     assert.equal(view.find(node => node.type === "input" && node.props["aria-label"] === "Incluir " + identity).props.checked, true);
   }
-  await view.click("Escolher testes"); await view.click("Filtros dos testes");
+   await view.click("Filtros dos testes");
   await choose("Filtrar por fluxo funcional", "unclassified");
   assert.equal(view.find(node => node.type === "input" && node.props["aria-label"] === "Incluir CT003").props.checked, false);
   assert.equal(view.all().filter(node => node.type === "button" && /^Retirar CT00[12] desta execução$/.test(node.props["aria-label"] || "")).length, 2);
@@ -984,49 +986,29 @@ test("planning groups the catalog, scrollable editor and actions separately from
   assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
 });
 
-test("one small accessible icon replaces preparation actions and refresh while keeping the selector reachable", async t => {
+test("preparation keeps the chooser open without a redundant toggle", async t => {
   const view = await workspace(t, undefined, undefined, { initialCaseId: "CT001" });
-  const nav = view.find(node => node.props["aria-label"] === "Áreas da base de testes");
-  const icon = view.button("Escolher testes");
-  assert.equal([...elements(nav)].includes(icon), true);
-  assert.equal(icon.props.type, "button");
-  assert.equal(text(icon), "", "Only the icon is visible, no label or duplicated count");
-  assert.equal(icon.props["aria-controls"], "suite-case-selector");
-  assert.equal(icon.props["aria-expanded"], false);
-  const tooltip = view.find(node => node.type === tooltipModule.exports.default && node.props.children === icon);
-  assert.match(tooltip.props.text, /Escolher testes da base/);
-  assert.equal(view.all().some(node => node.props["aria-label"] === "Atualizar conjunto"), false);
-  assert.equal(view.all().some(node => node.props.className === "suite-plan-heading suite-plan-toolbar"), false);
-  assert.equal(view.all().filter(node => node.type === "button" && text(node) === "Adicionar teste").length, 1, "Creation remains in the main header only");
-  await view.click("Escolher testes");
-  assert.equal(view.button("Escolher testes").props["aria-expanded"], true);
-  assert.equal(view.focus.at(-1).name, "Buscar CTs");
+  assert.equal(view.all().some(node => node.props["aria-label"] === "Escolher testes"), false);
   assert.equal(view.find(node => node.props.id === "suite-case-selector").props.hidden, false);
-  await view.click("Escolher testes");
-  assert.equal(view.find(node => node.props.id === "suite-case-selector").props.hidden, true);
   assert.deepEqual(plannedIds(view), ["CT001"]);
   await view.click("Testes");
-  assert.equal(view.all().some(node => node.props["aria-label"] === "Atualizar conjunto"), true, "Catalog refresh is independent of the removed preparation refresh");
-  assert.equal(view.calls.some(call => call.method !== "GET"), false);
+  assert.equal(view.all().some(node => node.props["aria-label"] === "Atualizar conjunto"), true);
 });
 
 test("opening and finishing CT selection preserves order, filters and existing capture checkpoints", async t => {
   const capture = { version: 1, checkpoints: [{ id: "drawer-print", gap: 0, order: 0 }] };
   const view = await workspace(t, catalogFixture(), undefined, { initialCaseId: "CT050", initialCapturePlan: capture });
-  assert.equal(view.find(node => node.props.id === "suite-case-selector").props.hidden, true);
-  await view.click("Escolher testes");
   assert.equal(view.find(node => node.props.id === "suite-case-selector").props.hidden, false);
-  assert.equal(view.focus.at(-1).name, "Buscar CTs");
+
+  assert.equal(view.find(node => node.props.id === "suite-case-selector").props.hidden, false);
   view.find(node => node.type === "input" && node.props["aria-label"] === "Buscar CTs").props.onChange({ target: { value: "CT067" } });
   await view.settle();
   view.find(node => node.type === "input" && node.props["aria-label"] === "Incluir CT067").props.onChange();
   await view.settle();
-  await view.click("Ver roteiro (2)");
-  assert.equal(view.find(node => node.props.id === "suite-case-selector").props.hidden, true);
-  assert.equal(view.button("Escolher testes").props["aria-expanded"], false);
+  assert.equal(view.find(node => node.props.id === "suite-case-selector").props.hidden, false);
   assert.deepEqual(plannedIds(view), ["CT050", "CT067"]);
   assert.equal(view.all().some(node => node.props["data-checkpoint-id"] === "drawer-print"), true);
-  await view.click("Escolher testes");
+
   assert.equal(view.find(node => node.type === "input" && node.props["aria-label"] === "Buscar CTs").props.value, "CT067");
   assert.equal(view.find(node => node.type === "input" && node.props["aria-label"] === "Incluir CT067").props.checked, true);
   assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
@@ -1036,7 +1018,7 @@ test("the chooser starts with only search and a filter icon, while filtering and
   const suite = suiteFixture();
   suite.cases.push({ ...suite.cases[0], id: "CT002", title: "Cliente sem nome", status: "FAIL" });
   const view = await workspace(t, suite, undefined, { initialCaseId: "CT001" });
-  await view.click("Escolher testes");
+
   const searchbar = view.find(node => node.props.className === "suite-selector-searchbar");
   assert.equal([...elements(searchbar)].filter(node => node.type === "input").length, 1);
   assert.equal([...elements(searchbar)].filter(node => node.type === "button").length, 1);
@@ -1059,14 +1041,13 @@ test("the chooser starts with only search and a filter icon, while filtering and
   await view.click("Adicionar filtrados");
   assert.deepEqual(plannedIds(view), ["CT001", "CT002"]);
   assert.equal(view.has("suite-selector-filters"), false);
-  assert.equal(view.focus.at(-1).name, "Buscar CTs");
   assert.equal(view.calls.some(call => call.method !== "GET"), false);
 });
 
 test("filter controls close on Escape or outside click without resetting filters, selection or capture plans", async t => {
   const capture = { version: 1, checkpoints: [{ id: "kept-print", gap: 0, order: 0 }] };
   const view = await workspace(t, suiteFixture(), undefined, { initialCaseId: "CT001", initialCapturePlan: capture });
-  await view.click("Escolher testes"); await view.click("Filtros dos testes");
+   await view.click("Filtros dos testes");
   view.find(node => node.type === "select" && node.props["aria-label"] === "Filtrar CTs").props.onChange({ target: { value: "PASS" } }); await view.settle();
   const inside = {};
   view.find(node => node.props.className === "suite-selector-tools").props.ref.current.contains = target => target === inside;
@@ -1491,9 +1472,8 @@ test("preparation omits the numbered step bar without removing selection, script
   for (const label of ["1. Escolher testes", "2. Ajustar roteiro", "3. Revisar e confirmar"]) {
     assert.equal(view.all().some(node => text(node) === label), false);
   }
-  await view.click("Escolher testes");
+
   assert.equal(view.find(node => node.props.id === "suite-case-selector").props.hidden, false);
-  await view.click("Ver roteiro (1)");
   assert.deepEqual(plannedIds(view), ["CT001"]);
   assert.equal(view.all().some(node => node.props["data-checkpoint-id"] === "preserved-print"), true);
   assert.equal(view.button("Salvar rascunho").props.disabled, false);
@@ -1710,7 +1690,7 @@ test("review uses all available width for a long exact list, with one execution 
   const suite = suiteFixture();
   suite.cases = Array.from({ length: 50 }, (_, i) => ({ ...suite.cases[0], id: `CT${String(i + 1).padStart(3, "0")}`, title: `Teste ${i + 1}` }));
   const view = await workspace(t, suite, undefined, { initialCaseId: "CT001" });
-  await view.click("Escolher testes"); await view.click("Filtros dos testes"); await view.click("Adicionar filtrados"); await view.click("Revisar execução");
+   await view.click("Filtros dos testes"); await view.click("Adicionar filtrados"); await view.click("Revisar execução");
   assert.equal(view.all().filter(node => node.props.role === "listitem" && node.props.className === "suite-review-case").length, 50);
   assert.equal(view.all().filter(node => node.type === "button" && text(node) === "Executar 50 testes").length, 1);
   assert.equal(view.all().some(node => node.props.className === "suite-planner-layout with-chat"), false);
@@ -2030,4 +2010,89 @@ test("an archived test in a saved selection must be removed or restored before r
   await view.click("Retirar indisponíveis desta execução");
   assert.deepEqual(plannedIds(view), []);
   assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
+});
+
+test("review opens before validation finishes without marking pending tests unavailable", async t => {
+  let finish;
+  const pending = new Promise(resolve => { finish = resolve; });
+  const view = await workspace(t, undefined, undefined, {
+    initialCaseId: "CT001", validationReply: async checked => { await pending; return checked; },
+  });
+  view.button("Revisar execução").props.onClick();
+  await view.settle();
+  assert.equal(view.has("suite-plan-review"), true);
+  const review = view.find(node => node.props.id === "suite-plan-review");
+  assert.match(text(review), /Conferindo roteiro/);
+  assert.doesNotMatch(text(review), /Indisponível/);
+  assert.equal(view.button("Executar 1 teste").props.disabled, true);
+  assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
+  finish(); await view.settle();
+  assert.match(text(view.find(node => node.props.id === "suite-plan-review")), /Pronto/);
+  assert.equal(view.button("Executar 1 teste").props.disabled, true);
+});
+
+test("private round vault inputs are masked, required before confirmation and never saved in plans", async t => {
+  const navigations = [];
+  const view = await workspace(t, undefined, undefined, { initialCaseId: "CT001", navigate: hash => navigations.push(hash),
+    validationReply: checked => ({ ...checked, required_inputs: ["login_alias", "password_alias"],
+      items: checked.items.map(item => ({ ...item, required_inputs: ["login_alias", "password_alias"] })) }),
+  });
+  await view.click("Revisar execução");
+  await acceptReview(view);
+  const inputs = () => view.all().filter(node => node.type === "input" && node.props.type === "password");
+  assert.equal(inputs().length, 2);
+  assert.ok(inputs().every(node => node.props.autoComplete === "off" && node.props.required));
+  assert.equal(view.button("Executar 1 teste").props.disabled, true);
+  inputs()[0].props.onChange({ target: { value: "round-user" } }); await view.settle();
+  assert.equal(view.button("Executar 1 teste").props.disabled, true);
+  inputs()[1].props.onChange({ target: { value: "   " } }); await view.settle();
+  assert.equal(view.button("Executar 1 teste").props.disabled, true);
+  inputs()[1].props.onChange({ target: { value: "round-private-value" } }); await view.settle();
+  assert.equal(view.button("Executar 1 teste").props.disabled, false);
+  assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
+  await view.click("Executar 1 teste");
+  const start = view.calls.find(call => call.path.endsWith("/start"));
+  assert.deepEqual(start.body.credentials, { login_alias: "round-user", password_alias: "round-private-value" });
+  assert.ok(view.calls.filter(call => !call.path.endsWith("/start")).every(call => !JSON.stringify(call.body || {}).includes("round-private-value")));
+  assert.ok(inputs().every(node => node.props.value === ""), "private values cleared after submission");
+  assert.equal(navigations.length, 1);
+});
+
+test("private round inputs are discarded when leaving review", async t => {
+  const view = await workspace(t, undefined, undefined, { initialCaseId: "CT001",
+    validationReply: checked => ({ ...checked, required_inputs: ["private_alias"] }),
+  });
+  await view.click("Revisar execução");
+  let input = view.all().find(node => node.type === "input" && node.props.type === "password");
+  input.props.onChange({ target: { value: "not-retained" } }); await view.settle();
+  await view.click("Ajustar");
+  await view.click("Revisar execução");
+  input = view.all().find(node => node.type === "input" && node.props.type === "password");
+  assert.equal(input.props.value, "");
+  assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
+});
+
+
+test("suite detail uses the full viewport and back restores the application navigation", async () => {
+  const app = await readFile(new URL("../app/AutoJevApp.tsx", import.meta.url), "utf8");
+  const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  const workspace = await readFile(new URL("../app/components/TestSuitesWorkspace.tsx", import.meta.url), "utf8");
+  assert.ok(app.includes('route.view === "explorations" && route.suiteId ? " suite-fullscreen" : ""'));
+  assert.match(css, /\.app-shell\.suite-fullscreen > \.sidebar,[\s\S]*?display: none/);
+  assert.match(css, /\.app-shell\.suite-fullscreen > \.app-main\s*\{\s*margin-left: 0/);
+  assert.ok(workspace.includes('aria-label="Voltar para Meus testes"'));
+  assert.ok(workspace.includes('onClick={() => navigate("#/exploracoes")}'));
+});
+
+
+test("add test moves to the selector footer and replaces view script", async t => {
+  const view = await workspace(t, undefined, undefined, { initialCaseId: "CT001" });
+  const footer = view.find(node => node.props.className === "suite-selector-footer");
+  const add = view.button("Adicionar teste");
+  assert.equal([...elements(footer)].includes(add), true);
+  assert.equal(view.all().filter(node => node.type === "button" && text(node) === "Adicionar teste").length, 1);
+  assert.equal(view.all().some(node => node.type === "button" && /^Ver roteiro \(/.test(text(node))), false);
+  assert.equal(add.props.disabled, false);
+  await view.click("Adicionar teste");
+  assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
 });

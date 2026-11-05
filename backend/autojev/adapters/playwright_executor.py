@@ -30,6 +30,15 @@ from autojev.domain.product_identity import (
     declared_product_id, matching_product_indexes, product_ledger_key,
 )
 from autojev.adapters.browser_rerun_panel import BrowserRerunPanel, is_panel_url
+from autojev.services.coverage import CoveragePlanner, semantic_element_fingerprint
+
+
+class _RerunPageState(dict):
+    """Transient equality attestations are not part of serialized page state."""
+
+    def __init__(self, state=(), bindings: dict[str, str] | None = None) -> None:
+        super().__init__(state)
+        self.rerun_field_bindings = dict(bindings or {})
 
 
 class BrowserUnavailableError(RuntimeError):
@@ -139,6 +148,7 @@ class PlaywrightExecutor:
         headless: bool = True,
         browser_name: str = "chromium",
         secret_values: list[str] | None = None,
+        replay_credentials: dict[str, str] | None = None,
     ) -> None:
         self.artifact_dir = artifact_dir
         self.options = options
@@ -180,6 +190,10 @@ class PlaywrightExecutor:
         # Per-run opaque tokens compare field contents without storing PII.
         self._field_token_key = secrets.token_bytes(32)
         self._field_semantics: dict[str, dict[str, Any]] = {}
+        self._rerun_credentials: dict[str, str] = dict(replay_credentials or {})
+        self.secret_values.extend(value for value in self._rerun_credentials.values()
+                                  if value and value not in self.secret_values)
+        self._rerun_input_refs: dict[str, str] = {}
         self._last_page_state: dict[str, Any] = {}
         self._cart_expectation: dict[str, Any] = {
             "items": [], "items_known": False, "revision": 0,
@@ -1690,7 +1704,7 @@ class PlaywrightExecutor:
 
     _SYNTHETIC_SAMPLE = re.compile(
         r"(?:\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2})?|\d{2}/\d{2}/\d{4}|\d{4}-\d{2}|\d{2}:\d{2}"
-        r"|529\.982\.247-25|11\.222\.333/0001-81|100,00)"
+        r"|529\.982\.247-25|11\.222\.333/0001-81|100,00|01001000|AutoJev QA [a-z ]{1,48})"
     )
 
     @classmethod
@@ -1709,11 +1723,17 @@ class PlaywrightExecutor:
             "autojev.qa@example.com", "11999999999", "1", "https://example.com",
         }
         private_values: list[str] = []
+        rerun_bindings: dict[str, str] = {}
         for item in state.get("fields", []):
             if not isinstance(item, dict):
                 continue
             raw = str(item.pop("_raw_value", ""))
             sensitive = bool(item.get("sensitive"))
+            if raw:
+                aliases = sorted(alias for alias, value in getattr(self, "_rerun_credentials", {}).items()
+                                 if hmac.compare_digest(raw.encode(), value.encode()))
+                if aliases:
+                    rerun_bindings[str(item.get("ref") or "")] = aliases[0]
             if raw and not sensitive and self._is_synthetic_sample(raw):
                 safe_synthetic.add(raw)
             if raw and (sensitive or raw not in safe_synthetic):
@@ -1748,6 +1768,8 @@ class PlaywrightExecutor:
                 return self._redact_text(value)
             return value
         sanitized = scrub(state)
+        if rerun_bindings:
+            sanitized = _RerunPageState(sanitized, rerun_bindings)
         for item in [*sanitized.get("products", []), *sanitized.get("cart", {}).get("items", []),
                      *(sanitized.get("checkout") or {}).get("items", [])]:
             if item.get("image_src"):
@@ -3051,6 +3073,8 @@ class PlaywrightExecutor:
                     }
                     if isinstance(node_guard, dict):
                         self._ref_semantics[str(element["ref"])]["_node_guard"] = node_guard
+        self._rerun_input_refs = {str(element["ref"]): "replay_" + semantic_element_fingerprint(element)
+                                  for element in elements if element.get("ref")}
         page_state = self._sanitize_page_state(snapshot.get("page_state", {}))
         if self._on_auth_origin():
             page_state["authentication_challenge"] = True
@@ -3379,6 +3403,10 @@ class PlaywrightExecutor:
     ) -> tuple[ActionResult, Observation]:
         if not self.is_active():
             raise BrowserUnavailableError("Browser page is not active")
+        self._rerun_credentials.update({key: value for key, value in credentials.items() if value})
+        for value in credentials.values():
+            if value and value not in self.secret_values:
+                self.secret_values.append(value)
         started = utc_now()
         before_url = self._public_url(self._page.url)
         success = False
@@ -3477,6 +3505,13 @@ class PlaywrightExecutor:
                     fill_value = decision.value
                 else:
                     raise ValueError("fill requires value or credential_key")
+                alias = decision.credential_key or self._rerun_input_refs.get(str(decision.target))
+                public_fill = any(action == "fill" and value == fill_value
+                                  for action, value in CoveragePlanner._candidate_actions(
+                                      {**self._ref_semantics.get(str(decision.target), {}),
+                                       "tag": self._ref_semantics.get(str(decision.target), {}).get("tag", "input")}))
+                if alias and fill_value and (decision.credential_key or not public_fill):
+                    self._rerun_credentials[alias] = fill_value
                 field = self._field_semantics.get(str(decision.target))
                 if field and not field.get("sensitive") and not decision.credential_key:
                     execution_evidence["business_input"] = {
@@ -3493,10 +3528,9 @@ class PlaywrightExecutor:
                     )
                 else:
                     await self._retype_if_mask_dropped(locator, fill_value)
-                    if decision.key:
-                        # e.g. Tab: leave the field so the form validates it,
-                        # without a separate action round trip.
-                        await locator.press(decision.key, timeout=5_000)
+                if decision.key:
+                    # Leave the field so the form validates it in the same action.
+                    await locator.press(decision.key, timeout=5_000)
             elif action == "select":
                 if decision.value is None:
                     raise ValueError("select requires value")
@@ -3743,6 +3777,8 @@ class PlaywrightExecutor:
         return results
 
     async def close(self) -> None:
+        self._rerun_credentials.clear()
+        self._rerun_input_refs.clear()
         if self._rerun_panel is not None:
             self._rerun_panel.close()
         await self._release_observed_element_handles()

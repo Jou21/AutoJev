@@ -212,6 +212,7 @@ class TestSuiteService:
         suite = self.catalog(identity)
         available = {case["id"]: case for case in suite["cases"]}
         result, seen = [], set()
+        origins, sources, source_cases = {}, {}, {}
         for request in selected:
             case_id = request["case_id"]
             if case_id not in available or case_id in seen:
@@ -227,12 +228,16 @@ class TestSuiteService:
             integrations = deepcopy(request.get("planned_integrations") or [])
             step_count = len(case.get("recorded_steps") or case["steps"])
             if case["mode"] == "automatic":
-                origin = scenario_report_origin(self.repository, source_id)
+                if source_id not in origins:
+                    origins[source_id] = scenario_report_origin(self.repository, source_id)
+                origin = origins[source_id]
                 lineage_root, lineage_case = case["lineage_exploration_id"], case["lineage_case_id"]
                 if origin["report_exploration_id"] != lineage_root or (source_id == lineage_root and source_case != lineage_case) or (source_id != lineage_root and origin["report_scenario_id"] != lineage_case):
                     raise ValueError("A execução de referência não pertence a este CT.")
-                source = self.repository.get_exploration(source_id)
-                stored = next((value for value in source.get("scenarios") or [] if value["id"] == source_case), None)
+                if source_id not in sources:
+                    sources[source_id] = self.repository.get_exploration(source_id)
+                    source_cases[source_id] = {value["id"]: value for value in sources[source_id].get("scenarios") or []}
+                stored = source_cases[source_id].get(source_case)
                 if stored is None:
                     raise ValueError("O CT de referência não existe.")
                 frozen = definition(stored)
@@ -260,6 +265,11 @@ class TestSuiteService:
         plan = self.store.get(plan_id)
         checks = []
         archived = {identity for identity, state in self.store.catalog_states(plan["root_id"]).items() if state["archived"]}
+        automatic = [item for item in plan["items"] if item["case_id"] not in archived
+                     and not item.get("planned_integrations") and item["mode"] != "manual"]
+        preflights = iter(self.reruns.preflight_many([
+            (item["source_exploration_id"], item["source_scenario_id"]) for item in automatic
+        ]))
         for item in plan["items"]:
             if item["case_id"] in archived:
                 check = {"available": False, "code": "archived", "reason": "Teste arquivado. Restaure-o na base ou remova-o desta execução."}
@@ -269,19 +279,20 @@ class TestSuiteService:
                 check = {"available": True, "code": "manual", "reason": "Execução e avaliação feitas pelo usuário, sem automação."}
             else:
                 try:
-                    check = self.reruns.preflight(item["source_exploration_id"], item["source_scenario_id"])
+                    check = next(preflights)
                     if check["available"]:
                         self.reruns._capture_plan(item.get("capture_plan"), check["timeline_count"], check["action_index"])
                 except (ValueError, NotFoundError) as exc:
                     check = {"available": False, "reason": str(exc)}
             checks.append({"case_id": item["case_id"], **check})
         return {"revision": plan["revision"], "available": bool(checks) and all(check["available"] for check in checks), "items": checks,
+                "required_inputs": sorted({key for check in checks for key in check.get("required_inputs", [])}),
                 "effects": ["Os CTs serão executados um de cada vez, na ordem planejada.",
-                            "Cada CT automático usa um navegador novo e exige sua preparação/continuação.",
+                            "Cada CT automático usa um navegador novo; jornadas completas executam a preparação e as ações automaticamente.",
                             "CTs manuais aguardam o resultado registrado por você. Ações podem modificar dados na aplicação.",
                             "SWS, SQL e instruções livres não são executados."]}
 
-    def start(self, plan_id, expected_revision):
+    def start(self, plan_id, expected_revision, credentials=None):
         plan = self.store.get(plan_id)
         # An already accepted start is idempotent, even after it finishes.
         if plan["status"] != "draft":
@@ -290,14 +301,23 @@ class TestSuiteService:
             raise PlanConflict("Revise a versão atual do planejamento antes de executar.")
         # Serialize the last archive check with the durable start transition.
         with self.repository._lock:
-            if not self.validate(plan_id)["available"]:
+            validation = self.validate(plan_id)
+            if not validation["available"]:
                 raise ValueError("Há CTs indisponíveis. Revise o planejamento antes de executar.")
+            required = validation["required_inputs"]
+            supplied = credentials or {}
+            if any(not isinstance(supplied.get(key), str) or not supplied[key].strip() for key in required):
+                raise ValueError("Informe todos os dados privados solicitados antes de iniciar a rodada.")
             plan.update(status="running", started_at=utc_now())
             plan = self.store.replace(plan, expected_revision)
+        self.reruns.manager.credential_vault.put(plan_id, {key: supplied[key] for key in required})
         self.signals[plan_id] = asyncio.Event()
         task = asyncio.create_task(self._run(plan_id))
         self.tasks[plan_id] = task
-        task.add_done_callback(lambda _: self.tasks.pop(plan_id, None))
+        def finished(_):
+            self.tasks.pop(plan_id, None)
+            self.reruns.manager.credential_vault.discard(plan_id)
+        task.add_done_callback(finished)
         return plan
 
     def stop(self, plan_id):
@@ -345,7 +365,11 @@ class TestSuiteService:
                     continue
                 # No await between dispatch and durable binding: shutdown or a
                 # duplicate request cannot slip in and dispatch this item twice.
-                child = self.reruns.submit(item["source_exploration_id"], item["source_scenario_id"], capture_plan=item.get("capture_plan"))
+                required = self.reruns.preflight(item["source_exploration_id"], item["source_scenario_id"]).get("required_inputs", [])
+                supplied = self.reruns.manager.credential_vault.get(identity)
+                child = self.reruns.submit(item["source_exploration_id"], item["source_scenario_id"], capture_plan=item.get("capture_plan"),
+                                           **({"credentials": {key: supplied[key] for key in required if key in supplied}} if required else {}))
+                supplied.clear()
                 item.update(state="running", execution_id=child)
                 self.repository.add_event(child, "info", "execution_round_item", "CT vinculado à rodada", {"round_id": identity, "root_id": plan["root_id"], "case_id": item["case_id"]})
                 self.store.replace(plan, plan["revision"])
@@ -378,6 +402,7 @@ class TestSuiteService:
             plan.update(status="interrupted", finished_at=utc_now(), reason="A rodada foi interrompida. Resultados existentes foram preservados; nenhuma ação será repetida automaticamente.")
             self.store.replace(plan, plan["revision"])
         finally:
+            self.reruns.manager.credential_vault.discard(identity)
             self.signals.pop(identity, None)
 
     def report_snapshot(self, identity, context="consolidated", round_id=None, case_id=None, focus_case_id=None):
@@ -458,6 +483,7 @@ class TestSuiteService:
     async def shutdown(self):
         for identity, task in list(self.tasks.items()):
             task.cancel()
+            self.reruns.manager.credential_vault.discard(identity)
             plan = self.store.get(identity)
             if plan["status"] in ACTIVE:
                 plan.update(status="interrupted", finished_at=utc_now(), reason="Servidor encerrado; nenhuma ação será retomada automaticamente.")

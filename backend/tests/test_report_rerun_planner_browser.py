@@ -36,7 +36,9 @@ async def drag_across_track(page, source, target, screenshot_path=None):
 
 async def open_planner(page):
     await page.evaluate("() => { window.__opened = []; window.open = (...args) => { window.__opened.push(args); return null; }; }")
-    await page.locator("#case-rerun").click()
+    await page.locator('[data-report-nav="journey"]').click()
+    await page.locator('[data-journey-page]').first.click()
+    await page.locator('[data-edit-case="0"]:visible').click()
     await expect(page.locator("#case-editor")).to_be_visible()
     assert await page.evaluate("window.__opened") == []
 
@@ -44,7 +46,7 @@ async def open_planner(page):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("viewport", [{"width": 1440, "height": 1000}, {"width": 390, "height": 844}], ids=["desktop", "mobile"])
 async def test_planner_click_drag_reorder_and_explicit_confirmation_preserve_results(tmp_path, viewport):
-    _, markup, images = rendered_report(tmp_path)
+    _, markup, images = rendered_report(tmp_path, with_journey=True)
     requests = []
     state = {"key": "revisions-v2", "markup": markup}
     async with async_playwright() as driver:
@@ -109,15 +111,15 @@ async def test_planner_click_drag_reorder_and_explicit_confirmation_preserve_res
             assert len(opened) == 1
             assert opened[0][1:] == ["_blank", "noopener,noreferrer"]
             target = opened[0][0]
-            assert target.startswith(ORIGIN + "/#/planejar/latest-rerun/CT001?")
+            assert target.startswith(ORIGIN + "/#/conjuntos/root?tab=planner&ct=CT147&source=latest-rerun&source_ct=CT001&")
             plan = json.loads(parse_qs(target.split("?", 1)[1])["capture_plan"][0])
             assert [(item["gap"], item["order"]) for item in plan["checkpoints"]] == [(1, 0), (2, 1)]
             assert set(plan) == {"version", "checkpoints"}
             assert all(set(item) == {"id", "gap", "order"} for item in plan["checkpoints"])
             await page.locator("#case-editor-close").click()
-            await expect(page.locator("#case-rerun")).to_be_focused()
+            await expect(page.locator('[data-edit-case="0"]:visible')).to_be_focused()
             await expect(page.locator(".case-inline-insert, .case-inline-draft")).to_have_count(0)
-            await page.locator("#case-rerun").click()
+            await page.locator('[data-edit-case="0"]:visible').click()
             await expect(steps.locator(".case-editor-prototype")).to_have_count(3)
             await no_duplicate_ids(page)
             assert not errors
@@ -141,27 +143,21 @@ async def test_planner_cancel_export_and_historical_plans_are_isolated(tmp_path)
             await page.locator(".case-editor-insert").first.click()
             await page.locator('#step-picker [data-step-choice="wait_print"]').click()
             await page.locator("#case-editor-close").click()
-            await page.locator("#case-rerun").click()
+            await page.locator('[data-edit-case="0"]:visible').click()
             await expect(page.locator(".case-editor-prototype")).to_have_count(0)
             await page.locator(".case-editor-insert").nth(1).click()
             await page.locator('#step-picker [data-step-choice="wait_print"]').click()
             await page.locator("#case-editor-save").click()
             await page.locator("#case-editor-close").click()
+            await page.locator('[data-report-nav="results"]').click()
             await page.locator('#case-execution-list [data-execution-version="1"]').click()
-            await open_planner(page)
-            await expect(page.locator("#case-editor-title")).to_contain_text("Tentativa anterior")
-            await expect(page.locator(".case-editor-prototype")).to_have_count(0)
-            await page.locator(".case-editor-insert").first.click()
-            await page.locator('#step-picker [data-step-choice="wait_print"]').click()
-            await page.locator("#case-editor-rerun").click()
+            await page.evaluate("() => { window.__opened = []; window.open = (...args) => { window.__opened.push(args); return null; }; }")
+            await page.locator("#case-rerun").click()
+            await expect(page.locator("#case-editor")).not_to_be_visible()
             opened = await page.evaluate("window.__opened")
-            assert len(opened) == 1 and "/#/planejar/old-rerun/CT001?" in opened[0][0]
-            plan = json.loads(parse_qs(opened[0][0].split("?", 1)[1])["capture_plan"][0])
-            assert [checkpoint["gap"] for checkpoint in plan["checkpoints"]] == [0]
+            assert opened == [[ORIGIN + "/#/conjuntos/root?tab=planner&ct=CT147&source=old-rerun&source_ct=CT001", "_blank", "noopener,noreferrer"]]
             drafts = json.loads(await page.locator("#report-drafts").text_content())["cases"]
             assert drafts["0"][0]["gap"] == 1
-            assert drafts["history:0:1"][0]["gap"] == 0
-            await page.locator("#case-editor-close").click()
             async with page.expect_download() as pending:
                 await page.locator("#download-report").click()
             export = tmp_path / "planner-offline.html"
@@ -189,7 +185,7 @@ async def test_planner_cancel_export_and_historical_plans_are_isolated(tmp_path)
 
 @pytest.mark.asyncio
 async def test_running_backend_old_editor_shell_gets_the_new_planner_without_restart(tmp_path):
-    _, markup, _ = rendered_report(tmp_path)
+    _, markup, _ = rendered_report(tmp_path, with_journey=True)
     markup = markup.replace('class="case-editor-dialog case-rerun-planner"', 'class="case-editor-dialog"')
     markup = re.sub(r'(<aside id="case-editor-palette"[^>]*>).*?(</aside>)',
                     r'\1<button id="database-step-card" draggable="true">Consulta antiga</button><p>Adicionar aqui</p>\2',

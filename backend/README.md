@@ -503,7 +503,11 @@ including values filled manually rather than supplied through the vault.
 
 Token usage is accumulated for both JEV and auxiliary calls as prompt,
 completion and total tokens. Monetary cost is persisted only when the provider
-returns it; unknown cost remains `—` rather than being estimated. The live
+returns it (usage or top-level JSON cost, or the LiteLLM response-cost header),
+including HTTP error responses and compatibility retries. A null usage cost
+falls back to the top-level cost. Timeouts or responses without billing metadata
+remain explicitly unknown: tokens alone cannot establish the charged amount.
+Unknown cost remains `—` rather than being estimated. The live
 browser panel and React sidebar show the running total, and exploration history,
 detail payloads and the standalone report retain the final values. New runs
 persist `usage.by_role.jev` and `usage.by_role.auxiliary`, with the same token
@@ -512,6 +516,17 @@ role, not its model ID. Exploration detail and the report show **Custo JEV**,
 **Custo LLM** and **Custo total** in USD. Known zero-cost calls show zero;
 incomplete known sums are marked partial. Migrated historical rows keep their
 combined total with an empty role breakdown, never an estimated split.
+
+Auxiliary visual enrichment preserves an already complete local replay journey
+when its action and local assertions are unchanged. Model opinions remain in
+the CT evidence and are explicitly omitted from local-only replay; they do not
+invalidate the captured local contract. Mandatory visual checks at initial
+capture still fail closed.
+
+Round readiness checks use one fresh source snapshot per exploration and batch
+all selected CTs. Timeline presentation excludes event logs and replay journeys
+from its working copy; the original journeys are still validated in full before
+execution. No browser or model call is needed to check a saved script.
 
 ## Security notes
 
@@ -522,6 +537,55 @@ combined total with an empty role breakdown, never an estimated split.
 - Page text is untrusted prompt data. The system prompt forbids following page instructions, and the executor independently validates the action/ref allowlist.
 - This MVP has no multi-user authentication. Bind to loopback unless it sits behind an authenticated gateway.
 - `asyncio.create_task` is appropriate for the local MVP but is not a durable production queue. A process restart marks in-flight runs failed; production should move workers to a queue and isolated browser containers.
+
+## Execution review and replay records
+
+Opening an execution review immediately displays the selected tests with a pending
+check indicator. Saving and validation still must finish before consent can start
+an execution. Review and start use fresh request-scoped snapshots: each source
+execution and its projected timeline is loaded once per batch, never cached across
+reviews. Plan saving also resolves each source and lineage once.
+
+Repeated attempts merged into one semantic CT are not a multi-action script.
+Replay selects the current durable action only when every historical attempt has
+the same recorded action/value and semantic target identity. Genuine multi-action
+scripts from legacy captures remain unsupported rather than silently dropping actions.
+
+New explorations capture a private `ct-journey-v1` contract on each CT in SQLite,
+atomically with the scenario. The contract includes every dispatched action from
+the initial page through that CT, semantic target bindings, public test data,
+local checks, and authentication preparations at their original action boundaries.
+This deliberately replays the full prefix rather than guessing which setup actions
+can be skipped. Replays execute the prefix in a fresh browser, validate every
+precondition, persist each actual action, stop on a failed setup/check, and then
+compare the original CT checks. No model supplies missing execution steps.
+
+Recipes are captured before dispatch and persisted with the observed action result
+and CT. They support empty fills, required-field probes, navigation/history,
+waits, screenshots, select, hover, click and supported keys. Generated `AutoJev QA …`
+and postal test values remain portable. Private fills store vault aliases, not
+values. Each rerun explicitly requests those inputs (including username/password
+for saved login preparation); values live only in the per-execution memory vault
+and are discarded on completion. Fresh DOM equality attestations bind private
+field state without serializing values, cookies, browser storage, or session HMACs.
+The frontend never saves rerun inputs to local storage or a plan. Suite-round
+review aggregates the required aliases and explicitly collects masked inputs
+before start. The round keeps them in its own ephemeral vault, passes only each
+child's required aliases, and clears them on termination, cancellation or shutdown.
+
+Preflight reports completeness and concrete gaps instead of hiding CTs or turning
+them into manual tests. Missing/duplicate actions, unsupported mandatory checks
+(including visual-model assertions), uncaptured preparation, ambiguous controls,
+or unsafe data prevent a complete declaration. Visual auxiliary commentary is not
+an assertion and is not represented as visual approval. State drift, changed routes,
+expired external data, CAPTCHA/MFA, altered authentication UI, or unavailable inputs
+can still block a previously complete recipe. This is an executable capture
+contract, **not universal reproduction against external changes**. Login signatures
+are deliberately conservative; unsupported login shapes need a supported capture,
+not a heuristic manual fallback. Legacy CTs/data are neither migrated nor rewritten.
+
+Local tests use temporary SQLite databases and loopback-only browser fixtures;
+validation must not submit actions against production sites or real user data.
 
 ## Tests
 

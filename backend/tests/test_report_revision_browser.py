@@ -317,11 +317,8 @@ async def test_execution_timeline_switches_owned_evidence_without_changing_lates
             await offline.close()
             await page.evaluate("() => { window.__opened = []; window.open = (...args) => { window.__opened.push(args); return null; }; }")
             await page.locator("#case-rerun").click()
-            await expect(page.locator("#case-editor")).to_be_visible()
-            assert await page.evaluate("window.__opened") == []
-            await page.locator("#case-editor-rerun").click()
-            assert await page.evaluate("window.__opened") == [[ORIGIN + "/#/planejar/old-rerun/CT001", "_blank", "noopener,noreferrer"]]
-            await page.locator("#case-editor-close").click()
+            await expect(page.locator("#case-editor")).not_to_be_visible()
+            assert await page.evaluate("window.__opened") == [[ORIGIN + "/#/conjuntos/root?tab=planner&ct=CT147&source=old-rerun&source_ct=CT001", "_blank", "noopener,noreferrer"]]
             await page.locator('#case-execution-list [data-execution-version="3"]').click()
             await expect(page.locator("#case-selected-execution")).to_contain_text("Cancelada")
             await expect(page.locator("#case-rerun")).to_be_disabled()
@@ -535,12 +532,9 @@ async def test_connected_focus_refreshes_latest_report_in_same_blob_and_hash(tmp
             }""")
             await expect(page.locator("#case-rerun")).to_be_visible()
             await page.locator("#case-rerun").click()
-            await expect(page.locator("#case-editor")).to_be_visible()
-            assert await page.evaluate("window.__opened") == []
-            await page.locator("#case-editor-rerun").click()
+            await expect(page.locator("#case-editor")).not_to_be_visible()
             opened = await page.evaluate("window.__opened")
-            assert opened == [[ORIGIN + "/#/planejar/latest-rerun/CT001", "_blank", "noopener,noreferrer"]]
-            await page.locator("#case-editor-close").click()
+            assert opened == [[ORIGIN + "/#/conjuntos/root?tab=planner&ct=CT147&source=latest-rerun&source_ct=CT001", "_blank", "noopener,noreferrer"]]
             async with page.expect_download() as pending:
                 await page.locator("#download-report").click()
             exported_path = tmp_path / "connected-download.html"
@@ -615,7 +609,7 @@ async def test_selected_history_layout_stays_inside_viewport(tmp_path, viewport)
 
 @pytest.mark.asyncio
 async def test_connected_saved_draft_blocks_auto_refresh_and_cancel_preserves_it(tmp_path):
-    _, original, _ = rendered_report(tmp_path)
+    _, original, _ = rendered_report(tmp_path, with_journey=True)
     _, newer, _ = rendered_report(tmp_path, key="revisions-v3", title="Mais novo resultado após reexecução")
     state = {"key": "revisions-v2", "markup": newer}
     requests = []
@@ -623,11 +617,14 @@ async def test_connected_saved_draft_blocks_auto_refresh_and_cancel_preserves_it
         browser = await driver.chromium.launch(headless=True)
         context, page = await connected_page(browser, original, state, requests)
         try:
-            await page.locator("#case-rerun").click()
+            await page.locator('[data-report-nav="journey"]').click()
+            await page.locator('[data-journey-page]').first.click()
+            await page.locator('[data-edit-case="0"]:visible').click()
             await page.locator(".case-editor-insert").first.click()
             await page.locator('#step-picker [data-step-choice="wait_print"]').click()
             await page.locator("#case-editor-save").click()
             await page.locator("#case-editor-close").click()
+            await page.locator('[data-report-nav="results"]').click()
             before = await page.locator("#report-drafts").text_content()
             assert json.loads(before)["cases"]["0"][0]["type"] == "wait_print"
             state["key"] = "revisions-v3"
