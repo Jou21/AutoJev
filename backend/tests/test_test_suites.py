@@ -600,3 +600,36 @@ def test_native_review_and_save_decode_only_selected_cases(runtime, monkeypatch)
     result = response.json()["items"][0]
     assert result["case_id"] == "CT001"
     assert {key: value for key, value in result.items() if key != "case_id"} == expected
+
+
+def test_round_reuses_only_its_own_ephemeral_inputs(runtime):
+    app, client, root = runtime
+    reruns = app.state.scenario_rerun_service
+    vault = reruns.manager.credential_vault
+    reruns.preflight = lambda *args, **kwargs: {
+        "available": True, "timeline_count": 2, "action_index": 1,
+        "required_inputs": ["private_alias"],
+    }
+    plan = create_plan(client, root, ["CT001"])
+    path = f"/api/test-suites/rounds/{plan['id']}"
+    vault.put(root, {"private_alias": "other-execution"})
+    assert client.post(path + "/validate").json()["missing_inputs"] == ["private_alias"]
+    response = client.post(path + "/start", json={"confirm": True, "expected_revision": 1})
+    assert response.status_code == 409
+    vault.put(plan["id"], {"private_alias": "this-round", "unused": "ignored"})
+    validation = client.post(path + "/validate").json()
+    assert validation["required_inputs"] == ["private_alias"]
+    assert validation["missing_inputs"] == []
+    assert "this-round" not in str(validation)
+    calls = []
+    def fail_dispatch(*args, **kwargs):
+        calls.append(kwargs)
+        raise ValueError("Dispatch failed")
+    reruns.submit = fail_dispatch
+    response = client.post(path + "/start", json={"confirm": True, "expected_revision": 1})
+    assert response.status_code == 202
+    round_state(client, plan["id"], "interrupted")
+    assert calls == [{"capture_plan": None, "credentials": {"private_alias": "this-round"}}]
+    assert vault.get(plan["id"]) == {}
+    assert vault.get(root) == {"private_alias": "other-execution"}
+    vault.discard(root)

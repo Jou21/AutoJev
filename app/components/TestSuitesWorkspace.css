@@ -321,7 +321,7 @@
 .suite-planner-view .suite-section-heading { margin-bottom: 10px; }
 .suite-planner-view .suite-source-step { width: 185px; min-height: 140px; padding: 12px; gap: 12px; }
 /* Fit the test lane to its cards; the step editor takes all remaining height. */
-.suite-flow-board { container: suite-flow / size; display: grid; grid-template-rows: max-content minmax(0, 1fr); flex: 1 0 420px; min-width: 0; min-height: 360px; gap: 8px; }
+.suite-flow-board { container: suite-flow / size; display: grid; grid-template-rows: minmax(0, 1fr); flex: 1 0 420px; min-width: 0; min-height: 360px; gap: 8px; }
 .suite-planner-view .suite-plan-center:has(> .suite-flow-board:only-child) { overflow: hidden; }
 .suite-plan-center > .suite-flow-board:only-child { flex: 1 1 0; min-height: 0; }
 .suite-flow-board .suite-flow-lane { display: flex; flex-direction: column; gap: 6px; min-width: 0; min-height: 0; padding: 6px 8px; border-radius: 10px; }

@@ -28,6 +28,16 @@ after validation; do not leave the interactive localhost backend headless.
 
 OpenAPI is available at `http://127.0.0.1:8000/docs`; the frontend normally uses `http://127.0.0.1:8000/api`.
 
+Suite execution is authorized by clicking **Executar**, without an additional
+review checkbox. Review validation reports required private input aliases and
+`missing_inputs`, never their values. Only the current round's in-memory vault
+may be reused; credentials from earlier explorations are not inherited. If
+inputs are missing, execution opens an on-demand authentication dialog. Cancel
+or completion discards frontend values; backend round credentials are filtered
+to each CT and discarded on completion, interruption, cancellation or shutdown.
+Full-journey authentication validation remains mandatory; missing credentials
+do not silently turn an automatic CT into a manual one.
+
 ## Architecture and trust boundaries
 
 ```text
@@ -547,8 +557,12 @@ is needed to check a saved script.
 ## Execution review and replay records
 
 Opening an execution review immediately displays the selected tests with a pending
-check indicator. Saving and validation still must finish before consent can start
-an execution. Review and start use fresh request-scoped snapshots: each source
+check indicator. Saving and validation must finish before the Execute button can
+start an execution; clicking Execute is the explicit authorization, without an
+additional review checkbox. The suite workspace opens directly in preparation,
+without separate catalog/history tabs or a duplicate selected-test strip. The
+sidebar retains selection, execution numbering and drag ordering; execution
+monitoring remains available inside the same workspace. Review and start use fresh request-scoped snapshots: each source
 execution and its projected timeline is loaded once per batch, never cached across
 reviews. Plan saving also resolves each source and lineage once.
 

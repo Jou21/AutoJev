@@ -198,8 +198,8 @@ test("Add starts a local conversation with only two creation cards inside the ch
   assert.equal(view.all().some(node => text(node) === "Escrever teste"), false);
   assert.equal(view.has("suite-case-editor"), false);
   assert.equal(view.has("suite-record-confirmation"), false);
-  assert.equal(view.find(node => node.props.className?.includes("suite-maintenance-view")).props["data-chat-only"], true);
-  assert.equal(view.chat().props.purpose, "base");
+  assert.equal(view.has("suite-planning-heading"), true);
+  assert.equal(view.chat().props.purpose, "execution");
   const attentionKey = view.chat().props.creationActions.key;
   view.chat().props.onValueChange("Mensagem ainda não enviada"); await view.settle();
   assert.equal(view.chat().props.creationActions.key, attentionKey, "Typing does not restart the highlight");
@@ -386,7 +386,7 @@ test("Add protects an edited draft before replacing its editor with the chat cho
   await view.click("Adicionar teste"); await view.click("Descartar e sair");
   assert.equal(view.has("suite-case-editor"), false);
   assert.equal(view.chat().props.messages.at(-1).kind, "creation_prompt");
-  assert.equal(view.find(node => node.props.className?.includes("suite-maintenance-view")).props["data-chat-only"], true);
+  assert.equal(view.has("suite-planning-heading"), true);
   assert.equal(view.calls.some(call => call.method !== "GET"), false);
 });
 
@@ -449,8 +449,8 @@ test("AI suggestions open a focused editor and a manual case is created only aft
   await view.submit();
   assert.equal(view.calls.filter(call => call.path.endsWith("/cases")).length, 1);
   assert.equal(view.has("suite-case-editor"), false);
-  assert.equal(view.find(node => node.type === "input" && node.props["aria-label"] === "Selecionar CT002").props.checked, false);
-  assert.match(text(view.find(node => node.props.role === "status" && text(node).includes("adicionado à base"))), /Nenhuma execução foi criada/);
+  assert.equal(view.find(node => node.type === "input" && node.props["aria-label"] === "Incluir CT002").props.checked, true);
+  assert.match(view.chat().props.messages.at(-1).content, /salvo na base e incluído na preparação/);
   assert.equal(view.calls.filter(call => /\/(plans|start|discover)$/.test(call.path)).length, 0);
 });
 
@@ -463,82 +463,16 @@ test("cloning an existing case also opens the editor with its reference intact",
   assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
 });
 
-test("catalog rows open the stable CT in the consolidated report without planning or executing it", async t => {
-  const suite = suiteFixture(), reports = [];
-  suite.cases[0].source_exploration_id = "child-run";
-  suite.cases[0].source_scenario_id = "CT009";
-  const before = structuredClone(suite);
-  const view = await workspace(t, suite, async (...args) => { reports.push(args); });
-  await view.click("Ver resultado de CT001: Ordenar produtos");
-  assert.deepEqual(reports, [[suite.id, "consolidated", undefined, "CT001"]], "The report uses catalog identity, not an executor's local CT number");
-  assert.equal(view.find(node => node.type === "input" && node.props["aria-label"] === "Selecionar CT001").props.checked, false);
-  assert.deepEqual(suite, before);
-  assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
-  assert.equal(view.has("suite-case-editor"), false);
-});
-
-test("selection, duplication and manual editing remain separate from opening a result", async t => {
-  const suite = suiteFixture(), reports = [];
-  suite.cases.push({ ...suite.cases[0], id: "CT002", title: "Caso manual", mode: "manual", status: undefined });
-  const view = await workspace(t, suite, async (...args) => { reports.push(args); });
-  const pending = view.button("Ver resultado de CT002: Caso manual");
-  assert.equal(pending.props.disabled, true);
-  assert.equal(text(pending), "Ainda não executado");
-  view.find(node => node.type === "input" && node.props["aria-label"] === "Selecionar CT001").props.onChange();
-  await view.settle();
-  assert.equal(view.find(node => node.type === "input" && node.props["aria-label"] === "Selecionar CT001").props.checked, true);
-  await view.click("Duplicar CT001 como novo CT manual");
-  assert.equal(view.field("Título").props.value, "Ordenar produtos · cópia");
-  await view.click("Testes");
-  await view.click("Descartar e sair");
-  await view.click("Editar");
-  assert.equal(view.field("Título").props.value, "Caso manual");
-  assert.deepEqual(reports, []);
-  assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
-  const css = await readFile(new URL("../app/components/TestSuitesWorkspace.css", import.meta.url), "utf8");
-  assert.match(css, /\.suite-case-row > \.suite-check::after\s*\{[^}]*inset:\s*0;[^}]*z-index:\s*1/, "Clicking anywhere on the row only toggles the checkbox");
-  assert.match(css, /\.suite-case-row > \.suite-check\s*\{[^}]*position:\s*static/, "The overlay is sized by the row, not the label");
-  assert.match(css, /\.suite-case-row > button\s*\{[^}]*position:\s*relative;[^}]*z-index:\s*2/, "Ver resultado and row actions stay clickable above the overlay");
-  assert.doesNotMatch(css, /\.suite-case-open[^{]*::after/, "Ver resultado no longer captures the whole row");
-});
-
-test("catalog icon hints explain duplication, archive confirmation and restoring without applying any action", async t => {
-  const suite = suiteFixture();
-  suite.cases.push({ ...suite.cases[0], id: "CT002", archived: true });
-  const view = await workspace(t, suite);
-  await view.click("Gerenciar");
-  const tips = () => view.all().filter(node => node.type === tooltipModule.exports.default).map(node => node.props.text);
-  assert.ok(tips().some(value => /Duplicar teste.*cópia.*manual.*revisar e salvar/.test(value)));
-  assert.ok(tips().some(value => /Arquivar teste.*abre uma confirmação.*sem apagar resultados e prints/.test(value)));
-  view.find(node => node.type === "select" && node.props["aria-label"] === "Filtrar CTs").props.onChange({ target: { value: "archived" } });
-  await view.settle();
-  assert.ok(tips().some(value => /Restaurar teste.*base ativa.*histórico preservado/.test(value)));
-  assert.equal(view.calls.some(call => call.method !== "GET"), false);
-});
-
-test("failed result navigation gives feedback without changing filters or selections", async t => {
-  const view = await workspace(t, suiteFixture(), async () => { throw new Error("Não foi possível carregar as evidências."); });
-  await view.click("Ver resultado de CT001: Ordenar produtos");
-  assert.match(text(view.find(node => node.props.role === "alert")), /Não foi possível carregar as evidências/);
-  assert.equal(view.button("Ver resultado de CT001: Ordenar produtos").props.disabled, false);
-  assert.equal(view.find(node => node.type === "input" && node.props["aria-label"] === "Selecionar CT001").props.checked, false);
-  assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
-});
-
 function catalogFixture() {
-  const suite = suiteFixture();
-  const original = suite.cases[0];
+  const suite = suiteFixture(), original = suite.cases[0];
   suite.cases = ["CT050", "CT060", "CT067", "CT094", "CT097", "CT108", "CT109"].map(id => ({ ...original, id, title: "Carrinho · " + id }));
   return suite;
 }
-
 async function markCatalog(view, id) {
-  view.find(node => node.type === "input" && node.props["aria-label"] === "Selecionar " + id).props.onChange();
+  view.find(node => node.type === "input" && node.props["aria-label"] === "Incluir " + id).props.onChange();
   await view.settle();
 }
-
-const selectionBar = view => view.find(node => node.props["aria-label"] === "Selecionados para reexecução");
-const plannedIds = view => view.all().filter(node => node.type === "button" && /^Retirar CT/.test(node.props["aria-label"] || "")).map(node => node.props["aria-label"].match(/^Retirar (CT\d+)/)[1]);
+const plannedIds = view => view.all().filter(node => node.props.className === "suite-selector-position").map(node => ({id: view.all().find(card => card.props["data-selector-case"] && [...elements(card)].includes(node)).props["data-selector-case"], order: Number(text(node))})).sort((a,b)=>a.order-b.order).map(item=>item.id);
 const buildingCard = view => view.find(node => node.props["data-construction-card"]);
 
 test("About closes on outside clicks without stealing focus or cancelling the clicked action", async t => {
@@ -584,7 +518,7 @@ test("Add reveals one distinct construction card without counting it as a saved 
   assert.equal(view.calls.some(call => call.method !== "GET"), false);
   await view.click("Ver teste em construção");
   assert.match(text(view.find(node => node.props["aria-label"] === "Etapas do teste em construção")), /Descreva o teste no assistente/);
-  await view.click("Ver etapas de CT001: Ordenar produtos"); assert.ok(view.image());
+  await view.click("1º na execução: CT001 · Ordenar produtos"); assert.ok(view.image());
   await view.click("Descartar teste em construção");
   assert.equal(view.all().some(node => node.props["data-construction-card"]), false);
   assert.equal(view.button("Revisar execução").props.disabled, false);
@@ -720,7 +654,7 @@ test("a failed explicit save retains the construction card, edited definition an
 test("a meaningful construction draft protects navigation even when no existing tests are selected", async t => {
   const navigations = [];
   const view = await workspace(t, undefined, undefined, { navigate: hash => navigations.push(hash) });
-  await view.click("Preparar execução"); await view.click("Adicionar teste"); await view.click("Planejar com IA");
+  await view.click("Adicionar teste"); await view.click("Planejar com IA");
   await view.chat().props.onSend("Quero testar o carrinho", { provider_id: "fixture", model_id: "planner" }); await view.settle();
   assert.equal(view.unloadBlocked(), true);
   assert.equal(await view.navigate("#/exploracoes"), false);
@@ -731,221 +665,43 @@ test("a meaningful construction draft protects navigation even when no existing 
   assert.equal(view.calls.some(call => /\/(cases|plans|start)$/.test(call.path)), false);
 });
 
-test("two checked rows have a visible next step and planning includes only those two, never all seven", async t => {
-  const suite = catalogFixture(), before = structuredClone(suite);
-  const view = await workspace(t, suite);
-  assert.equal(view.all().some(node => node.props["aria-label"] === "Selecionados para reexecução"), false);
-  assert.match(text(view.find(node => node.props.id === "suite-catalog-selection-help")), /Selecionar não inicia nenhum teste/);
-  await markCatalog(view, "CT050");
-  assert.match(text(selectionBar(view)), /1 teste selecionado/);
-  assert.equal(view.button("Preparar execução (1)").props.disabled, false);
-  await markCatalog(view, "CT067");
-  assert.match(text(selectionBar(view)), /2 testes selecionadosCT050 · CT067/);
-  assert.equal(view.button("Selecionar os outros 5 filtrados").props.disabled, false);
-  assert.equal(view.all().some(node => node.type === "button" && /Planejar CTs filtrados/.test(text(node))), false);
-  await view.click("Preparar execução (2)");
-  assert.deepEqual(plannedIds(view), ["CT050", "CT067"]);
-  assert.equal(view.all().some(node => node.props["aria-label"] === "Selecionados para reexecução"), false);
-  assert.equal(view.focus.at(-1).name, "suite-planning-heading");
-  assert.equal(view.scroll.at(-1).name, "suite-planning-heading");
-  assert.match(text(view.find(node => node.props.id === "suite-planning-guidance")), /2 testes selecionados.*Revisar execução.*após sua confirmação/);
-  assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
-  assert.deepEqual(suite, before);
-});
-
-test("filtered-out selections stay explicit and proceed without adding an unselected visible CT", async t => {
+test("suite roots open only preparation and keep exact selection through search and bulk filters", async t => {
   const view = await workspace(t, catalogFixture());
+  assert.equal(view.has("suite-planning-heading"), true);
+  assert.equal(view.all().some(node => node.props.className === "suite-tabs suite-main-tabs"), false);
+  assert.equal(view.all().some(node => node.props.className === "panel suite-catalog"), false);
   await markCatalog(view, "CT050");
   await markCatalog(view, "CT067");
-  view.find(node => node.type === "input" && node.props["aria-label"] === "Buscar CTs").props.onChange({ target: { value: "CT060" } });
+  view.find(node => node.props["aria-label"] === "Buscar CTs").props.onChange({ target: { value: "CT060" } });
   await view.settle();
-  assert.match(text(selectionBar(view)), /2 selecionados fora dos filtros atuais/);
-  assert.equal(view.find(node => node.type === "input" && node.props["aria-label"] === "Selecionar CT060").props.checked, false);
-  await view.click("Preparar execução (2)");
-  assert.deepEqual(plannedIds(view), ["CT050", "CT067"]);
-  assert.equal(view.find(node => node.type === "input" && node.props["aria-label"] === "Buscar CTs").props.value, "CT060");
-  assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
+  assert.equal(view.find(node => node.props["aria-label"] === "Incluir CT060").props.checked, false);
+  await view.click("Filtros dos testes");
+  await view.click("Adicionar filtrados (1)");
+  await view.click("Salvar rascunho");
+  assert.deepEqual(view.calls.find(call => call.method === "POST").body.items.map(item => item.case_id), ["CT050", "CT067", "CT060"]);
+  assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
 });
 
-test("clearing or unchecking the final CT removes the bar, resets checkboxes and keeps the current query", async t => {
-  const view = await workspace(t, catalogFixture());
-  await markCatalog(view, "CT050");
-  await markCatalog(view, "CT067");
-  view.find(node => node.type === "input" && node.props["aria-label"] === "Buscar CTs").props.onChange({ target: { value: "CT050" } });
-  await view.settle();
-  await view.click("Limpar seleção");
-  assert.equal(view.all().some(node => node.props["aria-label"] === "Selecionados para reexecução"), false);
-  assert.equal(view.find(node => node.type === "input" && node.props["aria-label"] === "Selecionar CT050").props.checked, false);
-  assert.equal(view.find(node => node.type === "input" && node.props["aria-label"] === "Buscar CTs").props.value, "CT050");
-  assert.equal(view.focus.at(-1).name, "suite-catalog-selection-help");
-  await markCatalog(view, "CT050");
-  await markCatalog(view, "CT050");
-  assert.equal(view.all().some(node => node.props["aria-label"] === "Selecionados para reexecução"), false);
-  assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
-});
-
-test("bulk selection marks visible cases without jumping screens or executing; its next action uses the exact count", async t => {
-  const view = await workspace(t, catalogFixture());
-  await view.click("Selecionar todos os 7 filtrados");
-  assert.match(text(selectionBar(view)), /7 testes selecionados/);
-  assert.match(text(selectionBar(view)), /\+3/);
-  assert.equal(view.button("Todos os 7 filtrados selecionados").props.disabled, true);
-  assert.equal(view.has("suite-planning-heading"), false);
-  assert.equal(view.all().filter(node => node.type === "input" && node.props.type === "checkbox" && node.props.checked).length, 7);
-  const status = [...elements(selectionBar(view))].find(node => node.props.role === "status");
-  assert.equal(status.props["aria-live"], "polite");
-  await view.click("Preparar execução (7)");
-  assert.equal(plannedIds(view).length, 7);
-  assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
-  const css = await readFile(new URL("../app/components/TestSuitesWorkspace.css", import.meta.url), "utf8");
-  assert.match(css, /\.suite-catalog-selection\s*\{[^}]*position:\s*sticky;[^}]*bottom:/);
-  assert.match(css, /@media \(max-width: 640px\)[^\n]*\.suite-selection-actions\s*\{\s*width:\s*100%/);
-});
-
-test("catalog-to-planner keeps an existing capture plan and the chosen CT order", async t => {
-  const suite = catalogFixture();
-  const capture = { version: 1, checkpoints: [{ id: "existing-print", gap: 0, order: 0 }] };
-  const view = await workspace(t, suite, undefined, { initialCaseId: "CT050", initialCapturePlan: capture });
-  assert.equal(view.all().some(node => node.props["data-checkpoint-id"] === "existing-print"), true);
-  await view.click("Testes");
-  await markCatalog(view, "CT067");
-  await view.click("Preparar execução (2)");
-  assert.deepEqual(plannedIds(view), ["CT050", "CT067"]);
-  assert.equal(view.all().some(node => node.props["data-checkpoint-id"] === "existing-print"), true);
-  assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
-});
-
-test("compact flow filters combine with verdicts and bulk planning keeps the selected stable CTs", async t => {
-  const suite = suiteFixture();
-  const original = suite.cases[0];
-  const create = { id: "flow-create", name: "Cadastrar cliente", entity: "cliente", operation: "create", description: "Cadastros de cliente", confidence: "identified", reason: "Objetivo explícito" };
-  const remove = { ...create, id: "flow-delete", name: "Excluir cliente", operation: "delete" };
-  const flow = memberships => ({ version: "functional-flows-v1", memberships });
-  suite.functional_flows = [create, remove];
-  suite.cases = [
-    { ...original, id: "CT001", title: "Criar cliente", status: "PASS", flow_classification: flow([create]) },
-    { ...original, id: "CT002", title: "Criar cliente sem nome", status: "FAIL", flow_classification: flow([create]) },
-    { ...original, id: "CT003", title: "Preencher campo", status: "PASS", flow_classification: flow([]) },
-    { ...original, id: "CT004", title: "Excluir cliente", status: "BLOCKED", flow_classification: flow([remove]) },
-  ];
-  const before = structuredClone(suite);
-  const view = await workspace(t, suite);
-  const visibleIds = () => view.all().filter(node => node.props.className === "suite-case-row").map(row => text(row.props.children[0]));
-  const choose = async (label, value) => {
-    view.find(node => node.type === "select" && node.props["aria-label"] === label).props.onChange({ target: { value } });
-    await view.settle();
-  };
-  assert.deepEqual(visibleIds(), ["CT001", "CT002", "CT003", "CT004"]);
-  await choose("Filtrar por fluxo funcional", "flow-create");
-  assert.deepEqual(visibleIds(), ["CT001", "CT002"]);
-  await choose("Filtrar CTs", "PASS");
-  assert.deepEqual(visibleIds(), ["CT001"]);
-  const option = view.find(node => node.type === "option" && node.props.value === "flow-create");
-  assert.match(text(option), /\(1\)/);
-  assert.doesNotMatch(text(option), /reprovado/);
-  await view.click("Remover filtro de fluxo");
-  assert.deepEqual(visibleIds(), ["CT001", "CT003"], "Removing the flow keeps the status filter");
-  await choose("Filtrar CTs", "all");
-  await choose("Filtrar por fluxo funcional", "unclassified");
-  assert.deepEqual(visibleIds(), ["CT003"]);
-  await choose("Filtrar por fluxo funcional", "flow-create");
-  await view.click("Selecionar todos os 2 filtrados");
-  await view.click("Preparar execução (2)");
-  for (const identity of ["CT001", "CT002"]) {
-    assert.equal(view.find(node => node.type === "input" && node.props["aria-label"] === "Incluir " + identity).props.checked, true);
-  }
-   await view.click("Filtros dos testes");
-  await choose("Filtrar por fluxo funcional", "unclassified");
-  assert.equal(view.find(node => node.type === "input" && node.props["aria-label"] === "Incluir CT003").props.checked, false);
-  assert.equal(view.all().filter(node => node.type === "button" && /^Retirar CT00[12] desta execução$/.test(node.props["aria-label"] || "")).length, 2);
-  assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
-  assert.deepEqual(suite, before);
-});
-
-test("the compact header keeps identity and actions together, with secondary context collapsed by default", async t => {
-  const suite = catalogFixture();
-  suite.created_at = "2026-10-14T19:22:00Z";
-  const view = await workspace(t, suite);
-  const header = view.find(node => node.type === "header" && node.props.className === "suite-detail-header");
-  const headerElements = [...elements(header)];
-  const title = headerElements.find(node => node.type === "h1");
-  assert.equal(text(title), "fixture.invalid");
-  assert.equal(title.props.title, "fixture.invalid");
-  assert.equal(text(headerElements.find(node => node.props.className === "suite-detail-count")), "7 testes");
-  assert.equal(headerElements.some(node => node.props.className === "section-kicker"), false);
-  assert.equal(view.all().some(node => node.props.className === "suite-notice"), false, "No always-visible catalog banner");
-  const context = headerElements.find(node => node.type === "details");
-  assert.ok(context);
-  assert.ok(!context.props.open, "Native details hides secondary information without a loading request");
-  assert.equal(text(context.props.children[0]), "Sobre o conjunto");
-  assert.match(text(context), /root-fixture/);
-  assert.match(text(context), /Iniciado em/);
-  assert.match(text(context), /CTs iniciais1CTs no catálogo7/);
-  assert.match(text(context), /datas e rodadas diferentes.*não revalida os demais.*histórico é preservado/);
-  const nav = headerElements.find(node => node.type === "nav");
-  assert.equal(nav.props["aria-label"], "Áreas da base de testes");
-  assert.deepEqual([...elements(nav)].filter(node => node.type === "button").map(node => node.props["aria-label"] || text(node)), ["Testes", "Preparar execução", "Execuções", "Atualizar conjunto"]);
-  assert.equal(view.button("Testes").props["aria-pressed"], true);
-  assert.equal(view.calls.length, 1);
-});
-
-test("compact navigation preserves selections, filters and capture plans, and focuses planning from either entry point", async t => {
+test("planner filter changes preserve capture plans and the selected order", async t => {
   const capture = { version: 1, checkpoints: [{ id: "header-print", gap: 0, order: 0 }] };
   const view = await workspace(t, catalogFixture(), undefined, { initialCaseId: "CT050", initialCapturePlan: capture });
-  await view.click("Testes");
   await markCatalog(view, "CT067");
-  view.find(node => node.type === "input" && node.props["aria-label"] === "Buscar CTs").props.onChange({ target: { value: "CT050" } });
+  await view.click("Filtros dos testes");
+  view.find(node => node.props["aria-label"] === "Filtrar CTs").props.onChange({ target: { value: "PASS" } });
   await view.settle();
-  assert.equal(text(view.button("Preparar execução")), "Preparar execução2");
-  await view.click("Execuções");
-  assert.equal(view.button("Execuções").props["aria-pressed"], true);
-  await view.click("Preparar execução");
-  assert.deepEqual(plannedIds(view), ["CT050", "CT067"]);
-  assert.equal(view.focus.at(-1).name, "suite-planning-heading");
-  assert.equal(view.all().some(node => node.props["data-checkpoint-id"] === "header-print"), true);
-  await view.click("Testes");
-  assert.equal(view.find(node => node.type === "input" && node.props["aria-label"] === "Buscar CTs").props.value, "CT050");
-  assert.match(text(selectionBar(view)), /1 selecionado fora dos filtros atuais/);
-  const focusCount = view.focus.length;
-  await view.click("Preparar execução");
-  assert.deepEqual(plannedIds(view), ["CT050", "CT067"]);
-  assert.equal(view.focus.length, focusCount + 1);
-  assert.equal(view.scroll.at(-1).name, "suite-planning-heading");
-  assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
+  await view.click("Salvar rascunho");
+  const items = view.calls.find(call => call.method === "POST").body.items;
+  assert.deepEqual(items.map(item => item.case_id), ["CT050", "CT067"]);
+  assert.deepEqual(items[0].capture_plan, capture);
 });
 
-test("compact report, refresh and back actions stay read-only and do not clear selected cases", async t => {
+test("planner reports and back remain read-only without alternative workspace screens", async t => {
   const reports = [], navigations = [];
-  const view = await workspace(t, catalogFixture(), async (...args) => { reports.push(args); }, { navigate: hash => navigations.push(hash) });
-  await markCatalog(view, "CT050");
-  await markCatalog(view, "CT067");
+  const view = await workspace(t, catalogFixture(), async (...args) => reports.push(args), { navigate: hash => navigations.push(hash) });
   await view.click("Abrir relatório consolidado");
-  assert.deepEqual(reports, [["root-fixture", "consolidated"]]);
-  assert.match(text(selectionBar(view)), /2 testes selecionadosCT050 · CT067/);
-  const callsBeforeRefresh = view.calls.length;
-  await view.click("Atualizar conjunto");
-  assert.equal(view.calls.length, callsBeforeRefresh + 1);
-  assert.deepEqual(view.calls.at(-1), { path: "/test-suites/root-fixture", method: "GET", body: undefined });
-  assert.equal(view.button("Atualizar conjunto").props.disabled, false);
-  assert.match(text(selectionBar(view)), /2 testes selecionadosCT050 · CT067/);
   await view.click("Voltar para Meus testes");
+  assert.deepEqual(reports, [["root-fixture", "consolidated"]]);
   assert.deepEqual(navigations, ["#/exploracoes"]);
-  assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
-});
-
-test("leaving an unfinished base editor offers staying or explicit discard without creating an execution", async t => {
-  const view = await workspace(t);
-  await view.click("Duplicar CT001 como novo CT manual");
-  await view.change("Título", "Novo teste ainda não salvo");
-  await view.click("Testes");
-  assert.equal(view.find(node => node.props.role === "dialog").props["aria-modal"], "true");
-  await view.click("Continuar editando");
-  assert.equal(view.has("suite-case-editor"), true);
-  assert.equal(view.field("Título").props.value, "Novo teste ainda não salvo");
-  await view.click("Voltar aos testes");
-  await view.click("Descartar e sair");
-  assert.equal(view.has("suite-case-editor"), false);
-  assert.equal(view.button("Testes").props["aria-pressed"], true);
   assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
 });
 
@@ -970,7 +726,6 @@ test("compact header styles are scoped to suite details and long application nam
 
 test("planning groups the catalog, scrollable editor and actions separately from the chat", async t => {
   const view = await workspace(t);
-  await view.click("Preparar execução");
   const planner = view.find(node => node.props.className === "suite-planner-view");
   assert.equal(planner.props["data-mobile-pane"], "plan");
   const layout = view.find(node => node.props.className === "suite-planner-layout with-chat");
@@ -991,8 +746,7 @@ test("preparation keeps the chooser open without a redundant toggle", async t =>
   assert.equal(view.all().some(node => node.props["aria-label"] === "Escolher testes"), false);
   assert.equal(view.find(node => node.props.id === "suite-case-selector").props.hidden, false);
   assert.deepEqual(plannedIds(view), ["CT001"]);
-  await view.click("Testes");
-  assert.equal(view.all().some(node => node.props["aria-label"] === "Atualizar conjunto"), true);
+  assert.equal(view.all().some(node => node.props["aria-label"] === "Áreas da base de testes"), false);
 });
 
 test("opening and finishing CT selection preserves order, filters and existing capture checkpoints", async t => {
@@ -1006,7 +760,7 @@ test("opening and finishing CT selection preserves order, filters and existing c
   view.find(node => node.type === "input" && node.props["aria-label"] === "Incluir CT067").props.onChange();
   await view.settle();
   assert.equal(view.find(node => node.props.id === "suite-case-selector").props.hidden, false);
-  assert.deepEqual(plannedIds(view), ["CT050", "CT067"]);
+  assert.deepEqual(plannedIds(view), ["CT067"]);
   assert.equal(view.all().some(node => node.props["data-checkpoint-id"] === "drawer-print"), true);
 
   assert.equal(view.find(node => node.type === "input" && node.props["aria-label"] === "Buscar CTs").props.value, "CT067");
@@ -1034,14 +788,16 @@ test("the chooser starts with only search and a filter icon, while filtering and
   await view.click("Filtros dos testes");
   assert.equal(view.has("suite-selector-filters"), false);
   assert.equal(view.find(node => node.type === "input" && node.props["aria-label"] === "Buscar CTs").props.value, "CT002");
-  assert.deepEqual(plannedIds(view), ["CT001"]);
+  assert.deepEqual(plannedIds(view), []);
   await view.click("Filtros dos testes"); await view.click("Limpar filtros");
   assert.equal(view.button("Filtros dos testes").props["data-active"], false);
   assert.equal(view.find(node => node.type === "input" && node.props["aria-label"] === "Buscar CTs").props.value, "CT002", "Clearing filters does not erase the search");
   await view.click("Adicionar filtrados");
-  assert.deepEqual(plannedIds(view), ["CT001", "CT002"]);
+  assert.deepEqual(plannedIds(view), ["CT002"]);
+  await view.click("Salvar rascunho");
+  assert.deepEqual(view.calls.find(call => call.path.endsWith("/plans")).body.items.map(item => item.case_id), ["CT001", "CT002"]);
   assert.equal(view.has("suite-selector-filters"), false);
-  assert.equal(view.calls.some(call => call.method !== "GET"), false);
+  assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
 });
 
 test("filter controls close on Escape or outside click without resetting filters, selection or capture plans", async t => {
@@ -1067,61 +823,32 @@ test("filter controls close on Escape or outside click without resetting filters
   assert.equal(view.calls.some(call => call.method !== "GET"), false);
 });
 
-test("the script keeps two named horizontal rails without the visible Testes and Etapas headings", async t => {
-  const suite = suiteFixture();
-  suite.cases.push({ ...suite.cases[0], id: "CT003", title: "Consultar produto", steps: ["Abrir detalhe", "Conferir produto"] });
-  const view = await workspace(t, suite, undefined, { initialCaseId: "CT001" });
-  await view.chat().props.onSend("Adicione CT003", null); await view.settle();
-  assert.equal(view.all().filter(node => node.props.className?.includes("suite-horizontal-rail")).length, 2);
-  assert.equal(view.find(node => node.props["aria-label"] === "Testes selecionados, rolagem horizontal").props.tabIndex, 0);
-  assert.equal(view.button("Ver etapas de CT001: Ordenar produtos").props["aria-pressed"], true);
-  await view.click("Ver etapas de CT003: Consultar produto");
-  assert.equal(view.button("Ver etapas de CT003: Consultar produto").props["aria-pressed"], true);
-  assert.equal(view.all().some(node => node.props["aria-label"] === "Etapas de CT003, rolagem horizontal"), true);
-  assert.equal(view.all().some(node => node.props.className === "suite-rail-heading"), false);
-  assert.equal(view.all().some(node => node.props["aria-label"] === "Testes desta execução"), true);
-  assert.equal(view.all().some(node => node.props["aria-label"] === "Etapas de CT003"), true);
-  assert.equal(view.all().some(node => node.props.className === "suite-plan-state"), false);
-  assert.match(text(view.find(node => node.props.className === "suite-planning-status sr-only")), /não salvo/);
-  const plan = view.find(node => node.props.className === "panel suite-case-plan suite-flow-lane");
-  assert.equal([...elements(plan)].some(node => node.props.className === "section-kicker"), false);
-  assert.equal([...elements(plan)].some(node => node.props.className === "suite-print-palette"), false);
-  assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
+test("preparation has only the steps rail and uses sidebar cards to switch tests", async t => {
+ const suite=suiteFixture();suite.cases.push({...suite.cases[0],id:"CT003",title:"Consultar produto"});
+ const view=await workspace(t,suite,undefined,{initialCaseId:"CT001"});
+ await view.chat().props.onSend("Adicione CT003",null);await view.settle();
+ await view.click("2º na execução: CT003 · Consultar produto");
+ assert.equal(view.all().some(n=>n.props["aria-label"]==="Etapas de CT003"),true);
+ assert.equal(view.all().some(n=>n.props.className?.includes("suite-selected-list")),false);
+ assert.equal(view.all().filter(n=>n.props.className?.includes("suite-horizontal-rail")).length,1);
 });
 
-test("horizontal order controls and removing the active card keep the remaining test and its print plan", async t => {
-  const suite = suiteFixture();
-  suite.cases.push({ ...suite.cases[0], id: "CT003", title: "Consultar produto" });
-  const capture = { version: 1, checkpoints: [{ id: "keep-print", gap: 0, order: 0 }] };
-  const view = await workspace(t, suite, undefined, { initialCaseId: "CT001", initialCapturePlan: capture });
-  await view.chat().props.onSend("Adicione CT003", null); await view.settle();
-  await view.click("Mover CT003 para esquerda");
-  assert.deepEqual(plannedIds(view), ["CT003", "CT001"]);
-  await view.click("Mover CT003 para direita");
-  assert.deepEqual(plannedIds(view), ["CT001", "CT003"]);
-  await view.click("Ver etapas de CT003: Consultar produto");
-  await view.click("Retirar CT003 desta execução");
-  assert.deepEqual(plannedIds(view), ["CT001"]);
-  assert.equal(view.button("Ver etapas de CT001: Ordenar produtos").props["aria-pressed"], true);
-  assert.equal(view.all().some(node => node.props["data-checkpoint-id"] === "keep-print"), true);
-  assert.equal(view.calls.some(call => call.method !== "GET"), false);
-});
 
 function caseTransfer() {
   let payload = "";
   return { types: ["application/x-autojev-test-case"], effectAllowed: "", dropEffect: "",
     setData(type, value) { assert.equal(type, this.types[0]); payload = value; }, getData() { return payload; } };
 }
-const draggedCard = (view, id) => view.find(node => node.props["data-case-id"] === id);
+const draggedCard = (view, id) => view.find(node => node.props["data-selector-case"] === id);
 async function beginCaseDrag(view, id, transfer) {
   const card = draggedCard(view, id);
-  const button = [...elements(card)].find(node => node.props.className === "suite-test-card-select");
+  const button = [...elements(card)].find(node => node.type === "button");
   assert.equal(button.props.draggable, true);
-  button.props.onDragStart({ dataTransfer: transfer }); await view.settle();
+  button.props.onDragStart({ dataTransfer: transfer, stopPropagation() {} }); await view.settle();
 }
 async function dropCaseOn(view, id, transfer, side) {
-  const event = { dataTransfer: transfer, clientX: side === "before" ? 20 : 180,
-    currentTarget: { getBoundingClientRect: () => ({ left: 0, width: 200 }) }, preventDefault() {}, stopPropagation() {} };
+  const event = { dataTransfer: transfer, clientY: side === "before" ? 20 : 180,
+    currentTarget: { getBoundingClientRect: () => ({ top: 0, height: 200 }) }, preventDefault() {}, stopPropagation() {} };
   draggedCard(view, id).props.onDragOver(event); await view.settle();
   assert.equal(draggedCard(view, id).props["data-drop-side"], side);
   draggedCard(view, id).props.onDrop(event); await view.settle();
@@ -1136,7 +863,7 @@ test("dragging test cards inserts on either side, keeps the active CT and saves 
   const transfer = caseTransfer();
   await beginCaseDrag(view, "CT005", transfer); await dropCaseOn(view, "CT001", transfer, "before");
   assert.deepEqual(plannedIds(view), ["CT005", "CT001", "CT003"]);
-  assert.equal(view.button("Ver etapas de CT001: Ordenar produtos").props["aria-pressed"], true);
+  assert.equal(view.find(n=>n.props["data-selector-case"]==="CT001").props.className.includes("selected"), true);
   await beginCaseDrag(view, "CT001", transfer); await dropCaseOn(view, "CT003", transfer, "after");
   assert.deepEqual(plannedIds(view), ["CT005", "CT003", "CT001"]);
   assert.equal(view.all().some(node => node.props["data-checkpoint-id"] === "db-8"), true);
@@ -1149,25 +876,6 @@ test("dragging test cards inserts on either side, keeps the active CT and saves 
   assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
 });
 
-test("the empty rail area accepts the last position, while cancelling and invalid drags never change a saved order", async t => {
-  const suite = suiteFixture(); suite.cases.push({ ...suite.cases[0], id: "CT003", title: "Consultar produto" });
-  const view = await workspace(t, suite, undefined, { initialCaseId: "CT001" });
-  await view.chat().props.onSend("Adicione CT003", null); await view.settle();
-  const transfer = caseTransfer(), rail = () => view.find(node => node.props["aria-label"] === "Testes selecionados, rolagem horizontal");
-  await beginCaseDrag(view, "CT001", transfer);
-  rail().props.onDrop({ dataTransfer: transfer, preventDefault() {}, stopPropagation() {} }); await view.settle();
-  assert.deepEqual(plannedIds(view), ["CT003", "CT001"]);
-  await beginCaseDrag(view, "CT003", transfer);
-  view.button("Ver etapas de CT003: Consultar produto").props.onDragEnd(); await view.settle();
-  assert.deepEqual(plannedIds(view), ["CT003", "CT001"]);
-  assert.equal(view.all().some(node => node.props["data-drop-side"]), false);
-  for (const invalid of ["not json", JSON.stringify({ rootId: "other-suite", caseId: "CT003" }), JSON.stringify({ rootId: suite.id, caseId: "CT999" })]) {
-    await beginCaseDrag(view, "CT003", transfer); transfer.setData(transfer.types[0], invalid);
-    rail().props.onDrop({ dataTransfer: transfer, preventDefault() {}, stopPropagation() {} }); await view.settle();
-    assert.deepEqual(plannedIds(view), ["CT003", "CT001"]);
-  }
-  assert.equal(view.calls.some(call => call.method !== "GET"), false);
-});
 
 test("square step cards keep a plus before and after each pause and persist the exact insertion order", async t => {
   const view = await workspace(t, suiteFixture(), undefined, { initialCaseId: "CT001" });
@@ -1398,11 +1106,11 @@ test("switching CTs clears the image selection and returning does not show anoth
   const view = await workspace(t, suite, undefined, { initialCaseId: "CT001" });
   await view.chat().props.onSend("Adicione CT002", null); await view.settle();
   await view.click("Ver imagem da etapa 1: Imagem A");
-  await view.click("Ver etapas de CT002: Segundo teste");
+  await view.click("2º na execução: CT002 · Segundo teste");
   assert.equal(view.find(node => node.props["aria-label"] === "Etapas de CT002").props["data-preview-open"], false);
   await view.click("Ver imagem da etapa 1: Imagem B");
   assert.match(view.image().props.src, /run-b\/screenshots\/b\.png$/);
-  await view.click("Ver etapas de CT001: Ordenar produtos");
+  await view.click("1º na execução: CT001 · Ordenar produtos");
   assert.equal(view.find(node => node.props["aria-label"] === "Etapas de CT001").props["data-preview-open"], false);
   assert.equal(view.calls.some(call => call.method !== "GET"), false);
 });
@@ -1479,13 +1187,13 @@ test("preparation omits the numbered step bar without removing selection, script
   assert.equal(view.button("Salvar rascunho").props.disabled, false);
   await view.click("Revisar execução");
   assert.equal(view.has("suite-plan-review"), true);
-  assert.equal(view.button("Executar 1 teste").props.disabled, true);
+  assert.equal(view.button("Executar 1 teste").props.disabled, false);
   assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
   const css = await readFile(new URL("../app/components/TestSuitesWorkspace.css", import.meta.url), "utf8");
   assert.equal(css.includes("suite-preparation-steps"), false);
 });
 
-test("creation and review stay inside the work pane and review requires explicit execution consent", async t => {
+test("creation and review stay inside the work pane and only Executar authorizes execution", async t => {
   const view = await workspace(t, suiteFixture(), undefined, { initialCaseId: "CT001" });
   await reviewAiProposal(view);
   const center = view.find(node => node.props.className === "suite-plan-center");
@@ -1497,7 +1205,7 @@ test("creation and review stay inside the work pane and review requires explicit
   assert.equal(view.focus.at(-1).name, "suite-plan-review");
   assert.equal(view.scroll.at(-1).name, "suite-plan-review");
   assert.equal(view.find(node => node.props.id === "suite-case-selector").props.hidden, true);
-  assert.equal(view.button("Executar 1 teste").props.disabled, true);
+  assert.equal(view.button("Executar 1 teste").props.disabled, false);
   assert.deepEqual(view.calls.filter(call => call.method === "POST" && !call.path.endsWith("/assistant")).map(call => call.path), ["/test-suites/root-fixture/plans", "/test-suites/rounds/plan-fixture/validate"]);
   assert.deepEqual(view.calls.find(call => call.path.endsWith("/plans")).body.items.map(item => item.case_id), ["CT001"]);
   assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
@@ -1506,7 +1214,7 @@ test("creation and review stay inside the work pane and review requires explicit
 test("saving a draft exposes its destination without starting or changing the selected tests", async t => {
   const navigations = [];
   const view = await workspace(t, catalogFixture(), undefined, { initialCaseId: "CT050", navigate: hash => navigations.push(hash) });
-  await view.click("Testes"); await markCatalog(view, "CT067"); await view.click("Preparar execução (2)");
+  await markCatalog(view, "CT067");
   assert.equal(view.all().some(node => node.props.className === "suite-draft-link text-button"), false);
   await view.click("Salvar rascunho");
   assert.match(text(view.find(node => node.props.className === "suite-planning-status sr-only")), /salvo em Rascunhos/);
@@ -1519,7 +1227,7 @@ test("saving a draft exposes its destination without starting or changing the se
   assert.equal(view.calls.some(call => /\/(start|discover|recordings)$/.test(call.path)), false);
 });
 
-test("review is a focused stage and returning to the script preserves checkpoints but clears consent", async t => {
+test("review is a focused stage and returning to the script preserves checkpoints without starting", async t => {
   const capture = { version: 1, checkpoints: [{ id: "review-print", gap: 0, order: 0 }] };
   const view = await workspace(t, undefined, undefined, { initialCaseId: "CT001", initialCapturePlan: capture });
   await view.click("Revisar execução");
@@ -1532,8 +1240,7 @@ test("review is a focused stage and returning to the script preserves checkpoint
   assert.equal(view.all().some(node => node.props.className === "suite-plan-footer"), false);
   assert.equal(view.all().some(node => node.props.className === "suite-detail-header"), false);
   assert.equal(view.all().some(node => node.props.className === "suite-plan-heading suite-plan-toolbar"), false);
-  const consent = [...elements(view.find(node => node.type === "label" && text(node).startsWith("Revisei os testes")))].find(node => node.type === "input");
-  consent.props.onChange({ target: { checked: true } }); await view.settle();
+  assert.equal(view.all().some(node => node.type === "label" && text(node).startsWith("Revisei os testes")), false);
   assert.equal(view.button("Executar 1 teste").props.disabled, false);
   await view.click("Ajustar");
   assert.equal(view.has("suite-plan-review"), false);
@@ -1541,17 +1248,11 @@ test("review is a focused stage and returning to the script preserves checkpoint
   assert.deepEqual(plannedIds(view), ["CT001"]);
   assert.equal(view.focus.at(-1).name, "suite-planning-heading");
   await view.click("Revisar execução");
-  assert.equal(view.button("Executar 1 teste").props.disabled, true);
+  assert.equal(view.button("Executar 1 teste").props.disabled, false);
   assert.equal(view.calls.filter(call => call.path.endsWith("/plans")).length, 1);
   assert.equal(view.calls.filter(call => call.path.endsWith("/validate")).length, 2);
   assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
 });
-
-async function acceptReview(view) {
-  const checkbox = [...elements(view.find(node => node.type === "label" && text(node).startsWith("Revisei os testes")))].find(node => node.type === "input");
-  checkbox.props.onChange({ target: { checked: true } });
-  await view.settle();
-}
 
 test("execution name is editable only in review and survives returning to the script", async t => {
   const capture = { version: 1, checkpoints: [{ id: "name-print", gap: 0, order: 0 }] };
@@ -1560,11 +1261,11 @@ test("execution name is editable only in review and survives returning to the sc
   await view.click("Revisar execução");
   assert.equal(view.field("Nome da execução").props.value, "Nova execução");
   assert.equal(view.field("Nome da execução").props.maxLength, 160);
-  await acceptReview(view);
+
   const before = view.calls.length;
   await view.change("Nome da execução", "Regressão do carrinho");
   assert.equal(view.has("suite-plan-review"), true, "Typing must not send the user back to preparation");
-  assert.equal(view.button("Executar 1 teste").props.disabled, true, "Renaming clears the earlier consent");
+  assert.equal(view.button("Executar 1 teste").props.disabled, false, "Renaming is saved and revalidated only when Executar is clicked");
   assert.equal(view.calls.length, before, "Typing never saves or starts a test");
   await view.click("Ajustar");
   assert.equal(view.all().some(node => node.props["aria-label"] === "Nome da execução"), false);
@@ -1585,7 +1286,7 @@ test("confirmed execution saves a renamed review and uses its revalidated revisi
   const view = await workspace(t, undefined, undefined, { initialCaseId: "CT001", navigate: hash => navigations.push(hash) });
   await view.click("Revisar execução");
   await view.change("Nome da execução", "Conferir ordenação");
-  await acceptReview(view);
+
   assert.equal(view.button("Executar 1 teste").props.disabled, false);
   await view.click("Executar 1 teste"); // Isolated request fixture: no live execution.
   assert.deepEqual(view.calls.filter(call => call.method !== "GET").map(call => [call.method, call.path]), [
@@ -1602,11 +1303,11 @@ test("a name save that refreshes test definitions requires a fresh review before
   const view = await workspace(t, undefined, undefined, { initialCaseId: "CT001",
     planUpdate: plan => ({ ...plan, items: plan.items.map(item => ({ ...item, definition: { title: "Definição atualizada na base" } })) }),
   });
-  await view.click("Revisar execução"); await view.change("Nome da execução", "Nova regressão"); await acceptReview(view);
+  await view.click("Revisar execução"); await view.change("Nome da execução", "Nova regressão");
   await view.click("Executar 1 teste");
   assert.equal(view.has("suite-plan-review"), true);
   assert.equal(view.field("Nome da execução").props.value, "Nova regressão");
-  assert.equal(view.button("Executar 1 teste").props.disabled, true);
+  assert.equal(view.button("Executar 1 teste").props.disabled, false);
   assert.match(text(view.find(node => node.props.className === "suite-error")), /condições da execução mudaram/);
   assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
 });
@@ -1615,23 +1316,23 @@ test("revalidation after renaming never starts a newly unavailable test", async 
   const view = await workspace(t, undefined, undefined, { initialCaseId: "CT001",
     validationReply: checked => checked.revision > 1 ? { ...checked, available: false, items: [{ case_id: "CT001", available: false, reason: "Teste arquivado", code: "archived" }] } : checked,
   });
-  await view.click("Revisar execução"); await view.change("Nome da execução", "Minha execução"); await acceptReview(view);
+  await view.click("Revisar execução"); await view.change("Nome da execução", "Minha execução");
   await view.click("Executar 1 teste");
   assert.equal(view.has("suite-plan-review"), true);
   assert.equal(view.field("Nome da execução").props.value, "Minha execução");
-  await acceptReview(view);
+
   assert.equal(view.button("Executar 1 teste").props.disabled, true);
   assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
 });
 
-test("failed name saves retain the review and need consent again before retrying", async t => {
+test("failed name saves retain review and allow an explicit execution retry", async t => {
   let reject = true;
   const view = await workspace(t, undefined, undefined, { initialCaseId: "CT001", rejectWrite: (path, options) => reject && options.method === "PUT" });
-  await view.click("Revisar execução"); await view.change("Nome da execução", "Nome preservado"); await acceptReview(view);
+  await view.click("Revisar execução"); await view.change("Nome da execução", "Nome preservado");
   await view.click("Executar 1 teste");
   assert.equal(view.has("suite-plan-review"), true);
   assert.equal(view.field("Nome da execução").props.value, "Nome preservado");
-  assert.equal(view.button("Executar 1 teste").props.disabled, true);
+  assert.equal(view.button("Executar 1 teste").props.disabled, false);
   assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
   reject = false;
   await view.click("Ajustar"); await view.click("Revisar execução");
@@ -1646,7 +1347,7 @@ test("saved names appear in review and an empty edit cannot strand the preparati
   assert.equal(view.all().some(node => node.props["aria-label"] === "Nome da execução"), false);
   await view.click("Revisar execução");
   assert.equal(view.field("Nome da execução").props.value, "Roteiro salvo");
-  await view.change("Nome da execução", "   "); await acceptReview(view);
+  await view.change("Nome da execução", "   ");
   assert.equal(view.field("Nome da execução").props["aria-invalid"], true);
   assert.equal(view.button("Executar 1 teste").props.disabled, true);
   await view.click("Ajustar");
@@ -1662,13 +1363,13 @@ test("a failed revalidation after saving the name retries validation, not the sa
   const view = await workspace(t, undefined, undefined, { initialCaseId: "CT001", navigate: hash => navigations.push(hash),
     rejectWrite: path => path.endsWith("/validate") && ++validations === 2,
   });
-  await view.click("Revisar execução"); await view.change("Nome da execução", "Revalidar com segurança"); await acceptReview(view);
+  await view.click("Revisar execução"); await view.change("Nome da execução", "Revalidar com segurança");
   await view.click("Executar 1 teste");
   assert.equal(view.has("suite-plan-review"), true);
   assert.equal(view.field("Nome da execução").props.value, "Revalidar com segurança");
-  assert.equal(view.button("Executar 1 teste").props.disabled, true);
+  assert.equal(view.button("Executar 1 teste").props.disabled, false);
   assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
-  await acceptReview(view); await view.click("Executar 1 teste");
+  await view.click("Executar 1 teste");
   assert.equal(view.calls.filter(call => call.method === "PUT").length, 1);
   assert.equal(view.calls.filter(call => call.path.endsWith("/validate")).length, 3);
   assert.deepEqual(view.calls.at(-1).body, { confirm: true, expected_revision: 2 });
@@ -1708,7 +1409,6 @@ test("CRUD analysis compares existing and missing tests but additions and propos
       { operation: "delete", status: "not_applicable", case_ids: [], new_case_indexes: [], reason: "O usuário informou que não há exclusão." },
     ] } };
   const view = await workspace(t, undefined, undefined, { assistantReply });
-  await view.click("Preparar execução");
   const llm = { provider_id: "fixture", model_id: "planner" };
   await view.chat().props.onSend("Meu teste consiste em testar o CRUD da tela Clientes", llm); await view.settle();
   const coverage = view.find(node => node.props["aria-label"] === "Comparação do CRUD com a base");
@@ -1762,44 +1462,15 @@ test("planner responsive styles reserve space for the composer and use pane tabs
   assert.match(css, /\.suite-planner-view \.suite-planner-layout.with-chat\s*\{\s*grid-template-columns: minmax\(0, 1fr\) clamp\(320px, 30%, 420px\);/);
   assert.match(css, /\.suite-planning-main > \.suite-plan-footer\s*\{[^}]*grid-area: footer;[^}]*position: static;/);
   assert.match(css, /\.suite-planner-view \.suite-plan-center\s*\{[^}]*min-height: 0;[^}]*overflow: auto;/);
-  assert.match(css, /\.suite-flow-board\s*\{[^}]*grid-template-rows: max-content minmax\(0, 1fr\);/, "Steps receive every pixel not needed by the test cards");
-  assert.match(css, /\.suite-flow-board \.suite-selected-list\s*\{[^}]*flex: none;[^}]*height: calc\(var\(--rail-card-size\) \+ 20px\);/, "The test lane fits its cards and horizontal scrollbar, rather than stretching");
   assert.doesNotMatch(css, /grid-template-rows: minmax\(105px, 3fr\) minmax\(0, 7fr\)/);
   assert.match(css, /@container suite-planner \(max-width: 830px\)/);
   assert.match(css, /data-mobile-pane="plan"[^}]*\.suite-chat\s*\{\s*display: none;/);
   assert.match(css, /data-mobile-pane="chat"[^}]*\.suite-planning-main\s*\{\s*display: none;/);
 });
 
-test("catalog archiving is explicit, clears only the archived selection and preserves visible result navigation", async t => {
-  const reports = [];
-  const view = await workspace(t, catalogFixture(), async (...args) => reports.push(args));
-  await markCatalog(view, "CT050"); await markCatalog(view, "CT067");
-  await view.click("Gerenciar");
-  await view.click("Arquivar CT050");
-  assert.equal(view.calls.filter(call => call.method === "PATCH").length, 0, "Opening confirmation never archives");
-  assert.equal(view.focus.at(-1).name, "Confirmar arquivamento");
-  await view.click("Cancelar");
-  assert.equal(view.focus.at(-1).name, "Arquivar CT050");
-  await view.click("Arquivar CT050");
-  await view.click("Confirmar arquivamento");
-  assert.equal(view.all().some(node => node.props["aria-label"] === "Selecionar CT050"), false);
-  assert.equal(view.find(node => node.props["aria-label"] === "Selecionar CT067").props.checked, true);
-  assert.match(text(selectionBar(view)), /1 teste selecionadoCT067/);
-  view.find(node => node.type === "select" && node.props["aria-label"] === "Filtrar CTs").props.onChange({ target: { value: "archived" } });
-  await view.settle();
-  assert.equal(view.find(node => node.props["aria-label"] === "Selecionar CT050").props.disabled, true);
-  await view.click("Ver resultado de CT050: Carrinho · CT050");
-  assert.deepEqual(reports, [["root-fixture", "consolidated", undefined, "CT050"]]);
-  await view.click("Restaurar CT050");
-  assert.equal(view.all().some(node => node.props["aria-label"] === "Selecionar CT050"), false, "Restored test leaves the archive filter");
-  assert.deepEqual(view.calls.filter(call => call.method === "PATCH").map(call => call.body), [{ archived: true, expected_revision: 0 }, { archived: false, expected_revision: 1 }]);
-  assert.equal(view.calls.some(call => /\/start|\/result|\/report/.test(call.path)), false);
-});
-
 test("archived tests cannot be added by direct chat and active tests remain available", async t => {
   const suite = catalogFixture(); suite.cases[0].archived = true;
   const view = await workspace(t, suite);
-  await view.click("Preparar execução");
   await view.chat().props.onSend("adicione CT050", null); await view.settle();
   assert.match(view.chat().props.messages.at(-1).content, /Não adicionei/);
   assert.deepEqual(plannedIds(view), []);
@@ -1808,15 +1479,14 @@ test("archived tests cannot be added by direct chat and active tests remain avai
   assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
 });
 
-test("execution history includes original and linked attempts, excludes drafts and keeps long results collapsed", async t => {
+test("legacy round links show an inline monitor and keep long results collapsed", async t => {
   const suite = suiteFixture(), navigations = [];
   const execution = { id: "round-fixture", root_id: suite.id, name: "Conferir produtos", status: "completed", revision: 2, created_at: "2026-10-20T12:00:00Z", updated_at: "2026-10-20T12:01:00Z", items: [{ case_id: "CT001", mode: "automatic", definition: suite.cases[0], state: "completed", execution_id: "run-fixture", result: { status: "PASS", actual_result: "Lista e opções conferidas" } }] };
   suite.rounds = [execution, { ...execution, id: "draft-fixture", name: "Não executado", status: "draft" }];
   suite.legacy_runs = [{ id: "legacy-fixture", count: 1, status: "completed", created_at: "2026-10-19T12:00:00Z" }];
   const view = await workspace(t, suite, undefined, { roundId: execution.id, navigate: hash => navigations.push(hash) });
-  const history = view.find(node => node.props["aria-label"] === "Execuções, mais recentes primeiro");
-  assert.deepEqual([...elements(history)].filter(node => node.type === "button").map(button => text([...elements(button)].find(node => node.type === "strong"))), ["Conferir produtos", "Reexecução", "Execução inicial"]);
-  assert.equal([...elements(history)].some(node => text(node).includes("Não executado")), false);
+  assert.equal(view.has("suite-planning-heading"), true);
+  assert.equal(view.all().some(node => node.props["aria-label"] === "Execuções, mais recentes primeiro"), false);
   assert.match(text(view.find(node => node.props.className === "panel suite-round-detail")), /1 de 1 teste com resultado/);
   const explanation = view.find(node => node.type === "details" && node.props.className === "suite-result-explanation");
   assert.equal(explanation.props.open, undefined);
@@ -1855,28 +1525,15 @@ async function reviewAiProposal(view) {
   await view.settle(); await view.click("Carrinho vazio");
 }
 
-test("base creation and explicit execution inclusion have different save destinations", async t => {
-  const base = await workspace(t);
-  await base.click("Duplicar CT001 como novo CT manual"); await fillManual(base);
-  assert.equal(base.chat().props.purpose, "base");
-  await base.submit();
-  assert.equal(base.find(node => node.props["aria-label"] === "Selecionar CT002").props.checked, false);
-  assert.equal(base.calls.filter(call => call.method !== "GET").length, 1);
-  assert.equal(base.calls[1].path, "/test-suites/root-fixture/cases");
-
-  const include = await workspace(t);
-  await include.click("Duplicar CT001 como novo CT manual"); await fillManual(include);
-  await include.click("Salvar e incluir na execução");
-  assert.deepEqual(plannedIds(include), ["CT002"]);
-  assert.equal(include.chat().props.purpose, "execution");
-  assert.equal(include.calls.filter(call => call.method !== "GET").length, 1);
-
-  const planner = await workspace(t, undefined, undefined, { initialCaseId: "CT001" });
-  await reviewAiProposal(planner); await fillManual(planner);
-  assert.equal(planner.button("Salvar e adicionar").props.type, "submit");
-  await planner.submit();
-  assert.deepEqual(plannedIds(planner), ["CT001", "CT002"]);
-  assert.equal(planner.calls.some(call => /\/(plans|start|discover)$/.test(call.path)), false);
+test("planner case creation saves to the base and includes the new case without starting execution", async t => {
+  const view = await workspace(t);
+  await view.click("Duplicar CT001 como novo CT manual"); await fillManual(view);
+  assert.equal(view.chat().props.purpose, "execution");
+  await view.submit();
+  assert.deepEqual(plannedIds(view), ["CT002"]);
+  assert.equal(view.calls.filter(call => call.method !== "GET").length, 1);
+  assert.equal(view.calls.find(call => call.method === "POST").path, "/test-suites/root-fixture/cases");
+  assert.equal(view.calls.some(call => /\/(plans|start|discover)$/.test(call.path)), false);
 });
 
 test("manual version edits preserve the ID and cannot inherit approval or alter old evidence", async t => {
@@ -1885,24 +1542,15 @@ test("manual version edits preserve the ID and cannot inherit approval or alter 
   suite.rounds = [{ id: "historical", root_id: suite.id, name: "Histórico", status: "completed", created_at: "2026-10-14T16:22:00Z", items: [{ case_id: "CT001", result: { status: "PASS", evidence: "preserved.png" } }] }];
   const historical = structuredClone(suite.rounds);
   const view = await workspace(t, suite);
-  await view.click("Editar"); await fillManual(view, "Nova definição"); await view.submit();
+  await view.click("Editar CT001"); await fillManual(view, "Nova definição"); await view.submit();
   const write = view.calls.find(call => call.method === "PUT");
   assert.equal(write.path, "/test-suites/root-fixture/cases/CT001");
   assert.equal(write.body.expected_revision, 3);
   assert.equal(suite.cases[0].revision, 4);
-  assert.equal(view.button("Ver resultado de CT001: Nova definição").props.disabled, true);
+  assert.notEqual(suite.cases[0].status, "PASS");
+  assert.equal(view.button("Editar CT001").props.disabled, false);
   assert.deepEqual(suite.rounds, historical);
   assert.equal(view.calls.some(call => /\/(plans|start)$/.test(call.path)), false);
-});
-
-test("editing a restored manual case retains its independent catalog revision for archiving", async t => {
-  const suite = suiteFixture();
-  suite.cases[0] = { ...suite.cases[0], mode: "manual", archived: false, catalog_revision: 4 };
-  const view = await workspace(t, suite);
-  await view.click("Editar"); await fillManual(view); await view.submit();
-  await view.click("Gerenciar"); await view.click("Arquivar CT001"); await view.click("Confirmar arquivamento");
-  assert.equal(view.calls.find(call => call.method === "PATCH").body.expected_revision, 4);
-  assert.equal(suite.cases[0].archived, true);
 });
 
 test("unsaved manual text blocks navigation and reload, then saves without executing before leaving", async t => {
@@ -1954,28 +1602,27 @@ test("an incomplete form and a stale version preserve the user's text and never 
 
   const suite = suiteFixture(); suite.cases[0].mode = "manual";
   const edit = await workspace(t, suite, undefined, { rejectWrite: () => true });
-  await edit.click("Editar"); await fillManual(edit, "Minha edição"); await edit.submit();
+  await edit.click("Editar CT001"); await fillManual(edit, "Minha edição"); await edit.submit();
   assert.equal(edit.field("Título").props.value, "Minha edição");
   assert.equal(suite.cases[0].title, "Ordenar produtos");
   assert.match(text(edit.find(node => node.props.role === "alert")), /alterado em outra tela.*alterações foram mantidas/);
 });
 
-test("empty bases, archived-only bases and empty filters explain different next actions", async t => {
-  const emptySuite = suiteFixture(); emptySuite.cases = [];
-  const empty = await workspace(t, emptySuite);
-  assert.match(text(empty.find(node => node.props.className === "suite-catalog-empty")), /Sua base ainda não tem testes/);
-  assert.ok(empty.button("Adicionar teste"));
-  const archivedSuite = suiteFixture(); archivedSuite.cases[0].archived = true;
-  const archived = await workspace(t, archivedSuite);
-  assert.match(text(archived.find(node => node.props.className === "suite-catalog-empty")), /Todos os testes estão arquivados.*resultados continuam no histórico/);
-  await archived.click("Ver arquivados");
-  assert.ok(archived.button("Restaurar CT001"));
+test("empty and archived-only bases retain preparation and empty filters retain the search", async t => {
+  for (const archived of [false, true]) {
+    const suite = suiteFixture();
+    if (archived) suite.cases[0].archived = true; else suite.cases = [];
+    const view = await workspace(t, suite);
+    assert.equal(view.has("suite-planning-heading"), true);
+    assert.ok(view.button("Adicionar teste"));
+    assert.match(text(view.find(node => node.props.role === "status" && text(node).includes("Nenhum CT"))), /Nenhum CT corresponde aos filtros/);
+  }
   const filtered = await workspace(t);
-  filtered.find(node => node.props["aria-label"] === "Buscar CTs").props.onChange({ target: { value: "nada-corresponde" } });
-  await filtered.settle();
-  assert.match(text(filtered.find(node => node.props.className === "suite-catalog-empty")), /Nenhum teste neste filtro/);
-  await filtered.click("Ver todos os testes");
-  assert.ok(filtered.button("Ver resultado de CT001: Ordenar produtos"));
+  const search = () => filtered.find(node => node.props["aria-label"] === "Buscar CTs");
+  search().props.onChange({ target: { value: "nada-corresponde" } }); await filtered.settle();
+  assert.equal(search().props.value, "nada-corresponde");
+  search().props.onChange({ target: { value: "" } }); await filtered.settle();
+  assert.ok(filtered.button("Selecionar CT001: Ordenar produtos"));
 });
 
 test("a failed initial load offers a read-only retry instead of stranding the user", async t => {
@@ -1989,7 +1636,7 @@ test("a failed initial load offers a read-only retry instead of stranding the us
   assert.match(text(view.find(node => node.props.role === "alert")), /Falha de rede/);
   failed = false;
   await view.click("Tentar novamente");
-  assert.ok(view.button("Ver resultado de CT001: Ordenar produtos"));
+  assert.ok(view.button("Selecionar CT001: Ordenar produtos"));
   assert.equal(reads.length, 2);
   assert.ok(reads.every(call => call.options === undefined));
 });
@@ -2028,48 +1675,62 @@ test("review opens before validation finishes without marking pending tests unav
   assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
   finish(); await view.settle();
   assert.match(text(view.find(node => node.props.id === "suite-plan-review")), /Pronto/);
-  assert.equal(view.button("Executar 1 teste").props.disabled, true);
+  assert.equal(view.button("Executar 1 teste").props.disabled, false);
 });
 
-test("private round vault inputs are masked, required before confirmation and never saved in plans", async t => {
+test("private round inputs appear only on demand and never enter saved plans", async t => {
   const navigations = [];
   const view = await workspace(t, undefined, undefined, { initialCaseId: "CT001", navigate: hash => navigations.push(hash),
-    validationReply: checked => ({ ...checked, required_inputs: ["login_alias", "password_alias"],
-      items: checked.items.map(item => ({ ...item, required_inputs: ["login_alias", "password_alias"] })) }),
+    validationReply: checked => ({ ...checked, required_inputs: ["login_alias", "password_alias"], missing_inputs: ["login_alias", "password_alias"] }),
   });
-  await view.click("Revisar execução");
-  await acceptReview(view);
   const inputs = () => view.all().filter(node => node.type === "input" && node.props.type === "password");
+  await view.click("Revisar execução");
+  assert.equal(inputs().length, 0);
+  assert.equal(view.button("Executar 1 teste").props.disabled, false);
+  await view.click("Executar 1 teste");
   assert.equal(inputs().length, 2);
   assert.ok(inputs().every(node => node.props.autoComplete === "off" && node.props.required));
-  assert.equal(view.button("Executar 1 teste").props.disabled, true);
+  assert.equal(view.button("Autenticar e executar").props.disabled, true);
   inputs()[0].props.onChange({ target: { value: "round-user" } }); await view.settle();
-  assert.equal(view.button("Executar 1 teste").props.disabled, true);
   inputs()[1].props.onChange({ target: { value: "   " } }); await view.settle();
-  assert.equal(view.button("Executar 1 teste").props.disabled, true);
+  assert.equal(view.button("Autenticar e executar").props.disabled, true);
   inputs()[1].props.onChange({ target: { value: "round-private-value" } }); await view.settle();
-  assert.equal(view.button("Executar 1 teste").props.disabled, false);
+  assert.equal(view.button("Autenticar e executar").props.disabled, false);
   assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
-  await view.click("Executar 1 teste");
+  const dialog = view.find(node => node.type === "dialog");
+  [...elements(dialog)].find(node => node.type === "form").props.onSubmit({ preventDefault() {} }); await view.settle();
   const start = view.calls.find(call => call.path.endsWith("/start"));
   assert.deepEqual(start.body.credentials, { login_alias: "round-user", password_alias: "round-private-value" });
+  assert.equal(start.body.confirm, true);
   assert.ok(view.calls.filter(call => !call.path.endsWith("/start")).every(call => !JSON.stringify(call.body || {}).includes("round-private-value")));
-  assert.ok(inputs().every(node => node.props.value === ""), "private values cleared after submission");
+  assert.equal(inputs().length, 0);
   assert.equal(navigations.length, 1);
 });
 
-test("private round inputs are discarded when leaving review", async t => {
+test("private round inputs are discarded on cancel and leaving review", async t => {
   const view = await workspace(t, undefined, undefined, { initialCaseId: "CT001",
     validationReply: checked => ({ ...checked, required_inputs: ["private_alias"] }),
   });
-  await view.click("Revisar execução");
-  let input = view.all().find(node => node.type === "input" && node.props.type === "password");
-  input.props.onChange({ target: { value: "not-retained" } }); await view.settle();
-  await view.click("Ajustar");
-  await view.click("Revisar execução");
-  input = view.all().find(node => node.type === "input" && node.props.type === "password");
-  assert.equal(input.props.value, "");
+  const input = () => view.all().find(node => node.type === "input" && node.props.type === "password");
+  await view.click("Revisar execução"); await view.click("Executar 1 teste");
+  input().props.onChange({ target: { value: "not-retained" } }); await view.settle();
+  await view.click("Cancelar");
+  assert.equal(input(), undefined);
+  await view.click("Executar 1 teste"); assert.equal(input().props.value, "");
+  input().props.onChange({ target: { value: "not-retained" } }); await view.settle();
+  view.find(node => node.type === "dialog").props.onCancel(); await view.settle();
+  await view.click("Ajustar"); await view.click("Revisar execução"); await view.click("Executar 1 teste");
+  assert.equal(input().props.value, "");
   assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
+});
+
+test("same-round vault availability starts without requesting private values", async t => {
+  const view = await workspace(t, undefined, undefined, { initialCaseId: "CT001",
+    validationReply: checked => ({ ...checked, required_inputs: ["private_alias"], missing_inputs: [] }),
+  });
+  await view.click("Revisar execução"); await view.click("Executar 1 teste");
+  assert.equal(view.all().some(node => node.type === "dialog"), false);
+  assert.deepEqual(view.calls.find(call => call.path.endsWith("/start")).body, { confirm: true, expected_revision: 1 });
 });
 
 

@@ -293,7 +293,12 @@ class TestSuiteService:
                 except (ValueError, NotFoundError) as exc:
                     check = {"available": False, "reason": str(exc)}
             checks.append({"case_id": item["case_id"], **check})
+        reusable = self.reruns.manager.credential_vault.get(plan_id)
+        missing = {key for check in checks for key in check.get("required_inputs", [])
+                   if not isinstance(reusable.get(key), str) or not reusable[key].strip()}
+        reusable.clear()
         return {"revision": plan["revision"], "available": bool(checks) and all(check["available"] for check in checks), "items": checks,
+                "missing_inputs": sorted(missing),
                 "required_inputs": sorted({key for check in checks for key in check.get("required_inputs", [])}),
                 "effects": ["Os CTs serão executados um de cada vez, na ordem planejada.",
                             "Cada CT automático usa um navegador novo; jornadas completas executam a preparação e as ações automaticamente.",
@@ -313,7 +318,8 @@ class TestSuiteService:
             if not validation["available"]:
                 raise ValueError("Há CTs indisponíveis. Revise o planejamento antes de executar.")
             required = validation["required_inputs"]
-            supplied = credentials or {}
+            supplied = self.reruns.manager.credential_vault.get(plan_id)
+            supplied.update(credentials or {})
             if any(not isinstance(supplied.get(key), str) or not supplied[key].strip() for key in required):
                 raise ValueError("Informe todos os dados privados solicitados antes de iniciar a rodada.")
             plan.update(status="running", started_at=utc_now())
