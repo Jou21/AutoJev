@@ -41,6 +41,84 @@ def test_step_image_metadata_is_lightweight_and_does_not_borrow_from_other_steps
         assert "screenshot" not in recorded_step_metadata([{"screenshot": filename}], "owner-run")[0]
 
 
+def test_step_markers_use_report_geometry_only_for_the_exact_capture():
+    from autojev.services.test_suites import recorded_step_metadata
+    preview = dict(version="action-target-v1", coordinate_space="screenshot-css-pixels", action="click", target="e2",
+                   image=dict(width=1000, height=800), box=dict(x=100, y=80, width=120, height=40),
+                   screenshot="target.jpg", url="https://example.test", private_value="never expose")
+    step = dict(kind="action", target="e2", url="https://example.test", action_preview=preview)
+    result = recorded_step_metadata([step], "owner")[0]
+    assert result["action_preview"]["box"] == preview["box"]
+    assert "private_value" not in result["action_preview"]
+    assert "url" not in result["action_preview"]
+    for invalid in [dict(step, screenshot="other.jpg"), dict(step, target="other"), dict(step, url="https://other.test"),
+                    dict(step, action_preview={**preview, "box": dict(x=-1, y=0, width=1, height=1)})]:
+        assert "action_preview" not in recorded_step_metadata([invalid], "owner")[0]
+    assert preview["private_value"] == "never expose"
+
+
+@pytest.mark.parametrize("passed,status,title", [(True, "confirmed", "A opção correta foi selecionada"), (False, "mismatch", "A seleção não correspondeu ao esperado"), (None, "unverified", "O resultado desta verificação não foi registrado")])
+def test_selection_step_shows_report_comparison_without_private_values(passed, status, title):
+    from autojev.services.test_suites import recorded_step_metadata
+    from autojev.adapters.report import StandaloneHtmlReport
+    selection = dict(version="select-labels-v1", status=status, requested_label="<script>choice</script>", after_label="Observed")
+    preview = dict(version="action-target-v1", action="select", target="e2", url="https://example.test", captured_at="2026-11-05T12:00:00Z", selection=selection)
+    action = dict(kind="action", target="e2", url="https://example.test", step_number=1, occurred_at="2026-11-05T12:00:01Z", action_preview=preview)
+    assertion = dict(kind="selection_matches", passed=passed, expected={"option_matches": True, "private": "secret-value"}, actual={"option_matches": passed, "token": "secret-value"})
+    check = dict(kind="assertion", title="Opção selecionada", target="e2", url="https://example.test", step_number=1, occurred_at="2026-11-05T12:00:02Z", assertion=assertion)
+    steps = [action, check]
+    before = deepcopy(steps)
+    html = recorded_step_metadata(steps, "owner")[1]["verification_html"]
+    assert title in html
+    assert "Opção esperada" in html and "Opção encontrada" in html
+    assert "&lt;script&gt;choice&lt;/script&gt;" in html and "<script>" not in html
+    assert "secret-value" not in html
+    assert "Ver dados técnicos" in html
+    safe = {"kind": "selection_matches", "expected": {"option_matches": True}}
+    if isinstance(passed, bool):
+        safe.update(passed=passed, actual={"option_matches": passed})
+    assert html == StandaloneHtmlReport._selection_assertion_detail(safe, StandaloneHtmlReport._selection_for_assertion(steps, 1))
+    check["step_number"] = 2
+    assert "&lt;script&gt;choice&lt;/script&gt;" not in recorded_step_metadata(steps, "owner")[1]["verification_html"]
+    check["step_number"] = 1
+    assert steps == before
+
+
+@pytest.mark.parametrize("passed", [True, False, None])
+@pytest.mark.parametrize("kind,expected,actual,marker", [
+    ("product_sort_order", {"by": "name", "descending": False, "products": ["A", "B"]}, {"products": ["A", "B"]}, "sort-verification"),
+    ("no_new_browser_errors", 0, {"console_errors": 0, "network_errors": 0}, "technical-verification"),
+    ("no_new_application_errors", 0, {"console_errors": 1, "network_errors": 2}, "technical-verification"),
+    ("observable_state_change", "Page changed", "Cart opened", "Verificação observada"),
+    ("visual_model", "No visual defect", "Observed issue", "Indício visual da LLM"),
+])
+def test_all_recorded_checks_show_report_details(kind, expected, actual, marker, passed):
+    from autojev.services.test_suites import recorded_step_metadata
+    from autojev.adapters.report import StandaloneHtmlReport
+    assertion = dict(kind=kind, passed=passed, expected=expected, actual=actual)
+    steps = [dict(kind="assertion", title="Check", assertion=assertion)]
+    before = deepcopy(steps)
+    result = recorded_step_metadata(steps, "owner")[0]
+    assert marker in result["verification_html"]
+    assert result["verification_html"] == StandaloneHtmlReport._assertion_detail(assertion, signals=[])
+    assert steps == before
+    private = dict(assertion, actual={"password": "never-expose", "token": "never-expose"})
+    assert "never-expose" not in recorded_step_metadata([dict(kind="assertion", assertion=private)], "owner")[0]["verification_html"]
+
+
+def test_technical_card_uses_report_caption_from_its_own_preceding_action():
+    from autojev.services.test_suites import recorded_step_metadata
+    technical = dict(kind="assertion", title="Ausência de novas falhas técnicas da aplicação", assertion=dict(kind="no_new_browser_errors", passed=True, expected=0, actual=dict(console_errors=0, network_errors=0)))
+    steps = [technical, dict(kind="action", title="Selecionar opção"), technical, dict(kind="action", title="Abrir carrinho"), technical]
+    before = deepcopy(steps)
+    projected = recorded_step_metadata(steps, "owner")
+    assert [projected[index]["title"] for index in (0, 2, 4)] == ["Erros durante a ação", "Erros durante «Selecionar opção»", "Erros durante «Abrir carrinho»"]
+    assert steps == before
+    html = projected[2]["verification_html"]
+    assert html.count('class="technical-value"') == 4
+    assert "technical-value-count" in html and "technical-value-label" in html
+
+
 def test_step_images_keep_the_latest_owner_and_explicit_historical_context_read_only(runtime):
     app, client, root = runtime
     repo = app.state.repository

@@ -1266,11 +1266,13 @@ async def get_screenshot(
     exploration_id: str, filename: str, request: Request
 ) -> FileResponse:
     try:
-        item = _repository(request).get_exploration(exploration_id)
+        _repository(request).get_exploration(exploration_id)
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     basename = Path(filename).name
-    if not any(Path(entry["path"]).name == basename for entry in item["screenshots"]):
+    # Action-target captures also live here but need not have a screenshots row.
+    # Resolve the same preserved artifacts as the report, without leaving this run.
+    if filename != basename or "\\" in filename or Path(basename).suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
         raise HTTPException(status_code=404, detail="Screenshot was not found")
     directory = (
         request.app.state.settings.artifact_dir / exploration_id / "screenshots"
@@ -1278,5 +1280,5 @@ async def get_screenshot(
     path = (directory / basename).resolve()
     if directory not in path.parents or not path.is_file():
         raise HTTPException(status_code=404, detail="Screenshot artifact was not found")
-    media_type = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+    media_type = {".png": "image/png", ".webp": "image/webp"}.get(path.suffix.lower(), "image/jpeg")
     return FileResponse(path, media_type=media_type)

@@ -3,10 +3,13 @@
 /* eslint-disable @next/next/no-img-element -- Preserved screenshots are served by the configured API. */
 import { useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { ExternalLink, Image, LoaderCircle, Minus, Plus, X } from "lucide-react";
+import { targetMarker, type ActionPreview } from "./suite-step-evidence";
 
-type Props = { title: string; index: number; total: number; src: string | null; onClose: () => void };
+type Props = { title: string; index: number; total: number; src: string | null; actionPreview?: ActionPreview; verificationHtml?: string; onClose: () => void };
 
-export default function StepEvidencePreview({ title, index, total, src, onClose }: Props) {
+export default function StepEvidencePreview({ title, index, total, src, actionPreview, verificationHtml, onClose }: Props) {
+  const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
+  const marker = targetMarker(actionPreview, dimensions.width, dimensions.height);
   const [zoom, setZoom] = useState(100), [state, setState] = useState<"loading" | "ready" | "error">("loading"), [attempt, setAttempt] = useState(0);
   const [panning, setPanning] = useState(false);
   const pan = useRef<{ pointerId: number; x: number; y: number; left: number; top: number } | null>(null);
@@ -34,7 +37,7 @@ export default function StepEvidencePreview({ title, index, total, src, onClose 
     event.preventDefault();
   };
   return <section id="suite-step-image" className="suite-step-image" aria-label={`Imagem da etapa ${index + 1}: ${title}`}>
-    <header><Image size={17} aria-hidden="true" /><div><strong>{title}</strong><small>Etapa {index + 1} de {total} · imagem da execução de referência</small></div>
+    <header><Image size={17} aria-hidden="true" /><div><strong>{title}</strong><small>Etapa {index + 1} de {total} · {verificationHtml ? "conferência da execução de referência" : "imagem da execução de referência"}</small></div>
       {src && state !== "error" && <div className="suite-image-zoom" role="group" aria-label="Zoom da imagem">
         <button type="button" className="icon-button" aria-label="Diminuir imagem" title="Diminuir imagem" disabled={zoom <= 50} onClick={() => setZoom(value => Math.max(50, value - 25))}><Minus size={16} /></button>
         <button type="button" className="suite-image-fit" title="Ajustar imagem ao espaço disponível" aria-label="Ajustar imagem ao espaço disponível" onClick={() => setZoom(100)}>{zoom}%</button>
@@ -46,9 +49,9 @@ export default function StepEvidencePreview({ title, index, total, src, onClose 
     <span id="suite-image-pan-help" className="sr-only">Clique e arraste a imagem para movê-la. Você também pode usar as barras de rolagem ou as setas do teclado. Em telas sensíveis ao toque, deslize sobre a imagem.</span>
     <div className="suite-image-stage" data-pannable={!!src && state === "ready"} data-panning={panning} tabIndex={src && state === "ready" ? 0 : undefined} role="region" aria-label="Visualização da captura, com rolagem quando ampliada" aria-describedby="suite-image-pan-help" title={src && state === "ready" ? "Clique e arraste para mover a imagem" : undefined}
       onPointerDown={startPan} onPointerMove={movePan} onPointerUp={endPan} onPointerCancel={endPan} onLostPointerCapture={endPan}>
-      {!src ? <div className="suite-image-placeholder" role="status"><Image size={26} /><strong>Esta etapa não tem imagem registrada.</strong><span>Selecione outra etapa para ver sua captura.</span></div>
+      {verificationHtml ? <div className="suite-step-verification" dangerouslySetInnerHTML={{ __html: verificationHtml }} /> : !src ? <div className="suite-image-placeholder" role="status"><Image size={26} /><strong>Esta etapa não tem imagem registrada.</strong><span>Selecione outra etapa para ver sua captura.</span></div>
         : state === "error" ? <div className="suite-image-placeholder" role="status"><Image size={26} /><strong>Não foi possível carregar esta imagem.</strong><span>A captura pode não estar mais disponível. Nenhuma outra imagem foi usada no lugar.</span><button type="button" className="button secondary" onClick={() => { setAttempt(value => value + 1); setState("loading"); }}>Tentar novamente</button></div>
-          : <><div className="suite-image-scale" style={{ width: `${zoom}%` }}><img key={attempt} src={src + (attempt ? `?preview_retry=${attempt}` : "")} alt={`${title} · captura preservada da etapa ${index + 1}`} draggable={false} onLoad={() => setState("ready")} onError={() => setState("error")} /></div>{state === "loading" && <div className="suite-image-loading" role="status"><LoaderCircle size={20} className="spin" />Carregando imagem…</div>}</>}
+          : <><div className="suite-image-scale" style={{ width: `${zoom}%` }}><img key={attempt} src={src + (attempt ? `?preview_retry=${attempt}` : "")} alt={`${title} · captura preservada da etapa ${index + 1}`} draggable={false} onLoad={event => { setDimensions({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight }); setState("ready"); }} onError={() => setState("error")} />{state === "ready" && marker && <span className="suite-action-target" style={marker.style} aria-label={marker.label}><span className="suite-action-dot" /><span className="suite-action-label" data-right={marker.right} data-above={marker.above}>{marker.label}</span></span>}</div>{state === "loading" && <div className="suite-image-loading" role="status"><LoaderCircle size={20} className="spin" />Carregando imagem…</div>}</>}
     </div>
   </section>;
 }

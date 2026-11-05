@@ -31,6 +31,34 @@ def settings(tmp_path: Path) -> Settings:
     )
 
 
+@pytest.mark.parametrize("filename,media_type", [("target.jpg", "image/jpeg"), ("before.png", "image/png"), ("after.webp", "image/webp")])
+def test_screenshot_serves_preserved_action_capture_without_catalog_row(tmp_path, filename, media_type):
+    app = create_app(settings(tmp_path))
+    with TestClient(app) as client:
+        repository = app.state.repository
+        run_id = repository.create_exploration(ExplorationRequest(
+            app_url="https://example.test", agent=ModelSelection("local", "agent"),
+            auxiliary_llm=ModelSelection("local", "auxiliary"), options=ExplorationOptions(),
+        ))
+        directory = tmp_path / "artifacts" / run_id / "screenshots"
+        directory.mkdir(parents=True)
+        capture = b"preserved action capture"
+        (directory / filename).write_bytes(capture)
+        assert repository.get_exploration(run_id)["screenshots"] == []
+        response = client.get(f"/api/explorations/{run_id}/screenshots/{filename}")
+        assert response.status_code == 200
+        assert response.content == capture
+        assert response.headers["content-type"] == media_type
+        outside = tmp_path / "private.jpg"
+        outside.write_bytes(b"not a capture")
+        (directory / "escaped.jpg").symlink_to(outside)
+        (directory / "private.txt").write_text("not an image")
+        for invalid in ("missing.jpg", "escaped.jpg", "private.txt", "nested/" + filename, "..%5Cprivate.jpg", "%2E%2E%2Fprivate.jpg"):
+            assert client.get(f"/api/explorations/{run_id}/screenshots/{invalid}").status_code == 404
+        assert client.get(f"/api/explorations/missing/screenshots/{filename}").status_code == 404
+        assert repository.get_exploration(run_id)["screenshots"] == []
+
+
 def test_economical_mode_does_not_count_unrequested_visual_reviews_as_unavailable(tmp_path):
     app = create_app(settings(tmp_path))
     with TestClient(app) as client:

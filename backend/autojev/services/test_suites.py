@@ -30,10 +30,38 @@ def definition(case):
 
 
 def recorded_step_metadata(steps, owner):
-    """Lightweight, owner-bound image references; never embed images or action data."""
+    """Owner-bound image references with the report's sanitized target geometry."""
+    from autojev.adapters.report import StandaloneHtmlReport
+
     result = []
-    for step in steps:
-        item = {"title": step.get("title") or "Registro", "kind": step.get("kind") or "observation"}
+    last_action_title = ""
+    for index, step in enumerate(steps):
+        title = step.get("title") or "Registro"
+        kind = step.get("kind") or "observation"
+        if kind == "action":
+            last_action_title = title.strip()
+        if kind == "assertion" and title == "Ausência de novas falhas técnicas da aplicação":
+            title = f"Erros durante «{last_action_title}»" if last_action_title else "Erros durante a ação"
+        item = {"title": title, "kind": kind}
+        assertion = step.get("assertion") or {}
+        if assertion.get("kind") == "selection_matches":
+            # Share the report's same-attempt binding and presentation, not raw inputs.
+            safe_assertion = {"kind": "selection_matches"}
+            if isinstance(assertion.get("passed"), bool):
+                safe_assertion["passed"] = assertion["passed"]
+            for key in ("expected", "actual"):
+                value = assertion.get(key)
+                if isinstance(value, dict) and isinstance(value.get("option_matches"), bool):
+                    safe_assertion[key] = {"option_matches": value["option_matches"]}
+            item["verification_html"] = StandaloneHtmlReport._selection_assertion_detail(
+                safe_assertion, StandaloneHtmlReport._selection_for_assertion(steps, index))
+        elif assertion.get("kind"):
+            from autojev.adapters.secrets import redact
+            safe_assertion = redact({key: assertion[key] for key in
+                                     ("kind", "passed", "expected", "actual", "expected_display", "message", "confidence", "region")
+                                     if key in assertion})
+            signals = redact(StandaloneHtmlReport._failing_signals_for_assertion(steps, index))
+            item["verification_html"] = StandaloneHtmlReport._assertion_detail(safe_assertion, signals=signals)
         preview = step.get("action_preview")
         screenshot = step.get("screenshot") or (preview.get("screenshot") if isinstance(preview, dict) else None)
         if isinstance(screenshot, str):
@@ -42,6 +70,10 @@ def recorded_step_metadata(steps, owner):
             if (owner and ".." not in parts and not any(ord(char) < 32 or char in "?#" for char in screenshot)
                     and filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))):
                 item.update(screenshot=filename, evidence_exploration_id=owner)
+                if isinstance(preview, dict) and preview.get("screenshot") == filename:
+                    geometry = StandaloneHtmlReport._preview_geometry(preview, step)
+                    if geometry:
+                        item["action_preview"] = geometry
         result.append(item)
     return result
 

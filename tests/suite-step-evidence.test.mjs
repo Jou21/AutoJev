@@ -10,7 +10,17 @@ const compile = async name => transpileModule(await readFile(new URL(`../app/com
 }).outputText;
 const helper = { exports: {} };
 new Function("module", "exports", await compile("suite-step-evidence.ts"))(helper, helper.exports);
-const { stepImageUrl } = helper.exports;
+const { stepImageUrl, targetMarker } = helper.exports;
+const geometry = { version: "action-target-v1", coordinate_space: "screenshot-css-pixels", action: "select", target: "e2", image: { width: 1600, height: 1200 }, box: { x: 1200, y: 120, width: 240, height: 60 }, selection: { requested_label: "Name (Z to A)" } };
+test("target markers follow recorded geometry at native and uniformly scaled sizes only", () => {
+  const marker = targetMarker(geometry, 1600, 1200);
+  assert.deepEqual(marker.style, { left: "75%", top: "10%", width: "15%", height: "5%" });
+  assert.equal(marker.label, "Selecionar: Name (Z to A)");
+  assert.deepEqual(targetMarker(geometry, 2000, 1500), marker);
+  for (const invalid of [undefined, { ...geometry, version: "unknown" }, { ...geometry, box: { ...geometry.box, x: 1590 } }, { ...geometry, image: { width: NaN, height: 1200 } }]) assert.equal(targetMarker(invalid, 1600, 1200), null);
+  assert.equal(targetMarker(geometry, 1024, 768 + 50), null);
+  assert.equal(targetMarker(geometry, 0, 0), null);
+});
 const preview = await compile("StepEvidencePreview.tsx");
 const text = node => node == null || typeof node === "boolean" ? "" : Array.isArray(node) ? node.map(text).join("") : typeof node === "object" ? text(node.props?.children) : String(node);
 function* elements(node) {
@@ -19,7 +29,7 @@ function* elements(node) {
   if (!node.props) return;
   yield node; yield* elements(node.props.children);
 }
-function imageView(src = "http://api.fixture.invalid/api/explorations/owner/screenshots/before.png") {
+function imageView(src = "http://api.fixture.invalid/api/explorations/owner/screenshots/before.png", actionPreview, verificationHtml) {
   let cursor = 0, tree, closed = 0;
   const slots = [], module = { exports: {} };
   new Function("require", "module", "exports", preview)(name => name === "react" ? { useState(initial) {
@@ -30,14 +40,40 @@ function imageView(src = "http://api.fixture.invalid/api/explorations/owner/scre
     const index = cursor++;
     if (!(index in slots)) slots[index] = { current: initial };
     return slots[index];
-  } } : require(name), module, module.exports);
-  const render = () => { cursor = 0; tree = module.exports.default({ title: "Antes da ação", index: 0, total: 3, src, onClose() { closed++; } }); };
+  } } : name === "./suite-step-evidence" ? helper.exports : require(name), module, module.exports);
+  const render = () => { cursor = 0; tree = module.exports.default({ title: "Antes da ação", index: 0, total: 3, src, actionPreview, verificationHtml, onClose() { closed++; } }); };
   const all = () => [...elements(tree)];
   const button = label => { const found = all().find(node => node.type === "button" && (node.props["aria-label"] === label || text(node) === label)); assert.ok(found, label); return found; };
   const stage = () => all().find(node => node.props.className === "suite-image-stage");
   render();
-  return { all, button, stage, pointer(name, event) { stage().props[name](event); render(); }, text: () => text(tree), get closed() { return closed; }, click(label) { const node = button(label); assert.ok(!node.props.disabled); node.props.onClick(); render(); }, imageEvent(name) { const img = all().find(node => node.type === "img"); assert.ok(img); img.props[name](); render(); } };
+  return { all, button, stage, pointer(name, event) { stage().props[name](event); render(); }, text: () => text(tree), get closed() { return closed; }, click(label) { const node = button(label); assert.ok(!node.props.disabled); node.props.onClick(); render(); }, imageEvent(name) { const img = all().find(node => node.type === "img"); assert.ok(img); img.props[name]({ currentTarget: { naturalWidth: 1600, naturalHeight: 1200 } }); render(); } };
 }
+
+test("image preview displays the recorded target after loading and preserves it while zooming", () => {
+  const view = imageView(undefined, geometry);
+  const markers = () => view.all().filter(node => node.props.className === "suite-action-target");
+  assert.equal(markers().length, 0);
+  view.imageEvent("onLoad");
+  assert.equal(markers().length, 1);
+  assert.equal(markers()[0].props["aria-label"], "Selecionar: Name (Z to A)");
+  view.click("Aumentar imagem");
+  assert.deepEqual(markers()[0].props.style, targetMarker(geometry, 1600, 1200).style);
+  const ordinary = imageView();
+  ordinary.imageEvent("onLoad");
+  assert.equal(ordinary.all().filter(node => node.props.className === "suite-action-target").length, 0);
+});
+
+test("selection verification shows the server-rendered report comparison instead of a missing image", () => {
+  const html = '<section aria-label="Comparação da opção selecionada">Opção esperada · Opção encontrada</section>';
+  const view = imageView(null, undefined, html);
+  const panel = view.all().find(node => node.props.className === "suite-step-verification");
+  assert.equal(panel.props.dangerouslySetInnerHTML.__html, html);
+  assert.ok(view.text().includes("conferência da execução de referência"));
+  assert.ok(!view.text().includes("Esta etapa não tem imagem registrada"));
+  assert.equal(view.all().filter(node => node.type === "img").length, 0);
+  view.click("Fechar imagem da etapa");
+  assert.equal(view.closed, 1);
+});
 
 function panSurface({ width = 1600, height = 1200 } = {}) {
   let left = 200, top = 150, prevented = 0;

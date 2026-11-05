@@ -377,7 +377,7 @@ test("AI choice asks for the screen and goal, preserves the composer and model, 
 
 test("Add protects an edited draft before replacing its editor with the chat choices", async t => {
   const view = await workspace(t);
-  await view.click("Duplicar CT001 como novo CT manual");
+  await reviewAiProposal(view);
   await view.change("Título", "Meu roteiro não salvo");
   await view.click("Adicionar teste");
   assert.ok(view.find(node => node.props.role === "dialog"));
@@ -387,7 +387,7 @@ test("Add protects an edited draft before replacing its editor with the chat cho
   assert.equal(view.has("suite-case-editor"), false);
   assert.equal(view.chat().props.messages.at(-1).kind, "creation_prompt");
   assert.equal(view.has("suite-planning-heading"), true);
-  assert.equal(view.calls.some(call => call.method !== "GET"), false);
+  assert.equal(view.calls.some(call => call.method !== "GET" && !call.path.endsWith("/assistant")), false);
 });
 
 test("reopening creation after direct chat keeps the selected order, print pauses and conversation", async t => {
@@ -454,13 +454,11 @@ test("AI suggestions open a focused editor and a manual case is created only aft
   assert.equal(view.calls.filter(call => /\/(plans|start|discover)$/.test(call.path)).length, 0);
 });
 
-test("cloning an existing case also opens the editor with its reference intact", async t => {
-  const view = await workspace(t);
-  await view.click("Duplicar CT001 como novo CT manual");
-  assert.equal(view.field("Título").props.value, "Ordenar produtos · cópia");
-  assert.equal(view.field("Resultado esperado").props.value, "Lista ordenada");
-  assert.equal(view.scroll.at(-1).name, "suite-case-editor");
-  assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
+test("sidebar cards do not add unrequested duplication buttons", async t => {
+ const view=await workspace(t);
+ assert.equal(view.all().some(n=>n.props["aria-label"]?.startsWith("Duplicar ")),false);
+ assert.equal(view.find(n=>n.props["data-selector-case"]==="CT001").props.children.filter(n=>n?.type==="button").length,1);
+ assert.equal(view.calls.some(call=>call.method!=="GET"),false);
 });
 
 function catalogFixture() {
@@ -1499,7 +1497,7 @@ test("legacy round links show an inline monitor and keep long results collapsed"
 
 test("manual editor shows essentials first, retaining the advanced fields without saving or executing", async t => {
   const view = await workspace(t);
-  await view.click("Duplicar CT001 como novo CT manual");
+  await reviewAiProposal(view);
   const editor = view.find(node => node.props.id === "suite-case-editor");
   const advanced = [...elements(editor)].find(node => node.props.className === "suite-case-advanced");
   assert.equal(advanced.props.open, undefined);
@@ -1509,7 +1507,7 @@ test("manual editor shows essentials first, retaining the advanced fields withou
   await view.change("Resultado esperado", "Resultado visível");
   assert.equal(view.field("Título").props.value, "Novo caso");
   assert.equal(view.field("Resultado esperado").props.value, "Resultado visível");
-  assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
+  assert.equal(view.calls.some(call => /\/(cases|plans|start)$/.test(call.path)), false);
 });
 
 async function fillManual(view, title = "Conferir carrinho") {
@@ -1527,12 +1525,12 @@ async function reviewAiProposal(view) {
 
 test("planner case creation saves to the base and includes the new case without starting execution", async t => {
   const view = await workspace(t);
-  await view.click("Duplicar CT001 como novo CT manual"); await fillManual(view);
+  await reviewAiProposal(view); await fillManual(view);
   assert.equal(view.chat().props.purpose, "execution");
   await view.submit();
   assert.deepEqual(plannedIds(view), ["CT002"]);
-  assert.equal(view.calls.filter(call => call.method !== "GET").length, 1);
-  assert.equal(view.calls.find(call => call.method === "POST").path, "/test-suites/root-fixture/cases");
+  assert.equal(view.calls.filter(call => call.method !== "GET" && !call.path.endsWith("/assistant")).length, 1);
+  assert.equal(view.calls.find(call => call.path.endsWith("/cases")).path, "/test-suites/root-fixture/cases");
   assert.equal(view.calls.some(call => /\/(plans|start|discover)$/.test(call.path)), false);
 });
 
@@ -1556,7 +1554,7 @@ test("manual version edits preserve the ID and cannot inherit approval or alter 
 test("unsaved manual text blocks navigation and reload, then saves without executing before leaving", async t => {
   const navigations = [];
   const view = await workspace(t, undefined, undefined, { navigate: hash => navigations.push(hash) });
-  await view.click("Duplicar CT001 como novo CT manual"); await fillManual(view);
+  await reviewAiProposal(view); await fillManual(view);
   assert.equal(view.unloadBlocked(), true);
   assert.equal(await view.navigate("#/execucoes-planejadas"), false);
   await view.click("Continuar editando");
@@ -1564,7 +1562,7 @@ test("unsaved manual text blocks navigation and reload, then saves without execu
   assert.equal(await view.navigate("#/execucoes-planejadas"), false);
   await view.click("Salvar e continuar");
   assert.deepEqual(navigations, ["#/execucoes-planejadas"]);
-  assert.equal(view.calls.filter(call => call.method !== "GET").length, 1);
+  assert.equal(view.calls.filter(call => call.method !== "GET" && !call.path.endsWith("/assistant")).length, 1);
   assert.equal(view.calls.some(call => /\/(plans|start)$/.test(call.path)), false);
 });
 
@@ -1594,11 +1592,11 @@ test("an unsaved new case must be resolved before the existing selection can be 
 
 test("an incomplete form and a stale version preserve the user's text and never navigate or overwrite", async t => {
   const view = await workspace(t);
-  await view.click("Duplicar CT001 como novo CT manual"); await view.change("Título", "Incompleto"); await view.change("Passos", "");
+  await reviewAiProposal(view); await view.change("Título", "Incompleto"); await view.change("Passos", "");
   await view.navigate("#/execucoes-planejadas"); await view.click("Salvar e continuar");
   assert.equal(view.field("Título").props.value, "Incompleto");
   assert.match(text(view.find(node => node.props.role === "alert")), /Complete título/);
-  assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
+  assert.equal(view.calls.filter(call => call.method !== "GET" && !call.path.endsWith("/assistant")).length, 0);
 
   const suite = suiteFixture(); suite.cases[0].mode = "manual";
   const edit = await workspace(t, suite, undefined, { rejectWrite: () => true });

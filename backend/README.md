@@ -105,7 +105,7 @@ All endpoints use `/api` (not `/api/v1`). Input accepts the documented snake_cas
 | POST | `/api/explorations/{id}/cancel` | Request cooperative cancellation |
 | POST | `/api/explorations/{id}/resume` | Resume after a manual-login intervention |
 | GET | `/api/explorations/{id}/report` | Standalone HTML report |
-| GET | `/api/explorations/{id}/screenshots/{file}` | Validated screenshot artifact |
+| GET | `/api/explorations/{id}/screenshots/{file}` | Preserved image inside this run's screenshots directory (including action-target captures without a screenshot catalog row); same artifacts as the report |
 
 Example exploration:
 
@@ -565,6 +565,22 @@ sidebar retains selection, execution numbering and drag ordering; execution
 monitoring remains available inside the same workspace. Review and start use fresh request-scoped snapshots: each source
 execution and its projected timeline is loaded once per batch, never cached across
 reviews. Plan saving also resolves each source and lineage once.
+
+Preparation image previews use the report's sanitized action-target geometry to
+highlight the recorded control, with percentage-based positioning that follows
+zoom. Markers appear only on the exact action capture after its dimensions are
+validated; historical images without coordinates remain unmarked. Raw action
+values and private metadata are not included in this projection. The selected-option
+verification also displays the report's expected/found comparison, recorded result,
+explanation and expandable technical booleans instead of a missing-image placeholder.
+Option labels are bound to the same attempt using the report's validation; private
+values and unrelated action labels are never substituted. Other recorded checks
+also reuse the report presentation: product sorting shows expected/observed
+sequences, technical checks compare console/network counters and linked failures,
+and remaining assertions show their recorded expected/actual result. These panels
+preserve historical verdicts and do not execute or re-evaluate checks. Technical
+step cards use the report's contextual “Erros durante «ação»” caption; their
+expected/found counters are displayed as separate numbered tiles, as in the report.
 
 Repeated attempts merged into one semantic CT are not a multi-action script.
 Replay selects the current durable action only when every historical attempt has
