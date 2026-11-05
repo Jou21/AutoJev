@@ -83,6 +83,8 @@ export default function TestSuitesWorkspace(props: Props) {
   const [stepNotice, setStepNotice] = useState("");
   const [draggedCaseId, setDraggedCaseId] = useState<string | null>(null), [caseDrop, setCaseDrop] = useState<{ id: string; side: "before" | "after" } | null>(null);
   const [caseOrderNotice, setCaseOrderNotice] = useState("");
+  const [selectorOrder, setSelectorOrder] = useState<string[]>([]);
+  const suppressSelectorClick = useRef(false);
   const [discovered, setDiscovered] = useState<{ session: string; cases: Case[] } | null>(null);
   const [chatOpen, setChatOpen] = useState(true), [chatText, setChatText] = useState(""), [chatBusy, setChatBusy] = useState(false);
   const [messages, setMessages] = useState<PlanningMessage[]>([]), [suggestion, setSuggestion] = useState<Suggestion | null>(null);
@@ -425,7 +427,7 @@ export default function TestSuitesWorkspace(props: Props) {
       if (target < 0) return;
       const next = placeRailItem(selection, selection.findIndex(item => item.case_id === source), targetId ? target + (side === "after" ? 1 : 0) : target);
       if (next === selection) return;
-      setSelection(next); change();
+      setSelection(next); setSelectorOrder([]); change();
       setCaseOrderNotice(`${source} movido para a posição ${next.findIndex(item => item.case_id === source) + 1} de ${next.length}. Salve o rascunho para manter a nova ordem.`);
     } catch { /* Foreign or malformed drags never change the execution order. */ }
   };
@@ -631,8 +633,79 @@ export default function TestSuitesWorkspace(props: Props) {
   const archivedCount = suite.cases.filter(item => item.archived).length;
   const baseCases = suite.cases.filter(item => (filter === "archived" ? !!item.archived : !item.archived) && `${item.id} ${item.title} ${flowMemberships(item).map(member => member.name).join(" ")}`.toLocaleLowerCase("pt-BR").includes(query.toLocaleLowerCase("pt-BR")) && (filter === "all" || filter === "archived" || item.status === filter || item.mode === filter));
   const cases = baseCases.filter(item => matchesFunctionalFlow(item, activeFlow));
+  const selectionPositions = new Map(selection.map((item, index) => [item.case_id, index]));
+  const selectorPositions = new Map(selectorOrder.map((id, index) => [id, index]));
+  const selectorCases = [...cases].sort((a, b) => (selectorPositions.get(a.id) ?? Infinity) - (selectorPositions.get(b.id) ?? Infinity));
+  const startSelectorPointer = (event: React.MouseEvent, id: string) => {
+    if (event.button !== 0 || busy || chatBusy) return;
+    event.preventDefault();
+    const startX = event.clientX, startY = event.clientY;
+    let moved = false;
+    let destination: { id: string; side: "before" | "after" } | null = null;
+    const move = (pointer: MouseEvent) => {
+      if (!moved && Math.hypot(pointer.clientX - startX, pointer.clientY - startY) < 5) return;
+      moved = true; suppressSelectorClick.current = true;
+      setDraggedCaseId(id);
+      const target = document.elementFromPoint(pointer.clientX, pointer.clientY)?.closest<HTMLElement>("[data-selector-case]");
+      if (!target) return;
+      const bounds = target.getBoundingClientRect();
+      destination = { id: target.dataset.selectorCase!, side: pointer.clientY < bounds.top + bounds.height / 2 ? "before" : "after" };
+      setCaseDrop(destination);
+      const list = target.closest(".suite-available-list");
+      if (list) { const box = list.getBoundingClientRect(); if (pointer.clientY < box.top + 44) list.scrollTop -= 24; else if (pointer.clientY > box.bottom - 44) list.scrollTop += 24; }
+    };
+    const up = () => {
+      document.removeEventListener("mousemove", move); document.removeEventListener("mouseup", up);
+      endCaseDrag();
+      if (moved && destination && destination.id !== id) {
+        if (selectionPositions.has(id) && selectionPositions.has(destination.id)) {
+          const next = placeRailItem(selection, selectionPositions.get(id)!, selectionPositions.get(destination.id)! + (destination.side === "after" ? 1 : 0));
+          const ids = selectorCases.map(item => item.id).filter(value => value !== id);
+          ids.splice(ids.indexOf(destination.id) + (destination.side === "after" ? 1 : 0), 0, id);
+          setSelection(next); setSelectorOrder(ids); change();
+        } else {
+          const ids = selectorCases.map(item => item.id).filter(value => value !== id);
+          ids.splice(ids.indexOf(destination.id) + (destination.side === "after" ? 1 : 0), 0, id); setSelectorOrder(ids);
+        }
+      }
+      setTimeout(() => { suppressSelectorClick.current = false; }, 0);
+    };
+    document.addEventListener("mousemove", move); document.addEventListener("mouseup", up);
+  };
+  const startSelectorDrag = (event: DragEvent, id: string) => {
+    if (busy || chatBusy) { event.preventDefault(); return; }
+    event.stopPropagation();
+    event.dataTransfer.setData(caseMime, JSON.stringify({ rootId, caseId: id }));
+    event.dataTransfer.effectAllowed = "move";
+    draggingCase.current = id; setDraggedCaseId(id); setCaseDrop(null);
+  };
+  const dropSelectorCase = (event: DragEvent<HTMLElement>, targetId: string) => {
+    if (!acceptsCaseDrag(event)) return;
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const side = event.clientY < bounds.top + bounds.height / 2 ? "before" : "after";
+    const source = draggingCase.current;
+    if (source && selectionPositions.has(source) && selectionPositions.has(targetId)) {
+      const ids = selectorCases.map(item => item.id).filter(id => id !== source);
+      ids.splice(ids.indexOf(targetId) + (side === "after" ? 1 : 0), 0, source);
+      const payload = event.dataTransfer.getData(caseMime);
+      dropCase(event, targetId, side);
+      try { const data = JSON.parse(payload); if (data.rootId === rootId && data.caseId === source) setSelectorOrder(ids); } catch { /* Ignore foreign drag data. */ }
+      return;
+    }
+    event.preventDefault(); event.stopPropagation(); endCaseDrag();
+    if (!source || busy || chatBusy) return;
+    try {
+      const payload = JSON.parse(event.dataTransfer.getData(caseMime));
+      if (payload.rootId !== rootId || payload.caseId !== source || !selectorCases.some(item => item.id === source)) return;
+      const ids = selectorCases.map(item => item.id).filter(id => id !== source);
+      const target = ids.indexOf(targetId);
+      if (target < 0) return;
+      ids.splice(target + (side === "after" ? 1 : 0), 0, source);
+      setSelectorOrder(ids);
+    } catch { /* Ignore foreign drag data. */ }
+  };
   const selectedIds = new Set(selection.map(item => item.case_id));
-  const remainingFilteredIds = cases.filter(item => !item.archived && !selectedIds.has(item.id)).map(item => item.id);
+  const remainingFilteredIds = selectorCases.filter(item => !item.archived && !selectedIds.has(item.id)).map(item => item.id);
   const hiddenSelectionCount = selection.length - cases.filter(item => selectedIds.has(item.id)).length;
   const selectionActionLabel = `Preparar execução (${selection.length})`;
   const selectFilteredLabel = !cases.length ? "Nenhum CT filtrado" : !remainingFilteredIds.length ? `Todos os ${cases.length} filtrados selecionados`
@@ -664,6 +737,8 @@ export default function TestSuitesWorkspace(props: Props) {
   const finishedCount = round?.finished_count ?? round?.items.filter(item => !!item.result).length ?? 0;
   const comparableRounds = suite.rounds.filter(item => item.id !== round?.id && item.status !== "draft");
   const reviewing = tab === "planner" && !!validation;
+  const planningActions = tab === "planner" && !validation && <><button className="button secondary" disabled={busy || formChanged || !!recording || !!construction || !selection.length || !name.trim()} onClick={() => void perform(async () => { await save(); })}><Save size={16} />Salvar rascunho</button><button className="button primary" disabled={busy || formChanged || !!recording || !!construction || !selection.length || !name.trim() || !!archivedSelection.length} onClick={() => void review()}>{busy ? <LoaderCircle className="spin" size={16} /> : <ClipboardList size={16} />}Revisar execução</button></>;
+  const planningStatus = tab === "planner" && !validation && <div className="suite-planning-status sr-only"><span role="status">{construction ? "Novo teste em construção · revise ou descarte para continuar. " : formChanged || recording ? "Salve ou finalize o novo teste antes de revisar. " : ""}{selection.length} {selection.length === 1 ? "teste" : "testes"} · {pendingIntegrations > 0 && <strong className="suite-integration-warning">{pendingIntegrations} SWS/SQL só no rascunho · </strong>}{dirty ? "não salvo" : saved ? "salvo em Rascunhos" : "nenhuma execução iniciada"}{saved && !dirty && <> · <button type="button" className="suite-draft-link text-button" disabled={busy} onClick={() => navigate("#/execucoes-planejadas")}>Ver rascunhos<ArrowRight size={13} /></button></>}</span></div>;
   const header = <>
     {!reviewing && <header className="suite-detail-header">
       <div className="suite-detail-topline">
@@ -688,8 +763,10 @@ export default function TestSuitesWorkspace(props: Props) {
           </details>
           <button type="button" className="button secondary" aria-label="Abrir relatório consolidado" title="Abrir relatório consolidado" disabled={busy} onClick={() => void perform(() => openReport(suite.id, "consolidated"))}><Download size={16} /><span>Relatório</span></button>
           {tab !== "planner" && <button type="button" className="button primary" onClick={openMaintenance}><Plus size={16} />Adicionar teste</button>}
+          {planningActions}
         </div>
       </div>
+      {planningStatus}
       <nav className="suite-tabs suite-main-tabs" aria-label="Áreas da base de testes">
         {[["catalog", "Testes"], ["planner", "Preparar execução"], ["rounds", "Execuções"]].map(([key, text]) => <button type="button" key={key} aria-pressed={tab === key} onClick={() => transition(() => { closeEditor(); if (key === "planner") showPlanning(); else setTab(key); })}>{text}{key === "planner" && selection.length > 0 && <span>{selection.length}</span>}</button>)}
         {tab !== "planner" && <button type="button" className="suite-refresh" aria-label="Atualizar conjunto" title="Atualizar conjunto" onClick={() => void perform(refresh)} disabled={busy}><RefreshCcw size={15} /></button>}
@@ -808,7 +885,14 @@ export default function TestSuitesWorkspace(props: Props) {
           <div className="suite-selector-searchbar"><label className="suite-search"><Search size={15} /><input ref={selectorSearch} aria-label="Buscar CTs" placeholder="Buscar testes…" value={query} onChange={event => setQuery(event.target.value)} /></label><button ref={selectorFilterTrigger} type="button" className="suite-selector-filter-toggle" aria-label="Filtros dos testes" aria-expanded={selectorFiltersVisible} aria-controls="suite-selector-filters" title={selectorFilterCount ? `Filtros · ${selectorFilterCount} ${selectorFilterCount === 1 ? "ativo" : "ativos"}` : "Filtrar testes"} data-active={selectorFilterCount > 0} onClick={() => setSelectorFiltersOpen(value => !value)}><SlidersHorizontal size={16} />{selectorFilterCount > 0 && <span aria-hidden="true">{selectorFilterCount}</span>}</button></div>
           {selectorFiltersVisible && <div ref={selectorFilterPanel} id="suite-selector-filters" className="suite-selector-filters" role="group" aria-label="Opções de filtro"><strong>Filtrar testes</strong><label>Resultado ou tipo{statusFilter}</label><FunctionalFlows compact flows={flows} cases={baseCases} selected={activeFlow} onSelect={setSelectedFlow} /><div className="suite-selector-filter-actions"><button type="button" className="text-button" disabled={!selectorFilterCount} onClick={() => { setFilter("all"); setSelectedFlow("all"); }}>Limpar filtros</button><span role="status">{cases.length} {cases.length === 1 ? "teste" : "testes"}</span></div><button type="button" className="button secondary" disabled={busy || !remainingFilteredIds.length} onClick={() => { add(remainingFilteredIds); setSelectorFiltersOpen(false); selectorSearch.current?.focus({ preventScroll: true }); }}><Plus size={14} />Adicionar filtrados ({cases.length})</button></div>}
         </div>
-        <div className="suite-available-list">{cases.map(item => <div className={selectedCase === item.id ? "selected" : ""} key={item.id}><input aria-label={`Incluir ${item.id}`} type="checkbox" checked={selection.some(value => value.case_id === item.id)} onChange={() => toggle(item.id)} /><button onClick={() => { if (!selection.some(value => value.case_id === item.id)) add([item.id]); setSelectedCase(item.id); }}><small>{item.id} · {item.mode === "manual" ? "Manual" : "Automático"}</small><strong>{item.title}</strong><span className="case-flow-label" title={flowMemberships(item).map(member => member.reason).join(" | ")}>{caseFlowLabel(item)}</span><Status value={item.status} /></button></div>)}</div>{!cases.length && <p className="suite-muted" role="status">Nenhum CT corresponde aos filtros.</p>}
+        <div className="suite-available-list" onDragOverCapture={event => { if (!acceptsCaseDrag(event)) return; const list = event.currentTarget, bounds = list.getBoundingClientRect(); if (event.clientY < bounds.top + 44) list.scrollTop -= 24; else if (event.clientY > bounds.bottom - 44) list.scrollTop += 24; }}>{selectorCases.map(item => <div className={`${selectedCase === item.id ? "selected" : ""}${draggedCaseId === item.id ? " is-dragging" : ""}`} key={item.id} data-selector-case={item.id} data-drop-side={caseDrop?.id === item.id ? caseDrop.side : undefined}
+          onDragOver={event => { if (!acceptsCaseDrag(event)) return; event.preventDefault(); event.stopPropagation(); const bounds = event.currentTarget.getBoundingClientRect(); setCaseDrop({ id: item.id, side: event.clientY < bounds.top + bounds.height / 2 ? "before" : "after" }); }}
+          onDrop={event => dropSelectorCase(event, item.id)}><input aria-label={`Incluir ${item.id}`} type="checkbox" checked={selection.some(value => value.case_id === item.id)} onChange={() => toggle(item.id)} />{selectionPositions.has(item.id) && <span className="suite-selector-position" aria-label={`${(selectionPositions.get(item.id) ?? 0) + 1}º na execução`}>{(selectionPositions.get(item.id) ?? 0) + 1}</span>}<button type="button" draggable={!busy && !chatBusy}
+          aria-label={selectionPositions.has(item.id) ? `${(selectionPositions.get(item.id) ?? 0) + 1}º na execução: ${item.id} · ${item.title}` : `Selecionar ${item.id}: ${item.title}`}
+          onMouseDown={event => startSelectorPointer(event, item.id)} onDragStart={event => startSelectorDrag(event, item.id)} onDragEnd={endCaseDrag}
+          onKeyDown={event => { if (event.altKey && (event.key === "ArrowUp" || event.key === "ArrowDown") && selectionPositions.has(item.id) && !busy && !chatBusy) { event.preventDefault(); setSelection(current => moveRailItem(current, selectionPositions.get(item.id)!, event.key === "ArrowUp" ? -1 : 1)); change(); } }}
+          onClick={() => { if (draggingCase.current || suppressSelectorClick.current) return; if (!selection.some(value => value.case_id === item.id)) add([item.id]); setSelectedCase(item.id); }}>
+          <small>{item.id} · {item.mode === "manual" ? "Manual" : "Automático"}</small><strong>{item.title}</strong><span className="case-flow-label" title={flowMemberships(item).map(member => member.reason).join(" | ")}>{caseFlowLabel(item)}</span><Status value={item.status} /></button></div>)}</div>{!cases.length && <p className="suite-muted" role="status">Nenhum CT corresponde aos filtros.</p>}
         <div className="suite-selector-footer"><button type="button" className="button primary" disabled={busy} onClick={openMaintenance}><Plus size={16} />Adicionar teste</button></div>
       </aside>
       <div ref={planCenter} className="suite-plan-center" role="region" aria-label="Roteiro da rodada">{!validation && <>{caseForm}{archivedSelection.length > 0 && <section className="panel suite-archived-selection" role="alert"><strong>{archivedSelection.map(item => item.case_id).join(", ")}{archivedSelection.some(item => !suite.cases.some(value => value.id === item.case_id)) ? " não está disponível nesta base." : " está arquivado."}</strong><p>Confira a base para restaurar um arquivado ou retire os indisponíveis desta execução antes de continuar.</p><button type="button" className="button secondary" onClick={() => { const ids = new Set(archivedSelection.map(item => item.case_id)); setSelection(current => current.filter(item => !ids.has(item.case_id))); if (selectedCase && ids.has(selectedCase)) setSelectedCase(null); change(); }}>Retirar indisponíveis desta execução</button></section>}<div className="suite-flow-board">
@@ -901,7 +985,7 @@ export default function TestSuitesWorkspace(props: Props) {
         </>}
         {validation && <section id="suite-plan-review" ref={reviewPanel} tabIndex={-1} aria-label="Revisão antes de executar" className="panel suite-review"><div className="suite-review-scope"><p>Somente estes testes serão executados. Os demais resultados não mudam.</p><details><summary>Cuidados da execução</summary>{validation.effects.map(effect => <p key={effect}>{effect}</p>)}</details></div><div className="suite-review-list" role="list" aria-label="Testes que serão executados">{validation.items.map(item => <div className="suite-review-case" role="listitem" key={item.case_id}><strong>{item.case_id}</strong><span className="suite-review-identity" title={suite.cases.find(value => value.id === item.case_id)?.title}>{suite.cases.find(value => value.id === item.case_id)?.title || item.case_id}{!item.available && item.code !== "checking" && <small>{item.reason || "Indisponível"}</small>}</span><span className="suite-review-availability">{item.available ? <><Check size={14} /><small>{item.code === "manual" ? "Manual" : "Pronto"}</small></> : item.code === "checking" ? <><LoaderCircle className="spin" size={14} /><small>Conferindo roteiro…</small></> : <small>Indisponível</small>}</span></div>)}</div>{requiredRoundInputs.length > 0 && <fieldset disabled={busy}><legend>Dados privados para esta rodada</legend><p>Informe novamente os valores necessários. Serão usados somente nesta rodada pelo cofre temporário, sem salvar no planejamento ou histórico.</p>{requiredRoundInputs.map((key, index) => <label key={key} htmlFor={`suite-private-${index}`}>{key}<input id={`suite-private-${index}`} type="password" autoComplete="off" required maxLength={8000} value={Object.hasOwn(roundCredentials, key) ? roundCredentials[key] : ""} onChange={event => setRoundCredentials(current => ({ ...current, [key]: event.target.value }))} /></label>)}</fieldset>}<label className="suite-check"><input type="checkbox" disabled={busy} checked={consent} onChange={event => setConsent(event.target.checked)} />Revisei os testes e autorizo esta execução real. Ações podem modificar dados; cada teste automático usa um navegador separado e jornadas completas executam a preparação automaticamente.</label></section>}
       </div>
-      {!validation && <footer className="suite-plan-footer"><span role="status">{construction ? "Novo teste em construção · revise ou descarte para continuar. " : formChanged || recording ? "Salve ou finalize o novo teste antes de revisar. " : ""}{selection.length} {selection.length === 1 ? "teste" : "testes"} · {pendingIntegrations > 0 && <strong className="suite-integration-warning">{pendingIntegrations} SWS/SQL só no rascunho · </strong>}{dirty ? "não salvo" : saved ? "salvo em Rascunhos" : "nenhuma execução iniciada"}{saved && !dirty && <> · <button type="button" className="suite-draft-link text-button" disabled={busy} onClick={() => navigate("#/execucoes-planejadas")}>Ver rascunhos<ArrowRight size={13} /></button></>}</span><button className="button secondary" disabled={busy || formChanged || !!recording || !!construction || !selection.length || !name.trim()} onClick={() => void perform(async () => { await save(); })}><Save size={16} />Salvar rascunho</button><button className="button primary" disabled={busy || formChanged || !!recording || !!construction || !selection.length || !name.trim() || !!archivedSelection.length} onClick={() => void review()}>{busy ? <LoaderCircle className="spin" size={16} /> : <ClipboardList size={16} />}Revisar execução</button></footer>}
+
       </div>
       {chatOpen && !validation && chatPanel}
       </div>

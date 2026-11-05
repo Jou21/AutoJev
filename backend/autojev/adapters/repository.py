@@ -722,6 +722,38 @@ class SQLiteRepository:
             },
         }
 
+    def get_rerun_sources(self, exploration_id: str, scenario_ids: list[str]) -> dict[str, Any]:
+        """Load selected native CTs without decoding unrelated journeys or events."""
+        ids = list(dict.fromkeys(scenario_ids))
+        with self._lock, self._connect() as connection:
+            row = connection.execute("SELECT * FROM explorations WHERE id = ?", (exploration_id,)).fetchone()
+            if row is None:
+                raise NotFoundError(f"Exploration {exploration_id} was not found")
+            result = self._row_to_exploration(row)
+            placeholders = ",".join("?" for _ in ids) or "NULL"
+            scenarios = [json.loads(item["data_json"]) for item in connection.execute(
+                f"SELECT data_json FROM scenarios WHERE exploration_id = ? AND id IN ({placeholders}) ORDER BY sequence",
+                (exploration_id, *ids)).fetchall()]
+            # Legacy timelines infer ownership from other scenarios. Preserve
+            # that behavior instead of reconstructing them from partial data.
+            if any(not (case.get("evidence") or {}).get("timeline") for case in scenarios):
+                return self.get_exploration(exploration_id)
+            steps = set()
+            for case in scenarios:
+                evidence = case.get("evidence") or {}
+                if evidence.get("action_step") is not None:
+                    steps.add(evidence["action_step"])
+                steps.update(entry.get("step_number") for entry in evidence.get("timeline", [])
+                             if entry.get("kind") == "action" and entry.get("step_number") is not None)
+            marks = ",".join("?" for _ in steps) or "NULL"
+            result["actions"] = [dict(id=action["id"], step_number=action["step_number"],
+                decision=json.loads(action["decision_json"]), result=json.loads(action["result_json"]),
+                created_at=action["created_at"]) for action in connection.execute(
+                    f"SELECT * FROM actions WHERE exploration_id = ? AND step_number IN ({marks}) ORDER BY step_number",
+                    (exploration_id, *sorted(steps))).fetchall()]
+            result.update(scenarios=scenarios, screenshots=[], issues=[], timeline_version="selected-native")
+            return result
+
     def get_exploration(
         self, exploration_id: str, include_details: bool = True
     ) -> dict[str, Any]:

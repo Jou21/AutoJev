@@ -135,9 +135,10 @@ class TestSuiteService:
                 "count": len(plan["items"]), "finished_count": sum(item["state"] in {"completed", "failed", "cancelled", "interrupted"} for item in plan["items"]),
                 "summary": {state.lower(): sum((item.get("result") or {}).get("status") == state for item in plan["items"]) for state in VERDICTS}}
 
-    def catalog(self, identity):
+    def catalog(self, identity, *, selected_ids=None):
         root = self.root(identity)
-        initial = self.repository.get_exploration(root)
+        initial = (self.repository.get_exploration(root) if selected_ids is None
+                   else self.repository.get_rerun_sources(root, list(selected_ids)))
         current = project_scenario_revisions(self.repository, initial)
         catalog = []
         for case in current.get("scenarios") or []:
@@ -150,8 +151,12 @@ class TestSuiteService:
                                 status=case.get("status"), recorded_at=revision.get("recorded_at"), flow_classification=classify_case_flows(case), **definition(case)))
         plans = self.store.list(root)
         for case in self.store.cases(root):
+            if selected_ids is not None and case["id"] not in selected_ids:
+                continue
             if case["mode"] == "automatic":
-                imported = project_scenario_revisions(self.repository, self.repository.get_exploration(case["source_exploration_id"]))
+                imported_source = (self.repository.get_exploration(case["source_exploration_id"]) if selected_ids is None
+                                   else self.repository.get_rerun_sources(case["source_exploration_id"], [case["source_scenario_id"]]))
+                imported = project_scenario_revisions(self.repository, imported_source)
                 actual = next(value for value in imported["scenarios"] if value["id"] == case["source_scenario_id"])
                 revision = actual.get("execution_revision") or {}
                 catalog.append({**case, "status": actual.get("status"), "recorded_at": revision.get("recorded_at"), "flow_classification": classify_case_flows(actual),
@@ -209,7 +214,7 @@ class TestSuiteService:
         return self.save_case(root, dict(**definition(case), mode="automatic", source_exploration_id=session_id, source_scenario_id=case_id))
 
     def _items(self, identity, selected):
-        suite = self.catalog(identity)
+        suite = self.catalog(identity, selected_ids={item["case_id"] for item in selected})
         available = {case["id"]: case for case in suite["cases"]}
         result, seen = [], set()
         origins, sources, source_cases = {}, {}, {}
@@ -235,7 +240,10 @@ class TestSuiteService:
                 if origin["report_exploration_id"] != lineage_root or (source_id == lineage_root and source_case != lineage_case) or (source_id != lineage_root and origin["report_scenario_id"] != lineage_case):
                     raise ValueError("A execução de referência não pertence a este CT.")
                 if source_id not in sources:
-                    sources[source_id] = self.repository.get_exploration(source_id)
+                    requested = [value.get("source_scenario_id") or available[value["case_id"]].get("source_scenario_id")
+                                 for value in selected if value["case_id"] in available
+                                 and (value.get("source_exploration_id") or available[value["case_id"]].get("source_exploration_id")) == source_id]
+                    sources[source_id] = self.repository.get_rerun_sources(source_id, requested)
                     source_cases[source_id] = {value["id"]: value for value in sources[source_id].get("scenarios") or []}
                 stored = source_cases[source_id].get(source_case)
                 if stored is None:

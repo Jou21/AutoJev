@@ -227,7 +227,8 @@ class ScenarioRerunService:
         for exploration_id, scenario_id in sources:
             try:
                 if exploration_id not in snapshots:
-                    snapshots[exploration_id] = self.repository.get_exploration(exploration_id)
+                    selected_ids = list(dict.fromkeys(case_id for source_id, case_id in sources if source_id == exploration_id))
+                    snapshots[exploration_id] = self.repository.get_rerun_sources(exploration_id, selected_ids)
                     snapshot = snapshots[exploration_id]
                     # Timeline rendering does not consume events or replay
                     # journeys. Copying every growing journey for every CT

@@ -524,9 +524,15 @@ invalidate the captured local contract. Mandatory visual checks at initial
 capture still fail closed.
 
 Round readiness checks use one fresh source snapshot per exploration and batch
-all selected CTs. Timeline presentation excludes event logs and replay journeys
-from its working copy; the original journeys are still validated in full before
-execution. No browser or model call is needed to check a saved script.
+all selected CTs. For native captures, SQLite loads only the requested scenario
+JSON and their referenced actions, without event logs or unrelated CT journeys.
+Plan saving uses the same selected-only catalog projection. Legacy captures
+without native timelines retain the full-source fallback to preserve inferred
+ownership. Timeline presentation excludes replay journeys from its working copy;
+the selected original journeys are still validated in full before execution.
+Snapshots are request-scoped, so status and recipe changes remain visible.
+Saving a changed draft is still required before review; no browser or model call
+is needed to check a saved script.
 
 ## Security notes
 

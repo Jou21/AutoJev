@@ -405,7 +405,7 @@ def test_saving_many_cases_loads_each_source_and_lineage_once(runtime, monkeypat
         cases.append({**case, "mode": "automatic", "revision": 1,
                       "lineage_exploration_id": root, "lineage_case_id": case["id"],
                       "source_exploration_id": root, "source_scenario_id": case["id"]})
-    monkeypatch.setattr(service, "catalog", lambda _: {"id": root, "cases": cases})
+    monkeypatch.setattr(service, "catalog", lambda _, **kwargs: {"id": root, "cases": cases})
     loads, origins = [], []
     def load(identity):
         loads.append(identity)
@@ -413,7 +413,7 @@ def test_saving_many_cases_loads_each_source_and_lineage_once(runtime, monkeypat
     def origin(repository, identity):
         origins.append(identity)
         return {"report_exploration_id": root, "report_scenario_id": None}
-    monkeypatch.setattr(repo, "get_exploration", load)
+    monkeypatch.setattr(repo, "get_rerun_sources", lambda identity, ids: load(identity))
     monkeypatch.setattr(test_suites, "scenario_report_origin", origin)
     plan = service.save_plan(root, "152 testes", [{"case_id": case["id"]} for case in cases])
     assert len(plan["items"]) == 152
@@ -565,3 +565,38 @@ def test_review_does_not_copy_large_events_or_private_journeys(runtime, monkeypa
     monkeypatch.setattr(service, "preflight", preflight)
     assert len(service.preflight_many([(root, "CT001")] * 151)) == 151
     assert len(checked) == 151
+
+
+def test_native_review_and_save_decode_only_selected_cases(runtime, monkeypatch):
+    import json
+    from autojev.adapters import repository as repository_module
+    from autojev.services import scenario_rerun
+    app, client, root = runtime
+    repo = app.state.repository
+    stored = repo.get_exploration(root)["scenarios"][0]
+    native = StoredScenario(**deepcopy(stored))
+    native.evidence["timeline"] = [{"kind": "action", "step_number": native.evidence["action_step"], "title": "Ação"}]
+    repo.add_scenario(root, 1, native)
+    with repo._lock, repo._connect() as connection:
+        for index in range(2, 153):
+            unrelated = {**stored, "id": f"CT{index:03}", "unrelated_decode_guard": True}
+            connection.execute("INSERT INTO scenarios (id, exploration_id, sequence, data_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                               (unrelated["id"], root, index, json.dumps(unrelated), "2026-01-01"))
+    expected = app.state.scenario_rerun_service.preflight(root, "CT001")
+    original_loads = repository_module.json.loads
+    original_prepare = scenario_rerun.prepare_scenario_timelines
+    def decode(value, *args, **kwargs):
+        assert "unrelated_decode_guard" not in (value.decode() if isinstance(value, bytes) else value)
+        return original_loads(value, *args, **kwargs)
+    def prepare(item):
+        assert [case["id"] for case in item["scenarios"]] == ["CT001"]
+        assert "events" not in item
+        return original_prepare(item)
+    monkeypatch.setattr(repository_module.json, "loads", decode)
+    monkeypatch.setattr(scenario_rerun, "prepare_scenario_timelines", prepare)
+    plan = create_plan(client, root, ["CT001"])
+    response = client.post(f"/api/test-suites/rounds/{plan['id']}/validate")
+    assert response.status_code == 200, response.text
+    result = response.json()["items"][0]
+    assert result["case_id"] == "CT001"
+    assert {key: value for key, value in result.items() if key != "case_id"} == expected
