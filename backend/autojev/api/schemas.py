@@ -259,6 +259,12 @@ class ExplorationOptionsInput(ApiModel):
     )
     auxiliary_max_requests: int | None = Field(default=None, ge=1, le=5000)
     auxiliary_review_max_attempts: int = Field(default=3, ge=1, le=5)
+    frontier_advice_max_requests: int = Field(
+        default=25,
+        ge=1,
+        le=100,
+        validation_alias=AliasChoices("frontier_advice_max_requests", "frontierAdviceMaxRequests"),
+    )
     capture_network_errors: bool = Field(
         default=True,
         validation_alias=AliasChoices("capture_network_errors", "captureNetworkErrors", "network_errors"),
@@ -306,7 +312,7 @@ class ExplorationCreate(ApiModel):
         validation_alias=AliasChoices("app_url", "appUrl", "application_url", "applicationUrl"),
     )
     # Kept optional for older clients; every exploration now uses the built-in
-    # AutoJev planner and only the auxiliary LLM is chosen.
+    # Test Lab planner and only the auxiliary LLM is chosen.
     agent: ModelSelectionInput | None = None
     auxiliary_llm: ModelSelectionInput = Field(
         validation_alias=AliasChoices("auxiliary_llm", "auxiliaryLLM")

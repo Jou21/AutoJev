@@ -969,3 +969,79 @@ def test_canonical_entry_url_keeps_the_coverage_planner_on_the_served_origin():
 
     assert stale._safe_candidate(link, stale.origin) is False  # the bug: www read as off-origin
     assert served._safe_candidate(link, served.origin) is True
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://app.test/gcar", "https://app.test/gcar/"),
+        ("https://app.test/gcar/", "https://app.test/gcar/"),
+        ("https://app.test/index.html", "https://app.test/index.html"),
+        ("https://app.test", "https://app.test/"),
+        ("https://app.test/gcar?x=1", "https://app.test/gcar/?x=1"),
+    ],
+)
+def test_trailing_slash_form_avoids_the_proxy_directory_redirect(url, expected):
+    assert PlaywrightExecutor._with_trailing_slash(url) == expected
+
+
+@pytest.mark.parametrize(
+    ("requested", "landed", "downgrade"),
+    [
+        ("https://app.test/gcar", "http://app.test/gcar/", True),
+        ("https://app.test/", "http://www.app.test/", True),
+        ("https://app.test/", "https://app.test/", False),
+        ("http://app.test/", "https://app.test/", False),
+        ("https://app.test/", "http://other.test/", False),
+    ],
+)
+def test_scheme_downgrade_is_detected_only_for_the_same_host(requested, landed, downgrade):
+    origin = PlaywrightExecutor._origin
+    assert PlaywrightExecutor._is_scheme_downgrade(origin(requested), origin(landed)) is downgrade
+
+
+def _sso_url(redirect="https://app.test/gcar/", **overrides):
+    from urllib.parse import urlencode
+
+    query = {"client_id": "gcar", "response_type": "code", "redirect_uri": redirect, **overrides}
+    query = {key: value for key, value in query.items() if value is not None}
+    return "https://idp.test/auth/realms/x/protocol/openid-connect/auth?" + urlencode(query)
+
+
+def _executor_for(url="https://app.test/gcar"):
+    executor = PlaywrightExecutor(Path("."), ExplorationOptions())
+    executor._allowed_origin = executor._origin(url)
+    return executor
+
+
+def test_identity_provider_hop_is_admitted_only_for_an_oidc_request_returning_to_the_app():
+    executor = _executor_for()
+    assert executor._register_auth_origin(_sso_url()) is True
+    assert executor._auth_origins == {("https", "idp.test", 443)}
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        _sso_url(redirect="https://evil.test/gcar/"),   # returns somewhere else
+        _sso_url(redirect=None),                        # not an authorization request
+        _sso_url(client_id=None),
+        _sso_url(response_type=None),
+        _sso_url().replace("https://", "http://", 1),   # never over plain http
+        "https://idp.test/just/a/page",
+        "https://user:pw@idp.test/auth?client_id=a&response_type=code&redirect_uri=https%3A%2F%2Fapp.test%2Fgcar%2F",
+    ],
+)
+def test_identity_provider_hop_rejects_anything_else(url):
+    executor = _executor_for()
+    assert executor._register_auth_origin(url) is False
+    assert executor._auth_origins == set()
+
+
+def test_identity_provider_hop_is_closed_after_authentication_and_bounded():
+    executor = _executor_for()
+    for host in ("a.idp.test", "b.idp.test"):
+        assert executor._register_auth_origin(_sso_url().replace("idp.test", host)) is True
+    assert executor._register_auth_origin(_sso_url().replace("idp.test", "c.idp.test")) is False
+    executor.protect_authenticated_history()
+    assert executor._register_auth_origin(_sso_url()) is False

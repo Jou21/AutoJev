@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import copy
 import hashlib
 import hmac
@@ -32,6 +34,10 @@ from autojev.adapters.browser_rerun_panel import BrowserRerunPanel, is_panel_url
 
 class BrowserUnavailableError(RuntimeError):
     pass
+
+
+class EntryNavigationError(RuntimeError):
+    """The entry URL cannot be served as authorised; the run fails with this text."""
 
 
 class StaleObservedControlError(ValueError):
@@ -149,6 +155,13 @@ class PlaywrightExecutor:
         self._screenshot_number = 0
         self._allowed_origin: tuple[str, str, int] | None = None
         self._blocked_navigation_url: str | None = None
+        # Identity-provider origins the application itself redirected to with a
+        # standard OIDC authorization request that returns to the allowed origin.
+        self._auth_origins: set[tuple[str, str, int]] = set()
+        # Origin/path/kind of the request the credential guard last aborted.
+        self.last_blocked_request: dict[str, str] | None = None
+        # True when the last render wait ended with nothing on screen.
+        self.render_stalled = False
         self._ref_selectors: dict[str, str] = {}
         self._ref_semantics: dict[str, dict[str, Any]] = {}
         self._observed_node_guard_key = secrets.token_hex(16)
@@ -173,6 +186,64 @@ class PlaywrightExecutor:
             "source": "unobserved", "pending_membership": [],
         }
         self._document_response: dict[str, Any] | None = None
+
+    _ELEMENT_NAME_JS = r"""
+              // A control with no text, aria-label or title is still a control:
+              // name it from its field label or its icon so it can be planned,
+              // told apart from its siblings and understood by the advisor.
+              const IGNORED_ICON_TOKENS = /^(?:icon|icon-(?:inherit|xs|sm|md|lg|xl)|ng-.*|mat-.*|cdk-.*)$/i;
+              const glyphOf = (node) => {
+                for (const pseudo of [null, '::before', '::after']) {
+                  try {
+                    const style = getComputedStyle(node, pseudo);
+                    const raw = (pseudo ? style.content : style.getPropertyValue('--sisbr-icon-glyph')) || '';
+                    // Computed ::before content is the glyph character itself
+                    // (private-use area); a custom property keeps its token text.
+                    const glyphChars = Array.from(raw).filter(ch => ch.codePointAt(0) > 127)
+                      .map(ch => ch.codePointAt(0).toString(16));
+                    const glyph = glyphChars.length ? glyphChars.join('') : raw.replace(/[^a-zA-Z0-9]/g, '');
+                    if (glyph && !['none', 'normal'].includes(glyph.toLowerCase())) return glyph.slice(0, 12);
+                  } catch (error) { /* detached node */ }
+                }
+                return '';
+              };
+              const fieldLabel = (node) => {
+                const own = node.labels && node.labels[0] ? node.labels[0].innerText : '';
+                // The label is usually a sibling of the field's wrapper: climb
+                // while the ancestor still holds at most one field, so an icon
+                // next to a field takes that field's label, never a form's first.
+                let near = '';
+                for (let owner = node.parentElement, depth = 0; owner && !near && depth < 5;
+                     owner = owner.parentElement, depth += 1) {
+                  if (owner.querySelectorAll('input,select,textarea').length > 1) break;
+                  const label = owner.querySelector('label');
+                  if (label && label.innerText.trim()) near = label.innerText;
+                }
+                return (own || near || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+              };
+              const derivedName = (node) => {
+                const isField = ['INPUT', 'SELECT', 'TEXTAREA'].includes(node.tagName);
+                if (isField) return fieldLabel(node);
+                const titled = (node.getAttribute('title') || '').trim();
+                if (titled) return titled;
+                const svgTitle = node.querySelector('svg title');
+                if (svgTitle && svgTitle.textContent.trim()) return svgTitle.textContent.trim();
+                const owner = fieldLabel(node);
+                if (owner) return `Ícone ao lado de “${owner}”`;
+                for (const inner of [node, ...Array.from(node.querySelectorAll('*')).slice(0, 4)]) {
+                  const glyph = glyphOf(inner);
+                  if (glyph) return `Ícone ${glyph}`;
+                  const token = (typeof inner.className === 'string' ? inner.className : '').split(/\s+/)
+                    .find(item => /^(?:icon|mdi|fa|bi|x|arrow|ss)[-_]/i.test(item) && !IGNORED_ICON_TOKENS.test(item));
+                  if (token) return `Ícone ${token}`;
+                }
+                return 'Ícone sem nome';
+              };
+              const elementName = el => (el.getAttribute('aria-label') || el.innerText
+                || (el instanceof HTMLInputElement && ['submit','button','reset'].includes(el.type) ? el.value : '')
+                || el.getAttribute('placeholder') || el.getAttribute('name') || '').trim().slice(0, 300)
+                || (el instanceof HTMLInputElement && ['hidden','password'].includes(el.type) ? '' : derivedName(el));
+    """
 
     def _observed_node_guard_script(self, script: str) -> str:
         """Internal node/owner identity; never add attributes or export it."""
@@ -207,7 +278,9 @@ class PlaywrightExecutor:
             };
           };
         """.replace("__GUARD_KEY__", json.dumps(self._observed_node_guard_key))
-        return script.replace("__OBSERVED_NODE_GUARD_JS__", helper)
+        return script.replace("__OBSERVED_NODE_GUARD_JS__", helper).replace(
+            "__ELEMENT_NAME_JS__", self._ELEMENT_NAME_JS
+        )
 
     async def _release_observed_element_handles(self) -> None:
         handles, self._observed_element_handles = self._observed_element_handles, []
@@ -258,7 +331,7 @@ class PlaywrightExecutor:
         self._mark_inactive()
 
     async def _prepare_page(self, page: Any) -> None:
-        """Attach AutoJev observation hooks to a newly adopted browser page."""
+        """Attach Test Lab observation hooks to a newly adopted browser page."""
 
         try:
             await page.expose_binding(
@@ -304,6 +377,7 @@ class PlaywrightExecutor:
         # The supplied URL on the origin actually served; the coverage planner
         # derives its own origin and root from this, so the two must agree.
         self.entry_url = url
+        self._auth_origins = set()
         self._inactive_event.clear()
         self._authenticated_history_root_url = None
         try:
@@ -360,23 +434,52 @@ class PlaywrightExecutor:
                 await self._page.wait_for_load_state("load", timeout=5_000)
             except Exception:
                 pass
+            landed = self._origin(self._page.url)
+            if self._is_scheme_downgrade(self._allowed_origin, landed):
+                # Reverse proxies often answer ``/app`` with a 301 to
+                # ``http://host/app/`` (the internal scheme). The SPA then
+                # fetches its https assets cross-origin, never boots and stays
+                # on its splash. The slash form is served directly over https.
+                slashed = self._with_trailing_slash(url)
+                if slashed != url:
+                    response = await self._page.goto(slashed, wait_until="domcontentloaded", timeout=30_000)
+                    try:
+                        await self._page.wait_for_load_state("load", timeout=5_000)
+                    except Exception:
+                        pass
+                    landed = self._origin(self._page.url)
+                    if not self._is_scheme_downgrade(self._allowed_origin, landed):
+                        url = self.entry_url = slashed
+                if self._is_scheme_downgrade(self._allowed_origin, landed):
+                    raise EntryNavigationError(
+                        "O servidor redirecionou https para http, o que o Test Lab não aceita: "
+                        f"{self._public_url(self._page.url)}. Informe o endereço exatamente como "
+                        "o site o serve em https (por exemplo, com a barra final)."
+                    )
             # Server redirects on the first load are not routed, so a site that
             # canonicalises saucedemo.com -> www.saucedemo.com would otherwise
             # leave every later action "outside the authorized origin".
-            landed = self._origin(self._page.url)
             if self._is_canonical_redirect(self._allowed_origin, landed):
                 self._allowed_origin = landed
                 scheme, host, port = landed
                 netloc = host if port == (443 if scheme == "https" else 80) else f"{host}:{port}"
                 self.entry_url = urlunsplit(urlsplit(url)._replace(scheme=scheme, netloc=netloc))
+            # A server-side redirect straight to the identity provider is not
+            # routed either; recognise it with the same rule as the guard.
+            if landed != self._allowed_origin:
+                self._register_auth_origin(self._page.url)
             # Give hydrated SPAs one short frame budget to attach click
             # handlers before the first observed refs can be executed.
             await self._page.wait_for_timeout(250)
+            # Angular/React shells show a splash (and may bounce to the SSO)
+            # before any control exists; observing it earlier read an empty
+            # application and ended the run as "complete".
+            await self.wait_for_application_render()
             initial = await self.observe("initial")
             if response is not None:
                 initial.page_state["navigation_response"] = self._navigation_metadata(response)
             return initial
-        except BrowserUnavailableError:
+        except (BrowserUnavailableError, EntryNavigationError):
             await self.close()
             raise
         except Exception as exc:
@@ -497,16 +600,16 @@ class PlaywrightExecutor:
       } catch (error) {}
       panel.dataset.pinned = savedPinned ? 'true' : 'false';
       panel.dataset.collapsed = userCollapsed ? 'true' : 'false';
-      panel.setAttribute('aria-label', 'Status da exploração do AutoJev');
+      panel.setAttribute('aria-label', 'Status da exploração do Test Lab');
       panel.setAttribute('aria-live', 'polite');
 
       const rail = document.createElement('div');
       rail.className = 'autojev-panel-rail';
       rail.setAttribute('role', 'button');
       rail.setAttribute('tabindex', '0');
-      rail.setAttribute('aria-label', 'Expandir ou recolher painel do AutoJev');
+      rail.setAttribute('aria-label', 'Expandir ou recolher painel do Test Lab');
       rail.setAttribute('aria-expanded', savedPinned ? 'true' : 'false');
-      rail.innerHTML = '<span class="autojev-rail-mark">J</span><span class="autojev-rail-status"></span><span class="autojev-rail-label">AutoJev</span>';
+      rail.innerHTML = '<span class="autojev-rail-mark">J</span><span class="autojev-rail-status"></span><span class="autojev-rail-label">Test Lab</span>';
       const togglePinned = () => {
         const expanded = panel.dataset.pinned === 'true'
           || panel.dataset.mode === 'attention' && panel.dataset.collapsed !== 'true';
@@ -543,7 +646,7 @@ class PlaywrightExecutor:
       header.className = 'autojev-panel-header';
       const kicker = document.createElement('div');
       kicker.className = 'autojev-panel-kicker';
-      kicker.innerHTML = '<span class="autojev-live-dot"></span><span id="autojev-kicker-text">AUTOJEV · EXPLORANDO</span>';
+      kicker.innerHTML = '<span class="autojev-live-dot"></span><span id="autojev-kicker-text">TEST LAB · EXPLORANDO</span>';
       const hint = document.createElement('span');
       hint.id = 'autojev-panel-hint';
       hint.className = 'autojev-panel-hint';
@@ -665,7 +768,7 @@ class PlaywrightExecutor:
             return await self._rerun_panel.update(payload)
         except Exception:
             # Some sites forbid embedded frames. Keep their CSP intact and
-            # retain the main AutoJev application as a confirmation fallback.
+            # retain the main Test Lab application as a confirmation fallback.
             return False
 
     async def _set_sidepanel_automation(self, active: bool) -> None:
@@ -788,7 +891,7 @@ class PlaywrightExecutor:
                   if (button) {
                     button.disabled = buttonDisabled; button.textContent = buttonLabel;
                   }
-                  if (kicker) kicker.textContent = 'AUTOJEV · AÇÃO NECESSÁRIA';
+                  if (kicker) kicker.textContent = 'TEST LAB · AÇÃO NECESSÁRIA';
                   if (hint) hint.textContent = 'Aguardando você';
                   if (panel) {
                     panel.dataset.mode = 'attention';
@@ -813,7 +916,7 @@ class PlaywrightExecutor:
                   const action = document.getElementById('autojev-panel-action');
                   if (action) action.hidden = true;
                   const kicker = document.getElementById('autojev-kicker-text');
-                  if (kicker) kicker.textContent = 'AUTOJEV · EXPLORANDO';
+                  if (kicker) kicker.textContent = 'TEST LAB · EXPLORANDO';
                   const hint = document.getElementById('autojev-panel-hint');
                   let savedPinned = false;
                   try { savedPinned = sessionStorage.getItem('autojev-panel-open') === 'true'; } catch (error) {}
@@ -845,11 +948,11 @@ class PlaywrightExecutor:
         This waiter is cancelled only after the service accepts an image.
         """
         while True:
-            guidance = ("Este site restringe o painel integrado. Volte à aplicação AutoJev "
+            guidance = ("Este site restringe o painel integrado. Volte à aplicação Test Lab "
                         "para acompanhar o mapa, colar ou escolher seu print e confirmar o envio."
                         if self._rerun_panel is not None and self._rerun_panel.unavailable else message)
             await self.show_intervention_panel(guidance, title="Aguardando seu print",
-                button_label="Anexe na aplicação AutoJev", button_disabled=True)
+                button_label="Anexe na aplicação Test Lab", button_disabled=True)
             # Restore passive guidance after a full navigation, even when the
             # bootstrap has already recreated a hidden default panel.
             await asyncio.sleep(1.0)
@@ -882,6 +985,10 @@ class PlaywrightExecutor:
         """Checagem leve (sem screenshot) para detectar tela de login."""
         if not self._page:
             return False
+        # The identity provider is a sign-in step whatever its form looks like
+        # (username-only first step, federated buttons, ...).
+        if self._on_auth_origin():
+            return True
         try:
             return bool(
                 await self._page.evaluate(
@@ -946,7 +1053,7 @@ class PlaywrightExecutor:
         """
         if not self.is_active():
             raise BrowserUnavailableError("Browser page is not active")
-        if self._origin(self._page.url) != self._allowed_origin:
+        if not self._is_login_origin(self._page.url):
             return LoginAttempt("manual_required", "unsafe_origin")
         # Mask even anonymous/email username controls before the refresh can
         # capture a bitmap. This reads no values and changes no input contents.
@@ -998,6 +1105,10 @@ class PlaywrightExecutor:
         blocked_request = False
         submit_started = False
         self._blocked_navigation_url = None
+        # Credentials may reach only the authorised origin and the identity
+        # provider whose form is being filled, never another admitted origin.
+        login_origin = self._origin(page.url)
+        credential_origins = {self._allowed_origin, login_origin}
 
         async def guard_authentication_request(route: Any, request: Any) -> None:
             nonlocal blocked_request
@@ -1034,18 +1145,43 @@ class PlaywrightExecutor:
             )
             # Authorization headers and opaque body formats cannot bypass the
             # short-secret checks (e.g. multipart/plain-text password "1234").
+            # Only a header that carries the credentials is a leak: a Bearer
+            # token the application obtained after signing in, sent to its own
+            # API on another origin, is ordinary traffic and must not be cut
+            # (the app would otherwise fail to load its permissions).
             authorization = request.headers.get("authorization", "")
+            scheme, _, token = authorization.partition(" ")
+            header_values = [token.strip()]
+            if scheme.lower() == "basic":
+                try:
+                    header_values.append(base64.b64decode(token.strip(), validate=False).decode("utf-8", "replace"))
+                except (binascii.Error, ValueError):
+                    pass
+            authorization_carries_secret = bool(authorization) and any(
+                value == candidate or (len(value) >= 8 and value in candidate)
+                or (scheme.lower() == "basic" and value in candidate)
+                for value in (username, password) if value
+                for candidate in (*header_values, authorization)
+            )
             if (
                 secret_in_url
-                or ((secret_in_body or authorization) and self._origin(request.url) != self._allowed_origin)
+                or ((secret_in_body or authorization_carries_secret)
+                    and self._origin(request.url) not in credential_origins)
             ):
                 blocked_request = True
+                # Where, never what: no query string and no credential value.
+                self.last_blocked_request = {
+                    "origin": "{}://{}".format(*self._origin(request.url)[:2]),
+                    "path": urlsplit(request.url).path[:200],
+                    "kind": "credential_in_url" if secret_in_url else (
+                        "credential_in_body" if secret_in_body else "credential_in_authorization_header"),
+                }
                 await route.abort("blockedbyclient")
                 return
             await route.fallback()
 
         try:
-            if self._origin(page.url) != self._allowed_origin:
+            if not self._is_login_origin(page.url):
                 return LoginAttempt("manual_required", "unsafe_origin")
             plan = await page.evaluate(
                 self._login_challenge_script("""({selectors, panel}) => {
@@ -1074,7 +1210,7 @@ class PlaywrightExecutor:
                   const submits = Array.from(document.querySelectorAll('button,input[type="submit"],input[type="button"],[role="button"]')).filter(el => {
                     if (!visible(el) || (el.form || el.closest('[role="form"]')) !== scope) return false;
                     const label = (el.getAttribute('aria-label') || el.innerText || el.value || '').trim();
-                    return /^(log[ -]?in|sign[ -]?in|sign on|entrar|acessar|autenticar|iniciar sessão)(\\b|$)/i.test(label);
+                    return /^(log[ -]?in|logar|sign[ -]?in|sign on|entrar|acessar|autenticar|iniciar sessão)(\\b|$)/i.test(label);
                   });
                   if (submits.length !== 1 || [username,password,submits[0]].some(el => el.disabled || el.readOnly || el.getAttribute('aria-disabled') === 'true')) return {reason:'ambiguous_form'};
                   const submit = submits[0];
@@ -1102,7 +1238,7 @@ class PlaywrightExecutor:
             control_identity = plan["identity"]
 
             async def controls_unchanged() -> bool:
-                if self._page is not page or self._origin(page.url) != self._allowed_origin:
+                if self._page is not page or self._origin(page.url) != login_origin:
                     return False
                 return bool(await page.evaluate(
                     self._login_challenge_script("""({controls:[username,password,submit],expected}) => {
@@ -1125,7 +1261,7 @@ class PlaywrightExecutor:
                       __LOGIN_CHALLENGE_JS__
                       if (authenticationChallenge) return false;
                       const label=(submit.getAttribute('aria-label') || submit.innerText || submit.value || '').trim();
-                      if (!/^(log[ -]?in|sign[ -]?in|sign on|entrar|acessar|autenticar|iniciar sessão)(\\b|$)/i.test(label)) return false;
+                      if (!/^(log[ -]?in|logar|sign[ -]?in|sign on|entrar|acessar|autenticar|iniciar sessão)(\\b|$)/i.test(label)) return false;
                       const action = submit.getAttribute('formaction') || (scope instanceof HTMLFormElement ? scope.action : location.href);
                       return new URL(action,location.href).origin === location.origin;
                     }"""), {"controls": handles, "expected": control_identity},
@@ -1207,7 +1343,9 @@ class PlaywrightExecutor:
                 return LoginAttempt("manual_required", "controls_changed")
             submit_started = True
             await submit.click(timeout=4_000)
-            deadline = time.monotonic() + 8
+            # Leaving the SSO means a redirect, the code exchange and the SPA
+            # booting again: give that more than the same-origin 8 seconds.
+            deadline = time.monotonic() + (8 if login_origin == self._allowed_origin else 20)
             await self._wait_for_dom_settle()
             clear_reads = 0
             previous_signature = None
@@ -1215,7 +1353,7 @@ class PlaywrightExecutor:
                 if not self.is_active():
                     raise BrowserUnavailableError("Browser page is not active")
                 state = await probe()
-                if blocked_request or self._blocked_navigation_url or self._origin(page.url) != self._allowed_origin:
+                if blocked_request or self._blocked_navigation_url or self._origin(page.url) not in credential_origins:
                     return LoginAttempt("manual_required", "unsafe_authentication_request")
                 if state["challenge"]:
                     return LoginAttempt("manual_required", "authentication_challenge")
@@ -1326,6 +1464,184 @@ class PlaywrightExecutor:
             return True
         return (old_scheme, old_port, new_scheme, new_port) == ("http", 80, "https", 443)
 
+    MAX_AUTH_ORIGINS = 2
+
+    def _register_auth_origin(self, url: str) -> bool:
+        """Admit the application's own redirect to its identity provider.
+
+        Corporate SPAs authenticate through an SSO on another origin (Keycloak,
+        Azure AD, ...). Only the standard authorization request is admitted:
+        https, ``client_id`` + ``response_type`` and a ``redirect_uri`` that
+        returns to the authorised origin, and only before the authenticated
+        boundary. The identity provider is then a login page the person
+        completes by hand; automatic login and every exploratory action still
+        require the authorised origin.
+        """
+
+        if self._allowed_origin is None or self._protect_authenticated_history:
+            return False
+        try:
+            parsed = urlsplit(url)
+            if parsed.scheme != "https" or parsed.username or parsed.password:
+                return False
+            query = dict(parse_qsl(parsed.query))
+            if not (query.get("client_id") and query.get("response_type") and query.get("redirect_uri")):
+                return False
+            if self._origin(query["redirect_uri"]) != self._allowed_origin:
+                return False
+            origin = self._origin(url)
+        except ValueError:
+            return False
+        if origin == self._allowed_origin:
+            return False
+        if origin not in self._auth_origins and len(self._auth_origins) >= self.MAX_AUTH_ORIGINS:
+            return False
+        self._auth_origins.add(origin)
+        return True
+
+    def _is_login_origin(self, url: str) -> bool:
+        """The authorised origin or an admitted identity provider."""
+
+        origin = self._origin(url)
+        return origin == self._allowed_origin or origin in self._auth_origins
+
+    def _on_auth_origin(self) -> bool:
+        return bool(
+            self._auth_origins and self._page is not None
+            and self._origin(self._page.url) in self._auth_origins
+        )
+
+    async def wait_for_application_render(self, timeout_ms: int = 20_000) -> bool:
+        """Wait until the page shows controls or real content, bounded.
+
+        Returns False when nothing rendered (blank/stuck shell) or the only
+        navigation the page attempted was blocked, so the caller reports it
+        instead of reading an empty application.
+        """
+
+        if not self._page:
+            return False
+        self.render_stalled = True
+        deadline = time.monotonic() + timeout_ms / 1000
+        stable = 0
+        while time.monotonic() < deadline:
+            if not self.is_active():
+                return False
+            if self._blocked_navigation_url:
+                # Let the aborted navigation finish swapping in Chromium's
+                # error page before the caller evaluates the document again.
+                await asyncio.sleep(0.6)
+                return False
+            try:
+                rendered = await self._page.evaluate(
+                    """panel => {
+                      const visible = el => {
+                        if (el.closest(panel)) return false;
+                        const b = el.getBoundingClientRect(), s = getComputedStyle(el);
+                        return b.width > 0 && b.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+                      };
+                      const controls = Array.from(document.querySelectorAll(
+                        'a[href],button,input,select,textarea,[role="button"],[role="link"],[role="menuitem"],[tabindex]'
+                      )).some(visible);
+                      const text = Array.from(document.body?.children || [])
+                        .filter(el => !el.matches(panel)).map(el => el.innerText || '').join(' ').trim();
+                      return document.readyState !== 'loading' && (controls || text.length >= 40);
+                    }""",
+                    self.PANEL_SELECTOR,
+                )
+            except Exception:
+                # A navigation (e.g. the hop to the SSO) destroyed the context.
+                rendered = False
+            stable = stable + 1 if rendered and not self._pending_app_requests else 0
+            if stable >= 2:
+                self.render_stalled = False
+                return True
+            await asyncio.sleep(0.25)
+        return False
+
+    async def describe_focus_candidates(self, focus_area: str, limit: int = 12) -> list[dict[str, Any]]:
+        """Where the requested menu label lives in the DOM, for diagnosis.
+
+        Used when the focus was not found: reports how the deepest elements
+        showing each ``>`` segment are built (tag, role, tabindex, cursor,
+        visibility, ancestors), never their typed values.
+        """
+
+        if not self._page:
+            return []
+        segments = [part.strip() for part in re.split(r"\s*(?:>|/|→)\s*", focus_area or "") if part.strip()]
+        if not segments:
+            return []
+        try:
+            return await self._page.evaluate(
+                r"""([segments, limit, panel]) => {
+                  const norm = value => (value || '').normalize('NFD').replace(/[̀-ͯ]/g, '')
+                    .replace(/\s+/g, ' ').trim().toLowerCase();
+                  const wanted = segments.map(norm);
+                  const CONTROL = 'a,button,input,select,textarea,[aria-haspopup],[role="button"],[role="link"],[role="menuitem"],[tabindex]';
+                  const visible = el => {
+                    const b = el.getBoundingClientRect(), s = getComputedStyle(el);
+                    return b.width > 0 && b.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+                  };
+                  const describe = el => `${el.tagName.toLowerCase()}${el.id ? '#' + el.id : ''}`
+                    + `${typeof el.className === 'string' && el.className ? '.' + el.className.trim().split(/\s+/).slice(0, 3).join('.') : ''}`.slice(0, 80);
+                  const out = [];
+                  for (const el of document.body.querySelectorAll('*')) {
+                    if (out.length >= limit) break;
+                    if (el.closest(panel) || ['SCRIPT', 'STYLE'].includes(el.tagName)) continue;
+                    const text = norm(el.textContent);
+                    const segment = wanted.findIndex(item => item && text.includes(item));
+                    if (segment < 0 || text.length > 200) continue;
+                    if (Array.from(el.children).some(child => norm(child.textContent).includes(wanted[segment]))) continue;
+                    const hidden = Array.from(el.querySelectorAll(CONTROL)).filter(node => !visible(node)).length;
+                    const chain = [];
+                    for (let owner = el.parentElement; owner && chain.length < 4; owner = owner.parentElement) chain.push(describe(owner));
+                    const semantic = el.closest(CONTROL);
+                    out.push({
+                      segment: segments[segment],
+                      element: describe(el),
+                      text: text.slice(0, 80),
+                      role: el.getAttribute('role'),
+                      tabindex: el.getAttribute('tabindex'),
+                      cursor: getComputedStyle(el).cursor,
+                      visible: visible(el),
+                      hidden_controls_inside: hidden,
+                      closest_control: semantic ? describe(semantic) : null,
+                      ancestors: chain,
+                    });
+                  }
+                  return out;
+                }""",
+                [segments, limit, self.PANEL_SELECTOR],
+            )
+        except Exception:
+            return []
+
+    @staticmethod
+    def _is_scheme_downgrade(
+        requested: tuple[str, str, int] | None, landed: tuple[str, str, int],
+    ) -> bool:
+        """True when an https entry was answered on the same host over http."""
+
+        if requested is None:
+            return False
+        (old_scheme, old_host, _), (new_scheme, new_host, _) = requested, landed
+        return (
+            old_scheme == "https"
+            and new_scheme == "http"
+            and old_host.removeprefix("www.") == new_host.removeprefix("www.")
+        )
+
+    @staticmethod
+    def _with_trailing_slash(url: str) -> str:
+        """``/app`` -> ``/app/``; leaves files, existing slashes and queries' paths alone."""
+
+        parts = urlsplit(url)
+        last_segment = parts.path.rsplit("/", 1)[-1]
+        if parts.path.endswith("/") or "." in last_segment:
+            return url
+        return urlunsplit(parts._replace(path=(parts.path or "") + "/"))
+
     async def _guard_navigation(self, route: Any, request: Any) -> None:
         if self._rerun_panel is not None and await self._rerun_panel.route(route, request):
             return
@@ -1343,6 +1659,8 @@ class PlaywrightExecutor:
                 request.is_navigation_request()
                 and is_top_level
                 and self._origin(request.url) != self._allowed_origin
+                and self._origin(request.url) not in self._auth_origins
+                and not self._register_auth_origin(request.url)
             ):
                 self._blocked_navigation_url = self._public_url(request.url)
                 await route.abort("blockedbyclient")
@@ -1370,6 +1688,17 @@ class PlaywrightExecutor:
             "status_code": response.status,
         }
 
+    _SYNTHETIC_SAMPLE = re.compile(
+        r"(?:\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2})?|\d{2}/\d{2}/\d{4}|\d{4}-\d{2}|\d{2}:\d{2}"
+        r"|529\.982\.247-25|11\.222\.333/0001-81|100,00)"
+    )
+
+    @classmethod
+    def _is_synthetic_sample(cls, raw: str) -> bool:
+        """Dates and the fixed CPF/CNPJ/amount samples the planner itself types."""
+
+        return cls._SYNTHETIC_SAMPLE.fullmatch(raw) is not None
+
     def _sanitize_page_state(self, state: Any) -> dict[str, Any]:
         """Raw field contents never leave the executor in public observations."""
         if not isinstance(state, dict):
@@ -1385,6 +1714,8 @@ class PlaywrightExecutor:
                 continue
             raw = str(item.pop("_raw_value", ""))
             sensitive = bool(item.get("sensitive"))
+            if raw and not sensitive and self._is_synthetic_sample(raw):
+                safe_synthetic.add(raw)
             if raw and (sensitive or raw not in safe_synthetic):
                 private_values.append(raw)
             if not sensitive:
@@ -1935,18 +2266,57 @@ class PlaywrightExecutor:
         """
         return await self.observe("rerun_login_watch", capture_screenshot=False)
 
+    _NAVIGATION_RACE = (
+        "execution context was destroyed",
+        "frame was detached",
+        "navigation interrupted",
+        "page is navigating",
+        "cannot find context with specified id",
+    )
+
     async def observe(
+        self, screenshot_label: str = "page", *, capture_screenshot: bool = True,
+    ) -> Observation:
+        """Observe the page, riding out a navigation that is still in flight.
+
+        An action (a go_back, a link, a submit) can start a navigation after it
+        returned; reading or masking the old document then raises "Execution
+        context was destroyed". That is a moment, not a failure of the run:
+        wait for the new document and look again.
+        """
+
+        attempts = 4
+        for attempt in range(attempts):
+            try:
+                return await self._observe_once(screenshot_label, capture_screenshot=capture_screenshot)
+            except BrowserUnavailableError:
+                raise
+            except Exception as exc:
+                racing = any(marker in str(exc).lower() for marker in self._NAVIGATION_RACE)
+                if not racing or attempt == attempts - 1 or not self.is_active():
+                    raise
+                try:
+                    await self._page.wait_for_load_state("domcontentloaded", timeout=5_000)
+                except Exception:
+                    pass
+                await self._page.wait_for_timeout(150 * (attempt + 1))
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    async def _observe_once(
         self, screenshot_label: str = "page", *, capture_screenshot: bool = True,
     ) -> Observation:
         if not self.is_active():
             raise BrowserUnavailableError("Browser page is not active")
+        if screenshot_label in {"after-user-input", "after-confirmed-login"}:
+            # Returning from the SSO lands on the SPA shell again.
+            await self.wait_for_application_render()
         await self._release_observed_element_handles()
         snapshot = await self._page.evaluate(
             self._observed_node_guard_script(self._login_challenge_script("""() => {
               __OBSERVED_NODE_GUARD_JS__
               const PANEL_SELECTOR = '#autojev-sidepanel,#autojev-intervention-panel,#autojev-live-panel';
               // Nunca altera a renderização do painel durante a observação.
-              // A UI do AutoJev é excluída apenas da cópia lógica entregue ao
+              // A UI do Test Lab é excluída apenas da cópia lógica entregue ao
               // JEV, evitando o flash de visibility:hidden a cada etapa.
               const isVisible = (el) => {
                 const box = el.getBoundingClientRect();
@@ -2049,13 +2419,57 @@ class PlaywrightExecutor:
                     && box.bottom > 0 && box.top < window.innerHeight;
                 });
                 const overlayFor = (node) => overlays.find((owner) => owner.contains(node)) || null;
-                const candidates = Array.from(document.querySelectorAll(
-                  'a,button,input,select,textarea,[aria-haspopup],[role="button"],[role="link"],[role="menuitem"],[role="checkbox"],[role="radio"],[tabindex]'
-                )).filter((el) => {
+                const CONTROL_SELECTOR = 'a,button,input,select,textarea,[aria-haspopup],[role="button"],[role="link"],[role="menuitem"],[role="checkbox"],[role="radio"],[tabindex]';
+                const semanticCandidates = Array.from(document.querySelectorAll(CONTROL_SELECTOR)).filter((el) => {
                   if (el.closest(PANEL_SELECTOR)) return false;
                   if (activeDialog && !activeDialog.contains(el)) return false;
                   return isVisible(el);
-                }).slice(0, 300);
+                });
+                // Angular/Vue menus often bind (click) on plain li/div/span, so
+                // no role or tabindex marks them. The browser still tells us:
+                // a widget the author made clickable has cursor:pointer. Keep
+                // only the outermost small widget with a short label that holds
+                // no real control (cursor is inherited, so a clickable list's
+                // items would otherwise all repeat and its container too).
+                const pointerWidgets = (() => {
+                  const viewportArea = Math.max(window.innerWidth * window.innerHeight, 1);
+                  const found = [];
+                  const pool = document.body
+                    ? document.body.querySelectorAll('li,div,span,p,td,th,label,img,svg,i,h1,h2,h3,h4,h5,h6')
+                    : [];
+                  for (let index = 0; index < pool.length && index < 6000 && found.length < 100; index += 1) {
+                    const el = pool[index];
+                    if (el.matches(CONTROL_SELECTOR) || el.closest(PANEL_SELECTOR)) continue;
+                    // textContent also counts a collapsed submenu's text; the
+                    // visible label (innerText) is what names the entry.
+                    if ((el.textContent || '').length > 600) continue;
+                    const label = (el.getAttribute('aria-label') || el.getAttribute('title') || el.innerText || '').trim();
+                    if (label.length > 80) continue;
+                    const box = el.getBoundingClientRect();
+                    if (box.width < 8 || box.height < 8 || box.width * box.height > viewportArea * 0.25) continue;
+                    // No text at all is fine for a small glyph (a search magnifier
+                    // beside a field, a header icon): it gets a derived name.
+                    if (!label && (box.width > 64 || box.height > 64)) continue;
+                    if (getComputedStyle(el).cursor !== 'pointer') continue;
+                    if (activeDialog && !activeDialog.contains(el)) continue;
+                    // Inside a real link/button the control itself is the target.
+                    if (el.closest('a,button,[role="button"],[role="link"],[role="menuitem"]')) continue;
+                    if (!isVisible(el)) continue;
+                    // A menu parent routinely holds its collapsed submenu links;
+                    // only a control the person can see makes the real one the target.
+                    if (Array.from(el.querySelectorAll(CONTROL_SELECTOR)).some(isVisible)) continue;
+                    found.push(el);
+                  }
+                  const set = new Set(found);
+                  return found.filter(el => {
+                    for (let owner = el.parentElement; owner; owner = owner.parentElement) {
+                      if (set.has(owner)) return false;
+                    }
+                    return true;
+                  });
+                })();
+                const candidates = [...semanticCandidates, ...pointerWidgets].slice(0, 300);
+                const pointerSet = new Set(pointerWidgets);
               const selectorFor = (node) => {
                 const parts = [];
                 let current = node;
@@ -2106,9 +2520,7 @@ class PlaywrightExecutor:
                 node instanceof HTMLAnchorElement ? node.href : '', node.getAttribute('aria-haspopup') || '',
               ]);
               const signatures = new Map(candidates.map(node => [node, controlSignature(node)]));
-              const allControls = Array.from(document.querySelectorAll(
-                'a,button,input,select,textarea,[aria-haspopup],[role="button"],[role="link"],[role="menuitem"],[role="checkbox"],[role="radio"],[tabindex]'
-              ));
+              const allControls = [...document.querySelectorAll(CONTROL_SELECTOR), ...pointerWidgets];
               const allSignatures = new Map(allControls.map(node => [node, controlSignature(node)]));
               const anchorSignatures = new Map();
               // Include hidden/disabled duplicates: uniqueness is a DOM fact,
@@ -2163,6 +2575,20 @@ class PlaywrightExecutor:
                     // The full name/href/role/type remain in the fingerprint.
                     // Avoid copying credential-bearing URLs into metadata.
                     return 'navigation:unique-declared-href';
+                  }
+                }
+                return null;
+              };
+              __ELEMENT_NAME_JS__
+              // The title of the block a field or button sits in ("Arquivo
+              // Recebido"): the nearest heading before it in an enclosing box.
+              const HEADING_SELECTOR = 'h1,h2,h3,h4,h5,h6,[role="heading"],legend';
+              const sectionTitle = (el) => {
+                for (let parent = el.parentElement, depth = 0; parent && depth < 8; parent = parent.parentElement, depth += 1) {
+                  const before = Array.from(parent.querySelectorAll(HEADING_SELECTOR)).filter((heading) => !heading.contains(el)
+                    && (heading.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING) && isVisible(heading));
+                  if (before.length) {
+                    return (before[before.length - 1].innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 80) || null;
                   }
                 }
                 return null;
@@ -2222,9 +2648,9 @@ class PlaywrightExecutor:
                   ref,
                   tag: el.tagName.toLowerCase(),
                   role: el.getAttribute('role') || null,
-                  name: (el.getAttribute('aria-label') || el.innerText
-                    || (el instanceof HTMLInputElement && ['submit','button','reset'].includes(el.type) ? el.value : '')
-                    || el.getAttribute('placeholder') || el.getAttribute('name') || '').trim().slice(0, 300),
+                  // Clickable only by the author's cursor:pointer, not by markup.
+                  ...(pointerSet.has(el) ? {pointer_widget: true} : {}),
+                  name: elementName(el),
                   type: el.getAttribute('type') || null,
                   form: (el.form || el.closest('form,[role="form"]'))
                     ? selectorFor(el.form || el.closest('form,[role="form"]')) : null,
@@ -2236,6 +2662,18 @@ class PlaywrightExecutor:
                   enabled,
                   read_only: Boolean(el.readOnly),
                   required: Boolean(el.required || el.getAttribute('aria-required') === 'true'),
+                  // What a person reads beside the field: needed to type a
+                  // value that fits it (a date mask, a CPF) and to describe it.
+                  ...(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement
+                    ? {
+                        placeholder: el.getAttribute('placeholder') || null,
+                        label: fieldLabel(el) || null,
+                        // Programmatic identity for fields with no visible label
+                        // (Angular formcontrolname, name, a meaningful id).
+                        field_id: el.getAttribute('formcontrolname') || el.getAttribute('name')
+                          || (/^(?:mat|cdk|ng|p)-/.test(el.id) ? '' : el.id) || el.getAttribute('data-testid') || null,
+                      }
+                    : {}),
                   has_value: el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement
                     ? Boolean(el.value)
                     : null,
@@ -2270,6 +2708,7 @@ class PlaywrightExecutor:
                   obstructed_by_overlay: Boolean(obstructingOverlay && !overlay),
                   overlay_dismiss: Boolean(overlay && dismissCopy && !destructiveDismiss && !hasEnteredData),
                   in_navigation: Boolean(el.closest('nav,[role="navigation"],aside')),
+                  ...(el.matches('input,select,textarea,button,[role="button"]') ? {section: sectionTitle(el)} : {}),
                   context: contextNode
                     ? `${contextNode.tagName.toLowerCase()} ${contextMarker} ${contextNode.getAttribute('aria-label') || contextNode.getAttribute('role') || ''} ${contextText}`.trim().slice(0, 160)
                     : null,
@@ -2448,7 +2887,72 @@ class PlaywrightExecutor:
               ) : '';
               const reviewItems = cartNodes.map(productInfo).filter((item) => item.name);
               const optionalTotal = (selector) => reviewNode ? firstText(reviewNode, selector) || null : null;
+              // What a search produced: visible data rows (header and "no
+              // records" rows excluded) and whether the page says there is none.
+              const EMPTY_RESULTS = /(sem conte[uú]do|nenhum (?:registro|resultado|dado|t[ií]tulo|item)|n[aã]o (?:foram |h[aá] |foi )?(?:encontrad|registro|resultado)|sem resultados?|sem registros?|fa[cç]a uma pesquisa|no (?:results|records|data))/i;
+              const resultRows = Array.from(document.querySelectorAll(
+                'table tbody tr,[role="row"],mat-row,.mat-mdc-row,.ag-row,.p-datatable-tbody > tr'
+              )).filter((row) => isVisible(row) && !row.closest(PANEL_SELECTOR)
+                && (!activeDialog || activeDialog.contains(row))
+                && row.querySelector('td,[role="cell"],[role="gridcell"],mat-cell,.mat-mdc-cell,.ag-cell')
+                && !EMPTY_RESULTS.test((row.innerText || '').trim()));
+              const resultsRoot = document.querySelector('main') || document.body;
+              // Titles with nothing under them (no text, control, image or
+              // table down to the next title): placeholders of a results area
+              // the page shows before it has anything to put there.
+              const CONTENT_SELECTOR = 'input,select,textarea,button,a,img,svg,canvas,video,iframe,table,[role="grid"],[role="table"],[role="img"]';
+              const emptySections = Array.from(document.querySelectorAll(HEADING_SELECTOR)).filter((heading) => isVisible(heading)
+                && !heading.closest(PANEL_SELECTOR)
+                && !heading.closest('nav,[role="navigation"],header,[role="banner"],aside,[role="complementary"],form,[role="form"]')
+                && (!activeDialog || activeDialog.contains(heading))
+                && (heading.innerText || '').trim()).slice(0, 12).filter((heading) => {
+                const box = heading.getBoundingClientRect();
+                let container = heading.parentElement;
+                while (container && container !== document.body && container.getBoundingClientRect().height < box.height * 2 + 24) {
+                  container = container.parentElement;
+                }
+                if (!container || container === document.body || container === document.documentElement) return false;
+                let column = heading.parentElement;
+                while (column && column !== container && column.getBoundingClientRect().width < box.width + 40) column = column.parentElement;
+                const columnBox = (column || container).getBoundingClientRect();
+                const nextTitles = Array.from(container.querySelectorAll(HEADING_SELECTOR))
+                  .filter((other) => other !== heading && isVisible(other) && other.getBoundingClientRect().top >= box.bottom - 1)
+                  .map((other) => other.getBoundingClientRect().top);
+                const bottom = Math.min(container.getBoundingClientRect().bottom, ...nextTitles);
+                return !Array.from(container.querySelectorAll('*')).slice(0, 1500).some((node) => {
+                  if (node === heading || heading.contains(node) || node.contains(heading) || node.matches(HEADING_SELECTOR)) return false;
+                  const rect = node.getBoundingClientRect();
+                  if (rect.width < 4 || rect.height < 4 || rect.right <= columnBox.left || rect.left >= columnBox.right) return false;
+                  const middle = (rect.top + rect.bottom) / 2;
+                  if (middle <= box.bottom || middle >= bottom) return false;
+                  const ownText = Array.from(node.childNodes).some((child) => child.nodeType === Node.TEXT_NODE && child.textContent.trim());
+                  return (ownText || node.matches(CONTENT_SELECTOR)) && isVisible(node);
+                });
+              }).map((heading) => (heading.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 80));
+              // Is the page still loading (spinner, progress bar, or a dimming
+              // overlay with nothing written on it)? A search result read while
+              // this is true is the previous content, not the answer.
+              const BUSY_SELECTOR = '[aria-busy="true"],[role="progressbar"],.spinner,.loader,.loading,.mat-progress-spinner,.mat-mdc-progress-spinner,.mat-mdc-progress-bar,[class*="spinner"],[class*="loading"],[class*="loader"]';
+              const viewportArea = Math.max(window.innerWidth * window.innerHeight, 1);
+              const busyByMarkup = Array.from(document.querySelectorAll(BUSY_SELECTOR))
+                .some((node) => isVisible(node) && !node.closest(PANEL_SELECTOR));
+              const busyByOverlay = !busyByMarkup && Array.from(document.querySelectorAll('div,section,aside,app-loading,sisbr-loading')).slice(0, 4000).some((node) => {
+                if (node.closest(PANEL_SELECTOR)) return false;
+                const box = node.getBoundingClientRect();
+                if (box.width * box.height < viewportArea * 0.6) return false;
+                const style = getComputedStyle(node);
+                if (!['fixed', 'absolute'].includes(style.position) || style.display === 'none' || style.visibility === 'hidden') return false;
+                const match = /rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)(?:,\\s*([\\d.]+))?\\)/.exec(style.backgroundColor || '');
+                const alpha = match ? (match[4] === undefined ? 1 : Number.parseFloat(match[4])) : 0;
+                return alpha > 0 && alpha < 0.95 && !(node.innerText || '').trim();
+              });
               const page_state = {
+                busy: busyByMarkup || busyByOverlay,
+                results: {
+                  rows: resultRows.length,
+                  empty_state: EMPTY_RESULTS.test((resultsRoot.innerText || '').slice(0, 6000)),
+                  empty_sections: emptySections,
+                },
                 fields, forms, products,
                 product_detail: detailNode ? productInfo(detailNode) : null,
                 cart: {
@@ -2548,6 +3052,8 @@ class PlaywrightExecutor:
                     if isinstance(node_guard, dict):
                         self._ref_semantics[str(element["ref"])]["_node_guard"] = node_guard
         page_state = self._sanitize_page_state(snapshot.get("page_state", {}))
+        if self._on_auth_origin():
+            page_state["authentication_challenge"] = True
         if self._document_response:
             page_state["document_response"] = dict(self._document_response)
         self._observe_cart_expectation(page_state)
@@ -2605,13 +3111,12 @@ class PlaywrightExecutor:
             actual = await (handle or locator).evaluate(
                 self._observed_node_guard_script("""el => {
                   __OBSERVED_NODE_GUARD_JS__
+                  __ELEMENT_NAME_JS__
                   return {
                   tag: el.tagName.toLowerCase(),
                   role: el.getAttribute('role'),
                   type: el.getAttribute('type'),
-                  name: (el.getAttribute('aria-label') || el.innerText
-                    || (el instanceof HTMLInputElement && ['submit','button','reset'].includes(el.type) ? el.value : '')
-                    || el.getAttribute('placeholder') || el.getAttribute('name') || '').trim().slice(0, 300),
+                  name: elementName(el),
                   href: el instanceof HTMLAnchorElement ? el.href : null,
                   aria_haspopup: el.getAttribute('aria-haspopup'),
                   _node_guard: observedNodeGuard(el),
@@ -2635,6 +3140,31 @@ class PlaywrightExecutor:
                     "Observed element changed after the decision; re-observation is required"
                 )
         return _PinnedObservedElement(handle) if handle is not None else locator
+
+    @staticmethod
+    def _same_characters(typed: str, wanted: str) -> bool:
+        """Equal ignoring mask punctuation and case (``01012026`` == ``01/01/2026``)."""
+
+        keep = lambda text: re.sub(r"[^0-9a-z]", "", (text or "").lower())
+        return keep(typed) == keep(wanted)
+
+    async def _retype_if_mask_dropped(self, locator: Any, wanted: str) -> None:
+        """Input masks often ignore the single ``input`` event of ``fill``.
+
+        When the field does not hold what was typed, clear it and type it key by
+        key like a person would. Best effort: the caller still decides, from the
+        observed value, whether the field accepted it.
+        """
+
+        try:
+            if not wanted or self._same_characters(await locator.input_value(), wanted):
+                return
+            await locator.focus()
+            await self._page.keyboard.press("Control+A")
+            await self._page.keyboard.press("Delete")
+            await self._page.keyboard.type(wanted, delay=25)
+        except Exception:
+            return
 
     def _on_request_started(self, request: Any) -> None:
         # Only application API work is relevant to business-result settling.
@@ -2681,7 +3211,7 @@ class PlaywrightExecutor:
                 """([quietMs, timeoutMs, ownPanels]) => new Promise((resolve) => {
                   let quiet = 0;
                   const finish = () => { observer.disconnect(); clearTimeout(quiet); clearTimeout(hard); resolve(); };
-                  // AutoJev's own live panels tick inside the page; they are
+                  // Test Lab's own live panels tick inside the page; they are
                   // not the application settling and must not extend the wait.
                   const ours = (node) => {
                     const el = node && (node.nodeType === 1 ? node : node.parentElement);
@@ -2953,7 +3483,7 @@ class PlaywrightExecutor:
                         "identity": field.get("identity"),
                         "expected_token": self._field_value_token(fill_value),
                     }
-                preview = await self._capture_action_preview(locator, decision)
+                preview = None if decision.fast else await self._capture_action_preview(locator, decision)
                 if preview is not None:
                     execution_evidence["action_preview"] = preview
                 await locator.fill(fill_value, timeout=10_000)
@@ -2961,6 +3491,12 @@ class PlaywrightExecutor:
                     await locator.evaluate(
                         "el => el.setAttribute('data-autojev-secret-mask', 'true')"
                     )
+                else:
+                    await self._retype_if_mask_dropped(locator, fill_value)
+                    if decision.key:
+                        # e.g. Tab: leave the field so the form validates it,
+                        # without a separate action round trip.
+                        await locator.press(decision.key, timeout=5_000)
             elif action == "select":
                 if decision.value is None:
                     raise ValueError("select requires value")
@@ -2972,7 +3508,7 @@ class PlaywrightExecutor:
                         "identity": field.get("identity"),
                         "expected_token": self._field_value_token(decision.value),
                     }
-                preview = await self._capture_action_preview(locator, decision)
+                preview = None if decision.fast else await self._capture_action_preview(locator, decision)
                 if preview is not None:
                     execution_evidence["action_preview"] = preview
                     # Retain the checked node, not a selector that could later
@@ -3074,15 +3610,19 @@ class PlaywrightExecutor:
             else:
                 raise ValueError(f"Unsupported executor action: {action}")
             phase_mark("dispatch")
-            try:
-                await self._page.wait_for_load_state("domcontentloaded", timeout=3_000)
-            except Exception:
-                pass
+            if decision.fast:
+                # Just long enough for the framework to apply the change.
+                await self._page.wait_for_timeout(60)
+            else:
+                try:
+                    await self._page.wait_for_load_state("domcontentloaded", timeout=3_000)
+                except Exception:
+                    pass
             phase_mark("load_state")
             # SPA/API updates often land after the action promise resolves.
             # Observe only after a short stable DOM window so late controls are
             # not missed and refs do not point into a transient render.
-            if action not in {"wait", "screenshot"}:
+            if action not in {"wait", "screenshot"} and not decision.fast:
                 requests_settled = await self._wait_for_action_requests(action_started_monotonic)
                 if not requests_settled:
                     execution_evidence["business_settle"] = {
@@ -3133,7 +3673,12 @@ class PlaywrightExecutor:
             if cart_intent:
                 execution_evidence["business_cart_intent"] = cart_intent
         phase_mark("assertions")
-        observation = await self.observe(decision.action)
+        # Only fast steps change how the page is observed; everything else keeps
+        # the plain call (subclasses and doubles override observe(label)).
+        observation = (
+            await self.observe(decision.action, capture_screenshot=False)
+            if decision.fast else await self.observe(decision.action)
+        )
         phase_mark("observe")
         execution_evidence["phase_ms"] = phase_times
         if cart_intent and previous_cart_expectation is not None and previous_cart_state is not None:

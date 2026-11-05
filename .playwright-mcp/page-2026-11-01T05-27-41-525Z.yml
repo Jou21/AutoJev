@@ -1,0 +1,15 @@
+- generic [ref=f1e3]:
+  - generic [ref=f1e6]:
+    - generic [ref=f1e7]:
+      - text: Login
+      - textbox "Login" [active] [ref=f1e8]:
+        - /placeholder: Informe seu login
+    - generic [ref=f1e9]:
+      - text: Senha
+      - textbox "Senha" [ref=f1e10]:
+        - /placeholder: Informe sua senha
+    - generic [ref=f1e11]:
+      - button "Logar" [ref=f1e12] [cursor=pointer]
+      - button "Alterar senha" [ref=f1e13] [cursor=pointer]
+  - link "Esqueceu a senha?" [ref=f1e15] [cursor=pointer]:
+    - /url: /auth/realms/sisbr/login-actions/reset-credentials?client_id=gestao-cartoraria-sisbr&tab_id=Fs-sOsCyVKw&client_data=eyJydSI6Imh0dHBzOi8vZ2Nhci1nZXN0YW8tY2FydG9yYXJpYS1hbmd1bGFyLWJhY2tvZmZpY2Utbm9kZWpzLmFwcGhvbS5ob21vbG9nYWNhby5jb20uYnIvZ2Nhci1nZXN0YW8tY2FydG9yYXJpYS8iLCJydCI6ImNvZGUiLCJzdCI6IjRlZTg5ZTVlLTc5NjktNGIxNi1iMDBlLWI0MTg4NzJlZjg5YiJ9

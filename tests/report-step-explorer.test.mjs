@@ -293,7 +293,6 @@ function fixture(options = {}) {
   make("h1", "", topbar, "Visão geral").id = "view-title";
   make("p", "", topbar).id = "view-subtitle";
   const toolbar = make("div", "toolbar", topbar);
-  make("button", "", toolbar, "Imprimir").id = "print-report";
   if (!exported) make("button", "", toolbar, "Baixar relatório").id = "download-report";
   for (const view of ["overview", "tests"]) {
     make("section", "report-view", main).dataset.view = view;
@@ -552,14 +551,17 @@ function fixture(options = {}) {
     editor.id = "case-editor";
     editor.showModal = () => editor.setAttribute("open", "");
     editor.close = () => { editor.removeAttribute("open"); editor.dispatch("close"); };
-    for (const [tag, id] of [["h2", "case-editor-title"], ["button", "case-editor-close"], ["ol", "case-editor-steps"], ["p", "case-editor-feedback"], ["button", "case-editor-save"], ["button", "case-editor-rerun"]]) {
-      make(tag, "", editor).id = id;
-    }
-    const palette = make("aside", "case-editor-palette", editor);
+    const editorHeader = make("header", "case-editor-header", editor);
+    const editorLayout = make("div", "case-editor-layout", editor);
+    const palette = make("aside", "case-editor-palette", editorLayout);
     palette.id = "case-editor-palette";
     const database = make("button", "database-step-card", palette, "Consulta em banco de dados");
     database.id = "database-step-card";
     database.setAttribute("draggable", "true");
+    const editorCanvas = make("section", "case-editor-canvas", editorLayout);
+    for (const [tag, id] of [["h2", "case-editor-title"], ["button", "case-editor-close"], ["ol", "case-editor-steps"], ["p", "case-editor-feedback"], ["button", "case-editor-save"], ["button", "case-editor-rerun"]]) {
+      make(tag, "", id === "case-editor-close" ? editorHeader : id === "case-editor-steps" ? editorCanvas : editor).id = id;
+    }
   }
   const theme = make("style", "", document.body, ".report-premium { color: white; }");
   theme.id = "report-theme";
@@ -576,8 +578,6 @@ function fixture(options = {}) {
   window.devicePixelRatio = options.devicePixelRatio || 1;
   window.getComputedStyle = (element) => ({ getPropertyValue: (name) => element.style.getPropertyValue(name) });
   window.setTimeout = () => {};
-  window.printCalls = 0;
-  window.print = () => { window.printCalls += 1; };
   window.openedTabs = [];
   window.open = (...values) => { window.openedTabs.push(values); };
   window.networkCalls = 0;
@@ -825,7 +825,7 @@ test("CT visual editor shows every canonical timeline kind without cloning evide
   assert.equal(list.querySelectorAll("img, figure").length, 0);
   assert.equal(list.querySelectorAll(".case-editor-gap").length, 5);
   assert.ok(list.querySelectorAll(".case-editor-recorded").every((item) => !item.hasAttribute("draggable") && !item.querySelector("button")));
-  assert.match(document.getElementById("case-editor-feedback").textContent, /não executado.*não altera este resultado/);
+  assert.equal(document.getElementById("case-editor-feedback").textContent, "", "No footer greeting is left in the planner");
   assert.deepEqual(originals.map((entry) => entry.outerHTML), before);
   assert.equal(originalImages.length, 2);
   assert.equal(document.getElementById("report-data").textContent, source);
@@ -1269,7 +1269,7 @@ test("HTML exports omit only their download control while preserving the untouch
     assert.equal(html, initialExport, "exports must reuse the initial canonical snapshot, not the currently filtered DOM");
     assert.ok(html.startsWith("<!DOCTYPE html>\n<html"));
     assert.doesNotMatch(html, /id="download-report"/);
-    assert.match(html, /id="print-report"/);
+    assert.doesNotMatch(html, /id="print-report"/);
     assert.match(html, /id="download-csv"/);
     assert.match(html, /id="download-evidence"/);
     assert.match(html, /id="report-theme"/);
@@ -1326,7 +1326,7 @@ test("offline HTML removes the old rerun toolbar before display and download", a
     assert.equal(document.getElementById("case-rerun"), null);
     assert.equal(document.getElementById("case-rerun-feedback"), null);
     assert.ok(document.querySelector("[data-edit-current]"));
-    assert.ok(document.getElementById("print-report"));
+    assert.equal(document.getElementById("print-report"), null);
     document.getElementById("case-next").click();
     assert.equal(document.body.dataset.view, "results");
     assert.equal(window.location.hash, "#view/results/CT002");
@@ -1339,12 +1339,10 @@ test("offline HTML removes the old rerun toolbar before display and download", a
   }
 });
 
-test("an exported report without its HTML download control retains navigation, printing and CSV", async () => {
-  const { document, window, cards, toolbar, topbar, blobs, downloads } = fixture({ exported: true });
+test("an exported report without its HTML download control retains navigation and CSV", async () => {
+  const { document, cards, toolbar, topbar, blobs, downloads } = fixture({ exported: true });
   assert.equal(document.getElementById("download-report"), null);
   assert.equal(toolbar.parentElement, document.getElementById("result-report-actions"));
-  document.getElementById("print-report").click();
-  assert.equal(window.printCalls, 1);
   cards[0].querySelectorAll(".case-step-button")[2].click();
   assert.equal(cards[0].querySelector(".case-selected-title").textContent, "Selecionar ordenação");
   document.getElementById("case-next").click();
@@ -1358,8 +1356,6 @@ test("an exported report without its HTML download control retains navigation, p
   assert.equal(blobs[0].type, "text/csv;charset=utf-8");
   assert.match(await blobs[0].text(), /"CT001"/);
   assert.match(await blobs[0].text(), /"CT002"/);
-  document.getElementById("print-report").click();
-  assert.equal(window.printCalls, 2);
   assert.equal(document.getElementById("download-report"), null);
 });
 
@@ -1422,33 +1418,30 @@ test("named report flows compose with status, search and CSV without changing ev
 test("the full-canvas results view reuses report actions and restores them outside results", () => {
   const { document, toolbar, topbar } = fixture();
   const resultActions = document.getElementById("result-report-actions");
-  const print = document.getElementById("print-report");
   const download = document.getElementById("download-report");
   assert.equal(toolbar.parentElement, resultActions);
   assert.equal(document.querySelectorAll(".toolbar").length, 1);
   for (const view of ["overview", "results", "tests", "results", "overview"]) {
     document.querySelector(`[data-report-nav="${view}"]`).click();
     assert.equal(toolbar.parentElement, view === "results" ? resultActions : topbar);
-    assert.equal(document.getElementById("print-report"), print);
     assert.equal(document.getElementById("download-report"), download);
-    assert.equal(document.querySelectorAll("#print-report").length, 1);
     assert.equal(document.querySelectorAll("#download-report").length, 1);
   }
 });
 
-test("result navigation focuses its visible heading and retains the live print action", () => {
-  const { document, window, toolbar } = fixture({ hash: "#view/overview" });
+test("result navigation focuses its visible heading and keeps the live download action", () => {
+  const { document, toolbar, downloads } = fixture({ hash: "#view/overview" });
   document.querySelector('[data-report-nav="results"]').click();
   const resultTitle = document.getElementById("result-view-title");
   assert.equal(document.activeElement, resultTitle);
   assert.equal(resultTitle.textContent, "Resultado do teste");
   assert.equal(toolbar.parentElement, document.getElementById("result-report-actions"));
-  document.getElementById("print-report").click();
-  assert.equal(window.printCalls, 1, "moving the original toolbar must preserve its event handlers");
+  document.getElementById("download-report").click();
+  assert.equal(downloads.length, 1, "moving the original toolbar must preserve its event handlers");
   document.querySelector('[data-report-nav="overview"]').click();
   assert.equal(document.activeElement, document.getElementById("view-title"));
-  document.getElementById("print-report").click();
-  assert.equal(window.printCalls, 2);
+  document.getElementById("download-report").click();
+  assert.equal(downloads.length, 2);
 });
 
 test("printing preserves the full-canvas toolbar location and selected case", () => {
@@ -2159,4 +2152,580 @@ test("printing from overview prepares markers in unvisited CTs and later navigat
     assert.equal(figure.querySelectorAll(".action-target-overlay").length, 1);
     assert.equal(figure.querySelector("img"), actionImages[index]);
   }
+});
+
+// ---- Planner side panels: the base CT list and the test assistant ---------------------------
+const panelConnection = { app_url: "http://localhost:5173", source_exploration_id: "source-123", api_url: "http://localhost:8000/api" };
+const connectedFixture = (extra = {}) => fixture({ visualEditor: true, runId: "source-123", locationProtocol: "blob:",
+  locationOrigin: "http://localhost:5173", appRuntime: panelConnection, ...extra });
+const flush = async () => { for (let turn = 0; turn < 8; turn += 1) await new Promise((resolve) => setImmediate(resolve)); };
+const jsonResponse = (body, status = 200) => ({ ok: status < 400, status, json: async () => body });
+const ctRows = (document) => document.querySelectorAll(".case-editor-cts-item");
+const pickedStates = (document) => ctRows(document).map((row) => row.dataset.picked);
+const tick = (row, checked) => { const box = row.querySelector("input"); box.checked = checked; box.dispatch("change"); };
+const say = async (document, message) => {
+  document.getElementById("case-assistant-input").value = message;
+  document.getElementById("case-assistant-send").click();
+  await flush();
+};
+const rerunLabel = (document) => document.getElementById("case-editor-rerun").textContent;
+
+test("the rerun planner lists every CT with a result and only the opened CT starts included", () => {
+  const { document, window } = connectedFixture();
+  let requests = 0;
+  window.fetch = async () => { requests += 1; return jsonResponse([]); };
+  document.querySelector("[data-edit-current]").click();
+  assert.equal(requests, 0, "Opening the planner never contacts the server, even with an API address");
+  assert.deepEqual(ctRows(document).map((row) => row.dataset.caseKey), ["0", "1"]);
+  assert.deepEqual(pickedStates(document), ["true", "false"]);
+  assert.deepEqual(ctRows(document).map((row) => row.dataset.active), ["true", "false"]);
+  assert.equal(document.getElementById("case-editor-cts-count").textContent, "1 de 2 na reexecução");
+  assert.equal(rerunLabel(document), "Revisar e confirmar na aplicação →");
+  const layout = document.querySelector(".case-editor-layout");
+  assert.ok(layout.classList.contains("has-panels") && layout.classList.contains("has-assistant"));
+  assert.deepEqual(layout.children.map((child) => child.id), ["case-editor-cts", "case-editor-palette", "", "case-editor-assistant"], "List, palette, script canvas, assistant");
+
+  tick(ctRows(document)[1], true);
+  assert.equal(document.getElementById("case-editor-cts-count").textContent, "2 de 2 na reexecução");
+  assert.equal(rerunLabel(document), "Revisar e confirmar 2 testes na aplicação →");
+  document.getElementById("case-editor-rerun").click();
+  const [target] = window.openedTabs.at(-1);
+  assert.match(target, /^http:\/\/localhost:5173\/#\/planejar-lote\/source-123\?itens=/);
+  assert.deepEqual(JSON.parse(decodeURIComponent(target.split("itens=")[1])),
+    [{ source: "source-123", ct: "CT001" }, { source: "source-123", ct: "CT002" }]);
+
+  tick(ctRows(document)[0], false);
+  tick(ctRows(document)[1], false);
+  assert.equal(document.getElementById("case-editor-rerun").disabled, true, "Nothing is ticked, so nothing can be confirmed");
+  assert.equal(requests, 0);
+  assert.equal(window.networkCalls, 0);
+});
+
+test("the CT list switches the script being planned, filters by search and ticks or clears the visible CTs", () => {
+  const { document, window } = connectedFixture();
+  window.fetch = async () => jsonResponse([]);
+  document.querySelector("[data-edit-current]").click();
+  ctRows(document)[1].querySelector(".case-editor-cts-open").click();
+  assert.match(document.getElementById("case-editor-title").textContent, /CT002/);
+  assert.deepEqual(ctRows(document).map((row) => row.dataset.active), ["false", "true"]);
+  assert.deepEqual(pickedStates(document), ["true", "false"], "Opening a script never includes it in the rerun");
+
+  const search = document.getElementById("case-editor-cts-search");
+  search.value = "carrinho";
+  search.dispatch("input");
+  assert.deepEqual(ctRows(document).map((row) => row.dataset.caseKey), ["1"]);
+  const action = (label) => document.getElementById("case-editor-cts").querySelectorAll("button").find((item) => item.textContent === label);
+  action("Marcar todos").click();
+  assert.equal(document.getElementById("case-editor-cts-count").textContent, "2 de 2 na reexecução", "Only the visible CT was ticked");
+  action("Limpar").click();
+  assert.equal(document.getElementById("case-editor-cts-count").textContent, "1 de 2 na reexecução");
+  search.value = "inexistente";
+  search.dispatch("input");
+  assert.match(document.querySelector(".case-editor-cts-empty").textContent, /Nenhum CT encontrado/);
+});
+
+test("the assistant sends the ticked CTs and the chosen model, and its suggestions apply only after acceptance", async () => {
+  const { document, window } = connectedFixture();
+  const calls = [];
+  window.fetch = async (url, options = {}) => {
+    calls.push({ url, options });
+    if (url.endsWith("/models")) return jsonResponse([
+      { id: "m1", provider_id: "p1", provider_name: "Prov", label: "Modelo 1", enabled: true },
+      { id: "img", provider_id: "p1", enabled: true, output_modalities: ["image"] },
+      { id: "off", provider_id: "p1", enabled: false },
+    ]);
+    return jsonResponse({ reply: "Sugiro **CT002** e <script>alert(1)</script>.", selected_case_ids: ["CT002", "CT404"], new_cases: [{ title: "novo" }] });
+  };
+  document.querySelector("[data-edit-current]").click();
+  await flush();
+  assert.equal(calls.length, 0, "Nothing is requested until the assistant is used");
+  const trigger = document.getElementById("case-assistant-model");
+  const popup = document.getElementById("case-assistant-model-popup");
+  const search = document.getElementById("case-assistant-model-search");
+  const optionLabels = () => document.getElementById("case-assistant-model-list").children
+    .filter((item) => item.getAttribute("role") === "option").map((option) => option.textContent);
+  assert.equal(trigger.textContent, "Modelo padrão da base");
+  assert.equal(popup.hidden, true);
+  document.getElementById("case-assistant-input").dispatch("focusin");
+  document.getElementById("case-assistant-input").dispatch("focusin");
+  await flush();
+  assert.equal(calls.filter((call) => call.url.endsWith("/models")).length, 1, "The model list is requested once");
+
+  trigger.click();
+  assert.equal(popup.hidden, false);
+  assert.equal(trigger.getAttribute("aria-expanded"), "true");
+  assert.deepEqual(optionLabels(), ["Modelo padrão da base", "Prov: Modelo 1"], "Image-only and disabled models are not offered");
+  search.value = "prov mod";
+  search.dispatch("input");
+  assert.deepEqual(optionLabels(), ["Prov: Modelo 1"], "Every typed word must match");
+  search.value = "zzz";
+  search.dispatch("input");
+  assert.deepEqual(optionLabels(), []);
+  assert.match(document.getElementById("case-assistant-model-list").textContent, /Nenhum modelo encontrado para “zzz”/);
+  search.value = "prov";
+  search.dispatch("input");
+  search.dispatch("keydown", { key: "Enter" });
+  assert.equal(popup.hidden, true);
+  assert.equal(trigger.textContent, "Prov: Modelo 1");
+  assert.equal(trigger.getAttribute("aria-label"), "Modelo do assistente: Prov: Modelo 1");
+  assert.equal(calls.filter((call) => call.url.endsWith("/models")).length, 1, "Reopening never asks again");
+  await say(document, "Sugira testes para executar novamente");
+
+  const request = calls.find((call) => call.url.endsWith("/assistant"));
+  assert.equal(request.url, "http://localhost:8000/api/test-suites/source-123/assistant");
+  assert.equal(request.options.method, "POST");
+  assert.deepEqual(JSON.parse(request.options.body), {
+    messages: [{ role: "user", content: "Sugira testes para executar novamente" }],
+    selected_case_ids: ["CT001"], llm: { provider_id: "p1", model_id: "m1" },
+  });
+  const transcript = document.getElementById("case-assistant-transcript");
+  assert.equal(document.querySelector(".case-assistant-message p strong").textContent, "CT002", "Bold is rendered as an element");
+  assert.doesNotMatch(transcript.outerHTML, /<script/, "Model text is never inserted as markup");
+  assert.match(transcript.textContent, /1 teste novo foi proposto.*não são criados aqui/);
+  const card = document.querySelector(".case-assistant-suggestion");
+  assert.match(card.textContent, /Sugestão: CT002/);
+  assert.doesNotMatch(card.textContent, /CT404/, "A CT outside the report is never offered");
+  assert.deepEqual(pickedStates(document), ["true", "false"], "A suggestion is not applied until it is accepted");
+
+  card.querySelector("button").click();
+  assert.deepEqual(pickedStates(document), ["true", "true"]);
+  assert.equal(document.querySelector(".case-assistant-suggestion button").disabled, true);
+  assert.equal(document.querySelector(".case-assistant-suggestion button").textContent, "Incluído na reexecução");
+  assert.equal(rerunLabel(document), "Revisar e confirmar 2 testes na aplicação →");
+  assert.equal(window.openedTabs.length, 0, "Accepting a suggestion never opens or starts anything");
+
+  const toggle = document.getElementById("case-editor-assistant-toggle");
+  toggle.click();
+  assert.equal(document.getElementById("case-editor").dataset.assistantOpen, "true");
+  assert.equal(toggle.getAttribute("aria-expanded"), "true");
+});
+
+test("explicit CT commands skip the model and API failures leave the plan untouched", async () => {
+  const { document, window } = connectedFixture();
+  const sent = [];
+  let mode = "ok";
+  window.fetch = async (url, options = {}) => {
+    if (url.endsWith("/models")) return jsonResponse([]);
+    sent.push(JSON.parse(options.body));
+    if (mode === "409") return jsonResponse({ detail: "Provedor indisponível." }, 409);
+    if (mode === "network") throw new TypeError("Failed to fetch");
+    if (mode === "422") { mode = "ok"; return jsonResponse({ detail: "A seleção contém CTs de outro conjunto." }, 422); }
+    return jsonResponse({ reply: "Pronto.", selected_case_ids: [] });
+  };
+  document.querySelector("[data-edit-current]").click();
+  await flush();
+  const lastReply = () => document.querySelectorAll('.case-assistant-message[data-role="assistant"] p').at(-1).textContent;
+
+  await say(document, "adicione CT002");
+  assert.equal(sent.length, 0, "A plain command is a deterministic edit, not a model call");
+  assert.deepEqual(pickedStates(document), ["true", "true"]);
+  assert.match(lastReply(), /CT002 foi incluído na reexecução.*Nada foi executado/);
+  await say(document, "inclua CT002 e CT999");
+  assert.equal(sent.length, 0);
+  assert.match(lastReply(), /CT002 já estava incluído.*Não encontrei CT999/);
+
+  mode = "409";
+  await say(document, "o que falta cobrir?");
+  assert.equal(lastReply(), "Provedor indisponível.");
+  assert.equal(document.querySelectorAll('.case-assistant-message[data-error="true"]').length, 1);
+  mode = "network";
+  await say(document, "e agora?");
+  assert.match(lastReply(), /Não foi possível falar com a aplicação Test Lab/);
+  assert.deepEqual(pickedStates(document), ["true", "true"], "Failures never change the selection");
+  assert.equal(document.getElementById("case-assistant-send").disabled, false, "The chat is usable again after a failure");
+
+  mode = "422";
+  const before = sent.length;
+  await say(document, "tente de novo");
+  assert.deepEqual(sent.slice(before).map((body) => body.selected_case_ids), [["CT001", "CT002"], []], "A rejected selection is retried without it");
+  assert.ok(sent.at(-1).messages.every((message) => !/Provedor indisponível|falar com a aplicação/.test(message.content)), "Errors are not sent back as conversation");
+  assert.ok(sent.at(-1).messages.length <= 12);
+  assert.equal(window.openedTabs.length, 0);
+});
+
+test("a connection without an API address keeps the CT list but offers no assistant and never uses the network", () => {
+  const { document, window } = fixture({ visualEditor: true, runId: "source-123", locationProtocol: "blob:",
+    locationOrigin: "http://localhost:5173", appRuntime: { app_url: "http://localhost:5173", source_exploration_id: "source-123" } });
+  document.querySelector("[data-edit-current]").click();
+  assert.equal(document.getElementById("case-editor-assistant"), null);
+  assert.equal(document.getElementById("case-editor-assistant-toggle"), null);
+  assert.equal(ctRows(document).length, 2);
+  assert.equal(window.networkCalls, 0);
+});
+
+test("Reexecutar testes in the tests view opens the planner with every CT included, and exists only when connected", () => {
+  const { document, window } = connectedFixture();
+  window.fetch = async () => jsonResponse([]);
+  const button = document.getElementById("tests-rerun");
+  assert.ok(button, "The app-connected report has the tests-view action");
+  button.click();
+  assert.deepEqual(pickedStates(document), ["true", "true"]);
+  assert.equal(rerunLabel(document), "Revisar e confirmar 2 testes na aplicação →");
+  assert.equal(document.getElementById("case-editor").hasAttribute("open"), true);
+
+  const offline = fixture({ visualEditor: true, runId: "source-123" });
+  assert.equal(offline.document.getElementById("tests-rerun"), null, "Downloaded and offline reports never get it");
+});
+
+test("the model picker filters with the keyboard, closes on Escape or an outside press, and retries after a failure", async () => {
+  const { document, window } = connectedFixture();
+  let models = null;
+  const modelRequests = [];
+  window.fetch = async (url) => {
+    modelRequests.push(url);
+    return models ? jsonResponse(models) : jsonResponse({}, 500);
+  };
+  document.querySelector("[data-edit-current]").click();
+  const trigger = document.getElementById("case-assistant-model");
+  const popup = document.getElementById("case-assistant-model-popup");
+  const search = document.getElementById("case-assistant-model-search");
+  const list = document.getElementById("case-assistant-model-list");
+
+  trigger.click();
+  await flush();
+  assert.match(list.textContent, /Não foi possível carregar a lista de modelos.*padrão da base continua disponível/);
+  assert.equal(list.children.filter((item) => item.getAttribute("role") === "option").length, 1, "The base model stays selectable");
+  search.dispatch("keydown", { key: "Escape" });
+  assert.equal(popup.hidden, true);
+  assert.equal(document.getElementById("case-editor").hasAttribute("open"), true, "Escape closes only the picker");
+
+  models = Array.from({ length: 200 }, (_, index) => ({ id: "model-" + index, provider_id: "p", provider_name: "OpenRouter", label: "Modelo " + index, enabled: true }));
+  trigger.click();
+  await flush();
+  assert.equal(modelRequests.length, 2, "A failed list is requested again on the next open");
+  assert.equal(list.children.filter((item) => item.getAttribute("role") === "option").length, 150);
+  assert.match(list.textContent, /Mostrando 150 de 201\. Continue digitando/);
+  search.value = "modelo 17";
+  search.dispatch("input");
+  assert.deepEqual(list.children.map((item) => item.textContent), ["OpenRouter: Modelo 17", "OpenRouter: Modelo 117", ...Array.from({ length: 10 }, (_, index) => "OpenRouter: Modelo 17" + index)]);
+  search.dispatch("keydown", { key: "ArrowDown" });
+  search.dispatch("keydown", { key: "ArrowDown" });
+  assert.deepEqual(list.children.map((item) => item.dataset.active), ["false", "false", "true", ...Array(9).fill("false")]);
+  search.dispatch("keydown", { key: "ArrowUp" });
+  search.dispatch("keydown", { key: "Enter" });
+  assert.equal(trigger.textContent, "OpenRouter: Modelo 117", "Down, down, up lands on the second match");
+
+  trigger.click();
+  assert.equal(popup.hidden, false);
+  assert.equal(list.children.find((item) => item.getAttribute("aria-selected") === "true").textContent, "OpenRouter: Modelo 117", "The chosen model is marked");
+  document.getElementById("case-editor-steps").dispatch("pointerdown");
+  assert.equal(popup.hidden, true, "Pressing anywhere else closes the picker");
+  trigger.click();
+  popup.dispatch("pointerdown");
+  assert.equal(popup.hidden, false, "Pressing inside the picker keeps it open");
+  document.getElementById("case-editor").dispatch("cancel");
+  assert.equal(popup.hidden, true, "The dialog Escape closes the picker first");
+  assert.equal(document.getElementById("case-editor").hasAttribute("open"), true);
+  assert.equal(window.openedTabs.length, 0);
+});
+
+test("pressing and dragging the empty dotted canvas slides the script, while cards and buttons keep their own behaviour", () => {
+  const { document, window } = connectedFixture();
+  window.fetch = async () => jsonResponse([]);
+  document.querySelector("[data-edit-current]").click();
+  const canvas = document.querySelector(".case-editor-canvas");
+  const steps = document.getElementById("case-editor-steps");
+  const captured = [];
+  canvas.setPointerCapture = (id) => captured.push(id);
+  canvas.releasePointerCapture = (id) => captured.push("release:" + id);
+  const press = (target, properties = {}) => target.dispatch("pointerdown", { button: 0, pointerId: 7, pointerType: "mouse", clientX: 500, clientY: 200, ...properties });
+  const move = (x, y = 200, pointerId = 7) => canvas.dispatch("pointermove", { pointerId, clientX: x, clientY: y });
+
+  steps.scrollLeft = 300;
+  steps.scrollTop = 20;
+  const down = press(steps);
+  assert.equal(down.defaultPrevented, true, "Starting a drag never selects text");
+  assert.equal(canvas.dataset.panning, "true");
+  assert.deepEqual(captured, [7]);
+  move(420, 190);
+  assert.equal(steps.scrollLeft, 380, "Dragging left reveals what is to the right");
+  assert.equal(steps.scrollTop, 30, "It follows the pointer vertically too");
+  move(560);
+  assert.equal(steps.scrollLeft, 240);
+  move(100, 200, 99);
+  assert.equal(steps.scrollLeft, 240, "Another pointer is ignored");
+  canvas.dispatch("pointerup", { pointerId: 7 });
+  assert.equal(canvas.dataset.panning, undefined);
+  assert.deepEqual(captured, [7, "release:7"]);
+  move(0);
+  assert.equal(steps.scrollLeft, 240, "Nothing moves after release");
+
+  const card = document.createElement("li");
+  card.className = "case-editor-step";
+  steps.appendChild(card);
+  const control = document.createElement("button");
+  card.appendChild(control);
+  const gap = document.createElement("li");
+  gap.className = "case-editor-gap";
+  steps.appendChild(gap);
+  for (const [label, target, properties] of [["a card", card, {}], ["a button", control, {}], ["touch", steps, { pointerType: "touch" }], ["the right button", steps, { button: 2 }]]) {
+    assert.equal(press(target, properties).defaultPrevented, undefined, label + " does not start a drag");
+    assert.equal(canvas.dataset.panning, undefined, label);
+  }
+  press(gap);
+  assert.equal(canvas.dataset.panning, "true", "The strip between cards is also empty background");
+  canvas.dispatch("pointercancel", { pointerId: 7 });
+  assert.equal(canvas.dataset.panning, undefined);
+});
+
+test("the planner header holds the back arrow, the CT title and the actions, with no banner, footer or list hint", () => {
+  const { document, window } = connectedFixture();
+  window.fetch = async () => jsonResponse([]);
+  document.querySelector("[data-edit-current]").click();
+  const dialog = document.getElementById("case-editor");
+  const header = dialog.querySelector(".case-editor-header");
+  assert.deepEqual(header.children.map((child) => child.className), ["button button-ghost case-editor-back", "case-editor-header-title", "case-editor-header-actions"]);
+  const back = document.getElementById("case-editor-close");
+  assert.equal(back.parentElement, header);
+  assert.equal(back.textContent, "←");
+  assert.equal(back.getAttribute("aria-label"), "Voltar ao resultado");
+  const title = document.getElementById("case-editor-title");
+  assert.equal(title.children[0].className, "result-sr-only", "The screen name is kept for screen readers only");
+  assert.equal(title.children[1].textContent, "CT001 · Ordenação de produtos");
+  assert.equal(document.getElementById("case-editor-feedback").parentElement, title.parentElement);
+  assert.equal(document.getElementById("case-editor-feedback").textContent, "");
+  const actions = header.children[2];
+  assert.deepEqual(actions.children.map((child) => child.id), ["case-editor-assistant-toggle", "case-editor-save", "case-editor-rerun"]);
+  assert.equal(document.getElementById("case-editor-rerun").className.includes("button-primary"), true);
+  assert.equal(dialog.querySelector(".case-editor-footer"), null);
+  assert.equal(dialog.querySelector(".case-editor-notice"), null);
+  assert.equal(dialog.querySelector(".page-kicker"), null);
+  assert.equal(document.getElementById("case-editor-cts-hint"), null);
+  back.click();
+  assert.equal(dialog.hasAttribute("open"), false, "The arrow returns to the result");
+});
+
+test("Reexecutar testes sits on the overview and tests views only, and is gone from every other view", () => {
+  const states = {};
+  for (const view of ["overview", "tests", "results", "journey"]) {
+    const { document } = connectedFixture({ journey: true, hash: "#view/" + view });
+    states[view] = document.getElementById("tests-rerun").hidden;
+  }
+  assert.deepEqual(states, { overview: false, tests: false, results: true, journey: true });
+  const { document, window } = connectedFixture({ hash: "#view/overview" });
+  window.fetch = async () => jsonResponse([]);
+  document.getElementById("tests-rerun").click();
+  assert.deepEqual(pickedStates(document), ["true", "true"], "From the overview it also starts with every CT included");
+  assert.equal(document.getElementById("print-report"), null, "There is no print button");
+});
+
+// ---- Step details below the script, run order of the ticked CTs, tests view layout -------------
+const layoutRows = (document) => ctRows(document).forEach((row, index) => { row.getBoundingClientRect = () => ({ top: index * 100, height: 100 }); });
+const pointerOn = (target, type, y, extra = {}) => target.dispatch(type, { button: 0, pointerId: 3, pointerType: "mouse", clientX: 40, clientY: y, ...extra });
+const chipTexts = (document) => ctRows(document).map((row) => row.querySelector(".case-editor-cts-order").textContent);
+const rowKeys = (document) => ctRows(document).map((row) => row.dataset.caseKey);
+const openButton = (row) => row.querySelector(".case-editor-cts-open");
+const handedCts = (window) => JSON.parse(decodeURIComponent(window.openedTabs.at(-1)[0].split("itens=")[1])).map((item) => item.ct);
+
+test("clicking a recorded card opens that step below the script as a copy, leaving the original evidence untouched", () => {
+  const { document, window, originals } = connectedFixture();
+  window.fetch = async () => jsonResponse([]);
+  const wrapper = document.createElement("button");
+  wrapper.className = "step-preview-button";
+  wrapper.id = "preview-wrapper";
+  const photo = document.createElement("img");
+  photo.setAttribute("src", "blob:capture");
+  wrapper.appendChild(photo);
+  const tool = document.createElement("button");
+  tool.className = "evidence-icon-button";
+  originals[0].append(wrapper, tool);
+  const before = originals.map((entry) => entry.outerHTML);
+  document.querySelector("[data-edit-current]").click();
+  const list = document.getElementById("case-editor-steps");
+  const panel = document.getElementById("case-editor-detail");
+  const cards = () => list.querySelectorAll(".case-editor-recorded");
+  assert.equal(panel.hidden, true, "Nothing is open until a card is clicked");
+  assert.equal(panel.parentElement, document.querySelector(".case-editor-canvas"));
+  assert.ok(cards().every((card) => card.getAttribute("role") === "button" && card.tabIndex === 0 && card.getAttribute("aria-pressed") === "false"));
+  assert.ok(cards().every((card) => !card.querySelector("button")), "The cards themselves stay light and button-free");
+
+  cards()[0].click();
+  assert.equal(panel.hidden, false);
+  assert.equal(cards()[0].getAttribute("aria-pressed"), "true");
+  assert.equal(panel.querySelector("h4").textContent, "Antes da ação");
+  assert.match(panel.querySelector(".case-editor-detail-titles small").textContent, /^Etapa 01 de 03 · Registro da página$/);
+  const copy = panel.querySelector(".timeline-entry");
+  assert.notEqual(copy, originals[0], "The panel shows a copy");
+  assert.equal(copy.hidden, false);
+  assert.equal(copy.id, "");
+  assert.equal(copy.querySelector("p").textContent, "Conteúdo original 0/0.");
+  assert.equal(panel.querySelectorAll("img").length, 2, "The capture and the unwrapped preview image are both shown");
+  assert.equal(panel.querySelectorAll(".case-editor-detail-body button").length, 0, "Viewer buttons are dropped, captures kept");
+  assert.equal(panel.querySelector("#preview-wrapper"), null);
+  assert.equal(list.querySelectorAll("img, figure").length, 0, "The strip never holds evidence");
+  assert.deepEqual(originals.map((entry) => entry.outerHTML), before, "The original evidence is not moved or changed");
+
+  cards()[0].click();
+  assert.equal(panel.hidden, true, "Clicking the open card again closes it");
+  assert.equal(cards()[0].getAttribute("aria-pressed"), "false");
+  cards()[1].click();
+  assert.equal(panel.querySelector("h4").textContent, "Selecionar ordenação");
+  assert.deepEqual(cards().map((card) => card.getAttribute("aria-pressed")), ["false", "true", "false"], "Only one step is open at a time");
+  const enter = cards()[2].dispatch("keydown", { key: "Enter" });
+  assert.equal(enter.defaultPrevented, true);
+  assert.equal(panel.querySelector("h4").textContent, "Conferir resultado");
+  cards()[1].dispatch("keydown", { key: " " });
+  assert.equal(panel.querySelector("h4").textContent, "Selecionar ordenação");
+  cards()[1].dispatch("keydown", { key: "a" });
+  assert.equal(panel.querySelector("h4").textContent, "Selecionar ordenação", "Other keys do nothing");
+
+  panel.querySelector(".case-editor-detail-close").click();
+  assert.equal(panel.hidden, true);
+  assert.equal(document.activeElement, cards()[1], "Closing returns to the card");
+
+  cards()[0].click();
+  ctRows(document)[1].querySelector(".case-editor-cts-open").click();
+  assert.equal(panel.hidden, true, "Switching CT starts without an open step");
+  assert.equal(list.querySelectorAll('[aria-pressed="true"]').length, 0);
+});
+
+test("the CT list numbers the run order, and ticking or unticking renumbers it", () => {
+  const { document, window } = connectedFixture();
+  window.fetch = async () => jsonResponse([]);
+  document.querySelector("[data-edit-current]").click();
+  assert.deepEqual(chipTexts(document), ["1", ""]);
+  assert.deepEqual(ctRows(document).map((row) => row.querySelector(".case-editor-cts-order").dataset.empty), ["false", "true"]);
+  tick(ctRows(document)[1], true);
+  assert.deepEqual(chipTexts(document), ["1", "2"]);
+  tick(ctRows(document)[0], false);
+  assert.deepEqual(chipTexts(document), ["", "1"]);
+  assert.match(openButton(ctRows(document)[1]).getAttribute("aria-label"), /Verificar carrinho\. Posição 1 de 1 na ordem de execução$/);
+  assert.doesNotMatch(openButton(ctRows(document)[0]).getAttribute("aria-label"), /Posição/);
+});
+
+test("pressing and dragging a CT card changes the run order, which is what the app receives", () => {
+  const { document, window } = connectedFixture();
+  window.fetch = async () => jsonResponse([]);
+  document.querySelector("[data-edit-current]").click();
+  tick(ctRows(document)[1], true);
+  layoutRows(document);
+  const list = document.getElementById("case-editor-cts-list");
+
+  // A short movement is still a click.
+  pointerOn(openButton(ctRows(document)[1]), "pointerdown", 150);
+  pointerOn(list, "pointermove", 153);
+  assert.equal(list.dataset.sorting, undefined);
+  pointerOn(list, "pointerup", 153);
+  openButton(ctRows(document)[1]).click();
+  assert.match(document.getElementById("case-editor-title").textContent, /CT002/, "A click without dragging still opens the CT");
+  openButton(ctRows(document)[0]).click();
+  assert.match(document.getElementById("case-editor-title").textContent, /CT001/);
+
+  // Ticking and touch scrolling never start a drag.
+  pointerOn(ctRows(document)[0].querySelector("input"), "pointerdown", 50);
+  pointerOn(list, "pointermove", 250);
+  assert.equal(list.dataset.sorting, undefined);
+  pointerOn(openButton(ctRows(document)[0]), "pointerdown", 50, { pointerType: "touch" });
+  pointerOn(list, "pointermove", 250, { pointerType: "touch" });
+  assert.equal(list.dataset.sorting, undefined, "Touch drags only from the grip");
+  layoutRows(document);
+  pointerOn(ctRows(document)[0].querySelector(".case-editor-cts-grip"), "pointerdown", 50, { pointerType: "touch" });
+  pointerOn(list, "pointermove", 250, { pointerType: "touch" });
+  assert.equal(list.dataset.sorting, "true");
+  pointerOn(list, "pointercancel", 250, { pointerType: "touch" });
+  assert.deepEqual(rowKeys(document), ["0", "1"], "A cancelled drag changes nothing");
+  assert.equal(list.dataset.sorting, undefined);
+
+  // Drag the second CT above the first.
+  layoutRows(document);
+  pointerOn(openButton(ctRows(document)[1]), "pointerdown", 150);
+  pointerOn(list, "pointermove", 140);
+  assert.equal(list.dataset.sorting, "true");
+  assert.equal(ctRows(document)[1].dataset.dragging, "true");
+  assert.equal(ctRows(document)[0].dataset.drop, "after", "Below the first card's middle it would stay where it is");
+  pointerOn(list, "pointermove", 20);
+  assert.equal(ctRows(document)[0].dataset.drop, "before");
+  pointerOn(list, "pointerup", 20);
+  assert.deepEqual(rowKeys(document), ["1", "0"]);
+  assert.deepEqual(chipTexts(document), ["1", "2"]);
+  assert.match(document.getElementById("case-editor-feedback").textContent, /CT002 agora é o 1º na ordem de execução/);
+  assert.equal(list.dataset.sorting, undefined);
+  assert.equal(ctRows(document).filter((row) => row.dataset.dragging || row.dataset.drop).length, 0);
+
+  // The click that ends a drag must not open the card.
+  const moved = openButton(ctRows(document)[0]);
+  const titleBefore = document.getElementById("case-editor-title").textContent;
+  moved.click();
+  assert.equal(document.getElementById("case-editor-title").textContent, titleBefore);
+  moved.click();
+  assert.match(document.getElementById("case-editor-title").textContent, /CT002/);
+
+  document.getElementById("case-editor-rerun").click();
+  assert.deepEqual(handedCts(window), ["CT002", "CT001"], "The app receives the CTs in the new run order");
+
+  // Dropping below the last card puts it at the end.
+  layoutRows(document);
+  pointerOn(openButton(ctRows(document)[0]), "pointerdown", 40);
+  pointerOn(list, "pointermove", 190);
+  assert.equal(ctRows(document)[1].dataset.drop, "after");
+  pointerOn(list, "pointerup", 190);
+  assert.deepEqual(rowKeys(document), ["0", "1"]);
+});
+
+test("Reordenar lists only the CTs that will run, with arrows and Alt + arrow keys to move them", () => {
+  const { document, window } = connectedFixture();
+  window.fetch = async () => jsonResponse([]);
+  document.querySelector("[data-edit-current]").click();
+  tick(ctRows(document)[1], true);
+  const panel = document.getElementById("case-editor-cts");
+  const toggle = document.getElementById("case-editor-cts-reorder");
+  assert.equal(toggle.textContent, "⇅ Reordenar");
+  assert.equal(toggle.getAttribute("aria-pressed"), "false");
+  assert.equal(document.querySelectorAll(".case-editor-cts-move").length, 0);
+
+  tick(ctRows(document)[1], false);
+  toggle.click();
+  assert.equal(panel.dataset.reorder, "true");
+  assert.equal(toggle.textContent, "✓ Concluir ordem");
+  assert.equal(toggle.getAttribute("aria-pressed"), "true");
+  assert.deepEqual(rowKeys(document), ["0"], "Only the ticked CT is listed");
+  toggle.click();
+  tick(ctRows(document)[1], true);
+  toggle.click();
+  assert.deepEqual(rowKeys(document), ["0", "1"]);
+  const arrows = () => ctRows(document).map((row) => ["up", "down"].map((direction) => row.querySelector('.case-editor-cts-move[data-direction="' + direction + '"]').disabled));
+  assert.deepEqual(arrows(), [[true, false], [false, true]], "The first cannot go up, the last cannot go down");
+
+  ctRows(document)[0].querySelector('.case-editor-cts-move[data-direction="down"]').click();
+  assert.deepEqual(rowKeys(document), ["1", "0"]);
+  assert.deepEqual(chipTexts(document), ["1", "2"]);
+  assert.match(document.getElementById("case-editor-feedback").textContent, /CT001 agora é o 2º/);
+  assert.equal(document.activeElement.dataset.direction, "up", "Focus follows the moved CT to a usable arrow");
+  ctRows(document)[1].querySelector('.case-editor-cts-move[data-direction="up"]').click();
+  assert.deepEqual(rowKeys(document), ["0", "1"]);
+
+  tick(ctRows(document)[1], false);
+  assert.deepEqual(rowKeys(document), ["0"], "Unticking removes it from the run queue shown");
+  toggle.click();
+  assert.equal(panel.dataset.reorder, "false");
+  assert.deepEqual(rowKeys(document), ["0", "1"], "Leaving the mode brings the whole list back");
+
+  const second = openButton(ctRows(document)[1]);
+  assert.equal(second.dispatch("keydown", { key: "ArrowUp", altKey: false }).defaultPrevented, undefined);
+  assert.equal(second.dispatch("keydown", { key: "ArrowUp", altKey: true }).defaultPrevented, true);
+  assert.deepEqual(rowKeys(document), ["1", "0"], "Alt + ↑ moves the focused CT up");
+  assert.equal(document.activeElement, openButton(ctRows(document)[0]));
+  openButton(ctRows(document)[0]).dispatch("keydown", { key: "ArrowDown", altKey: true });
+  assert.deepEqual(rowKeys(document), ["0", "1"]);
+
+  toggle.click();
+  document.getElementById("case-editor-close").click();
+  document.querySelector("[data-edit-current]").click();
+  assert.equal(document.getElementById("case-editor-cts").dataset.reorder, "false", "The planner always opens on the normal list");
+  assert.equal(window.openedTabs.length, 0);
+});
+
+test("the tests view puts the functional flows beside the table, and Reexecutar testes mirrors the results button", () => {
+  assert.match(reportCss, /@media screen and \(min-width: 1360px\)\s*\{\s*\.report-view\[data-view="tests"\]:not\(\[hidden\]\)\s*\{[^}]*display: grid;[^}]*grid-template-columns: clamp\(280px, 22vw, 340px\) minmax\(0, 1fr\);/);
+  assert.match(reportCss, /\.report-view\[data-view="tests"\] > \.functional-flows-panel\s*\{[^}]*grid-column: 1;[^}]*position: sticky;/);
+  assert.match(reportCss, /\.report-view\[data-view="tests"\] \.functional-flow-grid\s*\{\s*grid-template-columns: minmax\(0, 1fr\);/);
+  assert.match(reportCss, /\.report-topbar \.toolbar \.button\s*\{\s*min-height: 34px;\s*font-size: 11px;\s*\}/);
+  const { document } = connectedFixture();
+  const rerun = document.getElementById("tests-rerun");
+  assert.equal(rerun.className, "button button-rerun");
+  assert.equal(rerun.children.length, 1, "Only the arrow is a span, so the label is not enlarged like the icon");
+  assert.equal(rerun.children[0].textContent, "↻");
+  assert.equal(rerun.children[0].getAttribute("aria-hidden"), "true");
+  assert.equal(rerun.firstChild, rerun.children[0]);
+  assert.match(rerun.textContent, /Reexecutar testes/);
 });

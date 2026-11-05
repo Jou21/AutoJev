@@ -30,28 +30,28 @@ export async function generateMetadata(): Promise<Metadata> {
   return {
     metadataBase: origin,
     title: {
-      default: "AutoJev — Exploração inteligente de aplicações",
-      template: "%s · AutoJev",
+      default: "Test Lab — Exploração inteligente de aplicações",
+      template: "%s · Test Lab",
     },
     description:
       "Agente autônomo de QA para explorar aplicações web, registrar evidências e transformar descobertas em cenários de teste.",
-    applicationName: "AutoJev",
+    applicationName: "Test Lab",
     keywords: ["QA", "testes", "Playwright", "automação", "exploratório"],
     openGraph: {
-      title: "AutoJev — QA autônomo, evidência real",
+      title: "Test Lab — QA autônomo, evidência real",
       description:
-        "O AutoJev decide. Playwright executa. Sua LLM auxiliar interpreta as evidências.",
+        "O Test Lab decide. Playwright executa. Sua LLM auxiliar interpreta as evidências.",
       type: "website",
       locale: "pt_BR",
       images: [
-        { url: socialImage, width: 1774, height: 887, alt: "AutoJev" },
+        { url: socialImage, width: 1774, height: 887, alt: "Test Lab" },
       ],
     },
     twitter: {
       card: "summary_large_image",
-      title: "AutoJev — QA autônomo, evidência real",
+      title: "Test Lab — QA autônomo, evidência real",
       description:
-        "O AutoJev decide. Playwright executa. Sua LLM auxiliar interpreta as evidências.",
+        "O Test Lab decide. Playwright executa. Sua LLM auxiliar interpreta as evidências.",
       images: [socialImage],
     },
     icons: {

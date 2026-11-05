@@ -1,0 +1,145 @@
+- main [ref=f2e6]:
+  - navigation [ref=f2e8]:
+    - generic [ref=f2e10]:
+      - generic [ref=f2e11] [cursor=pointer]
+      - generic [ref=f2e13] [cursor=pointer]:
+        - text: Gestão Cartorária
+        - generic [ref=f2e14]: "| 3.5.3"
+    - generic [ref=f2e15]:
+      - generic [ref=f2e17]:
+        - generic [ref=f2e18] [cursor=pointer]: arrow_drop_down
+        - generic [ref=f2e22] [cursor=pointer]:
+          - text: Cooperativa
+          - heading "0300" [level=6] [ref=f2e23]
+      - generic [ref=f2e25]:
+        - generic "Avaliação" [ref=f2e29] [cursor=pointer]: star
+        - generic [ref=f2e31]:
+          - generic [ref=f2e33] [cursor=pointer]: 
+          - generic [ref=f2e131]:
+            - heading "Avalie esse aplicativo" [level=6] [ref=f2e132]
+            - paragraph [ref=f2e133]: Sua avaliação é muito importante para nós.
+            - generic [ref=f2e134]:
+              - generic [ref=f2e135] [cursor=pointer]: 󰓒
+              - generic [ref=f2e137] [cursor=pointer]: 󰓒
+              - generic [ref=f2e139] [cursor=pointer]: 󰓒
+              - generic [ref=f2e141] [cursor=pointer]: 󰓒
+              - generic [ref=f2e143] [cursor=pointer]: 󰓒
+            - text: Comentário
+            - textbox [ref=f2e145]
+            - button "Publicar" [ref=f2e147] [cursor=pointer]
+      - generic "Bandeja de Relatórios" [ref=f2e38] [cursor=pointer]: printer
+  - complementary [ref=f2e42]:
+    - generic [ref=f2e44] [cursor=pointer]:
+      - generic [ref=f2e45]: 󰋜
+      - text: menu.MNUHOME1
+    - generic [ref=f2e46]: Liberações
+    - generic [ref=f2e49] [cursor=pointer]:
+      - generic [ref=f2e50]: 󰐕
+      - text: Cadastro
+    - generic [ref=f2e51]: Consulta
+    - generic [ref=f2e54] [cursor=pointer]:
+      - text: Painel de Operações
+      - generic [ref=f2e55]:
+        - heading "Painel de Operações" [level=6] [ref=f2e56]
+        - generic [ref=f2e59]:
+          - generic [ref=f2e60]: Consulta Reapontamento/Desistência
+          - checkbox [ref=f2e61]
+        - generic [ref=f2e64]:
+          - generic [ref=f2e65]: Reapontamento/Desistência
+          - checkbox [ref=f2e66]
+        - generic [ref=f2e69]:
+          - generic [ref=f2e70]: Envio de Custas Cartorárias
+          - checkbox [ref=f2e71]
+        - generic [ref=f2e74]:
+          - generic [ref=f2e75]: Envio de Gravação Eletrônica
+          - checkbox [ref=f2e76]
+        - generic [ref=f2e79]:
+          - generic [ref=f2e80]: Sustação
+          - checkbox [ref=f2e81]
+        - generic [ref=f2e84]:
+          - generic [ref=f2e85]: Repasse Financeiro
+          - checkbox [ref=f2e86]
+        - generic [ref=f2e89]:
+          - generic [ref=f2e90]: Conciliação de Títulos Pagos em Cartório
+          - checkbox [ref=f2e91]
+        - generic [ref=f2e94]:
+          - generic [ref=f2e95]: Pesquisar Arquivos
+          - checkbox [ref=f2e96]
+        - generic [ref=f2e99]:
+          - generic [ref=f2e100]: Resumo
+          - checkbox [ref=f2e101]
+        - generic [ref=f2e104]:
+          - generic [ref=f2e105]: Pendências de Cartórios
+          - checkbox [ref=f2e106]
+    - generic [ref=f2e108] [cursor=pointer]:
+      - generic [ref=f2e109]: 󰈕
+      - text: Relatório
+    - generic [ref=f2e111] [cursor=pointer]:
+      - generic [ref=f2e112]: 󰢻
+      - text: Processamento
+  - generic [ref=f2e115]:
+    - generic [ref=f2e118]:
+      - heading "Início" [level=6] [ref=f2e119]
+      - list [ref=f2e120]:
+        - listitem [ref=f2e149]:
+          - link "Início" [ref=f2e150] [cursor=pointer]:
+            - /url: /gcar-gestao-cartoraria/
+        - listitem [ref=f2e151]:
+          - text: ›
+          - link "Conciliação de Títulos Pagos em Cartório" [ref=f2e152] [cursor=pointer]:
+            - /url: /gcar-gestao-cartoraria/conciliacao-titulos-pagos
+    - button "add Nova Conciliação" [ref=f2e157] [cursor=pointer]:
+      - generic [ref=f2e158]: add
+      - text: Nova Conciliação
+    - generic [ref=f2e128] [cursor=pointer]:
+      - generic [ref=f2e129]: face
+      - generic: Conteúdo interno
+  - generic [ref=f2e161]:
+    - article [ref=f2e167]:
+      - generic [ref=f2e168]: Sem Conteudo
+      - generic [ref=f2e169]: Faça uma pesquisa para apresentar resultados.
+    - complementary [ref=f2e193]:
+      - generic [ref=f2e195]:
+        - heading "Conciliação de Títulos Pagos em Cartório" [level=6] [ref=f2e197]
+        - generic [ref=f2e198]:
+          - generic [ref=f2e207]:
+            - generic [ref=f2e208]: UF
+            - combobox [ref=f2e209]:
+              - option "Todos" [selected]
+              - option "AC"
+              - option "AL"
+              - option "AM"
+              - option "AP"
+              - option "BA"
+              - option "CE"
+              - option "DF"
+              - option "ES"
+              - option "GO"
+              - option "MA"
+              - option "MG"
+              - option "MS"
+              - option "MT"
+              - option "PA"
+              - option "PB"
+              - option "PE"
+              - option "PI"
+              - option "PR"
+              - option "RJ"
+              - option "RN"
+              - option "RO"
+              - option "RR"
+              - option "RS"
+              - option "SC"
+              - option "SE"
+              - option "SP"
+              - option "TO"
+          - generic [ref=f2e211]:
+            - generic [ref=f2e216]:
+              - generic [ref=f2e217]: Data de início*
+              - textbox "01/01/2026" [ref=f2e218]
+            - generic [ref=f2e223]:
+              - generic [ref=f2e224]: Data de término*
+              - textbox "01/01/2026" [ref=f2e225]
+          - button "search PESQUISAR" [disabled] [ref=f2e230]:
+            - generic: search
+            - generic [ref=f2e231]: PESQUISAR

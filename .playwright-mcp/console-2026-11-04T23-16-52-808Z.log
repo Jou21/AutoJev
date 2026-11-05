@@ -1,0 +1,3 @@
+[    5978ms] [INFO] %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold @ http://localhost:3000/node_modules/.vite/deps/react-dom_client.js?v=e23d71e0:14337
+[    9245ms] [ERROR] Access to fetch at 'http://127.0.0.1:8000/api/models' from origin 'http://localhost:3000' has been blocked by CORS policy: The request client is not a secure context and the resource is in more-private address space `loopback`. @ blob:http://localhost:3000/d2a532e1-f534-48f5-a3e9-640e3f0786d8#view/results/CT001:0
+[    9247ms] [ERROR] Failed to load resource: net::ERR_FAILED @ http://127.0.0.1:8000/api/models:0

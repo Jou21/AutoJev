@@ -1,2 +1,2 @@
-"""Infrastructure adapters for AutoJev domain ports."""
+"""Infrastructure adapters for Test Lab domain ports."""
 

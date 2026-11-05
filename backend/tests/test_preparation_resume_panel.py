@@ -50,7 +50,7 @@ def preparation_site():
 
         def do_POST(self):
             # Deliberately public, arbitrary values belonging only to this
-            # disposable loopback form. AutoJev never performs this login.
+            # disposable loopback form. Test Lab never performs this login.
             self.rfile.read(int(self.headers.get("Content-Length", "0")))
             self.send_response(303)
             self.send_header("Set-Cookie", "fixture_session=yes; Path=/; HttpOnly; SameSite=Lax")

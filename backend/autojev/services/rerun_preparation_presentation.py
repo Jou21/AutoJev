@@ -9,9 +9,9 @@ CONSENT_LABEL = (
 )
 CONTINUE_LABEL = "Continuar reexecução"
 LOGIN_INSTRUCTION = (
-    "Marque a autorização e faça login pelo próprio site. O AutoJev identifica o login e "
+    "Marque a autorização e faça login pelo próprio site. O Test Lab identifica o login e "
     "continua automaticamente após conferir a página e os pré-requisitos. Se preferir, "
-    "preencha usuário e senha e clique em “Continuar reexecução” para o AutoJev tentar entrar."
+    "preencha usuário e senha e clique em “Continuar reexecução” para o Test Lab tentar entrar."
 )
 LOGIN_NOTE = (
     "Com a autorização marcada, o teste continua automaticamente após o login e a "
@@ -23,7 +23,7 @@ LOGIN_READY_INSTRUCTION = (
 )
 PREPARATION_INSTRUCTION = (
     "Prepare a página e os dados iniciais do teste. Depois, marque a autorização e clique em "
-    "“Continuar reexecução”. Se houver um login preenchido no site autorizado, o AutoJev tentará "
+    "“Continuar reexecução”. Se houver um login preenchido no site autorizado, o Test Lab tentará "
     "entrar. A ação do teste só será executada se os pré-requisitos forem confirmados."
 )
 VALIDATING_INSTRUCTION = (

@@ -138,7 +138,7 @@ def test_results_have_a_compact_accessible_header_without_duplicate_report_actio
     assert 'id="result-report-actions"' in result_section
     # The progressive enhancement moves this one existing toolbar into the
     # result header; it must not clone controls or canonical result/evidence.
-    assert document.count('id="print-report"') == 1
+    assert document.count('id="print-report"') == 0, "The report has no print button"
     assert document.count('id="download-report"') == 1
     assert document.count('id="case-rerun"') == 1
     assert document.count('<details class="scenario"') == 2

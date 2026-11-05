@@ -132,12 +132,132 @@ confirmed authenticated page becomes the coverage/history root. Omit both
 values for manual login; other credential aliases remain available to the
 executor but are never guessed as login credentials.
 
+Applications that sign in through an SSO on another origin (Keycloak, etc.) are
+supported for manual login: before authentication, the application's own
+redirect is followed only if it is an https OIDC authorization request
+(`client_id`, `response_type`) whose `redirect_uri` returns to the authorised
+origin. The identity provider is treated as a login page that you complete in
+the browser window; automatic login and every exploratory action stay on the
+authorised origin, and the allowance closes once authentication is confirmed.
+
+Entry URLs that a reverse proxy answers with a `301` to `http://…/` (adding the
+trailing slash over the internal scheme) are retried once with the trailing
+slash; any remaining https→http downgrade fails the run with an explicit
+message. A page that never renders a control fails with a message instead of
+finishing as "complete".
+
 `focus_area` is optional. Without it, the planner covers every safe reachable
 same-origin branch it can discover. With it, navigation may traverse the menus
 needed to reach the requested screen, then the selected route becomes the
 backtracking root and unrelated global navigation is excluded. If that root is
 a same-URL submenu or modal, its entry state is retained only as a replay anchor;
 background controls remain out of scope.
+
+While a `focus_area` has not been reached, the planner does not test the entry
+screen: only moves that can lead to it are candidates (navigation entries, menu
+openers, controls whose label/URL match the focus, and the advisor's picks
+below). A header star, "Publicar" or an unrelated button on the home page is
+left alone. Plain elements the author made clickable (`cursor:pointer`, e.g.
+Angular menu entries) are recognised as controls, including icon-only ones (a
+magnifier beside a field, header icons): they are named after the field they sit
+in ("Ícone ao lado de “CPF/CNPJ do Cooperado”") or their glyph, and fields take
+the text of their `<label>`. "Publicar"/"publish" is treated as a side-effect
+control (the rating widget) and is never clicked.
+
+On a screen, the planner tests what is on it before leaving it: its fields
+first, then the search/filter button they enable ("Pesquisar", "Buscar",
+"Filtrar"…), and only then links to other routes. Fields get values that fit
+them instead of generic text: a date mask's own example (`01/01/2026`) or
+`15/01/2026`, ISO dates for `type=date`, a valid CPF/CNPJ for CPF/CNPJ fields,
+`100,00` for amounts, and so on (the placeholder and label of each field are
+part of the observation).
+
+A screen with a start/end date pair and a search button is not searched once.
+The explorer runs the search for each of the 24 months of this year and the
+year before (the first and last day of each month, typed in the format the field
+uses; the last date typed also leaves the field with Tab in the same action, so
+a form that validates on blur enables its button). The range with the most
+records is searched again at the end, so its table is on screen for the rest of
+the run (row actions, pagination, details). There are no fixed pauses: the
+explorer waits only while the page is actually loading (a spinner, a progress
+bar, or an empty dimming overlay), polling every 0.4 s for up to about 12 s, and
+a "no records" answer is taken at face value. Each search is a test case and a
+`search_matrix_range` activity entry ("Período 03/2026: 3 registro(s)"). Rows are
+counted from the visible data rows of the page (`page_state.results`); a form
+that keeps rejecting the dates stops the matrix instead of trying every month. A
+period search in progress outranks the restoration graph, so the explorer does
+not wander off between two searches.
+
+When the search button stays disabled with the dates filled (typically a select
+left on "Todos" while the form needs a specific option), the explorer tries the
+select's other options, one at a time, until the button enables, and records
+which option unlocked it. Every section of the screen (for example "Arquivo
+Recebido" and "Recurso Recebido") gets its own matrix and variations, run
+strictly one after the other. Fields without a label are named from the
+placeholder or the form control (`formcontrolname`/`name`/`id`, split into words),
+which also decides the values they are varied with. A validation alert that was
+already on screen before a search and is still there afterwards is flagged
+`carried_over` in the report rather than attributed to that search.
+
+Defects the run can state from what it saw are listed as "Defeitos encontrados"
+(a tab in the app, a section of the report's overview), each with category,
+severity, steps, expected and observed behaviour and a screenshot. They are
+observations to confirm before filing, not CT verdicts; HTTP/console signals
+stay in the CT timelines. Four are detected today:
+
+- **Sem caminho de volta** (Navegação): a click outside the global menu opens
+  another route, the clicked control is gone and the new screen has no
+  Voltar/Cancelar/Fechar control nor a link to the previous route (a breadcrumb
+  that points at the new screen itself is called out).
+- **Pesquisa bloqueada com o valor padrão** (Formulário): the search stayed
+  disabled with the dates filled until a select was changed (for example
+  `UF = Todos` → `AC`); the finding names the block, the default, the option that
+  worked and any message on screen, with the screenshot of the screen as reached.
+- **Títulos de resultado sem conteúdo** (Interface): on a search screen with no
+  result rows, titles (`h1`–`h6`, `role=heading`, `legend`) outside forms, asides
+  and navigation have no text, control, image or table under them.
+- **Falta de massa de dados** (impedimento): no period and no data variation of
+  any search returned records, so the table, pagination and row actions were not
+  tested.
+
+Each field and button also carries `section`, the title of the block it sits in
+("Arquivo Recebido"), so search activity and findings name the block.
+
+`observe()` retries (up to 4 times, waiting for the load state) when a page
+navigation destroys the execution context mid-observation, so a `go_back` or a
+redirect no longer fails the run.
+
+After the months, the other fields of the same search are varied one at a time
+with the best range still typed in: a CPF/CNPJ field gets a valid CPF, a valid
+CNPJ, an invalid number, a short one and letters; amounts get `100,00`, zero, a
+negative, a huge value and letters; numbers, e-mails, phones and dates get their
+own valid, boundary and invalid values; plain text gets a common string, a long
+one, special characters, padded spaces and digits; a select is searched with every
+option. Each value is searched, then the field is cleared before the next one, and
+the best range is searched a last time so its table is on screen. Every search
+records rows and any validation message ("CNPJ inválido"). If the page keeps a
+mask that ignores a pasted value, the explorer types it key by key; date fields
+that only a calendar can fill are reported as unsupported instead of skipped
+silently. Everything is summarised as "Buscas exercitadas" in the "Cobertura e
+restrições" tab and in the HTML report, including the case where no period
+returned records.
+
+The auxiliary model always looks for flows still to cover, but only when
+something *opens*: the first authenticated screen, a new route, a menu/flyout,
+side panel, tab content or dialog that appeared. Each new screen is asked about
+once, and the number of requests is capped (`frontier_advice_max_requests`,
+default 25). The request has the focus, the safe untried controls (with their
+refs), the visible text and a short trail of what was already explored; the
+masked screenshot is attached only in `visual` evidence mode. The answer can
+only reorder controls the planner already accepted (a ref it did not offer is
+discarded); it never adds an action. It returns which controls likely open new
+areas (lookup icons, tabs, "new" buttons, filter panels, panels over panels),
+how the screen relates to the focus, and notes about what is visible but is not
+a control (collapsed sections, fields below a panel's fold). Everything appears
+as `frontier_advice` events in the Atividade tab; its tokens and cost count as
+auxiliary usage. The notes are also listed as "Lacunas apontadas pela IA" in the
+"Cobertura e restrições" tab and in the HTML report: leads to investigate, not
+approved tests nor confirmed defects.
 
 `max_duration_seconds` is enforced across browser startup, JEV decisions and
 Playwright actions. Each deterministic local CT is persisted immediately and a

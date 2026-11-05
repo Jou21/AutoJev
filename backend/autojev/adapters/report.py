@@ -15,7 +15,12 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from autojev.services.scenario_timeline import prepare_scenario_timelines
 from autojev.services.scenario_step_order import presentation_scenario_steps
 from autojev.services.rerun_projection import without_rerun_recipes
-from autojev.services.coverage_ledger import coverage_restriction_ledger
+from autojev.services.coverage_ledger import (
+    ai_flagged_gaps,
+    coverage_restriction_ledger,
+    functional_findings,
+    search_coverage,
+)
 from autojev.services.execution_summary import formatted_execution_duration, report_snapshot_key
 from autojev.services.visual_checks import visual_review_counts, visual_unavailability_label
 from autojev.services.verification_summary import NON_BUSINESS_CHECKS, verification_summary
@@ -74,18 +79,25 @@ class StandaloneHtmlReport:
         self.artifact_root = artifact_root.resolve()
         self.image_url = image_url
         self.online_image_sizes: dict[str, int] = {}
+        self._capture_files: dict[tuple[str, str], Path | None] = {}
+
+    def _capture_file(self, exploration_id: str, filename: str) -> Path | None:
+        """The resolved capture if it is a file inside that run's screenshots dir.
+
+        Path.resolve() is a filesystem round-trip (slow on Windows) and a suite
+        report checks the same captures thousands of times, so results are
+        memoized for one generate() call only: a renderer instance can be
+        long-lived and captures appear while a run is still going.
+        """
+        key = (exploration_id, filename)
+        if key not in self._capture_files:
+            allowed = (self.artifact_root / exploration_id / "screenshots").resolve()
+            candidate = (self.artifact_root / exploration_id / "screenshots" / filename).resolve()
+            self._capture_files[key] = candidate if allowed in candidate.parents and candidate.is_file() else None
+        return self._capture_files[key]
 
     def _image_path(self, exploration_id: str, relative_path: str) -> Path | None:
-        candidate = (
-            self.artifact_root
-            / exploration_id
-            / "screenshots"
-            / Path(relative_path).name
-        ).resolve()
-        allowed = (self.artifact_root / exploration_id / "screenshots").resolve()
-        if allowed not in candidate.parents or not candidate.is_file():
-            return None
-        return candidate
+        return self._capture_file(exploration_id, Path(relative_path).name)
 
     def _image_data(self, exploration_id: str, relative_path: str) -> str | None:
         candidate = self._image_path(exploration_id, relative_path)
@@ -228,9 +240,7 @@ class StandaloneHtmlReport:
                 or entry.get("url") and metadata.get("url") != entry["url"]
                 or Path(screenshot).suffix.lower() not in {".png", ".jpg", ".jpeg"}):
             return None
-        candidate = (self.artifact_root / exploration_id / "screenshots" / screenshot).resolve()
-        allowed = (self.artifact_root / exploration_id / "screenshots").resolve()
-        return screenshot if allowed in candidate.parents and candidate.is_file() else None
+        return screenshot if self._capture_file(exploration_id, screenshot) is not None else None
 
     def _action_preview(
         self,
@@ -265,9 +275,7 @@ class StandaloneHtmlReport:
                     break
         if not filename:
             return ""
-        candidate = (self.artifact_root / exploration_id / "screenshots" / filename).resolve()
-        allowed = (self.artifact_root / exploration_id / "screenshots").resolve()
-        if allowed not in candidate.parents or not candidate.is_file():
+        if self._capture_file(exploration_id, filename) is None:
             return ""
         # The original capture is already embedded in a canonical timeline
         # observation in most cases. Reference it instead of duplicating the
@@ -342,6 +350,78 @@ class StandaloneHtmlReport:
                + f'<a href="{image}" download="{_h(Path(screenshot).name)}">Baixar captura da ação bloqueadora</a>'
                if image else '')
             + '</div>'
+        )
+
+    def _findings_section(self, exploration_id: str, findings: list[dict[str, Any]]) -> str:
+        """Defects observed by the run, written as a tester files them."""
+
+        if not findings:
+            return ""
+        cards = "".join(
+            '<article class="context-note finding finding-' + _h(str(f.get("kind") or "")) + '">'
+            + '<strong>' + _h(f.get("title") or "Defeito") + '</strong> '
+            + '<small>' + _h(" · ".join(str(part) for part in (f.get("category"), f.get("severity")) if part)) + '</small>'
+            + ('<p>Passos: ' + _h(" → ".join(str(step) for step in f["steps"])) + '</p>' if f.get("steps") else '')
+            + ('<p>Esperado: ' + _h(f["expected"]) + '</p>' if f.get("expected") else '')
+            + ('<p>Observado: ' + _h(f["actual"]) + '</p>' if f.get("actual") else '')
+            + ('<div class="url">' + _h(self._public_issue_url(f["url"])) + '</div>' if f.get("url") else '')
+            + ('<div class="shots">' + self._screenshots(exploration_id, [f["screenshot"]]) + '</div>'
+               if f.get("screenshot") else '')
+            + '</article>'
+            for f in findings
+        )
+        return (
+            '<details class="completion findings" open><summary><strong>Defeitos encontrados · '
+            + str(len(findings)) + ' registros</strong></summary>'
+            '<p>Comportamentos observados nesta execução que um testador registraria como defeito, com passos, '
+            'resultado esperado e observado. Confirme cada um antes de abrir o chamado; sinais técnicos (HTTP, '
+            'console) continuam na linha do tempo de cada CT.</p>'
+            + cards + '</details>'
+        )
+
+    @staticmethod
+    def _search_coverage_section(searches: dict[str, Any]) -> str:
+        """Period and test-data searches, with what each one returned."""
+
+        ranges = searches["ranges"]
+        variations = searches["variations"]
+        if ranges:
+            verdict = (
+                "Registros encontrados em: " + ", ".join(_h(label) for label in searches["months_with_records"]) + "."
+                if searches["found_records"]
+                else "Nenhum período trouxe registros; a tabela de resultados não pôde ser explorada."
+            )
+        else:
+            verdict = ""
+        range_rows = "".join(
+            "<tr><td>" + _h(r["label"]) + "</td><td>"
+            + (_h(f"não pesquisado ({r['skipped']}" + (": " + "; ".join(r["blocked_by"]) if r.get("blocked_by") else "") + ")")
+               if r.get("skipped") else str(r.get("rows") or 0))
+            + "</td></tr>" for r in ranges
+        )
+        variation_rows = "".join(
+            "<tr><td>" + _h(v["field"]) + "</td><td>" + _h(v["kind"]) + "</td><td>"
+            + (_h("não pesquisado (" + str(v["skipped"]) + ")") if v.get("skipped") else str(v.get("rows") or 0))
+            + "</td><td>" + _h(v.get("first_error") or ("—" if not v.get("validation_errors") else "erro exibido"))
+            + (_h(" (já estava na tela antes desta busca)") if v.get("carried_over") else "")
+            + "</td></tr>" for v in variations
+        )
+        unsupported = "".join(
+            "<p class=\"muted\">Campos de data só aceitam calendário (" + _h(", ".join(u["fields"]))
+            + "): a busca por vários períodos não foi executada nesta tela.</p>" for u in searches["unsupported"]
+        )
+        return (
+            '<details class="completion coverage-searches"><summary><strong>Buscas exercitadas · '
+            + str(len(ranges) + len(variations)) + ' pesquisas</strong></summary>'
+            '<p>Cada busca foi executada com datas e dados diferentes. Um período sem registros é um resultado '
+            'observado, não uma falha.</p>'
+            + (("<p>" + verdict + "</p>") if verdict else "")
+            + ('<div class="table-wrap"><table class="report-table"><thead><tr><th>Período</th><th>Registros</th></tr></thead><tbody>'
+               + range_rows + '</tbody></table></div>' if ranges else "")
+            + ('<div class="table-wrap"><table class="report-table"><thead><tr><th>Campo</th><th>Dado informado</th>'
+               '<th>Registros</th><th>Validação</th></tr></thead><tbody>' + variation_rows + '</tbody></table></div>'
+               if variations else "")
+            + unsupported + '</details>'
         )
 
     def _restriction_card(
@@ -1691,6 +1771,7 @@ class StandaloneHtmlReport:
           {self._timeline(exploration_id, scenario)}</div></details>"""
 
     def generate(self, exploration: dict[str, Any], output_path: str) -> str:
+        self._capture_files = {}
         exploration = without_rerun_recipes(exploration)
         exploration = localize_report_presentation(prepare_scenario_timelines(exploration))
         exploration_id = str(exploration["id"])
@@ -1749,6 +1830,26 @@ class StandaloneHtmlReport:
             '<p>São lacunas de cobertura, não testes aprovados nem bugs confirmados.</p>'
             + (restriction_cards or '<p class="muted">' + restriction_note + '</p>') + '</details>'
         )
+        searches = search_coverage(exploration.get("events"))
+        if searches:
+            coverage_summary += self._search_coverage_section(searches)
+        ai_gaps = ai_flagged_gaps(exploration.get("events"))
+        if ai_gaps:
+            coverage_summary += (
+                '<details class="completion coverage-ai-gaps"><summary><strong>Lacunas apontadas pela IA · '
+                + str(len(ai_gaps)) + ' registros</strong></summary>'
+                '<p>A LLM auxiliar viu algo na tela que a exploração não cobriu (abas, seções recolhidas, '
+                'campos abaixo da dobra, fluxos sugeridos). São pistas a investigar: não são testes aprovados '
+                'nem defeitos confirmados.</p>'
+                + "".join(
+                    '<article class="context-note"><strong>' + _h(gap["note"]) + '</strong>'
+                    + ('<div class="url">' + _h(self._public_issue_url(gap["url"])) + '</div>' if gap.get("url") else '')
+                    + ('<div class="shots">' + self._screenshots(exploration_id, [gap["screenshot"]]) + '</div>'
+                       if gap.get("screenshot") else '')
+                    + '</article>'
+                    for gap in ai_gaps
+                ) + '</details>'
+            )
         if ledger["resolved_restrictions"]:
             coverage_summary += (
                 '<details class="completion coverage-recovered"><summary><strong>Restrições resolvidas com evidência · '
@@ -1840,7 +1941,7 @@ class StandaloneHtmlReport:
         generated = datetime.now().astimezone().strftime("%d/%m/%Y %H:%M:%S %Z")
         document = f"""<!doctype html>
 <html lang="pt-BR" data-report-locale="{REPORT_LOCALE_VERSION}" data-report-schema="ct-timeline-v1" data-report-summary="execution-v2" data-coverage-ledger="execution-evidence-v1" data-cost-breakdown="roles-v1" data-visual-review-policy="bounded-v1" data-report-snapshot="{report_snapshot_key(exploration)}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AutoJev — Relatório de testes exploratórios</title>
+<title>Test Lab — Relatório de testes exploratórios</title>
 <style>
 :root{{--bg:#0b0e14;--panel:#141923;--line:#293142;--text:#edf1f7;--muted:#9ca8ba;--accent:#f0b44d;--pass:#3ddc97;--fail:#ff647c;--blocked:#ffa657;--skipped:#8b98aa;--info:#83bffc}}
 *{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 Inter,system-ui,sans-serif}}main{{max-width:1120px;margin:auto;padding:48px 24px}}
@@ -1859,10 +1960,13 @@ class StandaloneHtmlReport:
             "generated": generated, "completion_reason": completion_reason,
             "cost_summary": cost_summary, "visual_summary": visual_summary,
             "strength_summary": strength_summary, "coverage_summary": coverage_summary,
+            "findings_summary": self._findings_section(exploration_id, functional_findings(exploration.get("events"))),
             "observations": execution_observations,
             "case_cards": cards,
         })
         output = Path(output_path)
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(document, encoding="utf-8")
+        # Exact bytes: write_text() would turn every LF into CRLF on Windows, so
+        # the file served from disk would differ from the document generated.
+        output.write_bytes(document.encode("utf-8"))
         return str(output)

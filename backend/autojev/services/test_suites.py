@@ -87,11 +87,25 @@ class TestSuiteService:
                 StandaloneHtmlReport(artifact_dir).generate(snapshot, str(path))
 
     def groups(self):
+        # Preload every lookup once: resolving roots/cases/states per run and
+        # per suite cost ~200 SQLite connections and a CT scan per ancestor.
         groups = {}
         plans = self.store.list()
         planned_runs = {item.get("execution_id") for plan in plans for item in plan["items"]}
+        ancestries = self.repository.get_all_scenario_revision_ancestries()
+        session_roots = self.store.all_session_roots()
+        all_cases = self.store.all_cases()
+        all_states = self.store.all_catalog_states()
+
+        def ancestry(identity):
+            try:
+                return ancestries[identity]
+            except KeyError:
+                raise NotFoundError(f"Exploration {identity} was not found") from None
+
         for run in self.repository.list_explorations(10000):
-            root = self.root(run["id"])
+            original = scenario_report_origin(self.repository, run["id"], ancestry)["report_exploration_id"]
+            root = session_roots.get(original, original)
             group = groups.setdefault(root, {"id": root, "runs": [], "rounds": []})
             group["runs"].append(run)
         for group in groups.values():
@@ -105,12 +119,13 @@ class TestSuiteService:
                                          count=(run.get("counters") or {}).get("scenarios", 0)) for run in group["runs"]
                                     if run["id"] != group["id"] and run["id"] not in planned_runs]
             group["active_count"] = sum(run["status"] not in TERMINAL for run in group["runs"]) + sum(plan["status"] == "waiting_manual" for plan in group["rounds"])
+            cases = all_cases.get(group["id"], [])
             group["latest_activity"] = max([run.get("finished_at") or run["created_at"] for run in group.pop("runs")]
                                            + [plan["updated_at"] for plan in group["rounds"]]
-                                           + [case["updated_at"] for case in self.store.cases(group["id"])])
-            states = self.store.catalog_states(group["id"])
+                                           + [case["updated_at"] for case in cases])
+            states = all_states.get(group["id"], {})
             group["archived_count"] = sum(value["archived"] for value in states.values())
-            group["case_count"] = group["initial_count"] + len(self.store.cases(group["id"])) - group["archived_count"]
+            group["case_count"] = group["initial_count"] + len(cases) - group["archived_count"]
             group["latest_activity"] = max([group["latest_activity"], *[value["catalog_updated_at"] for value in states.values()]])
         return sorted(groups.values(), key=lambda group: group["latest_activity"], reverse=True)
 
@@ -365,7 +380,9 @@ class TestSuiteService:
         finally:
             self.signals.pop(identity, None)
 
-    def report_snapshot(self, identity, context="consolidated", round_id=None, case_id=None):
+    def report_snapshot(self, identity, context="consolidated", round_id=None, case_id=None, focus_case_id=None):
+        """``case_id`` limits the report to one CT; ``focus_case_id`` keeps every
+        CT and only opens on that one (the in-app "Ver resultado" preview)."""
         root = self.root(identity)
         initial = self.repository.get_exploration(root)
         if case_id is not None:
@@ -428,8 +445,11 @@ class TestSuiteService:
         snapshot["summary"] = {"total_scenarios": len(snapshot["scenarios"]), **{state.lower(): sum(case.get("status") == state for case in snapshot["scenarios"]) for state in VERDICTS}}
         snapshot["suite_context"] = dict(root_id=root, scope=context, label=label, round_name=round_name, generated_at=utc_now(),
              note="O consolidado reúne resultados de datas diferentes; uma reexecução parcial não valida novamente os demais CTs." if context == "consolidated" else "Este relatório não inclui resultados emprestados de outras rodadas.")
-        if case_id is not None:
-            snapshot["suite_context"]["focused_case_id"] = case_id
+        if focus_case_id is not None:
+            if not any(case["id"] == focus_case_id for case in snapshot["scenarios"]):
+                raise NotFoundError("CT não encontrado neste conjunto ou nesta rodada.")
+        if (case_id or focus_case_id) is not None:
+            snapshot["suite_context"]["focused_case_id"] = case_id or focus_case_id
         # Scope-specific exports must not be replaced by the legacy freshness
         # endpoint's differently scoped report when the app regains focus.
         snapshot.pop("scenario_revisions_key", None)

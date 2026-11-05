@@ -57,14 +57,14 @@ class BrowserRecordingPanel:
         except Exception:
             trusted = False
         if not trusted:
-            raise ValueError("Finalize a gravação pelo painel atual do AutoJev.")
+            raise ValueError("Finalize a gravação pelo painel atual do Test Lab.")
         self.finishing = True
         try:
             await self.finish()
             return {"accepted": True}
         except Exception:
             self.finishing = False
-            raise ValueError("Não foi possível finalizar. Tente pela aplicação AutoJev.") from None
+            raise ValueError("Não foi possível finalizar. Tente pela aplicação Test Lab.") from None
 
     def _navigation(self, page, frame):
         if frame is page.main_frame:
@@ -98,8 +98,8 @@ class BrowserRecordingPanel:
                     await page.evaluate("""data => {
                       const panel = document.getElementById('autojev-sidepanel');
                       if (!panel) return;
-                      panel.setAttribute('aria-label', 'Gravação da navegação AutoJev');
-                      panel.querySelector('#autojev-kicker-text').textContent = 'AUTOJEV · GRAVANDO';
+                      panel.setAttribute('aria-label', 'Gravação da navegação Test Lab');
+                      panel.querySelector('#autojev-kicker-text').textContent = 'TEST LAB · GRAVANDO';
                       panel.querySelector('#autojev-panel-title').textContent = `Gravação · ${data.steps.length} passos`;
                       panel.querySelector('#autojev-usage').hidden = true;
                       const log = panel.querySelector('#autojev-panel-log');
@@ -131,7 +131,7 @@ class BrowserRecordingPanel:
             panel.append(style);
           }
           const frame = document.createElement('iframe'); frame.id = 'autojev-recording-frame';
-          frame.title = 'Gravação da navegação AutoJev'; frame.setAttribute('sandbox', 'allow-scripts');
+          frame.title = 'Gravação da navegação Test Lab'; frame.setAttribute('sandbox', 'allow-scripts');
           frame.setAttribute('referrerpolicy', 'no-referrer'); surface.append(frame); return frame;
         }""")
         element = handle.as_element()
@@ -153,7 +153,7 @@ class BrowserRecordingPanel:
             await page.evaluate("""() => {
               const panel = document.getElementById('autojev-sidepanel');
               delete panel.dataset.recording;
-              panel.querySelector('#autojev-panel-hint').textContent = 'Finalize e revise pela aplicação AutoJev';
+              panel.querySelector('#autojev-panel-hint').textContent = 'Finalize e revise pela aplicação Test Lab';
             }""")
             return None
         await element.evaluate("""el => {

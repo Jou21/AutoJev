@@ -130,7 +130,7 @@ class BrowserRerunPanel:
           surface.querySelector('#autojev-rerun-frame')?.remove();
           const frame = document.createElement('iframe');
           frame.id = 'autojev-rerun-frame';
-          frame.title = 'Mapa e prints da reexecução AutoJev';
+          frame.title = 'Mapa e prints da reexecução Test Lab';
           frame.setAttribute('sandbox', 'allow-scripts');
           frame.setAttribute('referrerpolicy', 'no-referrer');
           surface.append(frame);
@@ -158,7 +158,7 @@ class BrowserRerunPanel:
               delete panel.dataset.rerun;
               const text = panel.querySelector('#autojev-action-text');
               if (text) text.textContent = 'Este site restringe o painel integrado. '
-                + 'Use a aplicação AutoJev para acompanhar o mapa e anexar seu print.';
+                + 'Use a aplicação Test Lab para acompanhar o mapa e anexar seu print.';
             }""")
             return False
         await element.evaluate("""el => {

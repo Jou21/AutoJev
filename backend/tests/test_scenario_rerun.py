@@ -237,7 +237,8 @@ async def test_one_real_action_one_new_ct_no_model_calls_source_immutable(tmp_pa
 @pytest.mark.parametrize("change", ["title", "fields", "origin", "cart", "target", "authentication"])
 async def test_changed_preconditions_block_before_dispatch(tmp_path, monkeypatch, change):
     service, repository, source_id, _, _ = make_service(tmp_path)
-    service.intervention_timeout_seconds = 0.04
+    # Long enough for the test to observe attempt 2 on a loaded Windows clock (~15 ms ticks), short enough to stay fast.
+    service.intervention_timeout_seconds = 0.5
     before = observed("e42")
     if change == "title":
         before.title = "Other screen"

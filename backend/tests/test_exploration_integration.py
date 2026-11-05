@@ -354,7 +354,8 @@ async def test_full_exploration_finishes_and_preserves_business_failures(
     # fixture's <150/180s contract predated those additional observed routes.
     # Keep independently bounded actions, time and agent consultations; neither
     # extra time nor a COMPLETED status can waive the zero-gap healthy oracle.
-    await asyncio.wait_for(manager._run(run_id), timeout=240)
+    # ~150 s alone; the bound only guards against a hang, so leave room for a loaded machine.
+    await asyncio.wait_for(manager._run(run_id), timeout=480)
     run = repo.get_exploration(run_id)
     summary = [
         (a["step_number"], a["decision"], a["result"]["message"])
@@ -672,6 +673,9 @@ async def test_api_wait_is_bounded_and_ignores_old_and_third_party_requests(tmp_
 
     old = Request("http://shop.fixture.test/stream")
     executor._on_request_started(old)
+    # Windows' monotonic clock ticks every ~15 ms: without a gap "old" and
+    # "since" can share a tick and the old request would count as new.
+    await asyncio.sleep(0.05)
     since = time.monotonic()
     foreign = Request("http://analytics.fixture.test/events")
     executor._on_request_started(foreign)

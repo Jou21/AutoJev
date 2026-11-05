@@ -1,0 +1,139 @@
+- main [ref=f2e6]:
+  - navigation [ref=f2e8]:
+    - generic [ref=f2e10]:
+      - generic [ref=f2e11] [cursor=pointer]
+      - generic [ref=f2e13] [cursor=pointer]:
+        - text: Gestão Cartorária
+        - generic [ref=f2e14]: "| 3.5.3"
+    - generic [ref=f2e15]:
+      - generic [ref=f2e17]:
+        - generic [ref=f2e18] [cursor=pointer]: arrow_drop_down
+        - generic [ref=f2e22] [cursor=pointer]:
+          - text: Cooperativa
+          - heading "0300" [level=6] [ref=f2e23]
+      - generic [ref=f2e25]:
+        - generic "Avaliação" [ref=f2e29] [cursor=pointer]: star
+        - generic [ref=f2e31]:
+          - generic [ref=f2e33] [cursor=pointer]: 
+          - generic [ref=f2e131]:
+            - heading "Avalie esse aplicativo" [level=6] [ref=f2e132]
+            - paragraph [ref=f2e133]: Sua avaliação é muito importante para nós.
+            - generic [ref=f2e134]:
+              - generic [ref=f2e135] [cursor=pointer]: 󰓒
+              - generic [ref=f2e137] [cursor=pointer]: 󰓒
+              - generic [ref=f2e139] [cursor=pointer]: 󰓒
+              - generic [ref=f2e141] [cursor=pointer]: 󰓒
+              - generic [ref=f2e143] [cursor=pointer]: 󰓒
+            - text: Comentário
+            - textbox [ref=f2e145]
+            - button "Publicar" [ref=f2e147] [cursor=pointer]
+      - generic "Bandeja de Relatórios" [ref=f2e38] [cursor=pointer]: printer
+  - complementary [ref=f2e42]:
+    - generic [ref=f2e44] [cursor=pointer]:
+      - generic [ref=f2e45]: 󰋜
+      - text: menu.MNUHOME1
+    - generic [ref=f2e46]: Liberações
+    - generic [ref=f2e49] [cursor=pointer]:
+      - generic [ref=f2e50]: 󰐕
+      - text: Cadastro
+    - generic [ref=f2e51]: Consulta
+    - generic [ref=f2e53]: Painel de Operações
+    - generic [ref=f2e108] [cursor=pointer]:
+      - generic [ref=f2e109]: 󰈕
+      - text: Relatório
+    - generic [ref=f2e111] [cursor=pointer]:
+      - generic [ref=f2e112]: 󰢻
+      - text: Processamento
+  - generic [ref=f2e115]:
+    - generic [ref=f2e118]:
+      - heading "Início" [level=6] [ref=f2e119]
+      - list [ref=f2e120]:
+        - listitem [ref=f2e232]:
+          - link "Início" [ref=f2e233] [cursor=pointer]:
+            - /url: /gcar-gestao-cartoraria/
+        - listitem [ref=f2e234]:
+          - text: ›
+          - link "Conciliação de Títulos Pagos em Cartório" [ref=f2e235] [cursor=pointer]:
+            - /url: /gcar-gestao-cartoraria/conciliacao-titulos-pagos/nova-conciliacao
+    - generic [ref=f2e128] [cursor=pointer]:
+      - generic [ref=f2e129]: face
+      - generic: Conteúdo interno
+  - generic [ref=f2e238]:
+    - generic [ref=f2e240]:
+      - heading "Arquivo Recebido" [level=6] [ref=f2e244]
+      - heading "Recurso Recebido" [level=6] [ref=f2e248]
+    - complementary [ref=f2e250]:
+      - generic [ref=f2e252]:
+        - heading "Arquivo Recebido" [level=6] [ref=f2e254]
+        - generic [ref=f2e255]:
+          - generic [ref=f2e264]:
+            - generic [ref=f2e265]: UF*
+            - combobox [ref=f2e266]:
+              - option "Todos" [selected]
+              - option "AC"
+              - option "AL"
+              - option "AM"
+              - option "AP"
+              - option "BA"
+              - option "CE"
+              - option "DF"
+              - option "ES"
+              - option "GO"
+              - option "MA"
+              - option "MG"
+              - option "MS"
+              - option "MT"
+              - option "PA"
+              - option "PB"
+              - option "PE"
+              - option "PI"
+              - option "PR"
+              - option "RJ"
+              - option "RN"
+              - option "RO"
+              - option "RR"
+              - option "RS"
+              - option "SC"
+              - option "SE"
+              - option "SP"
+              - option "TO"
+          - generic [ref=f2e268]:
+            - generic [ref=f2e273]:
+              - generic [ref=f2e274]: Data de início*
+              - textbox "01/01/2026" [ref=f2e275]: 01/11/2026
+            - generic [ref=f2e280]:
+              - generic [ref=f2e281]: Data de término*
+              - textbox "01/01/2026" [ref=f2e282]: 01/11/2026
+          - button "search PESQUISAR" [disabled] [ref=f2e287]:
+            - generic: search
+            - generic [ref=f2e288]: PESQUISAR
+      - generic [ref=f2e290]:
+        - heading "Recurso Recebido" [level=6] [ref=f2e292]
+        - generic [ref=f2e293]:
+          - generic [ref=f2e295]:
+            - generic [ref=f2e300]:
+              - generic [ref=f2e301]: Data de início*
+              - textbox "01/01/2026" [ref=f2e302]: 01/11/2026
+            - generic [ref=f2e307]:
+              - generic [ref=f2e308]: Data de término*
+              - textbox "01/01/2026" [ref=f2e309]: 01/11/2026
+          - generic [ref=f2e314]:
+            - generic [ref=f2e315]: CNPJ
+            - textbox [ref=f2e316]
+          - generic [ref=f2e317]:
+            - generic [ref=f2e318]: Valor R$
+            - generic [ref=f2e319]:
+              - textbox [ref=f2e323]
+              - textbox [ref=f2e327]
+          - generic [ref=f2e330]:
+            - generic [ref=f2e331]: Transação
+            - combobox [ref=f2e332]:
+              - option "Todos" [selected]
+              - option "Ted"
+              - option "Doc"
+              - option "Dinheiro/Cheque"
+              - option "Transferência entre CCO"
+              - option "Dec"
+          - button "search PESQUISAR" [ref=f2e337] [cursor=pointer]:
+            - generic: search
+            - generic [ref=f2e338]: PESQUISAR

@@ -59,7 +59,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await manager.shutdown()
 
     app = FastAPI(
-        title="AutoJev API",
+        title="Test Lab API",
         description="FastAPI backend for evidence-based AI exploratory web testing.",
         version="0.1.0",
         lifespan=lifespan,

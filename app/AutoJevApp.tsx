@@ -11,6 +11,7 @@ import {
   Bot,
   Boxes,
   BrainCircuit,
+  Bug,
   Check,
   CheckCircle2,
   CircleDollarSign,
@@ -79,7 +80,9 @@ const TestSuitesWorkspace = lazy(() => import("./components/TestSuitesWorkspace"
 const PlannedExecutions = lazy(() => import("./components/PlannedExecutions"));
 
 const DEFAULT_API_URL =
-  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
+  // 127.0.0.1, not localhost: uvicorn listens on IPv4 only, and Windows tries
+  // ::1 first and waits ~2s for the refused connection before falling back.
+  process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000/api";
 
 type View =
   | "dashboard"
@@ -91,8 +94,10 @@ type View =
   | "detail";
 
 type ScenarioCapturePlan = { version: 1; checkpoints: { id: string; gap: number; order: number }[] };
+// One CT handed from a report's "Reexecutar testes" planner.
+export type PlanningBatchItem = { source: string; ct: string; capture_plan?: ScenarioCapturePlan };
 type RerunCaptureCheckpoint = { id: string; gap: number; order: number; version: number };
-type AppRoute = { view: View; suiteId?: string; planId?: string; roundId?: string; initialCaseId?: string; initialSourceId?: string; initialSourceCase?: string; explorationId?: string; rerunScenarioId?: string; capturePlan?: ScenarioCapturePlan; capturePlanError?: string; liveRerun?: boolean };
+type AppRoute = { view: View; suiteId?: string; planId?: string; roundId?: string; initialCaseId?: string; initialTab?: "planner"; initialBatch?: PlanningBatchItem[]; initialSourceId?: string; initialSourceCase?: string; explorationId?: string; rerunScenarioId?: string; capturePlan?: ScenarioCapturePlan; capturePlanError?: string; liveRerun?: boolean };
 
 type ScenarioRerunPreflight = {
   available: boolean;
@@ -233,6 +238,39 @@ type ScenarioCase = {
   };
 };
 
+type SearchCoverage = {
+  ranges: Array<{ label: string; rows?: number | null; skipped?: string | null; blocked_by?: string[] | null }>;
+  months_with_records: string[];
+  found_records: boolean;
+  stopped_reason?: string | null;
+  variations: Array<{ field: string; kind: string; value?: string | null; rows?: number | null; validation_errors?: number | null; first_error?: string | null; skipped?: string | null; blocked_by?: string[] | null; carried_over?: boolean }>;
+  variation_searches?: number;
+  variations_with_validation?: number;
+  unsupported: Array<{ fields: string[]; reason?: string | null }>;
+};
+
+type FunctionalFinding = {
+  id: string;
+  kind: string;
+  title: string;
+  category?: string | null;
+  severity?: string | null;
+  url?: string | null;
+  screenshot?: string | null;
+  steps?: string[];
+  expected?: string | null;
+  actual?: string | null;
+};
+
+type AiCoverageGap = {
+  id?: string;
+  note: string;
+  url?: string | null;
+  screenshot?: string | null;
+  trigger?: string | null;
+  focus_status?: string | null;
+};
+
 type CoverageRestriction = {
   id?: string;
   reason?: string;
@@ -368,6 +406,9 @@ type Exploration = {
     restorations_abandoned?: number | null;
     restrictions?: CoverageRestriction[];
     resolved_restrictions?: CoverageRestriction[];
+    ai_gaps?: AiCoverageGap[];
+    search_coverage?: SearchCoverage;
+    findings?: FunctionalFinding[];
   };
   verification_summary?: VerificationCounts;
   current_step?: string;
@@ -711,7 +752,7 @@ const FREE_MODEL_PREFERENCE = [
 // planner; this entry only names it for runs that recorded it.
 const LOCAL_AGENT_PROVIDER: Provider = {
   id: "autojev-local",
-  name: "AutoJev",
+  name: "Test Lab",
   base_url: "",
   enabled: true,
   models: [{ id: "autojev/deterministic", label: "Planejador determinístico", enabled: true }],
@@ -997,8 +1038,8 @@ export function scenarioRerunPreparationPresentation(preparation?: RerunPreparat
     title: validating ? "Entrando e conferindo preparação…" : loginReady ? "Login realizado. Autorize para continuar" : login ? "Faça login para continuar" : "Prepare a página para continuar",
     instruction: validating ? "Aguarde a conferência do login, da página e dos pré-requisitos. Não é necessário confirmar novamente."
       : loginReady ? "Seu login foi reconhecido e os pré-requisitos foram conferidos. Marque a autorização para o teste continuar automaticamente."
-        : login ? "Marque a autorização e faça login pelo próprio site. O AutoJev identifica o login e continua automaticamente após conferir a página e os pré-requisitos. Se preferir, preencha usuário e senha e clique em “Continuar reexecução” para o AutoJev tentar entrar."
-          : "Prepare a página e os dados iniciais do teste. Depois, marque a autorização e clique em “Continuar reexecução”. Se houver um login preenchido no site autorizado, o AutoJev tentará entrar. A ação do teste só será executada se os pré-requisitos forem confirmados.",
+        : login ? "Marque a autorização e faça login pelo próprio site. O Test Lab identifica o login e continua automaticamente após conferir a página e os pré-requisitos. Se preferir, preencha usuário e senha e clique em “Continuar reexecução” para o Test Lab tentar entrar."
+          : "Prepare a página e os dados iniciais do teste. Depois, marque a autorização e clique em “Continuar reexecução”. Se houver um login preenchido no site autorizado, o Test Lab tentará entrar. A ação do teste só será executada se os pré-requisitos forem confirmados.",
     consent_label: "Autorizo tentar entrar com o login preenchido e executar a ação original somente se a conferência dos pré-requisitos passar.",
     button_label: validating ? "Entrando e conferindo preparação…" : "Continuar reexecução",
     details_label: "Ver detalhes da preparação",
@@ -1128,6 +1169,23 @@ export function validateCapturePlanForPreflight(plan: ScenarioCapturePlan | unde
 }
 
 export function parseAppHash(hash: string): AppRoute {
+  const batch = hash.match(/^#\/planejar-lote\/([^/?]+)\?(.+)$/);
+  if (batch) {
+    try {
+      const parameters = new URLSearchParams(batch[2]);
+      if ([...parameters].length !== 1 || !parameters.has("itens") || parameters.get("itens")!.length > 200000) throw new Error();
+      const items: unknown = JSON.parse(parameters.get("itens")!);
+      if (!Array.isArray(items) || items.length < 1 || items.length > 500) throw new Error();
+      const identity = (value: unknown) => typeof value === "string" && value.length > 0 && value.length <= 200;
+      const initialBatch = items.map((item): PlanningBatchItem => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error();
+        const { source, ct, capture_plan, ...rest } = item as Record<string, unknown>;
+        if (Object.keys(rest).length || !identity(source) || !identity(ct)) throw new Error();
+        return { source: source as string, ct: ct as string, ...(capture_plan !== undefined ? { capture_plan: validateScenarioCapturePlan(capture_plan) } : {}) };
+      });
+      return { view: "explorations", suiteId: decodeURIComponent(batch[1]), initialTab: "planner", initialBatch };
+    } catch { return { view: "explorations" }; }
+  }
   const planning = hash.match(/^#\/planejar\/([^/?]+)\/([^/?]+)(?:\?(.*))?$/);
   if (planning) {
     try {
@@ -1144,6 +1202,7 @@ export function parseAppHash(hash: string): AppRoute {
       return { view: "explorations", suiteId: decodeURIComponent(suite[1]), planId: params.get("plan") || undefined,
         roundId: params.get("round") || undefined, initialCaseId: params.get("ct") || undefined,
         initialSourceId: params.get("source") || undefined, initialSourceCase: params.get("source_ct") || undefined,
+        ...(params.get("tab") === "planner" ? { initialTab: "planner" as const } : {}),
         ...(params.has("capture_plan") ? { capturePlan: validateScenarioCapturePlan(JSON.parse(params.get("capture_plan")!)) } : {}) };
     } catch { return { view: "explorations" }; }
   }
@@ -1192,24 +1251,24 @@ export function connectReportToApplication(html: string, sourceExplorationId: st
   return clean.replace(/<head\b[^>]*>/i, (head) => head + '<script id="report-app-runtime" type="application/json">' + runtime + "</script>");
 }
 
-export async function openTestSuiteReport(request: ApiRequest, options: { root: string; scope: string; roundId?: string; caseId?: string; apiBase?: string }) {
+export async function openTestSuiteReport(request: ApiRequest, options: { root: string; scope: string; roundId?: string; caseId?: string; view?: "tests"; apiBase?: string }) {
   // A tiny local loading page paints immediately while the focused CT loads.
   // It contains no external resources and never leaves a white about:blank tab.
-  const label = (options.caseId || "relatório").replace(/[&<>"']/g, character => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]!);
-  const loadingHtml = `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AutoJev · Abrindo ${label}</title><style>html{color-scheme:dark;background:#0b1013;color:#e4e9ee;font-family:system-ui,sans-serif}body{margin:0;min-height:100vh;display:grid;place-items:center}main{max-width:420px;padding:32px}small{color:#f2c45b;letter-spacing:.15em}h1{font-size:24px;font-weight:600}p{color:#91a0ae;font-size:14px;line-height:1.7}.loader{height:3px;margin-top:28px;background:#263137;overflow:hidden;border-radius:8px}.loader:after{content:"";display:block;width:40%;height:100%;background:#f2c45b;animation:load 1.2s ease-in-out infinite alternate}@keyframes load{to{transform:translateX(150%)}}@media(prefers-reduced-motion:reduce){.loader:after{animation:none}}</style></head><body><main role="status" aria-live="polite"><small>AUTOJEV · EVIDÊNCIAS</small><h1>Abrindo ${label}</h1><p>${options.caseId ? "Buscando os detalhes deste teste. Os prints serão carregados conforme você os visualizar." : "Preparando o relatório com as evidências registradas."}</p><div class="loader" aria-hidden="true"></div></main></body></html>`;
+  const label = (options.caseId || (options.view ? "testes" : "relatório")).replace(/[&<>"']/g, character => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]!);
+  const loadingHtml = `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Test Lab · Abrindo ${label}</title><style>html{color-scheme:dark;background:#0b1013;color:#e4e9ee;font-family:system-ui,sans-serif}body{margin:0;min-height:100vh;display:grid;place-items:center}main{max-width:420px;padding:32px}small{color:#f2c45b;letter-spacing:.15em}h1{font-size:24px;font-weight:600}p{color:#91a0ae;font-size:14px;line-height:1.7}.loader{height:3px;margin-top:28px;background:#263137;overflow:hidden;border-radius:8px}.loader:after{content:"";display:block;width:40%;height:100%;background:#f2c45b;animation:load 1.2s ease-in-out infinite alternate}@keyframes load{to{transform:translateX(150%)}}@media(prefers-reduced-motion:reduce){.loader:after{animation:none}}</style></head><body><main role="status" aria-live="polite"><small>TEST LAB · EVIDÊNCIAS</small><h1>Abrindo ${label}</h1><p>${options.caseId ? "Buscando os detalhes deste teste. Os prints serão carregados conforme você os visualizar." : options.view ? "Preparando a lista de testes. Os prints serão carregados conforme você os visualizar." : "Preparando o relatório com as evidências registradas."}</p><div class="loader" aria-hidden="true"></div></main></body></html>`;
   const loadingUrl = URL.createObjectURL(new Blob([loadingHtml], { type: "text/html" }));
   const preview = window.open(loadingUrl, "_blank");
   if (!preview) { URL.revokeObjectURL(loadingUrl); throw new Error("Permita a abertura de novas abas para visualizar o resultado do teste."); }
   preview.opener = null;
   let objectUrl: string | undefined;
   try {
-    const parameters = new URLSearchParams({ scope: options.scope, ...(options.roundId ? { round_id: options.roundId } : {}), ...(options.caseId ? { case_id: options.caseId, preview: "true" } : {}) });
+    const parameters = new URLSearchParams({ scope: options.scope, ...(options.roundId ? { round_id: options.roundId } : {}), ...(options.caseId ? { case_id: options.caseId } : {}), ...(options.caseId || options.view ? { preview: "true" } : {}) });
     const response = await request<Response>(`/test-suites/${encodeURIComponent(options.root)}/report?${parameters}`, { raw: true });
     if (preview.closed) return;
     const html = connectReportToApplication(await response.text(), options.root, window.location.origin, options.apiBase);
     if (preview.closed) return;
     objectUrl = URL.createObjectURL(new Blob([html], { type: "text/html" }));
-    preview.location.replace(objectUrl + (options.caseId ? `#view/results/${encodeURIComponent(options.caseId)}` : ""));
+    preview.location.replace(objectUrl + (options.caseId ? `#view/results/${encodeURIComponent(options.caseId)}` : options.view ? `#view/${options.view}` : ""));
     const loadedUrl = objectUrl;
     window.setTimeout(() => URL.revokeObjectURL(loadedUrl), 60000);
   } catch (error) {
@@ -1586,7 +1645,7 @@ function activityCopy(event: ExplorationEvent) {
     action_requires_jev_judgment: "ação que exige julgamento de QA",
   };
   const fallback: Record<string, { title: string; detail?: string }> = {
-    started: { title: "Exploração iniciada", detail: "O navegador foi preparado para o AutoJev." },
+    started: { title: "Exploração iniciada", detail: "O navegador foi preparado para o Test Lab." },
     browser_launched: { title: "Aplicação aberta no navegador" },
     coverage_scope: { title: "Escopo de cobertura definido" },
     auxiliary_evidence_mode: { title: "Modo de evidência configurado", detail: payload.mode === "visual" ? "A LLM auxiliar receberá texto + screenshot." : "A LLM auxiliar receberá somente texto estruturado; screenshots ficam locais." },
@@ -1597,9 +1656,25 @@ function activityCopy(event: ExplorationEvent) {
     action_completed: { title: `Ação ${String(payload.step || "")} concluída`.trim(), detail: event.message },
     waiting_input: { title: "Aguardando uma ação sua", detail: event.message },
     limit_reached: { title: "Limite de ações atingido", detail: "A execução foi preservada com cobertura parcial." },
-    coverage_complete: { title: "Cobertura concluída", detail: "O AutoJev esgotou as opções alcançáveis." },
+    coverage_complete: { title: "Cobertura concluída", detail: "O Test Lab esgotou as opções alcançáveis." },
     coverage_complete_with_restrictions: { title: "Cobertura alcançável concluída", detail: "As verificações que não puderam ser concluídas foram documentadas com suas limitações." },
     coverage_stalled: { title: "Exploração bloqueada", detail: event.message },
+    coverage_scope_not_found: { title: "A tela pedida não foi encontrada", detail: `O Test Lab não achou o caminho até "${String(payload.scope || "o escopo configurado")}" entre os controles seguros alcançáveis. A exploração foi preservada como parcial.` },
+    frontier_advice: {
+      title: event.message || "IA analisou a tela",
+      detail: [
+        Array.isArray(payload.suggestions)
+          ? (payload.suggestions as Array<{ name?: string; why?: string }>)
+              .map((item) => [item?.name, item?.why].filter(Boolean).join(": "))
+              .filter(Boolean)
+              .join(" · ")
+          : "",
+        Array.isArray(payload.unexplored_notes) ? (payload.unexplored_notes as string[]).join(" · ") : "",
+      ].filter(Boolean).join(" — ") || undefined,
+    },
+    functional_finding: { title: event.message || "Defeito encontrado", detail: typeof payload.actual === "string" ? payload.actual : undefined },
+    frontier_advice_failed: { title: "Sugestão da IA indisponível nesta tela", detail: event.message },
+    frontier_advice_unavailable: { title: "Consulta de IA desativada nesta execução", detail: event.message },
     scenario_parallel_started: { title: "CTs ativados em paralelo", detail: "Cada evidência válida já começa a virar caso de teste enquanto o navegador continua." },
     scenario_draft_created: { title: `${scenario} preservado ao vivo`, detail: "A evidência local já está segura; a LLM auxiliar pode aprimorá-la em segundo plano." },
     scenario_draft_updated: { title: `${scenario} atualizado`, detail: "Uma tentativa mais recente substituiu a evidência provisória sem duplicar o caso." },
@@ -1713,10 +1788,10 @@ function Modal({
 
 function ArchitectureFlow({ compact = false }: { compact?: boolean }) {
   return (
-    <div className={`architecture-flow${compact ? " compact" : ""}`} aria-label="Arquitetura do AutoJev">
+    <div className={`architecture-flow${compact ? " compact" : ""}`} aria-label="Arquitetura do Test Lab">
       <div className="architecture-node node-primary">
         <span className="node-icon"><BrainCircuit size={20} /></span>
-        <div><strong>Planejador</strong><small>AutoJev · decide</small></div>
+        <div><strong>Planejador</strong><small>Test Lab · decide</small></div>
       </div>
       <span className="flow-arrow"><ArrowRight size={17} /></span>
       <div className="architecture-node">
@@ -2005,10 +2080,10 @@ export default function AutoJevApp() {
         );
       case "explorations":
         return <Suspense fallback={<section className="panel">Carregando conjuntos de testes…</section>}><TestSuitesWorkspace
-          key={[route.suiteId, route.planId, route.roundId, route.initialCaseId, route.initialSourceId, route.initialSourceCase, JSON.stringify(route.capturePlan)].join("/")}
-          rootId={route.suiteId} planId={route.planId} roundId={route.roundId} initialCaseId={route.initialCaseId}
+          key={[route.suiteId, route.planId, route.roundId, route.initialCaseId, route.initialTab, JSON.stringify(route.initialBatch), route.initialSourceId, route.initialSourceCase, JSON.stringify(route.capturePlan)].join("/")}
+          rootId={route.suiteId} planId={route.planId} roundId={route.roundId} initialCaseId={route.initialCaseId} initialTab={route.initialTab} initialBatch={route.initialBatch}
           initialSourceId={route.initialSourceId} initialSourceCase={route.initialSourceCase} initialCapturePlan={route.capturePlan}
-          apiBase={apiBase} request={request} navigate={navigate} openReport={(root, scope, roundId, caseId) => openTestSuiteReport(request, { root, scope, roundId, caseId, apiBase })} /></Suspense>;
+          apiBase={apiBase} request={request} navigate={navigate} openReport={(root, scope, roundId, caseId, view) => openTestSuiteReport(request, { root, scope, roundId, caseId, view, apiBase })} /></Suspense>;
       case "planned":
         return <Suspense fallback={<section className="panel" role="status">Carregando execuções planejadas…</section>}><PlannedExecutions request={request} navigate={navigate} /></Suspense>;
       case "providers":
@@ -2077,7 +2152,7 @@ export default function AutoJevApp() {
         <div className="brand-row">
           <button className="brand" onClick={() => navigate("#/dashboard")} aria-label="Ir para o dashboard">
             <span className="brand-mark"><Bot size={22} strokeWidth={2.1} /></span>
-            <span className="brand-copy"><strong>AutoJev</strong><small>Autonomous QA</small></span>
+            <span className="brand-copy"><strong>Test Lab</strong><small>Autonomous QA</small></span>
           </button>
         </div>
 
@@ -2121,7 +2196,7 @@ export default function AutoJevApp() {
           )}
           <div className={`api-indicator api-${apiState}`} title={`API: ${apiBase}`}>
             <span className="api-dot" />
-            <div><strong>{apiState === "online" ? "API conectada" : apiState === "checking" ? "Verificando API" : "API indisponível"}</strong><small>FastAPI · {apiState === "online" ? "operacional" : "localhost:8000"}</small></div>
+            <div><strong>{apiState === "online" ? "API conectada" : apiState === "checking" ? "Verificando API" : "API indisponível"}</strong><small>FastAPI · {apiState === "online" ? "operacional" : "127.0.0.1:8000"}</small></div>
           </div>
           <button className="collapse-button" onClick={() => setSidebarCollapsed((value) => !value)} aria-label={sidebarCollapsed ? "Expandir menu lateral" : "Recolher menu lateral"}>
             {sidebarCollapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
@@ -2135,7 +2210,7 @@ export default function AutoJevApp() {
           <button ref={mobileMenuTrigger} className="icon-button" onClick={() => setMobileNavOpen(true)} aria-label="Abrir menu" aria-controls="app-sidebar" aria-expanded={mobileNavOpen}>
             <Menu size={20} />
           </button>
-          <button className="mobile-brand" onClick={() => navigate("#/dashboard")}><span className="brand-mark"><Bot size={19} /></span><strong>AutoJev</strong></button>
+          <button className="mobile-brand" onClick={() => navigate("#/dashboard")}><span className="brand-mark"><Bot size={19} /></span><strong>Test Lab</strong></button>
           <button className="icon-button" onClick={() => void refreshAll()} aria-label="Atualizar dados"><RefreshCcw size={18} /></button>
         </header>
 
@@ -2176,7 +2251,7 @@ export default function AutoJevApp() {
       )}
 
       {reportData !== null && (
-        <Modal title="Relatório da exploração" description="Resultado consolidado pelo AutoJev." onClose={() => setReportData(null)} wide>
+        <Modal title="Relatório da exploração" description="Resultado consolidado pelo Test Lab." onClose={() => setReportData(null)} wide>
           <div className="report-preview">
             {typeof reportData === "string" ? <pre>{reportData}</pre> : <pre>{JSON.stringify(reportData, null, 2)}</pre>}
           </div>
@@ -2220,9 +2295,9 @@ export function ScenarioRerunConsent({ preflight, loading, error, busy, consent,
           <ul>{(preflight.effects?.length ? preflight.effects : ["Um novo navegador será aberto para preparar o teste.", "Somente a ação original deste CT será repetida.", "Um novo resultado e novas evidências serão registrados, preservando a execução original."]).map((effect, index) => <li key={index}>{effect}</li>)}</ul>
         </div>
         <p className="rerun-local-note"><ShieldCheck size={17} />As verificações locais salvas serão repetidas, sem chamadas à LLM. {checkpointCount ? "Somente as pausas para print serão aplicadas. SWS e SQL continuam bloqueados e não serão executados." : "Nenhuma pausa para print foi incluída. SWS e SQL não serão executados."}</p>
-        {checkpointCount > 0 && <div className="rerun-capture-plan"><span className="rerun-capture-plan-icon"><ImagePlus size={22} /></span><div><strong>{checkpointCount} {checkpointCount === 1 ? "pausa para print" : "pausas para print"} nesta reexecução</strong><p>Em cada pausa, adicione a imagem que você quiser na aplicação AutoJev: cole com Ctrl + V, arraste um arquivo ou escolha uma imagem PNG, JPG ou WEBP de até 10 MB. Pode ser de qualquer tela ou aplicativo; não há captura automática do navegador. Confira a prévia e clique em «Anexar print e continuar». A confirmação ocorre somente na aplicação AutoJev, nunca pela página testada. O print não aprova nem reprova o teste.</p><p>As pausas planejadas antes da ação ocorrem antes dela; as demais acontecem após a ação e suas conferências locais. A posição no rascunho fica registrada, sem interromper cada conferência individual.</p><p>Prazo de confirmação: até 15 minutos por pausa, com limite de 1 hora somando todas as pausas. Ao esgotar o prazo, a execução termina sem anexar ou continuar automaticamente.</p><ol>{[...capturePlan!.checkpoints].sort((left, right) => left.gap - right.gap || left.order - right.order).map((item) => <li key={item.id}><span>Aguardar print</span><small>Posição planejada: {item.gap === 0 ? "antes da primeira etapa" : `após a etapa ${item.gap}`}</small></li>)}</ol></div></div>}
+        {checkpointCount > 0 && <div className="rerun-capture-plan"><span className="rerun-capture-plan-icon"><ImagePlus size={22} /></span><div><strong>{checkpointCount} {checkpointCount === 1 ? "pausa para print" : "pausas para print"} nesta reexecução</strong><p>Em cada pausa, adicione a imagem que você quiser na aplicação Test Lab: cole com Ctrl + V, arraste um arquivo ou escolha uma imagem PNG, JPG ou WEBP de até 10 MB. Pode ser de qualquer tela ou aplicativo; não há captura automática do navegador. Confira a prévia e clique em «Anexar print e continuar». A confirmação ocorre somente na aplicação Test Lab, nunca pela página testada. O print não aprova nem reprova o teste.</p><p>As pausas planejadas antes da ação ocorrem antes dela; as demais acontecem após a ação e suas conferências locais. A posição no rascunho fica registrada, sem interromper cada conferência individual.</p><p>Prazo de confirmação: até 15 minutos por pausa, com limite de 1 hora somando todas as pausas. Ao esgotar o prazo, a execução termina sem anexar ou continuar automaticamente.</p><ol>{[...capturePlan!.checkpoints].sort((left, right) => left.gap - right.gap || left.order - right.order).map((item) => <li key={item.id}><span>Aguardar print</span><small>Posição planejada: {item.gap === 0 ? "antes da primeira etapa" : `após a etapa ${item.gap}`}</small></li>)}</ol></div></div>}
         {preflight.scope?.missing_visual_checks ? <p className="rerun-local-note">Nem todas as conferências originais poderão ser repetidas: a conferência visual da LLM ficará pendente. A reexecução não confirmará essa parte do teste.</p> : preflight.scope?.visual_review_omitted && <p className="rerun-local-note">A revisão visual auxiliar não será repetida. As verificações locais podem ser concluídas normalmente; isso não equivale a uma aprovação visual.</p>}
-        <div className="rerun-preparation"><strong>Preencha o login e continue pelo AutoJev</strong><p>Se precisar entrar, preencha usuário e senha no novo navegador. Ao clicar em «Continuar reexecução», o AutoJev tentará enviar um formulário de login preenchido e seguro. Se já estiver conectado, apenas conferirá a preparação. Recrie as pré-condições do CT e abra a página esperada; a ação original só será executada após essa conferência.</p></div>
+        <div className="rerun-preparation"><strong>Preencha o login e continue pelo Test Lab</strong><p>Se precisar entrar, preencha usuário e senha no novo navegador. Ao clicar em «Continuar reexecução», o Test Lab tentará enviar um formulário de login preenchido e seguro. Se já estiver conectado, apenas conferirá a preparação. Recrie as pré-condições do CT e abra a página esperada; a ação original só será executada após essa conferência.</p></div>
         <label className="rerun-consent"><input type="checkbox" checked={consent} disabled={busy} onChange={(event) => onConsent(event.target.checked)} /><span>Entendo que esta reexecução é real, pode tentar entrar com o login que eu preencher e pode modificar dados da aplicação{checkpointCount ? " e aguardará minha confirmação para cada print; SWS e SQL não serão executados." : " e não executará SWS ou SQL."}</span></label>
       </>}
     </>}
@@ -2322,11 +2397,11 @@ function DashboardView({
       <PageHeader
         eyebrow="Centro de operações"
         title="Boa exploração começa com uma boa decisão."
-        description="O AutoJev conduz o teste, o Playwright executa cada ação e sua LLM auxiliar interpreta as evidências — sem assumir o controle do navegador."
+        description="O Test Lab conduz o teste, o Playwright executa cada ação e sua LLM auxiliar interpreta as evidências — sem assumir o controle do navegador."
         actions={<button className="button primary" onClick={() => navigate("#/nova-exploracao")}><Plus size={17} />Nova exploração</button>}
       />
 
-      <section className="metric-grid" aria-label="Resumo do AutoJev">
+      <section className="metric-grid" aria-label="Resumo do Test Lab">
         <MetricCard icon={Activity} label="Explorações" value={loading ? "—" : String(explorations.length)} note={liveCount > 0 ? `${liveCount} em execução agora` : "Nenhuma execução ativa"} tone="amber" />
         <MetricCard icon={FileCheck2} label="Cenários gerados" value={loading ? "—" : String(scenarioCount)} note="Com evidências rastreáveis" />
         <MetricCard icon={CheckCircle2} label="Taxa de aprovação" value={loading ? "—" : passRate} note={verifiedCount ? `${passCount} cenários aprovados` : "Aguardando cenários verificados"} tone="teal" />
@@ -2338,7 +2413,7 @@ function DashboardView({
           <div>
             <span className="section-kicker"><Network size={15} />Arquitetura desacoplada</span>
             <h2>Planejador no comando. LLM intercambiável.</h2>
-            <p>O planejador do AutoJev decide as ações sem IA, percorrendo cada caminho uma vez; a LLM auxiliar recebe somente screenshot e DOM para interpretar a observação.</p>
+            <p>O planejador do Test Lab decide as ações sem IA, percorrendo cada caminho uma vez; a LLM auxiliar recebe somente screenshot e DOM para interpretar a observação.</p>
           </div>
           <button className="text-button" onClick={() => navigate("#/provedores")}>Configurar modelos <ArrowRight size={15} /></button>
         </div>
@@ -2568,7 +2643,7 @@ function NewExplorationView({
       if (username || password) body.credentials = { username: username.trim(), password };
       const created = await request<Exploration>("/explorations", { method: "POST", body: JSON.stringify(body) });
       onCreated(created);
-      toast("Exploração iniciada. O AutoJev já está preparando o navegador.", "success");
+      toast("Exploração iniciada. O Test Lab já está preparando o navegador.", "success");
       navigate(`#/exploracoes/${encodeURIComponent(created.id)}`);
     } catch (error) {
       toast(errorMessage(error), "error");
@@ -2581,7 +2656,7 @@ function NewExplorationView({
 
   return (
     <div className="view-stack new-view">
-      <PageHeader eyebrow="Nova execução" title="Prepare a exploração" description="Defina o alvo e escolha a LLM auxiliar que interpreta as evidências. O AutoJev decide as ações sozinho." />
+      <PageHeader eyebrow="Nova execução" title="Prepare a exploração" description="Defina o alvo e escolha a LLM auxiliar que interpreta as evidências. O Test Lab decide as ações sozinho." />
       {noModels && (
         <div className="callout warning-callout"><AlertCircle size={19} /><div><strong>Você precisa de um modelo ativo.</strong><span>Conecte um provedor e cadastre ou descubra seus modelos antes de iniciar.</span></div><button className="button secondary small" onClick={() => navigate("#/provedores")}>Configurar provedores</button></div>
       )}
@@ -2590,13 +2665,13 @@ function NewExplorationView({
           <section className="panel form-section">
             <div className="section-number">01</div>
             <div className="form-section-content">
-              <div className="form-section-heading"><div><h2>Aplicação alvo</h2><p>Informe a URL inicial. O AutoJev descobrirá as rotas durante a navegação.</p></div><Globe2 size={21} /></div>
+              <div className="form-section-heading"><div><h2>Aplicação alvo</h2><p>Informe a URL inicial. O Test Lab descobrirá as rotas durante a navegação.</p></div><Globe2 size={21} /></div>
               <label className="field-label" htmlFor="target-url">URL da aplicação</label>
               <div className="input-with-icon"><Globe2 size={17} /><input id="target-url" type="text" inputMode="url" required placeholder="https://app.exemplo.com ou www.exemplo.com" value={url} onChange={(event) => setUrl(event.target.value)} onBlur={() => setUrl(normalizeTargetUrl(url))} autoComplete="url" /></div>
               <span className="field-hint">A aplicação deve estar acessível pelo servidor que executa o Playwright.</span>
               <fieldset className="focus-area-field">
                 <legend>Tela, menu ou submenu <em>opcional</em></legend>
-                <p>Escolha se o AutoJev deve percorrer toda a aplicação ou esgotar primeiro um recorte funcional.</p>
+                <p>Escolha se o Test Lab deve percorrer toda a aplicação ou esgotar primeiro um recorte funcional.</p>
                 <div className="scope-mode-grid">
                   <label className={focusMode === "all" ? "selected" : ""}>
                     <input type="radio" name="exploration-scope" value="all" checked={focusMode === "all"} onChange={() => setFocusMode("all")} />
@@ -2613,7 +2688,7 @@ function NewExplorationView({
                   <div className="focus-area-input">
                     <label className="field-label" htmlFor="focus-area">Qual área deve ser explorada?</label>
                     <div className="input-with-icon"><Focus size={17} /><input id="focus-area" type="text" required maxLength={500} placeholder="Ex.: Configurações > Usuários > Permissões" value={focusArea} onChange={(event) => setFocusArea(event.target.value)} aria-describedby="focus-area-hint" /></div>
-                    <span className="field-hint" id="focus-area-hint">Informe o caminho visível dos menus ou descreva a funcionalidade. O AutoJev poderá navegar para frente e voltar entre telas dentro deste escopo.</span>
+                    <span className="field-hint" id="focus-area-hint">Informe o caminho visível dos menus ou descreva a funcionalidade. O Test Lab poderá navegar para frente e voltar entre telas dentro deste escopo.</span>
                   </div>
                 )}
               </fieldset>
@@ -2623,7 +2698,7 @@ function NewExplorationView({
           <section className="panel form-section model-section">
             <div className="section-number">02</div>
             <div className="form-section-content">
-              <div className="form-section-heading"><div><h2>Inteligência da exploração</h2><p>O AutoJev decide as ações percorrendo cada caminho uma vez; a LLM auxiliar transforma as evidências em CTs.</p></div><BrainCircuit size={21} /></div>
+              <div className="form-section-heading"><div><h2>Inteligência da exploração</h2><p>O Test Lab decide as ações percorrendo cada caminho uma vez; a LLM auxiliar transforma as evidências em CTs.</p></div><BrainCircuit size={21} /></div>
               <div className="model-choice-grid single">
                 <ModelRoleCard
                   roleTitle="LLM auxiliar"
@@ -2676,8 +2751,8 @@ function NewExplorationView({
           <section className="panel form-section">
             <div className="section-number">03</div>
             <div className="form-section-content">
-              <div className="form-section-heading"><div><h2>Parâmetros de execução</h2><p>A exploração termina pela cobertura: o AutoJev continua até esgotar as opções alcançáveis do escopo.</p></div><Gauge size={21} /></div>
-              <div className="coverage-mode-note"><CheckCircle2 size={19} /><div><strong>Sem teto fixo de ações ou duração</strong><span>Você pode cancelar quando quiser. O AutoJev só conclui normalmente depois de percorrer toda a cobertura alcançável.</span></div></div>
+              <div className="form-section-heading"><div><h2>Parâmetros de execução</h2><p>A exploração termina pela cobertura: o Test Lab continua até esgotar as opções alcançáveis do escopo.</p></div><Gauge size={21} /></div>
+              <div className="coverage-mode-note"><CheckCircle2 size={19} /><div><strong>Sem teto fixo de ações ou duração</strong><span>Você pode cancelar quando quiser. O Test Lab só conclui normalmente depois de percorrer toda a cobertura alcançável.</span></div></div>
               <div className="field-grid two-columns">
                 <label className="field-group"><span>Viewport</span><select value={viewport} onChange={(event) => setViewport(event.target.value)}><option value="1440x900">Desktop · 1440 × 900</option><option value="1280x720">Notebook · 1280 × 720</option><option value="390x844">Mobile · 390 × 844</option></select></label>
                 <div className="field-group"><span>Evidências</span><div className="static-field"><Eye size={16} />Screenshot + DOM</div></div>
@@ -2718,7 +2793,7 @@ function NewExplorationView({
           <span className="section-kicker">Resumo da execução</span>
           <h2>{url ? hostFromUrl(url) : "Aplicação não definida"}</h2>
           <div className="launch-summary">
-            <SummaryRow label="Decisão das ações" value="Planejador do AutoJev" />
+            <SummaryRow label="Decisão das ações" value="Planejador do Test Lab" />
             <SummaryRow label="LLM auxiliar" value={auxModel || "Selecione um modelo"} />
             <SummaryRow label="Evidência da LLM" value={auxiliaryEvidenceMode === "visual" ? "Visual · texto + imagem" : "Econômico · somente texto"} />
             <SummaryRow label="Chamadas auxiliares" value={`Até ${auxiliaryMaxRequests || "—"} · 3 tentativas/revisão`} />
@@ -2873,7 +2948,7 @@ export function ExplorationsView({ explorations, loading, navigate }: { explorat
           </div>
         </div>
         {loading ? <ListSkeleton rows={5} /> : explorations.length === 0 ? (
-          <EmptyState icon={MonitorPlay} title="Nenhuma exploração registrada" description="Quando o AutoJev explorar sua primeira aplicação, a execução aparecerá aqui com status e evidências." action={<button className="button primary" onClick={() => navigate("#/nova-exploracao")}><Rocket size={16} />Começar agora</button>} />
+          <EmptyState icon={MonitorPlay} title="Nenhuma exploração registrada" description="Quando o Test Lab explorar sua primeira aplicação, a execução aparecerá aqui com status e evidências." action={<button className="button primary" onClick={() => navigate("#/nova-exploracao")}><Rocket size={16} />Começar agora</button>} />
         ) : filtered.length === 0 ? (
           <EmptyState icon={Search} title="Nenhum resultado" description="Tente outro termo ou remova o filtro de status." action={<button className="button ghost" onClick={() => { setQuery(""); setFilter("all"); }}>Limpar filtros</button>} />
         ) : (
@@ -3152,7 +3227,7 @@ function AddProviderModal({ request, onClose, onSaved, toast }: { request: ApiRe
         <label className="field-group"><span>Nome do provedor</span><input required placeholder="Ex.: LiteLLM local" value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} /></label>
         <label className="field-group"><span>Base URL</span><input type="url" required placeholder="http://localhost:4000" value={draft.base_url} onChange={(event) => setDraft({ ...draft, base_url: event.target.value })} /></label>
         <label className="field-group"><span>API key <small>{isOpenRouter ? "obrigatória" : "opcional"}</small></span><input type="password" required={isOpenRouter} placeholder="A chave será armazenada somente pelo backend" value={draft.api_key} onChange={(event) => setDraft({ ...draft, api_key: event.target.value })} autoComplete="new-password" /></label>
-        <div className="modal-note"><ShieldCheck size={17} /><span>O AutoJev nunca exibe novamente uma chave salva.</span></div>
+        <div className="modal-note"><ShieldCheck size={17} /><span>O Test Lab nunca exibe novamente uma chave salva.</span></div>
         <div className="modal-actions"><button type="button" className="button ghost" onClick={onClose}>Cancelar</button><button type="submit" className="button primary" disabled={saving}>{saving ? <><Spinner />Conectando…</> : <><Plus size={16} />Adicionar endpoint</>}</button></div>
       </form>
     </Modal>
@@ -3193,7 +3268,7 @@ export function ExplorationDetailView({
   const [captureSubmittedKey, setCaptureSubmittedKey] = useState("");
   const [captureError, setCaptureError] = useState({ key: "", message: "" });
   const captureRequests = useRef(new Set<string>());
-  const [detailTab, setDetailTab] = useState<"overview" | "scenarios" | "coverage" | "activity" | "evidence" | "config">("overview");
+  const [detailTab, setDetailTab] = useState<"overview" | "scenarios" | "findings" | "coverage" | "activity" | "evidence" | "config">("overview");
   const [selectedRerunStepId, setSelectedRerunStepId] = useState<string | null>(null);
   const preparationConsent = useScenarioRerunPreparationConsent(exploration, request, resuming || cancelling);
   if (loading && !exploration) return <div className="detail-loading"><Spinner size={24} /><span>Carregando exploração…</span></div>;
@@ -3291,7 +3366,7 @@ export function ExplorationDetailView({
         : exploration.phase_label || status.label;
   const phaseDescription = rerun
     ? rerunFeedback?.notStarted ? `${rerunFeedback.detail} O resultado original não foi alterado.`
-      : validatingRerunPreparation ? "Se houver um formulário de login preenchido e seguro, o AutoJev tentará enviá-lo. Depois conferirá a página, os controles e as condições iniciais antes de executar a ação salva."
+      : validatingRerunPreparation ? "Se houver um formulário de login preenchido e seguro, o Test Lab tentará enviá-lo. Depois conferirá a página, os controles e as condições iniciais antes de executar a ação salva."
       : rerun.phase === "waiting_capture" ? "O CT está pausado. Cole, arraste ou escolha sua imagem no painel acima e confirme em «Anexar print e continuar». Pode ser um print de qualquer tela ou aplicativo."
       : rerun.phase === "capturing_print" ? "Sua imagem será anexada ao novo relatório como evidência enviada por você. Aguarde o salvamento; a ação original não será repetida."
       : rerun.phase === "waiting_preparation" ? preparationPresentation.instruction
@@ -3402,7 +3477,7 @@ export function ExplorationDetailView({
   const preparationPanel = waitingForInput && !capturePhase ? (
     <section className={`panel intervention-card intervention-wide ${rerun ? "rerun-intervention" : ""}`}>
       <span className="section-kicker"><span className="live-pulse" />{rerun ? preparationPresentation.kicker : "Ação necessária"}</span>
-      <div><h2>{rerun ? preparationPresentation.title : "Faça login no navegador"}</h2>{rerun ? <ScenarioRerunPreparation compact={liveRerun} preparation={rerun.preparation} validating={validatingRerunPreparation} /> : <p>{waitingEvent?.message || "Preencha usuário e senha no navegador. Ao continuar, o AutoJev tentará enviar um formulário de login preenchido e seguro."}</p>}{rerun && <>
+      <div><h2>{rerun ? preparationPresentation.title : "Faça login no navegador"}</h2>{rerun ? <ScenarioRerunPreparation compact={liveRerun} preparation={rerun.preparation} validating={validatingRerunPreparation} /> : <p>{waitingEvent?.message || "Preencha usuário e senha no navegador. Ao continuar, o Test Lab tentará enviar um formulário de login preenchido e seguro."}</p>}{rerun && <>
         <label className="rerun-consent"><input type="checkbox" checked={rerunPreparationConfirmed} disabled={resuming || validatingRerunPreparation || preparationConsent.pending} onChange={(event) => preparationConsent.setChecked(event.target.checked)} /><span>{preparationPresentation.consent_label}</span></label>
         {preparationConsent.pending && <p role="status">Sincronizando autorização…</p>}
         {preparationConsent.error && <p className="rerun-error" role="alert">{preparationConsent.error}</p>}
@@ -3413,6 +3488,10 @@ export function ExplorationDetailView({
     </section>
   ) : null;
   const showLiveRerun = !!rerun && liveRerun;
+  // Only the original exploration owns a test base; reruns and round items
+  // already link back to theirs ("Voltar à execução").
+  const canPrepareExecution = !rerun && !exploration.suite_round && !isLive(exploration.status)
+    && (exploration.counters?.scenarios ?? exploration.scenarios?.length ?? 0) > 0;
   const capturePanel = capturePhase && <ScenarioRerunCapture key={captureKey || exploration.id} checkpoint={rerun?.capture_checkpoint} completed={rerun?.captures_completed} total={rerun?.capture_count} busy={captureBusy} error={captureError.key === captureKey ? captureError.message : ""} timeoutSeconds={rerun?.capture_timeout_seconds} onCapture={(imageDataUrl) => void capturePrint(imageDataUrl)} request={request} explorationId={exploration.id} />;
   const rerunControls = <div id="rerun-live-controls" className={showLiveRerun ? "rerun-live-controls" : "rerun-standard-controls"}>
     {capturePanel}
@@ -3432,9 +3511,12 @@ export function ExplorationDetailView({
           {isLive(exploration.status) ? (
             <button className="button danger" onClick={() => void cancel()} disabled={cancelling}>{cancelling ? <Spinner /> : <CircleStop size={16} />}Cancelar</button>
           ) : exploration.report_available ? (
-            <button className="button primary" onClick={() => void openReport()} disabled={openingReport}>{openingReport ? <Spinner /> : <FileText size={16} />}Abrir relatório</button>
+            <button className={`button ${canPrepareExecution ? "secondary" : "primary"}`} onClick={() => void openReport()} disabled={openingReport}>{openingReport ? <Spinner /> : <FileText size={16} />}Abrir relatório</button>
           ) : (
             <button className="button secondary" disabled><FileText size={16} />Relatório indisponível</button>
+          )}
+          {canPrepareExecution && (
+            <button type="button" className="button primary prepare-execution-cta" title="Escolher os testes desta aplicação e montar uma nova execução" onClick={() => navigate(`#/conjuntos/${encodeURIComponent(exploration.id)}?tab=planner`)}><Play size={16} />Preparar execução</button>
           )}
         </div>
       </header>
@@ -3460,7 +3542,7 @@ export function ExplorationDetailView({
             {isLive(exploration.status) ? <Spinner size={22} /> : status.value === "failed" || rerunFeedback?.notStarted ? <AlertCircle size={22} /> : <CheckCircle2 size={22} />}
           </span>
           <div className="execution-command-copy">
-            <span className="section-kicker">{isLive(exploration.status) ? <><span className="live-pulse" />Agora no AutoJev</> : "Resultado da execução"}</span>
+            <span className="section-kicker">{isLive(exploration.status) ? <><span className="live-pulse" />Agora no Test Lab</> : "Resultado da execução"}</span>
             <h2>{phaseHeadline}</h2>
             <p>{phaseDescription}</p>
             {(phase === "documenting" || scenariosRunningInParallel) && (
@@ -3515,7 +3597,8 @@ export function ExplorationDetailView({
         <div className="detail-tabs" role="tablist" aria-label="Detalhes da exploração">
           <button role="tab" aria-selected={detailTab === "overview"} className={detailTab === "overview" ? "active" : ""} onClick={() => setDetailTab("overview")}><Gauge size={16} />Visão geral</button>
           <button role="tab" aria-selected={detailTab === "scenarios"} className={detailTab === "scenarios" ? "active" : ""} onClick={() => setDetailTab("scenarios")}><FileCheck2 size={16} />Casos de teste <span>{exploration.scenarios?.length ?? counters.scenarios}</span></button>
-          <button role="tab" aria-selected={detailTab === "coverage"} className={detailTab === "coverage" ? "active" : ""} onClick={() => setDetailTab("coverage")}><Focus size={16} />Cobertura e restrições <span>{completion.restrictions?.length || completion.blocked_candidates || 0}</span></button>
+          <button role="tab" aria-selected={detailTab === "findings"} className={detailTab === "findings" ? "active" : ""} onClick={() => setDetailTab("findings")}><Bug size={16} />Defeitos encontrados <span>{completion.findings?.length || 0}</span></button>
+          <button role="tab" aria-selected={detailTab === "coverage"} className={detailTab === "coverage" ? "active" : ""} onClick={() => setDetailTab("coverage")}><Focus size={16} />Cobertura e restrições <span>{(completion.restrictions?.length || completion.blocked_candidates || 0) + (completion.ai_gaps?.length || 0)}</span></button>
           <button role="tab" aria-selected={detailTab === "activity"} className={detailTab === "activity" ? "active" : ""} onClick={() => setDetailTab("activity")}><Activity size={16} />Atividade <span>{events.length}</span></button>
           <button role="tab" aria-selected={detailTab === "evidence"} className={detailTab === "evidence" ? "active" : ""} onClick={() => setDetailTab("evidence")}><Eye size={16} />Evidência</button>
           <button role="tab" aria-selected={detailTab === "config"} className={detailTab === "config" ? "active" : ""} onClick={() => setDetailTab("config")}><Settings size={16} />Configuração</button>
@@ -3573,7 +3656,9 @@ export function ExplorationDetailView({
             <ScenarioTimelinePanel key={exploration.id} scenarios={exploration.scenarios || []} contexts={exploration.scenario_contexts || []} explorationId={exploration.id} apiBase={apiBase} isRunning={isLive(exploration.status)} />
           )}
 
-          {detailTab === "coverage" && <CoverageRestrictionsPanel restrictions={completion.restrictions || []} resolvedRestrictions={completion.resolved_restrictions || []} blockedCount={completion.blocked_candidates || 0} explorationId={exploration.id} apiBase={apiBase} />}
+          {detailTab === "findings" && <FunctionalFindingsPanel findings={completion.findings || []} explorationId={exploration.id} apiBase={apiBase} />}
+
+          {detailTab === "coverage" && <CoverageRestrictionsPanel restrictions={completion.restrictions || []} resolvedRestrictions={completion.resolved_restrictions || []} aiGaps={completion.ai_gaps || []} searchCoverage={completion.search_coverage} blockedCount={completion.blocked_candidates || 0} explorationId={exploration.id} apiBase={apiBase} />}
 
           {detailTab === "activity" && (
             <section className="activity-card activity-card-wide">
@@ -3594,7 +3679,7 @@ export function ExplorationDetailView({
             <section className="configuration-card configuration-wide">
               <div className="panel-heading"><span className="section-kicker">Modelos da execução</span><h2>Configuração usada</h2></div>
               <div className="configuration-grid">
-                <div className="exploration-scope"><span className="model-role-icon"><Focus size={18} /></span><div><small>Escopo da exploração</small><strong>{explorationFocusArea(exploration.options) || "Aplicação inteira"}</strong><em>{explorationFocusArea(exploration.options) ? "O AutoJev prioriza e esgota este recorte funcional." : "O AutoJev explora todos os recursos que conseguir descobrir."}</em></div></div>
+                <div className="exploration-scope"><span className="model-role-icon"><Focus size={18} /></span><div><small>Escopo da exploração</small><strong>{explorationFocusArea(exploration.options) || "Aplicação inteira"}</strong><em>{explorationFocusArea(exploration.options) ? "O Test Lab prioriza e esgota este recorte funcional." : "O Test Lab explora todos os recursos que conseguir descobrir."}</em></div></div>
                 <div className="config-model"><span className="model-role-icon amber"><BrainCircuit size={18} /></span><div><small>Decisão das ações</small><strong>{exploration.agent?.model_id || exploration.agent?.model || "—"}</strong><em>{providerName(exploration.agent?.provider_id || exploration.agent?.provider)}</em></div></div>
                 <div className="config-model"><span className="model-role-icon teal"><Sparkles size={18} /></span><div><small>LLM auxiliar</small><strong>{exploration.auxiliary_llm?.model_id || exploration.auxiliary_llm?.model || "—"}</strong><em>{providerName(exploration.auxiliary_llm?.provider_id || exploration.auxiliary_llm?.provider)}</em></div></div>
                 <div className="config-model"><span className="model-role-icon teal">{explorationEvidenceMode(exploration.options) === "visual" ? <Eye size={18} /> : <Code2 size={18} />}</span><div><small>Evidência da LLM auxiliar</small><strong>{explorationEvidenceMode(exploration.options) === "visual" ? "Visual · texto + imagem" : "Econômico · somente texto"}</strong><em>O screenshot permanece salvo localmente nos dois modos.</em></div></div>
@@ -3721,7 +3806,25 @@ const RESTRICTION_REASONS: Record<string, string> = {
   form_probe_target_not_empty: "Não foi possível esvaziar o campo após as tentativas de preparação; sua validação não foi presumida",
 };
 
-export function CoverageRestrictionsPanel({ restrictions, resolvedRestrictions = [], blockedCount = 0, explorationId, apiBase }: { restrictions: CoverageRestriction[]; resolvedRestrictions?: CoverageRestriction[]; blockedCount?: number; explorationId?: string; apiBase?: string }) {
+export function FunctionalFindingsPanel({ findings, explorationId, apiBase }: { findings: FunctionalFinding[]; explorationId?: string; apiBase?: string }) {
+  return <section className="coverage-restrictions" aria-label="Defeitos encontrados">
+    <div className="panel-heading"><span className="section-kicker">Para registrar</span><h2>Defeitos encontrados</h2><p>Comportamentos observados nesta execução que um testador registraria como defeito, com passos, resultado esperado e observado. Confirme cada um antes de abrir o chamado; sinais técnicos (HTTP, console) continuam na linha do tempo de cada CT.</p></div>
+    {findings.length === 0 ? <p className="scenario-context-note">Nenhum defeito identificado automaticamente nesta execução. Isso não substitui a análise dos CTs e das restrições.</p> : <div className="restriction-list">{findings.map((finding, index) => {
+      const screenshot = apiBase && explorationId ? scenarioScreenshotUrl(apiBase, explorationId, finding.screenshot) : null;
+      return <article className="restriction-card" key={finding.id || index}>
+        <strong>{finding.title}</strong>
+        {(finding.category || finding.severity) && <small>{[finding.category, finding.severity].filter(Boolean).join(" · ")}</small>}
+        {!!finding.steps?.length && <p>Passos: {finding.steps.join(" → ")}</p>}
+        {finding.expected && <p>Esperado: {finding.expected}</p>}
+        {finding.actual && <p>Observado: {finding.actual}</p>}
+        {finding.url && <small>{finding.url}</small>}
+        {screenshot && <a href={screenshot} target="_blank" rel="noopener noreferrer">Ver a tela</a>}
+      </article>;
+    })}</div>}
+  </section>;
+}
+
+export function CoverageRestrictionsPanel({ restrictions, resolvedRestrictions = [], aiGaps = [], searchCoverage, blockedCount = 0, explorationId, apiBase }: { restrictions: CoverageRestriction[]; resolvedRestrictions?: CoverageRestriction[]; aiGaps?: AiCoverageGap[]; searchCoverage?: SearchCoverage; blockedCount?: number; explorationId?: string; apiBase?: string }) {
   return <section className="coverage-restrictions" aria-label="Cobertura e restrições">
     <div className="panel-heading"><span className="section-kicker">Limites da execução</span><h2>O que ficou sem testar</h2><p>Restrições são lacunas de cobertura, não testes aprovados nem bugs confirmados. Cada registro identifica o controle e o motivo observado.</p></div>
     {restrictions.length === 0 ? <p className="scenario-context-note">{blockedCount ? `Esta execução histórica registrou ${blockedCount} controles bloqueados sem detalhes individuais. Não é possível reconstruir seus motivos com segurança; as novas execuções registram cada restrição.` : "Nenhuma restrição individual registrada. Isso não garante todos os cenários possíveis: valores de entrada, perfis de acesso e combinações de estados exigem escopos específicos."}</p> : <div className="restriction-list">{restrictions.map((restriction, index) => <article className="restriction-card" key={restriction.id || index}>
@@ -3733,6 +3836,33 @@ export function CoverageRestrictionsPanel({ restrictions, resolvedRestrictions =
       <small>{scenarioActionLabel(restriction.action)} · {restriction.source_url || restriction.target_url || "URL não registrada"}</small>
       {restriction.target_url && restriction.target_url !== restriction.source_url && <small>Estado a retomar: {restriction.target_url}</small>}
     </article>)}</div>}
+    {searchCoverage && <details className="panel" open>
+      <summary>Buscas exercitadas · {searchCoverage.ranges.length + searchCoverage.variations.length}</summary>
+      <p>Cada busca foi executada com datas e dados diferentes. Um período sem registros é um resultado observado, não uma falha.</p>
+      {searchCoverage.ranges.length > 0 && <p><strong>{searchCoverage.found_records ? `Registros encontrados em: ${searchCoverage.months_with_records.join(", ")}.` : "Nenhum período trouxe registros; a tabela de resultados não pôde ser explorada."}</strong></p>}
+      {searchCoverage.ranges.length > 0 && <div className="restriction-list">{searchCoverage.ranges.map((range, index) => <article className="restriction-card" key={`${range.label}-${index}`}>
+        <strong>Período {range.label}</strong>
+        <p>{range.skipped ? `Não pesquisado (${range.skipped}${range.blocked_by?.length ? `: ${range.blocked_by.join("; ")}` : ""})` : range.rows ? `${range.rows} registro(s) na tabela` : "Sem registros"}</p>
+      </article>)}</div>}
+      {searchCoverage.variations.length > 0 && <div className="restriction-list">{searchCoverage.variations.map((variation, index) => <article className="restriction-card" key={`${variation.field}-${variation.kind}-${index}`}>
+        <strong>{variation.field} · {variation.kind}</strong>
+        <p>{variation.skipped ? `Não pesquisado (${variation.skipped}${variation.blocked_by?.length ? `: ${variation.blocked_by.join("; ")}` : ""})` : variation.rows ? `${variation.rows} registro(s)` : "Sem registros"}{variation.validation_errors ? ` · validação: ${variation.first_error || "erro exibido"}${variation.carried_over ? " (já estava na tela antes desta busca)" : ""}` : ""}</p>
+        {variation.value && <small>Dado informado: {variation.value}</small>}
+      </article>)}</div>}
+      {searchCoverage.unsupported.map((item, index) => <p key={index} className="scenario-context-note">Campos de data só aceitam calendário ({item.fields.join(", ")}): a busca por vários períodos não foi executada nesta tela.</p>)}
+    </details>}
+    {aiGaps.length > 0 && <details className="panel" open>
+      <summary>Lacunas apontadas pela IA · {aiGaps.length}</summary>
+      <p>A LLM auxiliar viu algo na tela que a exploração não cobriu (abas, seções recolhidas, campos abaixo da dobra, fluxos sugeridos). São pistas a investigar: não são testes aprovados nem defeitos confirmados.</p>
+      <div className="restriction-list">{aiGaps.map((gap, index) => {
+        const screenshot = apiBase && explorationId ? scenarioScreenshotUrl(apiBase, explorationId, gap.screenshot) : null;
+        return <article className="restriction-card" key={gap.id || index}>
+          <strong>{gap.note}</strong>
+          {gap.url && <small>{gap.url}</small>}
+          {screenshot && <a href={screenshot} target="_blank" rel="noopener noreferrer">Ver a tela analisada</a>}
+        </article>;
+      })}</div>
+    </details>}
     {resolvedRestrictions.length > 0 && <details className="panel">
       <summary>Restrições de retomada resolvidas · {resolvedRestrictions.length}</summary>
       <p>Estes controles foram executados posteriormente. A retomada deixou de ser uma lacuna de cobertura; a aprovação ou reprovação de cada CT continua independente.</p>

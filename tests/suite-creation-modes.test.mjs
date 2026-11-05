@@ -208,26 +208,36 @@ test("Add starts a local conversation with only two creation cards inside the ch
   assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
 });
 
-test("base cards have one native full-card opening action and a separate history expander", async t => {
+test("base cards open the original exploration from the whole card, the base from Ver testes, and expand history separately", async t => {
   const suite = { ...suiteFixture(), case_count: 1, active_count: 0, latest_activity: "2026-10-22T18:00:00Z" };
-  const navigations = [];
-  const view = await workspace(t, suite, undefined, { rootId: undefined, navigate: hash => navigations.push(hash) });
+  const navigations = [], reports = [];
+  const view = await workspace(t, suite, async (...args) => { reports.push(args); }, { rootId: undefined, navigate: hash => navigations.push(hash) });
   const card = view.find(node => node.props.className === "suite-group-main");
   const actions = [...elements(card)].filter(node => node.type === "button");
-  assert.equal(actions.length, 2, "Only opening the base and expanding history are separate focus targets");
+  assert.equal(actions.length, 3, "Opening the base, opening the original exploration and expanding history are the only focus targets");
   const open = actions.find(node => node.props.className.includes("suite-group-open"));
   assert.equal(open.props.type, "button");
   assert.match(open.props["aria-label"], /^Ver testes de fixture\.invalid, criado em /);
-  assert.equal([...elements(card)].filter(node => node.props.className === "suite-group-name")[0].props.children[0].type, "strong");
+  const title = [...elements(card)].filter(node => node.props.className === "suite-group-name")[0].props.children[0];
+  assert.equal(title.type, "button");
+  assert.equal(title.props.className, "suite-group-title");
+  assert.equal(title.props.type, "button");
+  assert.equal(title.props.title, "Grupo root-fixture");
+  assert.match(title.props["aria-label"], /^Abrir exploração de fixture\.invalid, criada em /);
   open.props.onClick(); await view.settle();
-  assert.deepEqual(navigations, ["#/conjuntos/root-fixture"]);
+  title.props.onClick(); await view.settle();
+  assert.deepEqual(reports, [["root-fixture", "consolidated", undefined, undefined, "tests"]], "Ver testes opens the report on its Testes view in a new tab");
+  assert.match(open.props.title, /nova aba/);
+  assert.deepEqual(navigations, ["#/exploracoes/root-fixture"], "Ver testes no longer navigates to the old suite screen");
   assert.equal(view.calls.some(call => call.method !== "GET"), false);
   const css = await readFile(new URL("../app/components/TestSuitesWorkspace.css", import.meta.url), "utf8");
   assert.match(css, /\.suite-group-main\s*\{[^}]*position: relative;/);
-  assert.match(css, /\.suite-group-open::after\s*\{[^}]*position: absolute;[^}]*inset: 0;[^}]*z-index: 1;/);
-  assert.match(css, /\.suite-workspace \.suite-group-open:active:not\(:disabled\)\s*\{[^}]*transform: none;/, "Pressing must not shrink the full-card hit area to the button");
+  assert.match(css, /\.suite-group-title::after\s*\{[^}]*position: absolute;[^}]*inset: 0;[^}]*z-index: 1;/, "The whole card opens the original exploration");
+  assert.match(css, /\.suite-workspace \.suite-group-title:active:not\(:disabled\)\s*\{[^}]*transform: none;/, "Pressing must not shrink the full-card hit area to the title");
+  assert.match(css, /\.suite-group-open\s*\{[^}]*position: relative;[^}]*z-index: 2;/, "Ver testes sits above the card overlay");
+  assert.doesNotMatch(css, /\.suite-group-open::after/, "Ver testes no longer owns the card-wide overlay");
   assert.match(css, /\.suite-expand\s*\{[^}]*position: relative;[^}]*z-index: 2;/);
-  assert.match(css, /\.suite-group-open:focus-visible::after\s*\{[^}]*outline: 2px solid/);
+  assert.match(css, /\.suite-group-title:focus-visible::after\s*\{[^}]*outline: 2px solid/);
 });
 
 test("expanding a base never opens it and history entries retain their own destinations", async t => {
@@ -272,8 +282,8 @@ test("Nova exploração on Meus testes opens the creation screen directly withou
 
 test("base pagination shows 20 per page, preserves newest-first order and disables its boundaries", async t => {
   const groups = baseGroupsFixture(), before = structuredClone(groups);
-  const navigations = [];
-  const view = await workspace(t, undefined, undefined, { rootId: undefined, groupsReply: groups, navigate: hash => navigations.push(hash) });
+  const navigations = [], reports = [];
+  const view = await workspace(t, undefined, async (...args) => { reports.push(args); }, { rootId: undefined, groupsReply: groups, navigate: hash => navigations.push(hash) });
   assert.deepEqual(visibleBaseIds(view), Array.from({ length: 20 }, (_, i) => `root-${String(i + 1).padStart(3, "0")}`));
   assert.match(text(basePagination(view)), /^1–20 de 45/);
   assert.equal(view.button("Página anterior").props.disabled, true);
@@ -285,7 +295,8 @@ test("base pagination shows 20 per page, preserves newest-first order and disabl
   assert.match(text(basePagination(view)), /^21–40 de 45.*Página 2 de 3/);
   const open = view.find(node => node.props.className?.includes("suite-group-open"));
   open.props.onClick(); await view.settle();
-  assert.deepEqual(navigations, ["#/conjuntos/root-021"]);
+  assert.deepEqual(reports, [["root-021", "consolidated", undefined, undefined, "tests"]]);
+  assert.deepEqual(navigations, []);
   await view.click("Próxima página");
   assert.deepEqual(visibleBaseIds(view), ["root-041", "root-042", "root-043", "root-044", "root-045"]);
   assert.match(text(basePagination(view)), /^41–45 de 45/);
@@ -483,8 +494,10 @@ test("selection, duplication and manual editing remain separate from opening a r
   assert.deepEqual(reports, []);
   assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
   const css = await readFile(new URL("../app/components/TestSuitesWorkspace.css", import.meta.url), "utf8");
-  assert.match(css, /\.suite-case-open:not\(:disabled\)::after\s*\{[^}]*inset:\s*0;[^}]*z-index:\s*1/);
-  assert.match(css, /\.suite-case-row > \.suite-check, \.suite-case-row > button:not\(\.suite-case-open\)\s*\{[^}]*z-index:\s*2/);
+  assert.match(css, /\.suite-case-row > \.suite-check::after\s*\{[^}]*inset:\s*0;[^}]*z-index:\s*1/, "Clicking anywhere on the row only toggles the checkbox");
+  assert.match(css, /\.suite-case-row > \.suite-check\s*\{[^}]*position:\s*static/, "The overlay is sized by the row, not the label");
+  assert.match(css, /\.suite-case-row > button\s*\{[^}]*position:\s*relative;[^}]*z-index:\s*2/, "Ver resultado and row actions stay clickable above the overlay");
+  assert.doesNotMatch(css, /\.suite-case-open[^{]*::after/, "Ver resultado no longer captures the whole row");
 });
 
 test("catalog icon hints explain duplication, archive confirmation and restoring without applying any action", async t => {

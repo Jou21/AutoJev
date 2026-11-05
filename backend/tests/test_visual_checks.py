@@ -348,8 +348,8 @@ def test_no_image_or_failed_action_cannot_support_visual_assertions():
 @pytest.mark.parametrize(
     ("label", "observed"),
     [
-        ("AutoJev", "The floating panel obscures the application cart button."),
-        ("Cart", "The AutoJev floating panel obscures the application cart button."),
+        ("Test Lab", "The floating panel obscures the application cart button."),
+        ("Cart", "The Test Lab floating panel obscures the application cart button."),
         ("Cart", "The JEV status panel obscures the application cart button."),
         ("Carrinho", "O painel flutuante do JEV encobre o botão de carrinho."),
     ],

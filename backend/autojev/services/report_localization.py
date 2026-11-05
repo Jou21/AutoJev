@@ -1,4 +1,4 @@
-"""Portuguese presentation of AutoJev's owned narration, without model calls.
+"""Portuguese presentation of Test Lab's owned narration, without model calls.
 
 Only complete, known templates are translated. Application labels, URLs,
 selectors, input/output values and raw browser diagnostics are not prose to
@@ -166,7 +166,7 @@ def _line(text: str) -> str:
     if match and match[2] in ACTION_LABELS:
         decider, action, control, coverage_kind, signal_text = match.groups()
         decider = {"TypeSafe JEV": "O TypeSafe JEV", "Laya": "O Laya",
-                   "AutoJev deterministic planner": "O planejador determinístico do AutoJev"}[decider]
+                   "AutoJev deterministic planner": "O planejador determinístico do Test Lab"}[decider]
         signals = []
         for part in signal_text.split("; "):
             key, _, value = part.partition(": ")
@@ -183,7 +183,7 @@ def _line(text: str) -> str:
     if match and match[1] in ACTION_LABELS:
         reason = {"conventional_form": "formulário convencional", "known_navigation": "navegação conhecida",
                   "single_clear_control": "controle único identificado", "clear_safe_frontier": "opções seguras identificadas"}.get(match[2], match[2])
-        return f"A política local do AutoJev selecionou a próxima ação segura ainda não testada: {action_label(match[1]).lower()} ({reason})."
+        return f"A política local do Test Lab selecionou a próxima ação segura ainda não testada: {action_label(match[1]).lower()} ({reason})."
     match = re.fullmatch(r"Playwright executed (\w+) successfully(.*)", text)
     if match and match[1] in ACTION_LABELS:
         suffix = match[2]

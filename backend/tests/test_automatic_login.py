@@ -481,3 +481,40 @@ async def test_rejected_session_relogin_is_never_retried(tmp_path):
         assert await executor._page.evaluate("window.loginSubmissions") == submissions
     finally:
         await executor.close()
+
+
+async def test_bearer_token_to_another_origin_api_is_not_mistaken_for_a_credential_leak(tmp_path):
+    # Real case: after SSO the SPA calls https://api.<corp>/permissoes with its
+    # own access token. Cutting it sent the user to /forbidden.
+    html = LOGIN.replace(
+        "window.loginSubmissions++;",
+        "window.loginSubmissions++;fetch('http://api.fixture.test/permissoes',"
+        "{headers:{Authorization:'Bearer eyJhbGciOiJSUzI1NiJ9.payload.signature'}}).catch(()=>{});",
+    )
+    executor, observation = await fixture_executor(tmp_path, html)
+    try:
+        result = await executor.attempt_login({"username": USER, "password": PASSWORD}, observation)
+        assert result.status == "success", result.reason
+        assert any("api.fixture.test/permissoes" in url for _, url in executor.requests)
+        assert executor.last_blocked_request is None
+    finally:
+        await executor.close()
+
+
+async def test_basic_authorization_carrying_the_credentials_is_still_blocked(tmp_path):
+    html = LOGIN.replace(
+        "window.loginSubmissions++;",
+        "window.loginSubmissions++;fetch('http://outside.fixture.test/api',"
+        "{headers:{Authorization:'Basic '+btoa(e.target.username.value+':'+e.target.password.value)}}).catch(()=>{});",
+    )
+    executor, observation = await fixture_executor(tmp_path, html)
+    try:
+        result = await executor.attempt_login({"username": USER, "password": PASSWORD}, observation)
+        assert result.status == "manual_required"
+        assert result.reason == "unsafe_authentication_request"
+        assert not any("outside.fixture.test" in url for _, url in executor.requests)
+        assert executor.last_blocked_request == {
+            "origin": "http://outside.fixture.test", "path": "/api", "kind": "credential_in_authorization_header",
+        }
+    finally:
+        await executor.close()

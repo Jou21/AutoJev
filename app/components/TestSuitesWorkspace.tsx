@@ -30,7 +30,7 @@ type Validation = { revision: number; available: boolean; effects: string[]; ite
 type Recording = { id: string; steps: string[]; url: string; status: string };
 type CreationMode = "write" | "ai" | "record";
 type Construction = { definition: Definition | null; goal: string; updates: number };
-type Props = { rootId?: string; planId?: string; roundId?: string; initialCaseId?: string; initialSourceId?: string; initialSourceCase?: string; initialCapturePlan?: CapturePlan; apiBase?: string; request: Request; navigate: (hash: string) => void; openReport: (root: string, scope: string, round?: string, caseId?: string) => Promise<void> };
+type Props = { rootId?: string; planId?: string; roundId?: string; initialCaseId?: string; initialTab?: "planner"; initialBatch?: { source: string; ct: string; capture_plan?: CapturePlan }[]; initialSourceId?: string; initialSourceCase?: string; initialCapturePlan?: CapturePlan; apiBase?: string; request: Request; navigate: (hash: string) => void; openReport: (root: string, scope: string, round?: string, caseId?: string, view?: "tests") => Promise<void> };
 
 const labels: Record<string, string> = { draft: "Rascunho", queued: "Na fila", running: "Em execução", waiting_manual: "Aguardando avaliação", stopping: "Parando", completed: "Concluída", partial: "Parcial", failed: "Sem resultado", cancelled: "Cancelada", interrupted: "Interrompida", PASS: "Aprovado", FAIL: "Reprovado", BLOCKED: "Bloqueado", SKIPPED: "Sem validação" };
 const date = (value?: string) => value ? new Date(value).toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" }) : "Ainda não executado";
@@ -52,8 +52,8 @@ export default function TestSuitesWorkspace(props: Props) {
   const { rootId, planId, roundId, request, navigate, openReport } = props;
   const [groups, setGroups] = useState<Group[]>([]), [suite, setSuite] = useState<Suite | null>(null);
   const [loading, setLoading] = useState(true), [error, setError] = useState(""), [busy, setBusy] = useState(false);
-  const [routePending, setRoutePending] = useState(!!(planId || roundId));
-  const [query, setQuery] = useState(() => catalogContexts.get(rootId || "")?.query || ""), [filter, setFilter] = useState(() => catalogContexts.get(rootId || "")?.filter || "all"), [tab, setTab] = useState(props.initialCaseId ? "planner" : "catalog");
+  const [routePending, setRoutePending] = useState(!!(planId || roundId || props.initialBatch?.length));
+  const [query, setQuery] = useState(() => catalogContexts.get(rootId || "")?.query || ""), [filter, setFilter] = useState(() => catalogContexts.get(rootId || "")?.filter || "all"), [tab, setTab] = useState(props.initialCaseId || props.initialTab === "planner" ? "planner" : "catalog");
   const [selectedFlow, setSelectedFlow] = useState(() => catalogContexts.get(rootId || "")?.flow || "all");
   const [basePage, setBasePage] = useState(() => catalogContexts.get("")?.page || 1);
   const [expanded, setExpanded] = useState<string | null>(null), [name, setName] = useState("Nova execução");
@@ -70,7 +70,7 @@ export default function TestSuitesWorkspace(props: Props) {
   const [recording, setRecording] = useState<Recording | null>(null), [creationMode, setCreationMode] = useState<CreationMode | null>(null);
   const [creationFocus, setCreationFocus] = useState<{ mode: CreationMode; version: number } | null>(null);
   const [planningFocus, setPlanningFocus] = useState(0);
-  const [selectorOpen, setSelectorOpen] = useState(!props.initialCaseId), [selectorFocus, setSelectorFocus] = useState(0);
+  const [selectorOpen, setSelectorOpen] = useState(!props.initialCaseId && !props.initialBatch?.length), [selectorFocus, setSelectorFocus] = useState(0);
   const [selectorFiltersOpen, setSelectorFiltersOpen] = useState(false);
   const [mobilePane, setMobilePane] = useState<"plan" | "chat">("plan");
   const [stepTool, setStepTool] = useState<StepKind>("capture"), [draggingStep, setDraggingStep] = useState(false), [dropSlot, setDropSlot] = useState<string | null>(null);
@@ -208,6 +208,30 @@ export default function TestSuitesWorkspace(props: Props) {
     }).catch(caught => { if (alive) setError(caught.message); });
     return () => { alive = false; };
   }, [request, rootId, props.initialSourceId, props.initialSourceCase, props.initialCaseId, props.initialCapturePlan, navigate]);
+  // "Reexecutar testes" from a report: every CT arrives selected, each with
+  // its own saved print pauses. Nothing runs until the round is confirmed.
+  const initialBatchKey = JSON.stringify(props.initialBatch || []);
+  useEffect(() => {
+    const batch: NonNullable<Props["initialBatch"]> = JSON.parse(initialBatchKey);
+    if (!batch.length || !rootId) return;
+    let alive = true;
+    // One request for every CT; the backend rejects CTs from another base.
+    request<{ root_id: string; case_id: string; mode: string }[]>(`/test-suites/${encode(rootId)}/case-contexts?itens=${encode(JSON.stringify(batch.map(({ source, ct }) => ({ source, ct }))))}`).then(contexts => {
+      if (!alive) return;
+      const results = contexts.map((context, index) => ({ item: batch[index], context }));
+      if (results.some(({ context }) => context.root_id !== rootId)) { setError("Alguns testes enviados pelo relatório não pertencem a esta base. Nada foi selecionado; reabra o relatório pela aplicação."); return; }
+      const seen = new Set<string>(), next: Selection[] = [];
+      for (const { item, context } of results) {
+        if (seen.has(context.case_id)) continue;
+        seen.add(context.case_id);
+        next.push(context.mode === "manual" ? { case_id: context.case_id }
+          : { case_id: context.case_id, source_exploration_id: item.source, source_scenario_id: item.ct, ...(item.capture_plan ? { capture_plan: item.capture_plan } : {}) });
+      }
+      setSelection(next); setSelectedCase(next[0]?.case_id || null); setDirty(true); setSelectorOpen(false); setTab("planner");
+    }).catch(caught => { if (alive) setError(caught instanceof Error ? caught.message : "Não foi possível carregar os testes enviados pelo relatório."); })
+      .finally(() => { if (alive) setRoutePending(false); });
+    return () => { alive = false; };
+  }, [request, rootId, initialBatchKey]);
   const selectedSource = selection.find(item => item.case_id === selectedCase);
   useEffect(() => {
     if (!selectedCase || !selectedSource?.source_exploration_id || !selectedSource?.source_scenario_id) return;
@@ -569,7 +593,7 @@ export default function TestSuitesWorkspace(props: Props) {
 
   // A refresh can remove the last page. Normalize the stored page without an extra effect render.
   if (!rootId && !loading && basePage !== currentBasePage) setBasePage(currentBasePage);
-  if (loading || routePending) return <section className="panel suites-loading" role="status"><LoaderCircle className="spin" />{planId ? "Abrindo seu rascunho…" : roundId ? "Abrindo a execução…" : "Carregando seus testes…"}</section>;
+  if (loading || routePending) return <section className="panel suites-loading" role="status"><LoaderCircle className="spin" />{planId ? "Abrindo seu rascunho…" : roundId ? "Abrindo a execução…" : props.initialBatch?.length ? `Preparando ${props.initialBatch.length} testes para a execução…` : "Carregando seus testes…"}</section>;
   if (!rootId) {
     const firstIndex = (currentBasePage - 1) * basePageSize;
     const changePage = (page: number) => { setBasePage(page); setExpanded(null); };
@@ -578,7 +602,7 @@ export default function TestSuitesWorkspace(props: Props) {
       <div className="suite-toolbar"><label className="suite-search"><Search size={17} /><input aria-label="Buscar bases de testes" placeholder="Buscar aplicação ou identificação…" value={query} onChange={event => { setQuery(event.target.value); changePage(1); }} /></label><div className="suite-tabs"><button aria-pressed={filter === "all"} onClick={() => { setFilter("all"); changePage(1); }}>Todos</button><button aria-pressed={filter === "live"} onClick={() => { setFilter("live"); changePage(1); }}>Em andamento</button></div><span className="suite-list-count" role="status">{filteredGroups.length} {filteredGroups.length === 1 ? "base" : "bases de testes"}</span><button className="button ghost" disabled={busy} onClick={() => void perform(refresh)}><RefreshCcw size={16} />Atualizar</button></div>
       {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- Named list with independent keyboard scrolling. */}
       <div id="suite-group-list" ref={baseList} className="suite-group-list" role="region" aria-label="Aplicações testadas, mais recentes primeiro" tabIndex={0}>{filteredGroups.slice(firstIndex, firstIndex + basePageSize).map(group => <section className="suite-group panel" key={group.id}>
-        <div className="suite-group-main"><button type="button" className="suite-expand" aria-label={`Mostrar execuções de ${host(group.app_url)} iniciadas em ${date(group.created_at)}`} aria-expanded={expanded === group.id} onClick={() => setExpanded(expanded === group.id ? null : group.id)}>{expanded === group.id ? <ChevronDown /> : <ChevronRight />}</button><span className="suite-app-icon"><Layers3 size={19} /></span><div className="suite-group-name"><strong title={`Grupo ${group.id}`}>{host(group.app_url)}</strong><span>Criado em {date(group.created_at)}{group.active_count > 0 && " · Em andamento"}</span></div><div className="suite-group-stat"><strong>{group.case_count}</strong><span>testes</span></div><div className="suite-group-stat"><strong>{1 + group.legacy_runs.length + group.rounds.filter(item => item.status !== "draft").length}</strong><span>execuções</span></div><div className="suite-group-activity"><span>Última atividade</span><time dateTime={group.latest_activity}>{date(group.latest_activity)}</time></div><button type="button" className="button secondary suite-group-open" aria-label={`Ver testes de ${host(group.app_url)}, criado em ${date(group.created_at)}`} onClick={() => navigate(`#/conjuntos/${encode(group.id)}`)}>Ver testes<ArrowRight size={16} /></button></div>
+        <div className="suite-group-main"><button type="button" className="suite-expand" aria-label={`Mostrar execuções de ${host(group.app_url)} iniciadas em ${date(group.created_at)}`} aria-expanded={expanded === group.id} onClick={() => setExpanded(expanded === group.id ? null : group.id)}>{expanded === group.id ? <ChevronDown /> : <ChevronRight />}</button><span className="suite-app-icon"><Layers3 size={19} /></span><div className="suite-group-name"><button type="button" className="suite-group-title" title={`Grupo ${group.id}`} aria-label={`Abrir exploração de ${host(group.app_url)}, criada em ${date(group.created_at)}`} onClick={() => navigate(`#/exploracoes/${encode(group.id)}`)}>{host(group.app_url)}</button><span>Criado em {date(group.created_at)}{group.active_count > 0 && " · Em andamento"}</span></div><div className="suite-group-stat"><strong>{group.case_count}</strong><span>testes</span></div><div className="suite-group-stat"><strong>{1 + group.legacy_runs.length + group.rounds.filter(item => item.status !== "draft").length}</strong><span>execuções</span></div><div className="suite-group-activity"><span>Última atividade</span><time dateTime={group.latest_activity}>{date(group.latest_activity)}</time></div><button type="button" className="button secondary suite-group-open" aria-label={`Ver testes de ${host(group.app_url)}, criado em ${date(group.created_at)}`} title="Abre os testes desta base em uma nova aba" disabled={busy} onClick={() => void perform(() => openReport(group.id, "consolidated", undefined, undefined, "tests"))}>Ver testes<ArrowRight size={16} /></button></div>
         {expanded === group.id && <div className="suite-child-list">{suiteExecutionHistory(group).map(item => <button key={`${item.kind}:${item.id}`} data-history-id={item.id} data-history-kind={item.kind} onClick={() => navigate(item.href)}>
           {item.kind === "initial" ? <Globe2 size={16} /> : item.kind === "round" ? <ClipboardList size={16} /> : <RefreshCcw size={16} />}
           <strong>{item.status === "draft" ? `Rascunho: ${item.title}` : item.title}</strong><span>{item.count} testes · {date(item.created_at)}</span><Status value={item.status} />

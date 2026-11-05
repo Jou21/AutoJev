@@ -23,14 +23,14 @@ async function render() {
   );
 }
 
-test("server-renders the AutoJev application shell", async () => {
+test("server-renders the Test Lab application shell", async () => {
   const response = await render();
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
 
   const html = await response.text();
-  assert.match(html, /<title>AutoJev — Exploração inteligente de aplicações<\/title>/i);
-  assert.match(html, /AutoJev/);
+  assert.match(html, /<title>Test Lab — Exploração inteligente de aplicações<\/title>/i);
+  assert.match(html, /Test Lab/);
   assert.match(html, /JEV no comando|Boa exploração começa/);
   assert.match(html, /Nova exploração/);
   assert.match(html, /Rascunhos/);
@@ -47,10 +47,19 @@ test("server-renders the AutoJev application shell", async () => {
 test("suite and report planning routes preserve stable identity and capture plans without authorizing execution", async () => {
   const { parseAppHash } = await timelineComponents();
   assert.deepEqual(parseAppHash("#/execucoes-planejadas"), { view: "planned" });
+  const plan = { version: 1, checkpoints: [{ id: "db-1", gap: 1, order: 0 }] };
   assert.deepEqual(parseAppHash("#/conjuntos/root?round=round-1"), { view: "explorations", suiteId: "root", planId: undefined,
     roundId: "round-1", initialCaseId: undefined, initialSourceId: undefined, initialSourceCase: undefined });
+  assert.equal(parseAppHash("#/conjuntos/root?tab=planner").initialTab, "planner", "The detail page CTA opens the base on Preparar execução");
+  assert.equal("initialTab" in parseAppHash("#/conjuntos/root?tab=other"), false, "Unknown tabs fall back to the catalog");
+  const batchItems = [{ source: "root", ct: "CT001" }, { source: "child", ct: "CT147", capture_plan: plan }];
+  assert.deepEqual(parseAppHash("#/planejar-lote/root?itens=" + encodeURIComponent(JSON.stringify(batchItems))),
+    { view: "explorations", suiteId: "root", initialTab: "planner", initialBatch: batchItems }, "Reexecutar testes hands every CT to Preparar execução");
+  for (const bad of [[], [{ source: "root" }], [{ source: "root", ct: "CT001", run: true }], [{ source: "root", ct: "CT001", capture_plan: { version: 2 } }]]) {
+    assert.deepEqual(parseAppHash("#/planejar-lote/root?itens=" + encodeURIComponent(JSON.stringify(bad))), { view: "explorations" }, JSON.stringify(bad));
+  }
+  assert.deepEqual(parseAppHash("#/planejar-lote/root?itens=%5B&start=1"), { view: "explorations" }, "Unknown parameters never authorize anything");
   assert.deepEqual(parseAppHash("#/planejar/child/CT001"), { view: "explorations", suiteId: "child", initialCaseId: "CT001", initialSourceId: "child", initialSourceCase: "CT001" });
-  const plan = { version: 1, checkpoints: [{ id: "db-1", gap: 1, order: 0 }] };
   assert.deepEqual(parseAppHash("#/planejar/child/CT001?capture_plan=" + encodeURIComponent(JSON.stringify(plan))).capturePlan, plan);
   assert.deepEqual(parseAppHash("#/planejar/%E0%A4%A/CT001"), { view: "explorations" });
 });
@@ -64,7 +73,7 @@ test("removes disposable starter assets and metadata", async () => {
 
   assert.match(page, /AutoJevApp/);
   assert.match(layout, /pt-BR/);
-  assert.match(layout, /AutoJev/);
+  assert.match(layout, /Test Lab/);
   assert.doesNotMatch(layout, /codex-preview|Starter Project/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
   assert.match(packageJson, /lucide-react/);
@@ -397,7 +406,7 @@ test("manual capture consent makes pauses and their positions explicit without e
   assert.match(html, /Anexar print e continuar/);
   assert.match(html, /cole com Ctrl \+ V, arraste um arquivo ou escolha uma imagem/);
   assert.match(html, /Pode ser de qualquer tela ou aplicativo; não há captura automática do navegador/);
-  assert.match(html, /A confirmação ocorre somente na aplicação AutoJev, nunca pela página testada/);
+  assert.match(html, /A confirmação ocorre somente na aplicação Test Lab, nunca pela página testada/);
   assert.match(html, /SWS e SQL continuam bloqueados e não serão executados/);
   assert.match(html, /O print não aprova nem reprova/);
   assert.doesNotMatch(html, /class="button primary"[^>]*disabled/);
@@ -582,7 +591,7 @@ test("rerun preparation compares the expected and open pages with readable corre
   const fallback = renderToStaticMarkup(createElement(ScenarioRerunPreparation, {}));
   assert.match(fallback, /Prepare a página e os dados iniciais do teste/);
   assert.match(fallback, /Continuar reexecução/);
-  assert.match(fallback, /Se houver um login preenchido no site autorizado, o AutoJev tentará entrar/);
+  assert.match(fallback, /Se houver um login preenchido no site autorizado, o Test Lab tentará entrar/);
   assert.match(fallback, /A ação do teste só será executada se os pré-requisitos forem confirmados/);
 });
 

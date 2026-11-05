@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from autojev.adapters.openai_compatible import (
     LOCAL_AGENT_PROVIDER_ID,
@@ -51,6 +52,8 @@ from autojev.services.auxiliary_review_policy import (
 from autojev.services.visual_review_input import build_visual_review_input
 from autojev.services.action_dispatch import is_stale_undispatched_action
 from autojev.services.coverage import CoveragePlanner, canonical_url
+from autojev.services.findings import FindingDetector
+from autojev.services.frontier_advice import FrontierAdvisor, opener_reason
 from autojev.services.rerun_recipe import build_rerun_recipe
 from autojev.services.scenario_documentation import local_scenario_documentation
 from autojev.services.technical_signals import (
@@ -1126,7 +1129,7 @@ class ExplorationManager:
     MAX_SESSION_RELOGINS = 5
     LOGIN_PANEL_MESSAGE = (
         "Preencha usuário e senha na página e clique em Continuar exploração abaixo. "
-        "O AutoJev tentará entrar usando os campos preenchidos, sem enviar credenciais à IA. "
+        "O Test Lab tentará entrar usando os campos preenchidos, sem enviar credenciais à IA. "
         "Você também pode fazer login pelo próprio site. CAPTCHA e etapas adicionais devem ser concluídos manualmente."
     )
 
@@ -1350,6 +1353,35 @@ class ExplorationManager:
             self.input_events.pop(exploration_id, None)
             self.credential_vault.discard(exploration_id)
             getattr(self, "usage_locks", {}).pop(exploration_id, None)
+
+    def _make_frontier_advisor(
+        self,
+        item: dict[str, Any],
+        options: ExplorationOptions,
+        auxiliary: OpenAIAuxiliaryScenarioGenerator,
+        secret_values: list[str],
+    ) -> tuple[FrontierAdvisor | None, OpenAICompatibleClient | None]:
+        """The advisor gets its own client, so its small request cap and cost
+        never touch the review queue's transport budget."""
+
+        try:
+            client = self._client_for(item["auxiliary_llm"]["provider_id"])
+        except Exception:
+            return None, None
+        if not isinstance(client, OpenAICompatibleClient):
+            return None, None
+        # Twice the cap: the transport's one format-compatibility retry also
+        # counts as an HTTP request.
+        client.chat_request_budget = options.frontier_advice_max_requests * 2
+        send_image = options.auxiliary_evidence_mode == "visual" and options.capture_screenshots
+        advisor = FrontierAdvisor(
+            client,
+            item["auxiliary_llm"]["model_id"],
+            max_requests=options.frontier_advice_max_requests,
+            multimodal=auxiliary._multimodal_content if send_image else None,
+            secret_values=secret_values,
+        )
+        return advisor, client
 
     def _client_for(self, provider_id: str) -> OpenAICompatibleClient:
         provider = self.repository.get_provider(provider_id)
@@ -1958,6 +1990,10 @@ class ExplorationManager:
 
         if is_stale_undispatched_action(result):
             return False, "stale_control_not_dispatched"
+        if decision_source == "search_matrix" and result.action != "click":
+            # Typing a date or waiting for the table is setup for the search;
+            # the search itself (the click) is the test case.
+            return False, "search_matrix_input_step"
         if decision_source == "coverage" or is_restoration_action:
             # Graph traversal is usually supporting navigation. But a real
             # business check or attributable negative evidence observed while
@@ -2198,6 +2234,101 @@ class ExplorationManager:
     @staticmethod
     def _verification_summary(evidence: dict[str, Any]) -> dict[str, Any]:
         return evidence_verification_summary(evidence)
+
+    def _record_findings(self, exploration_id: str, findings: list[dict[str, Any]]) -> None:
+        """Defects seen on screen (no way back, empty result titles), one event each."""
+
+        for finding in findings:
+            self.repository.add_event(
+                exploration_id, "warning", "functional_finding",
+                f"Defeito encontrado: {finding['title']}", finding,
+            )
+
+    def _record_search_matrix(
+        self, exploration_id: str, coverage: Any, first_screens: dict[str, str] | None = None,
+    ) -> None:
+        """Activity entries for the period matrix: ranges tried and what they returned."""
+
+        drain = getattr(coverage, "drain_search_events", None)
+        for event in drain() if callable(drain) else []:
+            kind = event.pop("type")
+            level = "info"
+            if kind == "search_matrix_unlocked" and first_screens:
+                # The screen as it was reached: the button still disabled.
+                page = str(event.get("matrix") or "").rsplit("#", 1)[0]
+                event["screenshot"] = next(
+                    (shot for url, shot in first_screens.items() if urlsplit(url).path.rstrip("/") == page.rstrip("/")),
+                    None,
+                )
+            if kind == "search_matrix_started":
+                message = (
+                    "Busca por período"
+                    + (f" em «{event['section']}»" if event.get("section") else "")
+                    + f": testando {event['planned_ranges']} meses "
+                    "(ano atual e anterior), com início e fim de cada mês"
+                )
+            elif kind == "search_matrix_range":
+                if event.get("skipped"):
+                    level = "warning"
+                    message = f"Período {event['label']} não pôde ser pesquisado ({event['skipped']})"
+                    if event.get("blocked_by"):
+                        message += ": " + "; ".join(event["blocked_by"])
+                elif event["rows"]:
+                    message = f"Período {event['label']}: {event['rows']} registro(s) na tabela"
+                else:
+                    message = f"Período {event['label']}: sem registros"
+            elif kind == "search_matrix_completed":
+                level = "info" if event.get("found_records") else "warning"
+                message = (
+                    f"Busca por período concluída: {event['searches']} períodos pesquisados; "
+                    + (
+                        f"registros em {', '.join(event['with_records'])}"
+                        if event.get("found_records")
+                        else "nenhum registro encontrado, então a tabela de resultados não pôde ser explorada"
+                    )
+                )
+            elif kind == "search_matrix_unlocked":
+                level = "warning"
+                message = (
+                    "A busca"
+                    + (f" de «{event['section']}»" if event.get("section") else "")
+                    + f" só habilitou depois de trocar «{event['field']}»"
+                    + (f" de «{event['default']}»" if event.get("default") else "")
+                    + (f" para «{event['option']}»" if event.get("option") else "")
+                    + f" ({event['tried']} opção(ões) tentada(s)); a escolha fica para os demais períodos"
+                )
+            elif kind == "search_matrix_unsupported":
+                level = "warning"
+                message = (
+                    "Campos de data só aceitam seleção em calendário ("
+                    + ", ".join(event.get("fields") or [])
+                    + "); a busca por vários períodos não pôde ser executada nesta tela"
+                )
+            elif kind == "search_variation_started":
+                message = (
+                    f"Variando os dados da busca: {len(event['fields'])} campo(s), "
+                    f"{event['planned_searches']} pesquisas planejadas"
+                )
+            elif kind == "search_variation_result":
+                if event.get("skipped"):
+                    level = "warning"
+                    message = f"«{event['field']}» ({event['kind']}) não pôde ser pesquisado ({event['skipped']})"
+                else:
+                    outcome = (
+                        f"{event['rows']} registro(s)" if event["rows"]
+                        else "sem registros"
+                    )
+                    if event["validation_errors"]:
+                        outcome += f"; validação: {event.get('first_error') or 'erro exibido'}"
+                        if event.get("carried_over"):
+                            outcome += " (já estava na tela antes desta busca)"
+                    message = f"«{event['field']}» = {event['kind']}: {outcome}"
+            else:
+                message = (
+                    f"Variação de dados concluída: {event['searches']} pesquisas em {event['fields']} campo(s); "
+                    f"{event['with_records']} com registros, {event['with_validation']} com mensagem de validação"
+                )
+            self.repository.add_event(exploration_id, level, kind, message, event)
 
     def _record_coverage_restrictions(self, exploration_id: str, coverage: CoveragePlanner, observation: Observation | None) -> None:
         drain = getattr(coverage, "drain_restrictions", None)
@@ -2552,6 +2683,15 @@ class ExplorationManager:
                 browser_name=self.settings.browser,
                 secret_values=secret_values,
             )
+            frontier_advisor, advisor_client = self._make_frontier_advisor(
+                item, options, auxiliary, secret_values
+            )
+            explored_trail: list[str] = []
+            first_screen_advised = False
+            finding_detector = FindingDetector()
+            # First capture of each route: the screen as a person reaches it,
+            # before searches change it (the evidence of a blocked default).
+            first_screens: dict[str, str] = {}
             self.repository.update_exploration(
                 exploration_id, status=ExplorationStatus.RUNNING, started_at=utc_now()
             )
@@ -2639,7 +2779,87 @@ class ExplorationManager:
             # nova, encerra (o resto é fumaça do modelo, não exploração).
             MAX_CONSECUTIVE_LOOP_REJECTIONS = 3
             coverage = CoveragePlanner(entry_url, options.focus_area)
+            coverage.gate_until_focus = True
             coverage.observe(observation)
+
+            async def consult_frontier(current: Observation, reason: str) -> None:
+                """Ask the auxiliary model about flows this screen still hides."""
+
+                if frontier_advisor is None:
+                    return
+                context = coverage.context(current)
+                if not frontier_advisor.should_ask(str(context.get("state_key"))):
+                    return
+                failures_before = frontier_advisor.failures
+                try:
+                    advice = await frontier_advisor.advise(
+                        current,
+                        context,
+                        focus_area=options.focus_area,
+                        focus_reached=coverage.focus_reached,
+                        reason=reason,
+                        trail=explored_trail,
+                    )
+                    await self._record_model_usage(
+                        exploration_id, [advisor_client], executor, "auxiliary"
+                    )
+                    if advice is None:
+                        if frontier_advisor.failures > failures_before:
+                            self.repository.add_event(
+                                exploration_id, "warning", "frontier_advice_failed",
+                                "A IA não respondeu à consulta sobre esta tela; a exploração continua.",
+                                {"error": frontier_advisor.last_error, "trigger": reason},
+                            )
+                        if frontier_advisor.disabled_reason:
+                            self.repository.add_event(
+                                exploration_id, "warning", "frontier_advice_unavailable",
+                                "A consulta de IA aos caminhos não percorridos foi desativada nesta execução; a exploração segue só com o planejador.",
+                                {"reason": frontier_advisor.disabled_reason, "detail": frontier_advisor.last_error},
+                            )
+                        return
+                    accepted = coverage.apply_advice(current, advice.priorities)
+                    names = {
+                        str(element.get("ref")): str(element.get("name") or "")[:80]
+                        for element in current.interactive_elements
+                    }
+                    suggestions = [
+                        {**suggestion, "name": names.get(suggestion["ref"], "")}
+                        for suggestion in advice.suggestions
+                        if suggestion["ref"] in accepted
+                    ]
+                    self.repository.add_event(
+                        exploration_id,
+                        "info",
+                        "frontier_advice",
+                        (
+                            f"IA indicou {len(suggestions)} caminho(s) ainda não percorrido(s) nesta tela"
+                            if suggestions
+                            else "IA não encontrou caminhos novos entre os controles desta tela"
+                        ),
+                        {
+                            "trigger": reason,
+                            "url": current.url,
+                            "screenshot": Path(current.screenshot).name if current.screenshot else None,
+                            "focus_status": advice.focus_status,
+                            "suggestions": suggestions,
+                            "unexplored_notes": advice.notes,
+                            "ignored_suggestions": advice.dropped + len(advice.suggestions) - len(suggestions),
+                            "requests_used": frontier_advisor.requests,
+                            "requests_limit": frontier_advisor.max_requests,
+                            "screenshot_sent": bool(
+                                frontier_advisor._multimodal and current.screenshot
+                            ),
+                        },
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.repository.add_event(
+                        exploration_id, "warning", "frontier_advice_failed",
+                        "Não foi possível obter a sugestão da IA nesta tela; a exploração continua.",
+                        {"error": type(exc).__name__},
+                    )
+
             self.repository.add_event(
                 exploration_id,
                 "info",
@@ -2752,7 +2972,15 @@ class ExplorationManager:
                             panel_message = self._automatic_login_message(reason)
                             self.repository.add_event(
                                 exploration_id, "warning", "automatic_login_manual_required",
-                                panel_message, {"reason": reason},
+                                panel_message,
+                                {
+                                    "reason": reason,
+                                    **(
+                                        {"blocked_request": blocked}
+                                        if (blocked := getattr(executor, "last_blocked_request", None))
+                                        else {}
+                                    ),
+                                },
                             )
                     elif credentials:
                         panel_message = self._automatic_login_message("already_attempted")
@@ -2857,6 +3085,7 @@ class ExplorationManager:
                         # reach a SPA route via pushState; moving the logical
                         # root there must not silently certify a GET deep link.
                         coverage = CoveragePlanner(entry_url, options.focus_area)
+                        coverage.gate_until_focus = True
                         coverage.observe(observation)
                         authentication_boundary_crossed = True
                         self.repository.add_event(
@@ -2869,11 +3098,42 @@ class ExplorationManager:
                     self._record_observation_issues(
                         exploration_id, observation, known_issues
                     )
+                if (
+                    frontier_advisor is not None
+                    and not first_screen_advised
+                    and not self._needs_login(observation)
+                ):
+                    first_screen_advised = True
+                    await consult_frontier(observation, "first_screen")
+                if not self._needs_login(observation):
+                    if observation.screenshot:
+                        first_screens.setdefault(canonical_url(observation.url), observation.screenshot)
+                    self._record_findings(exploration_id, finding_detector.observe(observation))
                 # Coverage owns the mechanical definition of "nothing safe is
                 # left to visit". Asking the model for one more decision here
                 # used to let it request go_back from the authenticated root
                 # forever, even though the frontier was already exhausted.
-                if coverage.can_finish():
+                search_pending = getattr(coverage, "has_search_work", None)
+                if coverage.can_finish() and not (
+                    search_pending is not None and search_pending(observation)
+                ):
+                    blocked_url = getattr(executor, "_blocked_navigation_url", None)
+                    if (
+                        actions_executed == 0
+                        and getattr(executor, "render_stalled", False)
+                        and not observation.interactive_elements
+                    ):
+                        # An empty frontier here means nothing rendered, not
+                        # that nothing is left to test: never report it as a
+                        # finished exploration.
+                        raise RuntimeError(
+                            "A aplicação não exibiu nenhum controle para explorar "
+                            "(página em branco ou ainda carregando)."
+                            + (
+                                f" Ela tentou navegar para {blocked_url}, fora da origem autorizada."
+                                if blocked_url else ""
+                            )
+                        )
                     self._record_coverage_restrictions(exploration_id, coverage, observation)
                     terminal = ExplorationStatus.COMPLETED
                     if coverage.coverage_complete():
@@ -2900,11 +3160,27 @@ class ExplorationManager:
                 # a new QA decision. Execute it directly so a long recovery
                 # cannot spend one full JEV prompt (or grow its history) for
                 # every mechanical browser step.
-                mechanical_restore = coverage.next_restoration_action(observation)
+                # A period search in progress outranks restoration: leaving the
+                # screen between two searches (the results reload the page's
+                # controls, which looks like a new state) would abandon it.
+                next_search = getattr(coverage, "next_search_action", None)
+                search_step = next_search(observation) if next_search is not None else None
+                mechanical_restore = (
+                    None if search_step is not None
+                    else coverage.next_restoration_action(observation)
+                )
                 self._record_coverage_restrictions(exploration_id, coverage, observation)
-                decision_source = "coverage" if mechanical_restore else "jev"
+                self._record_search_matrix(exploration_id, coverage, first_screens)
+                decision_source = (
+                    "coverage" if mechanical_restore
+                    else "search_matrix" if search_step
+                    else "jev"
+                )
                 if mechanical_restore is not None:
                     decision, coverage_override = mechanical_restore
+                elif search_step is not None:
+                    decision, _ = search_step
+                    coverage_override = None
                 else:
                     coverage_state = coverage.context(observation)
                     (
@@ -3078,12 +3354,19 @@ class ExplorationManager:
                         continue
                     if options.focus_area and not coverage.focus_reached:
                         terminal = ExplorationStatus.PARTIAL
+                        diagnostics: list[dict[str, Any]] = []
+                        describe = getattr(executor, "describe_focus_candidates", None)
+                        if describe is not None:
+                            with suppress(Exception):
+                                diagnostics = await asyncio.wait_for(
+                                    describe(options.focus_area), timeout=5
+                                )
                         self.repository.add_event(
                             exploration_id,
                             "warning",
                             "coverage_scope_not_found",
                             "The requested screen/menu scope was not found among reachable safe routes",
-                            coverage.context(observation),
+                            {**coverage.context(observation), "focus_diagnostics": diagnostics},
                         )
                         break
                     if not coverage.coverage_complete():
@@ -3142,9 +3425,10 @@ class ExplorationManager:
                 # Bounded planner probes/replays have their own retry budget.
                 # Three different required-field probes may submit the same
                 # button; they must not consume a later JEV happy-path retry.
-                if not is_mechanical_action:
+                matrix_action = decision_source == "search_matrix"
+                if not is_mechanical_action and not matrix_action:
                     action_counts[fingerprint] = action_counts.get(fingerprint, 0) + 1
-                if not is_mechanical_action and action_counts[fingerprint] > 2:
+                if not is_mechanical_action and not matrix_action and action_counts[fingerprint] > 2:
                     consecutive_loop_rejections += 1
                     # Direciona o modelo para elementos ainda não tentados,
                     # em vez de só dizer "não" e desistir em seguida.
@@ -3358,8 +3642,40 @@ class ExplorationManager:
                     exploration_id, next_action, safe_decision, safe_result
                 )
                 actions_executed += 1
+                reaches_new_state = frontier_advisor is not None and (
+                    coverage.state_key(next_observation) not in coverage.states
+                )
                 coverage.record_action(observation, decision, result, next_observation)
                 self._record_coverage_restrictions(exploration_id, coverage, next_observation)
+                if result.success and not is_mechanical_action:
+                    self._record_findings(
+                        exploration_id, finding_detector.after_action(observation, decision, next_observation)
+                    )
+                trail_label = next(
+                    (
+                        str(element.get("name") or "")[:60]
+                        for element in observation.interactive_elements
+                        if element.get("ref") == decision.target
+                    ),
+                    "",
+                )
+                explored_trail.append(
+                    f"{decision.action} '{trail_label}' -> {canonical_url(next_observation.url)[-80:]}"
+                )
+                opening = (
+                    opener_reason(
+                        decision=decision,
+                        result=result,
+                        before=observation,
+                        after=next_observation,
+                        new_state=reaches_new_state,
+                        mechanical=is_mechanical_action,
+                    )
+                    if frontier_advisor is not None
+                    else None
+                )
+                if opening:
+                    await consult_frontier(next_observation, opening)
                 verified_outcome = any(
                     assertion.kind not in {"observable_state_change", "no_new_browser_errors"}
                     for assertion in result.assertions
@@ -3538,7 +3854,7 @@ class ExplorationManager:
                             "coverage_route_unreachable",
                             (
                                 "Uma combinação antiga de tela não pôde ser "
-                                "recriada. O AutoJev registrou a restrição e "
+                                "recriada. O Test Lab registrou a restrição e "
                                 "continuou pela próxima opção de teste."
                             ),
                             {
@@ -3662,7 +3978,7 @@ class ExplorationManager:
                 with suppress(Exception):
                     await executor.update_live_panel(
                         "Exploração concluída",
-                        f"Status: {terminal.value} — veja o relatório no AutoJev.",
+                        f"Status: {terminal.value} — veja o relatório no Test Lab.",
                     )
                 await executor.close()
                 executor = None

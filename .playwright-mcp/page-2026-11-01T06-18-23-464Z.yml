@@ -1,0 +1,17 @@
+- generic [ref=f1e3]:
+  - generic [ref=f1e6]:
+    - generic [ref=f1e7]:
+      - text: Login
+      - textbox "Login" [active] [ref=f1e8]:
+        - /placeholder: Informe seu login
+        - text: usuario.automacao
+    - generic [ref=f1e9]:
+      - text: Senha
+      - textbox "Senha" [ref=f1e10]:
+        - /placeholder: Informe sua senha
+        - text: Senha@11
+    - generic [ref=f1e11]:
+      - button "Logar" [ref=f1e12] [cursor=pointer]
+      - button "Alterar senha" [ref=f1e13] [cursor=pointer]
+  - link "Esqueceu a senha?" [ref=f1e15] [cursor=pointer]:
+    - /url: /auth/realms/sisbr/login-actions/reset-credentials?client_id=cst-sisbr&tab_id=Zzt3WTcBvOA&client_data=eyJydSI6Imh0dHBzOi8vY3N0LWFuZ3VsYXItYmFja29mZmljZS1ub2RlanMuYXBwcy5ob20uaG9tb2xvZ2FjYW8uY29tLmJyL2NzdC13ZWIvbG90ZS1jaGVxdWVzIiwicnQiOiJjb2RlIiwic3QiOiJjNTkzMWY2Mi01ZWRlLTRkMjMtYTk4MS04YjU1MTc4MGUxMGMifQ

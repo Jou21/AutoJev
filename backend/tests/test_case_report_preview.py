@@ -28,11 +28,11 @@ def with_shot(app, owner, identity="CT001", filename="evidence.png"):
     repo.add_scenario(owner, int(identity[2:]), StoredScenario(**value))
 
 
-def test_preview_filters_before_rendering_and_never_reads_image_bytes(runtime, monkeypatch):
+def test_preview_lists_every_result_focused_on_the_clicked_ct_and_never_reads_image_bytes(runtime, monkeypatch):
     app, client, root = runtime
     repo = app.state.repository
     other = deepcopy(repo.get_exploration(root)["scenarios"][0])
-    other.update(id="CT002", title="Unrelated test must not be rendered")
+    other.update(id="CT002", title="Another result listed alongside the focused CT")
     repo.add_scenario(root, 2, StoredScenario(**other))
     with_shot(app, root)
     with_shot(app, root, "CT002", "unrelated.png")
@@ -50,11 +50,13 @@ def test_preview_filters_before_rendering_and_never_reads_image_bytes(runtime, m
     response = client.get(f"/api/test-suites/{root}/report?case_id=CT001&preview=true")
     assert response.status_code == 200, response.text
     payload = data(response.text)
-    assert [case["id"] for case in payload["cases"]] == ["CT001"]
+    assert [case["id"] for case in payload["cases"]] == ["CT001", "CT002"], "The results screen shows every result"
     assert payload["suite_context"]["focused_case_id"] == "CT001"
-    assert "unrelated.png" not in response.text
-    assert other["title"] not in response.text
-    assert payload["online_preview"]["image_sizes"] == {f"http://testserver/api/explorations/{root}/screenshots/evidence.png": len(PNG)}
+    assert other["title"] in response.text
+    assert payload["online_preview"]["image_sizes"] == {
+        f"http://testserver/api/explorations/{root}/screenshots/evidence.png": len(PNG),
+        f"http://testserver/api/explorations/{root}/screenshots/unrelated.png": len(PNG),
+    }
     sources = re.findall(r'<img[^>]*\bsrc="([^"]+)"', response.text)
     assert sources and all(source.startswith(f"http://testserver/api/explorations/{root}/screenshots/") for source in sources)
     assert '<img loading="lazy"' in response.text
@@ -63,7 +65,7 @@ def test_preview_filters_before_rendering_and_never_reads_image_bytes(runtime, m
     assert not app.state.scenario_rerun_service.tasks
 
 
-def test_offline_download_still_embeds_selected_evidence_and_normal_export_keeps_all_cts(runtime):
+def test_preview_download_exports_every_result_with_embedded_evidence(runtime):
     app, client, root = runtime
     with_shot(app, root)
     new_manual(client, root, "Outro CT não executado")
@@ -72,7 +74,9 @@ def test_offline_download_still_embeds_selected_evidence_and_normal_export_keeps
     offline = client.get("/api" + export_path)
     assert offline.status_code == 200
     assert "online_preview" not in data(offline.text)
-    assert [case["id"] for case in data(offline.text)["cases"]] == ["CT001"]
+    assert "case_id" not in export_path
+    assert [case["id"] for case in data(offline.text)["cases"]] == [case["id"] for case in data(preview.text)["cases"]]
+    assert len(data(offline.text)["cases"]) == 2
     assert re.findall(r'<img[^>]*\bsrc="([^"]+)"', offline.text)[0].startswith("data:image/png;base64,")
     all_cases = client.get(f"/api/test-suites/{root}/report")
     assert len(data(all_cases.text)["cases"]) == 2
@@ -97,8 +101,9 @@ def test_focused_preview_keeps_real_history_owners_and_stable_parent_identity(ru
     response = client.get(f"/api/test-suites/{root}/report?case_id=CT147&preview=true")
     assert response.status_code == 200, response.text
     payload = data(response.text)
-    case, = payload["cases"]
-    assert case["id"] == "CT147" and case["status"] == "FAIL"
+    assert payload["suite_context"]["focused_case_id"] == "CT147"
+    case = next(case for case in payload["cases"] if case["id"] == "CT147")
+    assert case["status"] == "FAIL"
     assert len(case["execution_history"]) == 2
     assert case["execution_revision"]["exploration_id"] == child
     images = payload["online_preview"]["image_sizes"]
@@ -117,16 +122,38 @@ def test_selected_manual_round_uses_only_its_own_result(runtime):
     round_state(client, plan["id"], "completed")
     response = client.get(f"/api/test-suites/{root}/report?scope=round&round_id={plan['id']}&case_id={item['id']}&preview=true")
     assert response.status_code == 200
-    case, = data(response.text)["cases"]
-    assert case["id"] == item["id"] and case["status"] == "BLOCKED"
+    payload = data(response.text)
+    assert payload["suite_context"]["focused_case_id"] == item["id"]
+    case = next(case for case in payload["cases"] if case["id"] == item["id"])
+    assert case["status"] == "BLOCKED"
     assert client.get(f"/api/test-suites/{root}/report?scope=round&round_id={plan['id']}&case_id=CT001&preview=true").status_code == 404
 
 
-@pytest.mark.parametrize("query,status", [("preview=true", 422), ("case_id=unknown&preview=true", 404), ("case_id=&preview=true", 422), ("scope=initial&case_id=unknown", 404)])
+@pytest.mark.parametrize("query,status", [("case_id=unknown&preview=true", 404), ("case_id=&preview=true", 422), ("scope=initial&case_id=unknown", 404)])
 def test_invalid_focus_never_falls_back_to_the_full_suite(runtime, query, status):
     app, client, root = runtime
     before = app.state.repository.get_exploration(root)
     response = client.get(f"/api/test-suites/{root}/report?{query}")
     assert response.status_code == status
     assert app.state.repository.get_exploration(root) == before
+    assert not app.state.scenario_rerun_service.tasks
+
+
+def test_preview_without_a_ct_lists_every_result_for_the_tests_view(runtime):
+    app, client, root = runtime
+    repo = app.state.repository
+    other = deepcopy(repo.get_exploration(root)["scenarios"][0])
+    other.update(id="CT002", title="Second listed result")
+    repo.add_scenario(root, 2, StoredScenario(**other))
+    with_shot(app, root)
+    before = deepcopy(repo.get_exploration(root))
+    response = client.get(f"/api/test-suites/{root}/report?preview=true")
+    assert response.status_code == 200, response.text
+    payload = data(response.text)
+    assert [case["id"] for case in payload["cases"]] == ["CT001", "CT002"]
+    assert "focused_case_id" not in payload["suite_context"], "No CT is singled out"
+    assert "case_id" not in payload["online_preview"]["export_path"], "The download exports everything"
+    sources = re.findall(r'<img[^>]*\bsrc="([^"]+)"', response.text)
+    assert sources and all(source.startswith(f"http://testserver/api/explorations/{root}/screenshots/") for source in sources), "Images load from the API, not embedded"
+    assert repo.get_exploration(root) == before
     assert not app.state.scenario_rerun_service.tasks

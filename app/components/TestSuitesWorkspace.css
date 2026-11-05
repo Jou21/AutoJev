@@ -58,14 +58,17 @@
 .suite-expand svg { width: 18px; }
 .suite-app-icon { display: grid; place-items: center; width: 46px; height: 46px; flex-shrink: 0; border: 1px solid #f2c45b3a; border-radius: 12px; background: linear-gradient(130deg, #f2c45b16, transparent); color: var(--suite-accent); }
 .suite-group-name { flex: 1; min-width: 130px; }
-.suite-group-name strong { display: block; color: var(--text); font-weight: 650; font-size: 15px; }
-.suite-group-open { position: static; }
-.suite-workspace .suite-group-open:active:not(:disabled) { transform: none; }
-.suite-group-open::after { content: ""; position: absolute; inset: 0; z-index: 1; border-radius: inherit; cursor: pointer; }
-.suite-group-main:has(.suite-group-open:hover) { background: #f2c45b07; }
-.suite-group-main:has(.suite-group-open:hover) .suite-group-name strong { color: var(--suite-accent); }
-.suite-workspace .suite-group-open:focus-visible { outline: none; }
-.suite-group-open:focus-visible::after { outline: 2px solid var(--suite-accent); outline-offset: -2px; }
+.suite-group-name strong, .suite-group-title { display: block; color: var(--text); font-weight: 650; font-size: 15px; }
+/* The whole card opens the original exploration: the app-name button owns a
+   card-wide overlay. "Ver testes" and the history expander sit above it. */
+.suite-group-title { position: static; max-width: 100%; padding: 0; border: 0; background: none; font-family: inherit; text-align: left; cursor: pointer; }
+.suite-workspace .suite-group-title:active:not(:disabled) { transform: none; }
+.suite-group-title::after { content: ""; position: absolute; inset: 0; z-index: 1; border-radius: inherit; cursor: pointer; }
+.suite-group-main:has(.suite-group-title:hover) { background: #f2c45b07; }
+.suite-group-main:has(.suite-group-title:hover) .suite-group-title { color: var(--suite-accent); }
+.suite-workspace .suite-group-title:focus-visible { outline: none; }
+.suite-group-title:focus-visible::after { outline: 2px solid var(--suite-accent); outline-offset: -2px; }
+.suite-group-open { position: relative; z-index: 2; }
 .suite-group-name span, .suite-group-stat span { display: block; margin-top: 5px; color: var(--muted); font-size: 10px; }
 .suite-group-stat { min-width: 100px; }
 .suite-group-stat strong { font-size: 13px; font-weight: 600; }
@@ -84,13 +87,16 @@
 .suite-catalog .suite-toolbar { margin-bottom: 16px; }
 .suite-case-table { border-top: 1px solid var(--suite-line); }
 .suite-case-row { position: relative; display: flex; align-items: center; gap: 16px; min-height: 76px; padding: 15px 0; border-bottom: 1px solid var(--suite-line); }
-.suite-case-row:has(.suite-case-open:not(:disabled):hover), .suite-case-row:has(.suite-case-open:focus-visible) { background: #f2c45b07; }
+.suite-case-row:has(.suite-check:not(:has(input:disabled)):hover), .suite-case-row:has(.suite-check input:focus-visible) { background: #f2c45b07; }
 .suite-case-open { display: inline-flex; align-items: center; justify-content: center; gap: 5px; flex-shrink: 0; padding: 7px 0; border: 0; background: transparent; color: var(--suite-accent); font-size: 10px; }
 /* Stretch the native button over the row; selection/editor controls sit above it. */
-.suite-case-open:not(:disabled)::after { content: ""; position: absolute; inset: 0; z-index: 1; cursor: pointer; border-radius: 7px; }
-.suite-case-open:focus-visible { outline: none !important; }
-.suite-case-open:focus-visible::after { outline: 2px solid var(--suite-accent); outline-offset: 3px; }
-.suite-case-row > .suite-check, .suite-case-row > button:not(.suite-case-open) { position: relative; z-index: 2; }
+.suite-case-open:not(:disabled):hover { text-decoration: underline; text-underline-offset: 3px; }
+/* Clicking anywhere on a CT row only toggles its checkbox: the checkbox label
+   owns a row-wide overlay. "Ver resultado" and the other actions sit above it. */
+.suite-case-row > .suite-check { position: static; }
+.suite-case-row > .suite-check::after { content: ""; position: absolute; inset: 0; z-index: 1; cursor: pointer; border-radius: 7px; }
+.suite-case-row > .suite-check:has(input:disabled)::after { cursor: not-allowed; }
+.suite-case-row > button { position: relative; z-index: 2; }
 .suite-case-row > .suite-case-open:disabled { opacity: 1; color: var(--muted); }
 @media (max-width: 640px) { .suite-case-row { gap: 9px; flex-wrap: wrap; }.suite-case-row > div { flex-basis: calc(100% - 90px); }.suite-case-open { min-height: 35px; } }
 .suite-case-row > div { flex: 1; min-width: 0; }
@@ -544,7 +550,7 @@
 .suite-home .suite-app-icon { width: 34px; height: 34px; border-radius: 9px; }
 .suite-home .suite-expand { min-width: 28px; height: 34px; }
 .suite-home .suite-group-name { min-width: 0; }
-.suite-home .suite-group-name strong { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.suite-home .suite-group-name :is(strong, .suite-group-title) { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
 .suite-home .suite-group-name span { margin-top: 3px; font-size: 11px; }
 .suite-home .suite-group-stat { display: block; min-width: 62px; }
 .suite-home .suite-group-stat span { margin-top: 3px; }

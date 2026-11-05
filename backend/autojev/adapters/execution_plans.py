@@ -110,6 +110,29 @@ class ExecutionPlanStore:
             rows = connection.execute("SELECT definition_json FROM authored_test_cases WHERE root_id = ? ORDER BY created_at, case_id", (root_id,)).fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    # Batch variants for listings: one connection instead of one per suite.
+    def all_session_roots(self):
+        with self.repository._lock, self.repository._connect() as connection:
+            rows = connection.execute("SELECT session_id, root_id FROM suite_sessions").fetchall()
+        return {row["session_id"]: row["root_id"] for row in rows}
+
+    def all_cases(self):
+        with self.repository._lock, self.repository._connect() as connection:
+            rows = connection.execute("SELECT root_id, definition_json FROM authored_test_cases ORDER BY created_at, case_id").fetchall()
+        grouped = {}
+        for row in rows:
+            grouped.setdefault(row["root_id"], []).append(json.loads(row["definition_json"]))
+        return grouped
+
+    def all_catalog_states(self):
+        with self.repository._lock, self.repository._connect() as connection:
+            rows = connection.execute("SELECT root_id, case_id, archived, revision, updated_at FROM test_case_catalog_state").fetchall()
+        grouped = {}
+        for row in rows:
+            grouped.setdefault(row["root_id"], {})[row["case_id"]] = {
+                "archived": bool(row["archived"]), "catalog_revision": row["revision"], "catalog_updated_at": row["updated_at"]}
+        return grouped
+
     def catalog_states(self, root_id):
         with self.repository._lock, self.repository._connect() as connection:
             rows = connection.execute("SELECT case_id, archived, revision, updated_at FROM test_case_catalog_state WHERE root_id = ?", (root_id,)).fetchall()

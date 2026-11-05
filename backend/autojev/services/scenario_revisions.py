@@ -10,7 +10,7 @@ import json
 from collections import defaultdict
 from copy import deepcopy
 from hashlib import sha256
-from typing import Any
+from typing import Any, Callable
 
 from autojev.adapters.repository import NotFoundError, SQLiteRepository
 from autojev.services.scenario_timeline import prepare_scenario_timelines
@@ -56,15 +56,22 @@ def _associated_actions(exploration: dict[str, Any], scenario: dict[str, Any]) -
             if isinstance(action, dict) and action.get("step_number") in references]
 
 
-def scenario_report_origin(repository: SQLiteRepository, run_id: str) -> dict[str, str | None]:
+def scenario_report_origin(
+    repository: SQLiteRepository, run_id: str,
+    ancestry: Callable[[str], dict[str, Any]] | None = None,
+) -> dict[str, str | None]:
     """Resolve the original report/CT without projecting any descendant data.
 
     Active reruns can have no case yet. Every existing ancestor, however,
     must contain the exact referenced case, and an ancestor rerun must bind
     its unique result to one unambiguous durable parent. Bad ancestry keeps
     the link on this execution rather than guessing another report.
+
+    ``ancestry`` lets a listing pass a preloaded lookup (it must raise
+    NotFoundError like the repository) instead of one query per node.
     """
-    own = repository.get_scenario_revision_ancestry(run_id)
+    load = ancestry or repository.get_scenario_revision_ancestry
+    own = load(run_id)
     own_cases = [case for case in own["scenarios"]
                  if _identity(case.get("id")) and case.get("status") in VERDICTS]
     fallback = {"report_exploration_id": run_id,
@@ -101,7 +108,7 @@ def scenario_report_origin(repository: SQLiteRepository, run_id: str) -> dict[st
                     or (case_source is not None and case_source != parent_case)):
                 return fallback
         try:
-            node = repository.get_scenario_revision_ancestry(parent)
+            node = load(parent)
         except NotFoundError:
             return fallback
         expected_case = parent_case

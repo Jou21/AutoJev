@@ -80,7 +80,7 @@ async def test_native_login_resumes_once_with_current_authorization_including_sa
         assert not browser.login_attempts and not browser.actions
         assert not service.input_events[run_id].is_set()
         # This represents clicking the tested site's own Login button. The
-        # AutoJev continue button and login-submission method are never used.
+        # Test Lab continue button and login-submission method are never used.
         browser.page = observed("e42")
         await asyncio.wait_for(task, 3)
         replay = repository.get_exploration(run_id)

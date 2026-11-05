@@ -107,6 +107,11 @@ class ExplorationOptions:
     auxiliary_review_max_attempts: int = 3
     capture_console_errors: bool = True
     capture_network_errors: bool = True
+    # The auxiliary model is always consulted at "opening" moments (new route,
+    # menu/panel/dialog opened, first authenticated screen) to point at flows
+    # not yet covered. It only reorders controls the planner already considers
+    # safe. Its requests have their own cap, apart from the review one.
+    frontier_advice_max_requests: int = 25
     generate_test_cases: bool = True
     generate_html_report: bool = True
     viewport_width: int = 1440
@@ -138,6 +143,10 @@ class AgentDecision:
     url: str | None = None
     assertions: list[dict[str, Any]] = field(default_factory=list)
     scenario_hint: dict[str, Any] | None = None
+    # An input step of a deterministic matrix (a date typed, a wait): nobody
+    # reviews its screenshot and it is not a test case, so the executor skips
+    # the target preview, the DOM-settle wait and the post-action screenshot.
+    fast: bool = False
 
 
 @dataclass(slots=True)

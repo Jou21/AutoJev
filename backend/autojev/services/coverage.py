@@ -9,7 +9,15 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from datetime import date
+
 from autojev.domain.models import ActionResult, AgentDecision, Observation
+from autojev.services.search_matrix import (
+    FieldVariations,
+    SearchMatrix,
+    detect_date_pairs,
+    readonly_date_fields,
+)
 
 _DESTRUCTIVE_WORDS = {
     "apagar",
@@ -19,20 +27,29 @@ _DESTRUCTIVE_WORDS = {
     "excluir",
     "logout",
     "pay",
+    "publicar",
+    "publish",
     "purchase",
     "remover",
     "remove",
     "sair",
     "sign out",
 }
+_SEARCH_ACTION = re.compile(
+    r"\b(?:pesquisar|buscar|consultar|filtrar|procurar|aplicar|search|find|filter)\b"
+)
 _CLICKABLE_TAGS = {"a", "button"}
 _CLICKABLE_ROLES = {"button", "link", "menuitem", "tab", "checkbox", "radio"}
 _FILLABLE_INPUT_TYPES = {
+    "date",
+    "datetime-local",
     "email",
+    "month",
     "number",
     "search",
     "tel",
     "text",
+    "time",
     "url",
 }
 _PASSIVE_ACTIONS = {"reload", "screenshot", "wait"}
@@ -272,11 +289,32 @@ class CoveragePlanner:
     memory, element novelty, the route stack and completion/backtracking rules.
     """
 
-    def __init__(self, start_url: str, focus_area: str | None = None) -> None:
+    def __init__(
+        self,
+        start_url: str,
+        focus_area: str | None = None,
+        *,
+        gate_until_focus: bool = False,
+    ) -> None:
         self.start_url = canonical_url(start_url)
         self.origin = urlsplit(self.start_url)[:2]
         self.focus_area = " ".join((focus_area or "").split()) or None
         self.focus_reached = not bool(self.focus_area)
+        # While a requested focus is still unreached, only controls that can
+        # lead there are candidates (navigation, menu openers, label/URL
+        # matches, advisor hints); the rest of the entry screen is not the scope.
+        self.gate_until_focus = gate_until_focus
+        # state key -> {move fingerprint: priority 1 (best) .. 3}, set by the
+        # auxiliary advisor and only ever over planner-approved candidates.
+        self.advice_hints: dict[str, dict[str, int]] = {}
+        # Date-range searches are run over many ranges, not once (see
+        # search_matrix). ``search_today`` lets tests pin the calendar.
+        self.search_matrices: dict[str, SearchMatrix] = {}
+        self.search_variations: dict[str, FieldVariations] = {}
+        self._pending_search_events: list[dict[str, Any]] = []
+        self._unsupported_reported: set[str] = set()
+        self.search_matrix_enabled = True
+        self.search_today: date | None = None
         self.focus_root: str | None = None
         self.focus_entry_anchor: str | None = None
         self.focus_entry_child: str | None = None
@@ -533,6 +571,9 @@ class CoveragePlanner:
         has_popup = _normalise_text(str(element.get("aria_haspopup") or ""))
         return (
             tag in _CLICKABLE_TAGS
+            # A plain element the page itself marks clickable (cursor:pointer),
+            # e.g. an Angular menu entry bound with (click).
+            or element.get("pointer_widget") is True
             or role in _CLICKABLE_ROLES
             or has_popup not in {"", "false", "none"}
             or (
@@ -568,11 +609,15 @@ class CoveragePlanner:
             return [("fill", "AutoJev QA exploratory input")]
         if tag == "input" and element_type in _FILLABLE_INPUT_TYPES:
             values = {
+                "date": "2026-01-15",
+                "datetime-local": "2026-01-15T10:30",
                 "email": "autojev.qa@example.com",
+                "month": "2026-01",
                 "number": "1",
                 "search": "AutoJev QA",
                 "tel": "11999999999",
                 "text": cls._safe_fill_value(element),
+                "time": "10:30",
                 "url": "https://example.com",
             }
             return [("fill", values[element_type])]
@@ -605,9 +650,34 @@ class CoveragePlanner:
         """Use distinct synthetic text per observed label to expose field mixups."""
 
         name = _normalise_text(str(element.get("name") or ""))
+        placeholder = str(element.get("placeholder") or "")
+        field_label = _normalise_text(str(element.get("label") or ""))
+        # A placeholder that is itself a valid example (a dd/mm/aaaa mask) is
+        # the safest thing to type; a bare mask hint gets a fixed valid date.
+        shown = f"{placeholder} {name}"
+        example = re.search(r"\b\d{2}/\d{2}/\d{4}\b", shown)
+        if example:
+            return example.group(0)
+        if re.search(r"\b(?:dd|d)/(?:mm|m)/(?:aaaa|yyyy|yy|aa)\b", _normalise_text(shown)):
+            return "15/01/2026"
+        if re.search(r"\bhh[:h]mm\b", _normalise_text(shown)):
+            return "10:30"
+        subject = f"{field_label} {name}".strip()
+        if re.search(r"\bcnpj\b", subject) and not re.search(r"\bcpf\b", subject):
+            return "11.222.333/0001-81"
+        if re.search(r"\bcpf\b", subject):
+            return "529.982.247-25"
+        if re.search(r"\b(?:valor|r\$|preco|montante)\b", subject):
+            return "100,00"
+        if re.search(r"\b(?:quantidade|qtd|qtde)\b", subject):
+            return "1"
+        if re.search(r"\b(?:telefone|celular|fone)\b", subject):
+            return "11999999999"
+        if re.search(r"\b(?:e-?mail)\b", subject):
+            return "autojev.qa@example.com"
         if re.search(r"\b(?:zip|postal|cep)\b", name):
             return "01001000"
-        label = re.sub(r"[^a-z ]", " ", name)
+        label = re.sub(r"[^a-z ]", " ", field_label or name)
         label = re.sub(r"\s+", " ", label).strip()[:48]
         return f"AutoJev QA {label}" if label else "AutoJev QA exploratory input"
 
@@ -1342,6 +1412,129 @@ class CoveragePlanner:
             and all(token in strong_surface for token in leaf_tokens)
         )
 
+    def _may_lead_to_focus(
+        self, state: _CoverageState, fingerprint: str, element: dict[str, Any]
+    ) -> bool:
+        """Before the focus is reached, keep only moves that can lead to it."""
+
+        if not (self.gate_until_focus and self.focus_area and not self.focus_reached):
+            return True
+        if fingerprint in self.advice_hints.get(state.key, {}):
+            return True
+        if element.get("in_navigation") or self._menu_toggle_kind(element):
+            return True
+        surface = _normalise_text(
+            f"{element.get('name') or ''} {element.get('href') or ''} {element.get('context') or ''}"
+        )
+        return any(token in surface for token in _meaningful_tokens(self.focus_area))
+
+    def _search_pairs(self, observation: Observation):
+        if not self.search_matrix_enabled or (self.focus_area and not self.focus_reached):
+            return []
+        path = urlsplit(canonical_url(observation.url)).path
+        return [(f"{path}#{pair.index}", pair) for pair in detect_date_pairs(observation)]
+
+    def _report_unsupported_dates(self, observation: Observation) -> None:
+        """Say so, once per screen, when its dates can only be picked on a calendar."""
+
+        path = urlsplit(canonical_url(observation.url)).path
+        if path in self._unsupported_reported:
+            return
+        fields = readonly_date_fields(observation)
+        if fields:
+            self._unsupported_reported.add(path)
+            self._pending_search_events.append({
+                "type": "search_matrix_unsupported", "matrix": path,
+                "reason": "readonly_date_fields", "fields": fields,
+            })
+
+    def has_search_work(self, observation: Observation) -> bool:
+        """A period search (or its follow-up field variations) still has work here."""
+
+        for key, _ in self._search_pairs(observation):
+            matrix = self.search_matrices.get(key)
+            variations = self.search_variations.get(key)
+            if matrix is None or not matrix.done or variations is None or not variations.done:
+                return True
+        return False
+
+    def next_search_action(
+        self, observation: Observation
+    ) -> tuple[AgentDecision, str] | None:
+        """The next step of the period matrix, then of the field variations."""
+
+        if self.search_matrix_enabled and not (self.focus_area and not self.focus_reached):
+            self._report_unsupported_dates(observation)
+        for key, pair in self._search_pairs(observation):
+            matrix = self.search_matrices.get(key)
+            if matrix is None:
+                matrix = self.search_matrices[key] = SearchMatrix(
+                    key=key, today=self.search_today or date.today()
+                )
+            if not matrix.done:
+                step = matrix.step(observation, pair)
+                if step is not None:
+                    return step
+                if not matrix.done:
+                    continue
+            variations = self.search_variations.get(key)
+            if variations is None:
+                variations = self.search_variations[key] = FieldVariations(
+                    key=key,
+                    restore_best_range=any(r["rows"] > 0 for r in matrix.records),
+                )
+            if variations.done:
+                continue
+            step = variations.step(observation, pair)
+            if step is not None:
+                return step
+            if not variations.done:
+                # This section is not finished: do not start the next one
+                # while its fields are not reachable for a moment.
+                return None
+        return None
+
+    def drain_search_events(self) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = list(self._pending_search_events)
+        self._pending_search_events.clear()
+        for holder in (*self.search_matrices.values(), *self.search_variations.values()):
+            events.extend(holder.events)
+            holder.events.clear()
+        return events
+
+    def apply_advice(
+        self, observation: Observation, priorities: dict[str, int]
+    ) -> dict[str, str]:
+        """Record advisor hints by ref; return ``{ref: fingerprint}`` accepted.
+
+        A hint only counts for a control that is already a safe, executable
+        candidate of this very state, so the model can reorder the frontier but
+        never add a move, widen the scope or reach a blocked control.
+        """
+
+        key = self.state_key(observation)
+        candidates = self._candidate_map(observation)
+        by_ref = {
+            str(element.get("ref")): fingerprint
+            for fingerprint, element in candidates.items()
+            if element.get("ref")
+        }
+        accepted: dict[str, str] = {}
+        hints = self.advice_hints.setdefault(key, {})
+        for ref, priority in priorities.items():
+            fingerprint = by_ref.get(ref)
+            if fingerprint is None:
+                continue
+            state = self.states.get(key)
+            if state is not None and (
+                fingerprint in state.attempted or fingerprint in state.blocked
+                or fingerprint in state.inherited
+            ):
+                continue
+            hints[fingerprint] = min(max(int(priority), 1), 3)
+            accepted[ref] = fingerprint
+        return accepted
+
     def _activate_focus(self, key: str) -> None:
         self.focus_reached = True
         self.focus_root = key
@@ -1532,6 +1725,8 @@ class CoveragePlanner:
                 continue
             if not self._link_is_inside_focus(element):
                 continue
+            if not self._may_lead_to_focus(state, fingerprint, element):
+                continue
             result.append((fingerprint, element))
 
         focus = _normalise_text(self.focus_area or "")
@@ -1541,7 +1736,7 @@ class CoveragePlanner:
 
         def priority(
             item: tuple[str, dict[str, Any]],
-        ) -> tuple[int, int, int, int, int, float, str, int, int]:
+        ) -> tuple[int, int, int, int, int, int, int, float, str, int, int]:
             move_key, element = item
             surface = _normalise_text(
                 f"{element.get('name') or ''} {element.get('href') or ''}"
@@ -1573,9 +1768,26 @@ class CoveragePlanner:
             # Distinct row/detail destinations are cheap, finite coverage.
             # Visit them before toggling a cart creates many transient states.
             detail_rank = 0 if element.get("href") and not element.get("in_navigation") else 1
+            hint_rank = self.advice_hints.get(state.key, {}).get(move_key, 9)
+            # Test the screen you are on before leaving it: its fields first,
+            # then the search/filter button they enable, then everything else
+            # (links to other routes included). Outside a <form> nothing else
+            # ties a "Pesquisar" to its fields.
+            tag = _normalise_text(str(element.get("tag") or ""))
+            move_action = self._move_action(element)
+            if move_action in {"fill", "select"} and tag in {"input", "select", "textarea"}:
+                flow_rank = 0
+            elif tag in {"button", "input"} and _SEARCH_ACTION.search(
+                _normalise_text(str(element.get("name") or ""))
+            ):
+                flow_rank = 1
+            else:
+                flow_rank = 2
             return (
                 exit_rank,
                 transaction_rank,
+                flow_rank,
+                hint_rank,
                 focus_rank,
                 navigation_rank,
                 detail_rank,

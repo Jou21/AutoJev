@@ -256,6 +256,48 @@ def case_context(source_id: str, case_id: str, request: Request):
             "source_exploration_id": source_id, "source_scenario_id": case_id}
 
 
+@router.get("/{root_id}/case-contexts")
+def case_contexts(root_id: str, request: Request, itens: str = Query(min_length=2, max_length=200_000)):
+    """Resolve many report CTs (``[{"source", "ct"}]``) to this base in one pass.
+
+    Same matching rule as ``case_context`` without its step reference: a
+    report's "Reexecutar testes" hands every CT at once, and resolving them one
+    request at a time rebuilt the whole catalog per CT.
+    """
+    import json
+    from autojev.services.scenario_revisions import scenario_report_origin
+    try:
+        items = json.loads(itens)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(422, "Lista de testes inválida.") from exc
+    if (not isinstance(items, list) or not 1 <= len(items) <= 500
+            or not all(isinstance(item, dict) and set(item) == {"source", "ct"}
+                       and all(isinstance(item[key], str) and 0 < len(item[key]) <= 200 for key in ("source", "ct")) for item in items)):
+        raise HTTPException(422, "Lista de testes inválida.")
+    suites = service(request)
+    catalog = call(lambda: suites.catalog(root_id))
+    if catalog["id"] != root_id:
+        raise HTTPException(409, "Abra a base de testes original para planejar estes CTs.")
+    origins, ancestries, result = {}, {}, []
+    for item in items:
+        source, ct = item["source"], item["ct"]
+        if source not in origins:
+            if call(lambda: suites.root(source)) != root_id:
+                raise HTTPException(409, f"{ct} não pertence a esta base de testes.")
+            origins[source] = call(lambda: scenario_report_origin(suites.repository, source))
+            ancestries[source] = {case["id"] for case in call(lambda: suites.repository.get_scenario_revision_ancestry(source))["scenarios"] if case["id"]}
+        origin = origins[source]
+        stable = origin["report_scenario_id"] if source != origin["report_exploration_id"] else ct
+        imported = next((case for case in catalog["cases"] if case.get("lineage_exploration_id") == origin["report_exploration_id"] and case.get("lineage_case_id") == stable), None)
+        if imported is None and source == catalog["id"]:
+            imported = next((case for case in catalog["cases"] if case["id"] == ct and case["mode"] == "manual"), None)
+        if imported is None or (imported["mode"] == "automatic" and ct not in ancestries[source]):
+            raise HTTPException(404, f"{ct} não foi encontrado no conjunto. Importe o CT descoberto antes de planejá-lo.")
+        result.append({"root_id": catalog["id"], "case_id": imported["id"], "mode": imported["mode"],
+                       "source_exploration_id": source, "source_scenario_id": ct})
+    return result
+
+
 @router.post("/{root_id}/assistant")
 async def assistant(root_id: str, body: AssistantInput, request: Request):
     from autojev.services.planning_assistant import suggest_plan
@@ -387,12 +429,14 @@ def update_plan(root_id: str, plan_id: str, body: PlanUpdateInput, request: Requ
 @router.get("/{root_id}/report")
 async def report(root_id: str, request: Request, scope: Literal["consolidated", "initial", "round"] = "consolidated", round_id: str | None = None,
                  case_id: str | None = Query(default=None, min_length=1, max_length=100), preview: bool = False):
-    if preview and case_id is None:
-        raise HTTPException(422, "A visualização rápida exige um CT específico.")
-    snapshot = await run_in_threadpool(lambda: call(lambda: service(request).report_snapshot(root_id, scope, round_id, case_id)))
+    # The in-app preview shows every result (opening on the clicked CT, if any);
+    # its images load from the API on demand, so the full list stays light.
+    snapshot = await run_in_threadpool(lambda: call(lambda: service(request).report_snapshot(
+        root_id, scope, round_id, None if preview else case_id, case_id if preview else None)))
     image_url = None
     if preview:
-        export_query = urlencode({"scope": scope, "case_id": case_id, **({"round_id": round_id} if round_id else {})})
+        # "Baixar relatório" exports what the preview shows: every CT.
+        export_query = urlencode({"scope": scope, **({"round_id": round_id} if round_id else {})})
         snapshot["online_preview"] = {"export_path": f'/test-suites/{quote(snapshot["id"], safe="")}/report?{export_query}'}
         base = str(request.base_url).rstrip("/")
         image_url = lambda owner, filename: base + "/api/explorations/" + quote(owner, safe="") + "/screenshots/" + quote(filename, safe="")

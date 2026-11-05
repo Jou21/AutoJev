@@ -5678,3 +5678,12 @@ input::placeholder {
 .restriction-card { padding: 16px; border: 1px solid var(--border, #293334); border-radius: 12px; border-left: 3px solid #f0b44d; }
 .restriction-card p { margin: 8px 0; }
 .restriction-card small { display: block; color: var(--text-muted, #93a4aa); overflow-wrap: anywhere; }
+
+/* Detail page: the next step after an exploration is preparing an execution. */
+.button.prepare-execution-cta {
+  padding-inline: 18px;
+  font-weight: 750;
+  box-shadow: 0 0 0 1px var(--amber), 0 8px 24px -8px var(--amber);
+}
+.button.prepare-execution-cta:focus-visible { outline: 2px solid var(--amber-bright); outline-offset: 3px; }
+@media (max-width: 720px) { .button.prepare-execution-cta { order: -1; width: 100%; } }

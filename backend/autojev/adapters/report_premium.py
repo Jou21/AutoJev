@@ -293,7 +293,7 @@ def render_premium_report(renderer: Any, exploration: dict[str, Any], scenarios:
     categories_html = '<div class="category-list">' + "".join(f'<div class="category-row"><span>{label}</span><strong>{category_counts[key]}</strong><div class="progress-track"><span class="progress-fill" style="width:{category_counts[key]/max(1,total)*100:.2f}%"></span></div></div>' for key, label in CATEGORIES.items()) + '</div>'
     top_pages = _pages_table(list(pages.values())[:6], compact=True)
     meta = f'<div class="meta"><div><strong>Aplicação</strong><div class="url">{_h(renderer._public_issue_url(exploration.get("app_url")))}</div></div><div><strong>Escopo</strong><div>{_h(fragments["scope"])}</div></div><div><strong>Evidência da LLM</strong><div>{_h(fragments["evidence_mode"])}</div></div><div><strong>Status</strong><div>{_h(fragments["status"])}</div></div><div><strong>Duração total</strong><div>{_h(renderer._duration(exploration))}</div></div><div><strong>Gerado em</strong><div>{_h(fragments["generated"])}</div></div></div>'
-    overview = meta + '<p class="muted">A duração total inclui revisões auxiliares e geração do relatório.</p>' + metrics_html + '<div class="dashboard-grid">' + _panel("Resultado dos testes", donut, "Distribuição dos resultados registrados") + _panel("Atividade ao longo da execução", chart, "Início dos CTs por intervalo da execução original · reexecuções posteriores não entram neste gráfico · não representa uso de CPU") + _panel("Natureza das verificações", categories_html, "Classificação derivada das evidências de cada CT") + _panel("Páginas com casos registrados", top_pages, "Contagem de CTs, não percentual de cobertura da página") + '</div>' + fragments["cost_summary"] + fragments["visual_summary"] + fragments["strength_summary"]
+    overview = meta + '<p class="muted">A duração total inclui revisões auxiliares e geração do relatório.</p>' + metrics_html + '<div class="dashboard-grid">' + _panel("Resultado dos testes", donut, "Distribuição dos resultados registrados") + _panel("Atividade ao longo da execução", chart, "Início dos CTs por intervalo da execução original · reexecuções posteriores não entram neste gráfico · não representa uso de CPU") + _panel("Natureza das verificações", categories_html, "Classificação derivada das evidências de cada CT") + _panel("Páginas com casos registrados", top_pages, "Contagem de CTs, não percentual de cobertura da página") + '</div>' + fragments["cost_summary"] + fragments["visual_summary"] + fragments["strength_summary"] + fragments.get("findings_summary", "")
     rerun_source = next((event.get("payload") for event in exploration.get("events", [])
                          if event.get("type") == "scenario_rerun_source"
                          and isinstance(event.get("payload"), dict)), None)
@@ -375,7 +375,7 @@ def render_premium_report(renderer: Any, exploration: dict[str, Any], scenarios:
     )
     js = (ASSETS / "premium.js").read_text(encoding="utf-8")
     data = _case_history_dialog() + _case_editor() + _step_picker() + data + '<script id="report-drafts" type="application/json">{"version":1,"cases":{}}</script>'
-    return head + f'<style>{css}</style></head><body class="report-premium" data-view="overview" data-theme="dark" data-density="comfortable" data-report-schema="ct-timeline-v1"><aside class="report-sidebar"><div class="report-brand"><span class="brand-mark">{_icon("robot")}</span><div><strong class="brand-name">AUTOJEV</strong><span class="brand-caption">Relatório exploratório</span></div></div><nav aria-label="Seções do relatório">{nav}</nav><div class="sidebar-footer"><span class="legend-dot"></span>Relatório local e independente<small>Dados preservados · sem chamadas de IA</small></div></aside><main class="report-main"><header class="report-topbar"><div><span class="page-kicker">{_h(app_name)} / RELATÓRIO</span><h1 id="view-title" tabindex="-1">Visão geral</h1><p id="view-subtitle">Uma visão clara dos testes, resultados e evidências da execução.</p></div><div class="toolbar"><button id="print-report" class="button button-ghost">Imprimir</button><button id="download-report" class="button button-primary">{_icon("download")}Baixar relatório</button></div></header>{views}<noscript><style>.report-view[hidden],#scenarios .scenario[hidden]{{display:block!important}}.report-sidebar,.report-tools,.result-navigation,.toolbar{{display:none!important}}</style><p>JavaScript está desativado. Todas as seções são exibidas para leitura; abra os casos para ver suas evidências.</p></noscript></main><dialog id="evidence-dialog" class="evidence-dialog"><div class="dialog-toolbar"><strong id="evidence-caption">Captura registrada</strong><a id="download-evidence" class="button button-ghost" download>Baixar captura</a><button id="close-evidence" class="button button-ghost" aria-label="Fechar captura">Fechar ✕</button></div><div class="dialog-content"><img id="evidence-preview" alt="Captura de evidência ampliada"></div></dialog>{data}<script>{js}</script></body></html>'
+    return head + f'<style>{css}</style></head><body class="report-premium" data-view="overview" data-theme="dark" data-density="comfortable" data-report-schema="ct-timeline-v1"><aside class="report-sidebar"><div class="report-brand"><span class="brand-mark">{_icon("robot")}</span><div><strong class="brand-name">TEST LAB</strong><span class="brand-caption">Relatório exploratório</span></div></div><nav aria-label="Seções do relatório">{nav}</nav><div class="sidebar-footer"><span class="legend-dot"></span>Relatório local e independente<small>Dados preservados · sem chamadas de IA</small></div></aside><main class="report-main"><header class="report-topbar"><div><span class="page-kicker">{_h(app_name)} / RELATÓRIO</span><h1 id="view-title" tabindex="-1">Visão geral</h1><p id="view-subtitle">Uma visão clara dos testes, resultados e evidências da execução.</p></div><div class="toolbar"><button id="download-report" class="button button-primary">{_icon("download")}Baixar relatório</button></div></header>{views}<noscript><style>.report-view[hidden],#scenarios .scenario[hidden]{{display:block!important}}.report-sidebar,.report-tools,.result-navigation,.toolbar{{display:none!important}}</style><p>JavaScript está desativado. Todas as seções são exibidas para leitura; abra os casos para ver suas evidências.</p></noscript></main><dialog id="evidence-dialog" class="evidence-dialog"><div class="dialog-toolbar"><strong id="evidence-caption">Captura registrada</strong><a id="download-evidence" class="button button-ghost" download>Baixar captura</a><button id="close-evidence" class="button button-ghost" aria-label="Fechar captura">Fechar ✕</button></div><div class="dialog-content"><img id="evidence-preview" alt="Captura de evidência ampliada"></div></dialog>{data}<script>{js}</script></body></html>'
 
 
 def _case_row(case: dict[str, Any]) -> str:
@@ -587,21 +587,18 @@ def _case_editor() -> str:
     )
     return (
         '<dialog id="case-editor" class="case-editor-dialog case-rerun-planner" aria-labelledby="case-editor-title">'
-        '<header class="case-editor-header"><div><span class="page-kicker">Planejamento · nova execução</span>'
-        '<h2 id="case-editor-title">Planejar reexecução</h2></div>'
-        '<button id="case-editor-close" class="button button-ghost" aria-label="Fechar editor de passos">Fechar ✕</button></header>'
-        '<div class="case-editor-notice">Rascunho visual · não executado · não altera este resultado. '
-        'As etapas registradas ficam preservadas. “Aguardar print” pode pausar uma nova reexecução confirmada na aplicação; '
-        'adicionar cards aqui não inicia ações, integrações ou capturas.</div>'
+        '<header class="case-editor-header">'
+        '<button id="case-editor-close" class="button button-ghost case-editor-back" aria-label="Voltar ao resultado" title="Voltar ao resultado sem iniciar a reexecução">←</button>'
+        '<div class="case-editor-header-title"><h2 id="case-editor-title">Planejar reexecução</h2>'
+        '<p id="case-editor-feedback" role="status" aria-live="polite"></p></div>'
+        '<div class="case-editor-header-actions"><button id="case-editor-save" class="button button-ghost">Guardar planejamento</button>'
+        '<button id="case-editor-rerun" class="button button-primary">Revisar e confirmar na aplicação →</button></div></header>'
         '<div class="case-editor-layout"><aside id="case-editor-palette" class="case-editor-palette">'
         '<h3>Adicionar ao roteiro</h3><p class="muted">Arraste um tipo de passo até um quadrado + ou clique no + para escolher SWS, SQL ou Aguardar print.</p>'
         + tools + '</aside>'
         '<section class="case-editor-canvas" aria-label="Etapas do roteiro"><h3>Roteiro da próxima execução</h3>'
         '<p class="muted">Etapas originais são somente leitura. Leia da esquerda para a direita e posicione seus novos cards entre elas.</p>'
-        '<ol id="case-editor-steps"></ol></section></div>'
-        '<footer class="case-editor-footer"><p id="case-editor-feedback" role="status" aria-live="polite"></p>'
-        '<div><button id="case-editor-save" class="button button-ghost">Guardar planejamento</button>'
-        '<button id="case-editor-rerun" class="button button-primary">Revisar e confirmar na aplicação →</button></div></footer></dialog>'
+        '<ol id="case-editor-steps"></ol></section></div></dialog>'
     )
 
 
@@ -609,7 +606,7 @@ def _step_picker() -> str:
     choices = (
         ("sws", "route", "Executar SWS", "Prepare uma etapa de SWS e defina se ela deve aguardar um print.", "Escolher SWS · em breve"),
         ("sql", "database", "Executar SQL", "Prepare uma etapa de banco de dados e defina se ela deve aguardar um print.", "Executar SQL · em breve"),
-        ("wait_print", "image", "Aguardar print", "Cole com Ctrl+V, arraste ou escolha uma imagem de qualquer conteúdo na aplicação AutoJev. Confira a prévia e clique em “Anexar print e continuar”.", "Sua imagem no relatório"),
+        ("wait_print", "image", "Aguardar print", "Cole com Ctrl+V, arraste ou escolha uma imagem de qualquer conteúdo na aplicação Test Lab. Confira a prévia e clique em “Anexar print e continuar”.", "Sua imagem no relatório"),
     )
     cards = "".join(
         f'<button type="button" class="step-picker-choice" data-step-choice="{kind}">'

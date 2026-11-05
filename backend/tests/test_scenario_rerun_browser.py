@@ -418,7 +418,7 @@ async def test_login_redirect_and_premature_resume_keep_browser_open_until_expli
             assert not task.done() and len(browser.dispatched) == expected_actions
             # Invalid payloads leave the planned point pending. Uploading via
             # the trusted iframe uses the same service acceptance gate as the
-            # origin-checked AutoJev app, never a browser screenshot operation.
+            # origin-checked Test Lab app, never a browser screenshot operation.
             with pytest.raises(ValueError):
                 service.capture_print(new_id, checkpoint["id"], checkpoint["version"], "")
             await asyncio.sleep(0.1)

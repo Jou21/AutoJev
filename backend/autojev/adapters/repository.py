@@ -128,6 +128,22 @@ class SQLiteRepository:
         CREATE INDEX IF NOT EXISTS idx_exploration_events ON exploration_events(exploration_id, id);
         CREATE INDEX IF NOT EXISTS idx_actions_exploration ON actions(exploration_id, step_number);
         CREATE INDEX IF NOT EXISTS idx_scenarios_exploration ON scenarios(exploration_id, sequence);
+        -- Expression indexes let list_explorations count statuses and visited
+        -- URLs from the index instead of re-parsing every scenario/action JSON
+        -- (tens of MB) on each dashboard load. The expressions must match the
+        -- query text exactly for SQLite to use them.
+        CREATE INDEX IF NOT EXISTS idx_scenarios_status ON scenarios(exploration_id, json_extract(data_json, '$.status'));
+        CREATE INDEX IF NOT EXISTS idx_actions_after_url ON actions(exploration_id, json_extract(result_json, '$.after_url'));
+        CREATE INDEX IF NOT EXISTS idx_screenshots_exploration ON screenshots(exploration_id, id);
+        CREATE INDEX IF NOT EXISTS idx_issues_exploration ON issues(exploration_id);
+        -- Covers _ANCESTRY_SCENARIOS_SQL (expressions must match it exactly).
+        CREATE INDEX IF NOT EXISTS idx_scenarios_ancestry ON scenarios(
+            exploration_id, sequence, id,
+            (CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.id') END),
+            (CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.status') END),
+            (CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.evidence.source_exploration_id') END),
+            (CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.evidence.source_scenario_id') END));
+        CREATE INDEX IF NOT EXISTS idx_exploration_events_type ON exploration_events(type, exploration_id, id);
         """
         with self._lock, self._connect() as connection:
             connection.executescript(schema)
@@ -862,39 +878,66 @@ class SQLiteRepository:
             })
         return result
 
+    # The SELECT expressions must match idx_scenarios_ancestry exactly so the
+    # ancestry is read from the index instead of re-parsing every CT's JSON.
+    _ANCESTRY_SCENARIOS_SQL = """SELECT exploration_id, id,
+                     CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.id') END AS saved_id,
+                     CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.status') END AS status,
+                     CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.evidence.source_exploration_id') END AS source_exploration_id,
+                     CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.evidence.source_scenario_id') END AS source_scenario_id
+                   FROM scenarios {where} ORDER BY exploration_id, sequence"""
+    _ANCESTRY_EVENTS_SQL = """SELECT exploration_id, payload_json FROM exploration_events
+                   WHERE type = 'scenario_rerun_source' {where} ORDER BY exploration_id, id"""
+
+    @staticmethod
+    def _ancestry_source(payload_json: Any) -> dict[str, Any] | None:
+        try:
+            payload = json.loads(payload_json)
+        except (json.JSONDecodeError, TypeError):
+            payload = None
+        return ({key: payload.get(key) for key in ("source_exploration_id", "source_scenario_id")}
+                if isinstance(payload, dict) else None)
+
+    @staticmethod
+    def _ancestry_scenario(row: sqlite3.Row) -> dict[str, Any]:
+        return {"id": row["id"] if row["id"] == row["saved_id"] else None,
+                "status": row["status"], "source_exploration_id": row["source_exploration_id"],
+                "source_scenario_id": row["source_scenario_id"]}
+
     def get_scenario_revision_ancestry(self, exploration_id: str) -> dict[str, Any]:
         """A small ancestor slice for live rerun report links, without actions."""
         with self._lock, self._connect() as connection:
             if connection.execute("SELECT id FROM explorations WHERE id = ?", (exploration_id,)).fetchone() is None:
                 raise NotFoundError(f"Exploration {exploration_id} was not found")
             events = connection.execute(
-                """SELECT payload_json FROM exploration_events
-                   WHERE exploration_id = ? AND type = 'scenario_rerun_source' ORDER BY id""",
-                (exploration_id,),
+                self._ANCESTRY_EVENTS_SQL.format(where="AND exploration_id = ?"), (exploration_id,),
             ).fetchall()
             scenarios = connection.execute(
-                """SELECT id,
-                     CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.id') END AS saved_id,
-                     CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.status') END AS status,
-                     CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.evidence.source_exploration_id') END AS source_exploration_id,
-                     CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.evidence.source_scenario_id') END AS source_scenario_id
-                   FROM scenarios WHERE exploration_id = ? ORDER BY sequence""",
-                (exploration_id,),
+                self._ANCESTRY_SCENARIOS_SQL.format(where="WHERE exploration_id = ?"), (exploration_id,),
             ).fetchall()
-        sources: list[dict[str, Any] | None] = []
+        return {"id": exploration_id,
+                "sources": [self._ancestry_source(event["payload_json"]) for event in events],
+                "scenarios": [self._ancestry_scenario(row) for row in scenarios]}
+
+    def get_all_scenario_revision_ancestries(self) -> dict[str, dict[str, Any]]:
+        """Every exploration's ancestry slice in one snapshot (same shape as above).
+
+        Listing screens resolve the origin of every run; doing that one run at
+        a time costs a connection and a CT scan per run and per ancestor.
+        """
+        with self._lock, self._connect() as connection:
+            ids = [row["id"] for row in connection.execute("SELECT id FROM explorations")]
+            events = connection.execute(self._ANCESTRY_EVENTS_SQL.format(where="")).fetchall()
+            scenarios = connection.execute(self._ANCESTRY_SCENARIOS_SQL.format(where="")).fetchall()
+        result: dict[str, dict[str, Any]] = {
+            identity: {"id": identity, "sources": [], "scenarios": []} for identity in ids}
         for event in events:
-            try:
-                payload = json.loads(event["payload_json"])
-            except (json.JSONDecodeError, TypeError):
-                payload = None
-            sources.append({key: payload.get(key) for key in ("source_exploration_id", "source_scenario_id")}
-                           if isinstance(payload, dict) else None)
-        return {"id": exploration_id, "sources": sources, "scenarios": [
-            {"id": row["id"] if row["id"] == row["saved_id"] else None,
-             "status": row["status"], "source_exploration_id": row["source_exploration_id"],
-             "source_scenario_id": row["source_scenario_id"]}
-            for row in scenarios
-        ]}
+            if event["exploration_id"] in result:
+                result[event["exploration_id"]]["sources"].append(self._ancestry_source(event["payload_json"]))
+        for row in scenarios:
+            if row["exploration_id"] in result:
+                result[row["exploration_id"]]["scenarios"].append(self._ancestry_scenario(row))
+        return result
 
     def get_report_path(self, exploration_id: str) -> str | None:
         with self._lock, self._connect() as connection:

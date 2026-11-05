@@ -1406,7 +1406,7 @@ async def test_deterministic_agent_walks_the_planner_frontier_in_order_without_a
 
     first = await agent.decide(observation, [], [], {"current_untried": [{"ref": "e2"}, {"ref": "e1"}]})
     assert (first.action, first.target) == ("click", "e2")  # the planner's first priority, not the DOM order
-    assert "planejador determinístico do AutoJev" in report_text(first.rationale)
+    assert "planejador determinístico do Test Lab" in report_text(first.rationale)
     assert {"kind": "url_contains", "expected": "/cart.html"} in first.assertions
 
     done = await agent.decide(observation, [], [], {"current_untried": [], "path_depth": 1})

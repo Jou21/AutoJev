@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="pt-BR"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Gravação AutoJev</title>
+<title>Gravação Test Lab</title>
 <style>
 *{box-sizing:border-box}html,body{margin:0;height:100%;background:#11191c;color:#ecf1f0;font:13px/1.5 system-ui,sans-serif}
 body{display:flex;flex-direction:column;padding:16px;gap:12px}header{display:flex;align-items:center;justify-content:space-between;gap:10px}
@@ -10,12 +10,12 @@ ol{flex:1;min-height:0;overflow:auto;margin:0;padding:0 0 0 27px}li{padding:9px 
 li::marker{color:#e4bb57}button{padding:11px;border:1px solid #f2c45b;border-radius:9px;background:#f2c45b;color:#211c10;font:600 13px system-ui;cursor:pointer;flex-shrink:0}
 button:disabled{opacity:.65;cursor:default}button:focus-visible{outline:2px solid white;outline-offset:3px}#feedback{font-size:11px;overflow-wrap:anywhere}#autojev-sidepanel{display:none!important}
 </style>
-<header><div><small><span id="live"></span>AUTOJEV · GRAVANDO</small><h1>Sua navegação</h1></div><span id="count" role="status">0 passos</span></header>
+<header><div><small><span id="live"></span>TEST LAB · GRAVANDO</small><h1>Sua navegação</h1></div><span id="count" role="status">0 passos</span></header>
 <p id="empty">Faça o teste normalmente. Seus passos aparecerão aqui.</p>
 <ol id="steps" aria-label="Passos gravados"></ol>
 <p>Senhas e valores digitados não são gravados. Nenhum teste será salvo ou executado automaticamente.</p>
 <button id="finish" type="button" disabled>Finalizar e revisar roteiro</button>
-<p id="feedback" role="status">Ao finalizar, volte ao AutoJev para revisar.</p>
+<p id="feedback" role="status">Ao finalizar, volte ao Test Lab para revisar.</p>
 <script>
 let nonce = null, finishing = false;
 const finish = document.getElementById('finish'), steps = document.getElementById('steps');
@@ -32,6 +32,6 @@ finish.addEventListener('click', async event => {
   if (!event.isTrusted || finish.disabled || !nonce) return;
   finishing = true; finish.disabled = true; finish.textContent = 'Finalizando…';
   try {await window.__autojev_recording_panel({op:'finish',confirm:true,nonce});}
-  catch (_) {finishing = false;finish.disabled = false;finish.textContent = 'Finalizar e revisar roteiro';document.getElementById('feedback').textContent = 'Se esta janela continuar aberta, finalize pela aplicação AutoJev.';}
+  catch (_) {finishing = false;finish.disabled = false;finish.textContent = 'Finalizar e revisar roteiro';document.getElementById('feedback').textContent = 'Se esta janela continuar aberta, finalize pela aplicação Test Lab.';}
 });
 </script></html>

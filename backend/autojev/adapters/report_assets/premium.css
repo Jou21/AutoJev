@@ -1,4 +1,4 @@
-/* AutoJev · relatório autônomo. Sem fontes, imagens ou dependências externas. */
+/* Test Lab · relatório autônomo. Sem fontes, imagens ou dependências externas. */
 :root {
   color-scheme: dark;
   --bg: #070f18;
@@ -81,6 +81,8 @@ code { font-size: .9em; overflow-wrap: anywhere; }
 #view-subtitle { max-width: 760px; margin: 8px 0 0; color: var(--muted); font-size: 13px; }
 .toolbar { display: flex; justify-content: flex-end; align-items: center; gap: 8px; flex-wrap: wrap; padding-top: 5px; }
 .toolbar .button { min-height: 38px; white-space: nowrap; font-size: 12px; }
+/* Same size as the action buttons of the results view, so Reexecutar testes matches Reexecutar teste. */
+.report-topbar .toolbar .button { min-height: 34px; font-size: 11px; }
 .report-view { min-width: 0; animation: reveal-view .18s ease-out; }
 @keyframes reveal-view { from { opacity: .4; transform: translateY(3px); } to { opacity: 1; transform: none; } }
 
@@ -175,6 +177,16 @@ button.functional-flow-card { display: flex; min-width: 0; flex-direction: colum
 .case-flow-label { display: block; margin-top: 6px; color: var(--muted); font-size: 9px; font-weight: 400; }.case-flow-label.associated { color: #b9cbe0; }
 @media (max-width: 1050px) { .functional-flow-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 640px) { .functional-flows-panel { padding: 13px; } .functional-flow-grid { grid-template-columns: minmax(0, 1fr); } .functional-flows-tools { width: 100%; } .functional-flows-tools button { flex: 1; padding: 8px; font-size: 10px; } }
+/* Tests view on wide screens: the functional flows live in a column beside the table. */
+@media screen and (min-width: 1360px) {
+  .report-view[data-view="tests"]:not([hidden]) { display: grid; grid-template-columns: clamp(280px, 22vw, 340px) minmax(0, 1fr); align-items: start; column-gap: 20px; }
+  .report-view[data-view="tests"] > * { grid-column: 2; min-width: 0; }
+  .report-view[data-view="tests"] > .functional-flows-panel { grid-column: 1; grid-row: 1 / span 12; position: sticky; top: 16px; max-height: calc(100vh - 32px); margin-bottom: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+  .report-view[data-view="tests"] .functional-flows-heading { flex-direction: column; align-items: stretch; gap: 12px; }
+  .report-view[data-view="tests"] .functional-flows-tools { width: 100%; }
+  .report-view[data-view="tests"] .functional-flows-tools button { flex: 1 1 0; justify-content: center; padding: 8px; }
+  .report-view[data-view="tests"] .functional-flow-grid { grid-template-columns: minmax(0, 1fr); }
+}
 .report-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 0 0 18px; }
 .report-tools .search { flex: 1 1 280px; min-width: 180px; }
 .report-tools select { min-height: 37px; font-size: 12px; }

@@ -78,7 +78,7 @@ async def test_native_login_navigation_is_detected_without_old_warning_or_stale_
     executor, page, captured = passive_page
     before_login = await executor.observe_preparation()
     assert ExplorationManager._needs_login(before_login)
-    # This is the user's own native site click, not the AutoJev Continue CTA.
+    # This is the user's own native site click, not the Test Lab Continue CTA.
     await page.get_by_role("button", name="Login", exact=True).click()
     after_login = await executor.observe_preparation()
     assert after_login.url == TARGET

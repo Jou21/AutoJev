@@ -109,7 +109,7 @@ async def test_native_login_resumes_only_with_consent_then_still_waits_for_print
 
             async def attempt_filled_login(self, observation=None):
                 self.login_submissions += 1
-                raise AssertionError("A native site login must never cause AutoJev to submit again")
+                raise AssertionError("A native site login must never cause Test Lab to submit again")
 
             async def execute(self, decision, credentials):
                 self.actions.append(deepcopy(decision))

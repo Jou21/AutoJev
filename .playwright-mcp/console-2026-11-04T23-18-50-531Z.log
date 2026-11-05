@@ -1,0 +1,5 @@
+[     969ms] [INFO] %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold @ http://localhost:3000/node_modules/.vite/deps/react-dom_client.js?v=e23d71e0:14337
+[    2978ms] [ERROR] Access to fetch at 'http://127.0.0.1:8000/api/health' from origin 'http://localhost:3000' has been blocked by CORS policy: The request client is not a secure context and the resource is in more-private address space `loopback`. @ blob:http://localhost:3000/89382220-becf-4ed1-8600-ad1d18754f23#view/results/CT001:0
+[    2978ms] [ERROR] Failed to load resource: net::ERR_FAILED @ http://127.0.0.1:8000/api/health:0
+[    2980ms] [ERROR] Access to fetch at 'http://localhost:8000/api/health' from origin 'http://localhost:3000' has been blocked by CORS policy: The request client is not a secure context and the resource is in more-private address space `loopback`. @ blob:http://localhost:3000/89382220-becf-4ed1-8600-ad1d18754f23#view/results/CT001:0
+[    2981ms] [ERROR] Failed to load resource: net::ERR_FAILED @ http://localhost:8000/api/health:0

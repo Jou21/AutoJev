@@ -60,7 +60,7 @@ async def test_J_and_recorded_steps_are_live_without_recording_controls_or_passw
     await page.locator('[name="customer"]').blur()
     await panel.refresh()
     assert "PRIVATE-" not in " ".join(steps)
-    assert not any("AutoJev" in step or "Finalizar" in step or "password" in step for step in steps)
+    assert not any("Test Lab" in step or "Finalizar" in step or "password" in step for step in steps)
     assert finishes == []
     await page.screenshot(path=str(panel.executor.artifact_dir / "recording-panel.png"))
 
@@ -157,7 +157,7 @@ async def test_CSP_is_not_weakened_and_recording_keeps_the_main_app_fallback(rec
     await panel.refresh()
     assert page in panel.blocked and page not in panel.frames
     assert await page.locator("#autojev-recording-frame").count() == 0
-    assert "aplicação AutoJev" in await page.locator("#autojev-panel-hint").inner_text()
+    assert "aplicação Test Lab" in await page.locator("#autojev-panel-hint").inner_text()
     await panel.refresh()
     assert await page.locator("#autojev-recording-frame").count() == 0
     assert finishes == []

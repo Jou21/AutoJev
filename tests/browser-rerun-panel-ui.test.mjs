@@ -264,7 +264,7 @@ test("detected login gives direct guidance without automatically resuming or ins
   } }));
   assert.equal(app.elements["preparation-eyebrow"].textContent, "Login necessário");
   assert.equal(app.elements["preparation-heading"].textContent, "Faça login para continuar");
-  assert.equal(app.elements["preparation-hint"].textContent, "Marque a autorização e faça login pelo próprio site. O AutoJev identifica o login e continua automaticamente após conferir a página e os pré-requisitos. Se preferir, preencha usuário e senha e clique em “Continuar reexecução” para o AutoJev tentar entrar.");
+  assert.equal(app.elements["preparation-hint"].textContent, "Marque a autorização e faça login pelo próprio site. O Test Lab identifica o login e continua automaticamente após conferir a página e os pré-requisitos. Se preferir, preencha usuário e senha e clique em “Continuar reexecução” para o Test Lab tentar entrar.");
   assert.equal(app.elements["preparation-note"].textContent, "Com a autorização marcada, o teste continua automaticamente após o login e a conferência dos pré-requisitos.");
   assert.equal(app.elements["preparation-consent"].checked, false);
   assert.equal(app.elements["confirm-preparation"].disabled, true);
@@ -283,7 +283,7 @@ test("a non-login URL mismatch keeps generic guidance and clears previous login-
   assert.equal(app.elements["preparation-eyebrow"].textContent, "Prepare a página");
   assert.equal(app.elements["preparation-heading"].textContent, "Prepare a página para continuar");
   assert.equal(app.elements["preparation-feedback"].textContent, reason);
-  assert.equal(app.elements["preparation-hint"].textContent, "Prepare a página e os dados iniciais do teste. Depois, marque a autorização e clique em “Continuar reexecução”. Se houver um login preenchido no site autorizado, o AutoJev tentará entrar. A ação do teste só será executada se os pré-requisitos forem confirmados.");
+  assert.equal(app.elements["preparation-hint"].textContent, "Prepare a página e os dados iniciais do teste. Depois, marque a autorização e clique em “Continuar reexecução”. Se houver um login preenchido no site autorizado, o Test Lab tentará entrar. A ação do teste só será executada se os pré-requisitos forem confirmados.");
   assert.equal(app.elements["confirm-preparation"].disabled, true);
   assert.equal(app.calls.length, 0);
 });

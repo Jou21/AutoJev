@@ -2,7 +2,7 @@
 
 This is deliberately not another exploration. No planner/provider is created;
 only an allowlisted manual screenshot checkpoint plan is admitted. Captures
-require confirmation through the trusted AutoJev application or its isolated
+require confirmation through the trusted Test Lab application or its isolated
 browser panel, never an authority exposed to the tested page. Integration drafts
 are never executed and an absent historical recipe is never replaced with a
 guessed action. The original run is read-only.
@@ -870,9 +870,9 @@ class ScenarioRerunService:
         version = self.states[exploration_id].get("captures_completed", 0) + 1
         active = {**checkpoint, "version": version}
         timeout = min(self.capture_timeout_seconds, remaining)
-        upload_surface = ("Use o painel AutoJev deste navegador ou a aplicação AutoJev para colar uma imagem com Ctrl+V, "
+        upload_surface = ("Use o painel Test Lab deste navegador ou a aplicação Test Lab para colar uma imagem com Ctrl+V, "
                           if callable(getattr(executor, "update_rerun_panel", None)) else
-                          "Volte à aplicação AutoJev para colar uma imagem com Ctrl+V, ")
+                          "Volte à aplicação Test Lab para colar uma imagem com Ctrl+V, ")
         message = ("A reexecução está pausada neste passo. " + upload_surface +
                    "arrastar um arquivo ou escolhê-lo no computador. A imagem pode mostrar qualquer conteúdo. "
                    "Depois, clique em Anexar print e continuar. Não há captura automática da página e nenhuma ação do teste será repetida. "

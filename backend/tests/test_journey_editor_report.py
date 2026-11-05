@@ -277,11 +277,7 @@ def test_case_editor_is_a_closed_planner_with_three_draggable_step_types():
     assert "open" not in dialog.attrs
     assert dialog.attrs["aria-labelledby"] == "case-editor-title"
     assert dialog.one("h2", id="case-editor-title").text == "Planejar reexecução"
-    notice = dialog.one("div", "case-editor-notice").text
-    assert "Rascunho visual · não executado · não altera este resultado" in notice
-    assert "As etapas registradas ficam preservadas" in notice
-    assert "reexecução confirmada na aplicação" in notice
-    assert "não inicia ações, integrações ou capturas" in notice
+    assert dialog.find_all("div", "case-editor-notice") == [], "The planner has no banner above its panels"
     palette = dialog.one("aside", id="case-editor-palette")
     tools = palette.find_all("button", "case-planner-tool")
     assert [tool.attrs["data-step-template"] for tool in tools] == ["wait_print", "sws", "sql"]

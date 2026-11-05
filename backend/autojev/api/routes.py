@@ -32,7 +32,12 @@ from autojev.domain.models import (
 from autojev.services.scenario_timeline import prepare_scenario_timelines
 from autojev.services.scenario_step_order import presentation_scenario_steps
 from autojev.services.rerun_step_progress import build_step_plan, project_step_progress
-from autojev.services.coverage_ledger import coverage_restriction_ledger
+from autojev.services.coverage_ledger import (
+    ai_flagged_gaps,
+    coverage_restriction_ledger,
+    functional_findings,
+    search_coverage,
+)
 from autojev.services.execution_summary import execution_duration_summary, report_snapshot_key
 from autojev.services.report_localization import REPORT_LOCALE_VERSION, check_label, localize_report_presentation
 from autojev.adapters.report_premium import ASSETS as REPORT_ASSETS, REPORT_LAYOUT_VERSION, render_premium_report
@@ -68,7 +73,7 @@ def _require_rerun_origin(request: Request) -> None:
     origin = request.headers.get("origin")
     allowed = {*request.app.state.settings.cors_origins, str(request.base_url).rstrip("/")}
     if origin is not None and origin not in allowed:
-        raise HTTPException(status_code=403, detail="Abra a reexecução pela aplicação AutoJev.")
+        raise HTTPException(status_code=403, detail="Abra a reexecução pela aplicação Test Lab.")
 
 
 def _attach_rerun_state(result: dict[str, Any], rerun: dict[str, Any], repository: SQLiteRepository | None = None) -> dict[str, Any]:
@@ -92,7 +97,7 @@ def _attach_rerun_state(result: dict[str, Any], rerun: dict[str, Any], repositor
         waiting = rerun["phase"] == "waiting_capture"
         result["phase"] = "waiting_input" if waiting else "exploring"
         result["phase_label"] = "Aguardando sua imagem" if waiting else "Salvando a imagem anexada"
-        result["phase_description"] = "Cole, arraste ou escolha uma imagem na aplicação AutoJev e confirme para continuar."
+        result["phase_description"] = "Cole, arraste ou escolha uma imagem na aplicação Test Lab e confirme para continuar."
         # Executing the sole saved action is not completion of its capture plan.
         result["overall_progress"] = min(result.get("overall_progress") or 0, 95)
     return result
@@ -321,6 +326,12 @@ def _phase_payload(result: dict[str, Any], events: list[dict[str, Any]]) -> dict
     completion["restrictions"] = ledger["restrictions"]
     if ledger["has_individual_records"]:
         completion["blocked_candidates"] = ledger["restriction_count"]
+    if ai_gaps := ai_flagged_gaps(events):
+        completion["ai_gaps"] = ai_gaps
+    if search_summary := search_coverage(events):
+        completion["search_coverage"] = search_summary
+    if findings := functional_findings(events):
+        completion["findings"] = findings
     if ledger["resolved_restrictions"]:
         completion["resolved_restrictions"] = ledger["resolved_restrictions"]
         completion["resolved_restriction_count"] = ledger["resolved_restriction_count"]
@@ -756,7 +767,7 @@ def _validate_selection(
         # Built in, needs no provider record, key or network. Only the JEV role
         # can use it: it decides moves, it cannot write documentation.
         if role != "JEV" or selection.model_id != DETERMINISTIC_AGENT_MODEL:
-            raise HTTPException(status_code=422, detail=f"{role} cannot use the built-in AutoJev planner")
+            raise HTTPException(status_code=422, detail=f"{role} cannot use the built-in Test Lab planner")
         return
     try:
         provider = repository.get_provider(selection.provider_id)
@@ -815,7 +826,7 @@ async def create_exploration(
     ) != (LOCAL_AGENT_PROVIDER_ID, DETERMINISTIC_AGENT_MODEL):
         raise HTTPException(
             status_code=422,
-            detail="O agente JEV foi removido; o AutoJev decide as ações com o planejador determinístico. Escolha apenas a LLM auxiliar.",
+            detail="O agente JEV foi removido; o Test Lab decide as ações com o planejador determinístico. Escolha apenas a LLM auxiliar.",
         )
     agent = ModelSelection(provider_id=LOCAL_AGENT_PROVIDER_ID, model_id=DETERMINISTIC_AGENT_MODEL)
     auxiliary = ModelSelection(
@@ -860,10 +871,13 @@ async def list_explorations(
     request: Request, limit: int = Query(default=100, ge=1, le=500)
 ) -> list[dict[str, Any]]:
     repository = _repository(request)
-    return [
-        _exploration_payload(item)
-        for item in repository.list_explorations(limit)
-    ]
+
+    def build() -> list[dict[str, Any]]:
+        return [_exploration_payload(item) for item in repository.list_explorations(limit)]
+
+    # Sync SQLite work off the event loop: the same loop drives Playwright and
+    # answers /health, so the dashboard poll must never stall it.
+    return await run_in_threadpool(build)
 
 
 def _exploration_detail_body(request: Request, exploration_id: str) -> tuple[bytes, bool]:

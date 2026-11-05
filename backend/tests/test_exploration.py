@@ -2101,7 +2101,7 @@ async def test_live_scenario_cancelled_finish_awaits_provider_cleanup():
     await asyncio.wait_for(cleanup_started.wait(), timeout=0.2)
 
     # Returning before the provider coroutine unwinds would leave paid work
-    # running after AutoJev already told the user that cancellation completed.
+    # running after Test Lab already told the user that cancellation completed.
     assert finish.done() is False
     assert active_provider_calls == 1
 

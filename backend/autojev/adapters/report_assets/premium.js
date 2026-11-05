@@ -177,18 +177,22 @@
     const draftLimit = 100;
     let draftSerial = 0;
     let editorCase = null;
+    // CTs open in the planner: one from a result, every CT from the tests view.
+    let editorQueue = [];
+    const editorPicked = new Set();
     let editorPlanKey = null;
     let editorRevision = null;
     let editorTool = null;
     let editorSequence = [];
     let editorTrigger = null;
     let editorDrag = null;
+    let editorSelectedStep = null;
     let stepPickerRequest = null;
     const draftKinds = {
       database: { title: "Consulta em banco de dados", symbol: "▤", description: "Exemplo sem conexão, SQL ou credenciais. Não executado." },
       sws: { title: "Executar SWS", symbol: "↗", description: "Etapa de SWS planejada. A integração ainda não está disponível e nada será executado." },
       sql: { title: "Executar SQL", symbol: "▤", description: "Etapa de SQL planejada. A integração ainda não está disponível e nenhuma consulta será executada." },
-      wait_print: { title: "Aguardar print", symbol: "▣", description: "Na reexecução, pausa para você colar com Ctrl+V, arrastar ou escolher uma imagem na aplicação AutoJev. Pode ser de qualquer conteúdo. Confira a prévia e clique em ‘Anexar print e continuar’. A imagem fica no novo relatório; nada é capturado automaticamente." },
+      wait_print: { title: "Aguardar print", symbol: "▣", description: "Na reexecução, pausa para você colar com Ctrl+V, arrastar ou escolher uma imagem na aplicação Test Lab. Pode ser de qualquer conteúdo. Confira a prévia e clique em ‘Anexar print e continuar’. A imagem fica no novo relatório; nada é capturado automaticamente." },
     };
     const isDraft = (item) => !!item && typeof item === "object" && !Array.isArray(item)
       && typeof item.type === "string" && Object.prototype.hasOwnProperty.call(draftKinds, item.type);
@@ -215,6 +219,7 @@
         state: Object.prototype.hasOwnProperty.call(editorStates, item.dataset.stepState) ? item.dataset.stepState : "unknown",
         outcome: Object.prototype.hasOwnProperty.call(editorStates, item.dataset.stepState) && typeof item.dataset.stepOutcome === "string"
           ? item.dataset.stepOutcome.trim() : "",
+        node: item,
       }));
       const payload = byIndex.get(key);
       if (revision && !revision.current) return [];
@@ -317,7 +322,7 @@
       const title = document.createElement("strong");
       title.textContent = "Aguardar print";
       const description = document.createElement("small");
-      description.textContent = "Pausar na reexecução para colar ou anexar uma imagem de sua escolha no AutoJev. A integração SWS ou SQL permanece desativada.";
+      description.textContent = "Pausar na reexecução para colar ou anexar uma imagem de sua escolha no Test Lab. A integração SWS ou SQL permanece desativada.";
       copy.append(title, description);
       label.append(input, copy);
       input.addEventListener("change", () => { item.wait_for_print = input.checked; onChange(); });
@@ -353,10 +358,39 @@
       return checkpoints.length ? { version: 1, checkpoints } : null;
     }
 
+    // Which recorded execution/CT a rerun starts from, plus its saved pauses.
+    function rerunSource(current, key, revision) {
+      const owner = !revision.current ? revision.exploration_id : typeof current.rerun_source_exploration_id === "string" && current.rerun_source_exploration_id
+        ? current.rerun_source_exploration_id : reportConnection.sourceId;
+      const scenario = !revision.current ? revision.scenario_id : typeof current.rerun_source_scenario_id === "string" && current.rerun_source_scenario_id
+        ? current.rerun_source_scenario_id : String(current.id);
+      return { owner, scenario, plan: caseCapturePlan(key, revision) };
+    }
+
+    function requestBatchRerun(keys, feedback) {
+      if (!reportConnection) { requestCaseRerun(keys[0], feedback); return; }
+      const items = [];
+      let pauses = 0;
+      keys.forEach((key) => {
+        const current = byIndex.get(String(key));
+        const revision = current && selectedExecution(current);
+        if (!current || !revision.has_result) return;
+        const { owner, scenario, plan } = rerunSource(current, key, revision);
+        if (plan) pauses += plan.checkpoints.length;
+        items.push({ source: owner, ct: scenario, ...(plan ? { capture_plan: plan } : {}) });
+      });
+      if (!items.length) { feedback("Nenhum CT selecionado tem resultado registrado. Nenhuma reexecução foi solicitada."); return; }
+      const target = reportConnection.appUrl + "/#/planejar-lote/" + encodeURIComponent(reportConnection.sourceId)
+        + "?itens=" + encodeURIComponent(JSON.stringify(items));
+      window.open(target, "_blank", "noopener,noreferrer");
+      feedback("Planejamento da rodada aberto na aplicação com " + items.length + " CTs. Revise e confirme lá; nenhuma ação foi iniciada por este relatório. "
+        + (pauses ? pauses + " pausa(s) para print serão apresentadas para confirmação. " : "") + "SWS e SQL não serão executados.");
+    }
+
     function requestCaseRerun(key, feedback) {
       const current = key != null && byIndex.get(String(key));
       if (!reportConnection || !current) {
-        feedback("Reexecução não iniciada. Abra o relatório pela aplicação AutoJev para reexecutar um CT e confirmar as pausas para print. Este arquivo não inicia ações nem capturas. SWS e SQL permanecem desativados.");
+        feedback("Reexecução não iniciada. Abra o relatório pela aplicação Test Lab para reexecutar um CT e confirmar as pausas para print. Este arquivo não inicia ações nem capturas. SWS e SQL permanecem desativados.");
         return;
       }
       const editor = $("case-editor");
@@ -368,11 +402,7 @@
         return;
       }
       if (!revision.has_result) { feedback("Esta tentativa não tem resultado registrado. Selecione uma execução com resultado para reexecutar o teste."); return; }
-      const plan = caseCapturePlan(key, revision);
-      const owner = !revision.current ? revision.exploration_id : typeof current.rerun_source_exploration_id === "string" && current.rerun_source_exploration_id
-        ? current.rerun_source_exploration_id : reportConnection.sourceId;
-      const scenario = !revision.current ? revision.scenario_id : typeof current.rerun_source_scenario_id === "string" && current.rerun_source_scenario_id
-        ? current.rerun_source_scenario_id : String(current.id);
+      const { owner, scenario, plan } = rerunSource(current, key, revision);
       const target = reportConnection.appUrl + "/#/planejar/" + encodeURIComponent(owner) + "/" + encodeURIComponent(scenario)
         + (plan ? "?capture_plan=" + encodeURIComponent(JSON.stringify(plan)) : "");
       window.open(target, "_blank", "noopener,noreferrer");
@@ -465,6 +495,18 @@
           card.append(create("small", "case-editor-kind", "Registro original · " + editorKinds[item.step.kind]),
             create("h3", "", item.step.title), create("span", "case-editor-state", item.step.outcome || editorStates[item.step.state]),
             create("small", "case-editor-readonly", "Somente leitura · resultado e evidências preservados"));
+          // Click (or Enter/Space) opens the recorded step below the script.
+          card.tabIndex = 0;
+          card.setAttribute("role", "button");
+          card.setAttribute("aria-controls", "case-editor-detail");
+          card.setAttribute("aria-pressed", "false");
+          card.setAttribute("aria-label", item.step.title + ". Ver o teste desta etapa abaixo.");
+          card.addEventListener("click", () => selectEditorStep(item.stepIndex));
+          card.addEventListener("keydown", (event) => {
+            if (event.target !== card || (event.key !== "Enter" && event.key !== " ")) return;
+            event.preventDefault();
+            selectEditorStep(item.stepIndex);
+          });
         } else {
           const metadata = draftKinds[item.type];
           card.dataset.draftId = item.id;
@@ -513,6 +555,7 @@
         list.appendChild(card);
       });
       addGap(editorSequence.length);
+      syncStepSelection();
       text($("case-planner-count"), originalEditorSteps(editorCase, editorRevision).length + " etapas originais · " + placeholderCount + " passos extras");
       if (focusId) {
         const target = all("[data-draft-id]", list).find((item) => item.dataset.draftId === focusId);
@@ -520,25 +563,174 @@
       }
     }
 
+    function recordedStepCard(stepIndex) {
+      const list = $("case-editor-steps");
+      return list ? all(".case-editor-recorded", list).find((card) => Number(card.dataset.recordedIndex) === stepIndex) : null;
+    }
+
+    // A copy of a recorded step for the detail panel. The original evidence is
+    // never moved or changed; viewer buttons are dropped but captures stay.
+    function stepContentCopy(node) {
+      const copy = node.cloneNode(true);
+      copy.removeAttribute("hidden");
+      copy.hidden = false;
+      copy.removeAttribute("id");
+      all("[id]", copy).forEach((element) => element.removeAttribute("id"));
+      all("button", copy).forEach((control) => {
+        if (!control.parentElement) return;
+        if (control.querySelector("img, canvas")) {
+          while (control.firstChild) control.parentElement.insertBefore(control.firstChild, control);
+        }
+        control.remove();
+      });
+      all(".step-evidence-tools", copy).forEach((element) => element.remove());
+      return copy;
+    }
+
+    function renderStepDetail() {
+      const panel = $("case-editor-detail");
+      if (!panel) return;
+      panel.replaceChildren();
+      const steps = editorSelectedStep == null ? [] : originalEditorSteps(editorCase, editorRevision);
+      const step = steps[editorSelectedStep];
+      if (!step) { panel.hidden = true; return; }
+      const head = executionNode("div", "case-editor-detail-head");
+      const titles = executionNode("div", "case-editor-detail-titles");
+      titles.append(executionNode("small", "", "Etapa " + String(editorSelectedStep + 1).padStart(2, "0") + " de " + String(steps.length).padStart(2, "0") + " · " + editorKinds[step.kind]),
+        executionNode("h4", "", step.title));
+      const closeDetail = button("Fechar ✕", () => {
+        const stepIndex = editorSelectedStep;
+        editorSelectedStep = null;
+        syncStepSelection();
+        const card = recordedStepCard(stepIndex);
+        if (card) card.focus();
+      }, "button button-ghost case-editor-detail-close");
+      closeDetail.setAttribute("aria-label", "Fechar os detalhes da etapa");
+      head.append(titles, executionNode("span", "case-editor-state", step.outcome || editorStates[step.state]), closeDetail);
+      const body = executionNode("div", "case-editor-detail-body");
+      if (step.node) {
+        const holder = document.createElement("ol");
+        holder.className = "case-timeline-panels";
+        holder.appendChild(stepContentCopy(step.node));
+        body.appendChild(holder);
+      } else {
+        body.appendChild(executionNode("p", "case-editor-detail-empty", "O conteúdo desta etapa não está disponível neste relatório."));
+      }
+      panel.append(head, body);
+      panel.hidden = false;
+    }
+
+    function syncStepSelection() {
+      const list = $("case-editor-steps");
+      if (list) all(".case-editor-recorded", list).forEach((card) => {
+        const on = Number(card.dataset.recordedIndex) === editorSelectedStep;
+        card.setAttribute("aria-pressed", String(on));
+        card.dataset.selected = String(on);
+      });
+      renderStepDetail();
+    }
+
+    function selectEditorStep(stepIndex) {
+      editorSelectedStep = editorSelectedStep === stepIndex ? null : stepIndex;
+      syncStepSelection();
+      const card = recordedStepCard(stepIndex);
+      if (editorSelectedStep != null && card && typeof card.scrollIntoView === "function") card.scrollIntoView({ block: "nearest", inline: "nearest" });
+    }
+
+    function enableCanvasPan(canvas) {
+      // Press and drag on the empty dotted area to slide the script around.
+      // Cards and buttons keep their own click and drag behaviour.
+      let pan = null;
+      const stop = (event) => {
+        if (!pan || (event && event.pointerId != null && event.pointerId !== pan.id)) return;
+        if (pan.captured && typeof canvas.releasePointerCapture === "function") {
+          try { canvas.releasePointerCapture(pan.id); } catch { /* already released */ }
+        }
+        pan = null;
+        delete canvas.dataset.panning;
+      };
+      canvas.addEventListener("pointerdown", (event) => {
+        const steps = $("case-editor-steps");
+        if (!steps || event.button !== 0 || event.pointerType === "touch") return;
+        const target = event.target;
+        if (!(target === canvas || target === steps || (target.classList && target.classList.contains("case-editor-gap")))) return;
+        pan = { id: event.pointerId, x: event.clientX, y: event.clientY, left: steps.scrollLeft, top: steps.scrollTop, captured: false };
+        if (typeof canvas.setPointerCapture === "function") {
+          try { canvas.setPointerCapture(event.pointerId); pan.captured = true; } catch { pan.captured = false; }
+        }
+        canvas.dataset.panning = "true";
+        event.preventDefault();
+      });
+      canvas.addEventListener("pointermove", (event) => {
+        if (!pan || event.pointerId !== pan.id) return;
+        const steps = $("case-editor-steps");
+        steps.scrollLeft = pan.left - (event.clientX - pan.x);
+        steps.scrollTop = pan.top - (event.clientY - pan.y);
+      });
+      ["pointerup", "pointercancel", "lostpointercapture"].forEach((type) => canvas.addEventListener(type, stop));
+    }
+
     function preparePlanner() {
       const dialog = $("case-editor"), palette = $("case-editor-palette");
       if (!dialog || !palette) return;
       dialog.classList.add("case-rerun-planner");
-      text(dialog.querySelector(".page-kicker"), "PLANEJAMENTO · NOVA EXECUÇÃO");
-      text(dialog.querySelector(".case-editor-notice"), "Planeje sem alterar este resultado. Os cards originais são referências da execução selecionada. As pausas para print serão apresentadas para confirmação na aplicação. SWS e SQL continuam indisponíveis; nenhuma ação começa aqui.");
-      text($("case-editor-close"), "Voltar ao resultado");
-      if ($("case-editor-close")) $("case-editor-close").setAttribute("aria-label", "Voltar ao resultado sem iniciar a reexecução");
-      text($("case-editor-save"), "Guardar planejamento");
-      const save = $("case-editor-save"), rerun = $("case-editor-rerun");
-      if (save && rerun) {
+      // The old banner and footer are dropped, including from reports
+      // generated before this change.
+      const staleNotice = dialog.querySelector(".case-editor-notice");
+      if (staleNotice) staleNotice.remove();
+      const header = dialog.querySelector(".case-editor-header");
+      const close = $("case-editor-close"), save = $("case-editor-save"), rerun = $("case-editor-rerun");
+      if (header && close && save && rerun && header.dataset.plannerHeader !== "true") {
+        header.dataset.plannerHeader = "true";
+        // One compact bar: back arrow, title, and the actions that used to sit in a footer.
+        close.className = "button button-ghost case-editor-back";
+        text(close, "←");
+        close.setAttribute("aria-label", "Voltar ao resultado");
+        close.setAttribute("title", "Voltar ao resultado sem iniciar a reexecução");
+        text(save, "Guardar planejamento");
         save.classList.remove("button-primary"); save.classList.add("button-ghost");
         rerun.classList.remove("button-ghost"); rerun.classList.add("button-primary");
-        save.parentElement.append(save, rerun);
+        const titleBlock = executionNode("div", "case-editor-header-title");
+        titleBlock.append(...[$("case-editor-title"), $("case-editor-feedback")].filter(Boolean));
+        const actions = executionNode("div", "case-editor-header-actions");
+        actions.append(save, rerun);
+        header.replaceChildren(close, titleBlock, actions);
+        const footer = dialog.querySelector(".case-editor-footer");
+        if (footer) footer.remove();
       }
       const canvas = dialog.querySelector(".case-editor-canvas");
       if (canvas) {
         text(canvas.querySelector("h3"), "Roteiro da próxima execução");
-        text(canvas.querySelector("p"), "Leia da esquerda para a direita. Clique nos quadrados + ou arraste um passo até eles. Os registros originais não podem ser removidos.");
+        text(canvas.querySelector("p"), "Leia da esquerda para a direita. Clique nos quadrados + ou arraste um passo até eles. Os registros originais não podem ser removidos. Clique em um card para ver o teste abaixo e arraste o fundo pontilhado para mover o roteiro.");
+        if (canvas.dataset.panReady !== "true") {
+          canvas.dataset.panReady = "true";
+          enableCanvasPan(canvas);
+        }
+        if (!$("case-editor-detail")) {
+          const detailPanel = executionNode("section", "case-editor-detail");
+          detailPanel.id = "case-editor-detail";
+          detailPanel.hidden = true;
+          detailPanel.setAttribute("aria-label", "Detalhes da etapa selecionada");
+          canvas.appendChild(detailPanel);
+        }
+      }
+      const layout = dialog.querySelector(".case-editor-layout");
+      if (layout && !$("case-editor-cts")) {
+        layout.classList.add("has-panels");
+        layout.insertBefore(buildCasePanel(), layout.firstChild);
+        if (assistantAvailable()) {
+          layout.classList.add("has-assistant");
+          layout.appendChild(buildAssistantPanel());
+          // On narrow screens the assistant is a drawer opened from the header.
+          const actions = dialog.querySelector(".case-editor-header-actions");
+          if (actions) {
+            const toggle = button("✦ Assistente", toggleAssistantPanel, "button button-ghost case-editor-assistant-toggle");
+            toggle.id = "case-editor-assistant-toggle";
+            toggle.setAttribute("aria-controls", "case-editor-assistant");
+            toggle.setAttribute("aria-expanded", "false");
+            actions.insertBefore(toggle, actions.firstChild);
+          }
+        }
       }
       if (palette.dataset.plannerReady === "true") return;
       palette.dataset.plannerReady = "true";
@@ -572,16 +764,721 @@
       palette.appendChild(count);
     }
 
+    function rerunnableCases() {
+      return cases.filter((item) => selectedExecution(item).has_result).map((item) => String(item.index));
+    }
+
+    // ---- Planner side panels -------------------------------------------------
+    // Left: every CT with a result (tick to include it in the rerun, click to
+    // plan its script). Right: the test assistant, only for reports opened by
+    // the app. Nothing here executes anything; the app confirms the round.
+    const statusNames = { PASS: "Aprovado", FAIL: "Reprovado", BLOCKED: "Bloqueado", SKIPPED: "Sem validação" };
+    const assistantState = { messages: [], busy: false, models: [], modelsStatus: "idle", model: null, modelQuery: "", modelActive: 0 };
+    const directWords = new Set("o a os as e tambem por favor na no ao aos da do dos das rodada execucao reexecucao planejamento plano rascunho lista fila ct cts caso casos de teste testes para pra pro essa esse esta este atual".split(" "));
+    let editorListQuery = "";
+    // Run order = list order: the ticked CTs execute from top to bottom.
+    let editorReorder = false;
+    let listDrag = null;
+    let justDragged = false;
+    const dragThreshold = 5;
+
+    function assistantAvailable() {
+      return !!(reportConnection && reportConnection.apiUrl && typeof window.fetch === "function");
+    }
+
+    function visibleCaseKeys() {
+      // In reorder mode only the CTs that will run are listed, in run order.
+      if (editorReorder) return editorQueue.filter((key) => editorPicked.has(key));
+      const needle = editorListQuery.trim().toLowerCase();
+      return editorQueue.filter((key) => {
+        const item = byIndex.get(key);
+        return item && (!needle || (String(item.id) + " " + String(item.title || "")).toLowerCase().includes(needle));
+      });
+    }
+
+    function pickedIds() {
+      return editorQueue.filter((key) => editorPicked.has(key)).map((key) => String(byIndex.get(key).id));
+    }
+
+    function orderPositions() {
+      const positions = new Map();
+      editorQueue.forEach((key) => { if (editorPicked.has(key)) positions.set(key, positions.size + 1); });
+      return positions;
+    }
+
+    function syncRerunControl() {
+      const rerunButton = $("case-editor-rerun");
+      if (!rerunButton || !editorQueue.length) return;
+      rerunButton.disabled = editorPicked.size === 0;
+      text(rerunButton, !reportConnection ? "Como reexecutar" : editorPicked.size > 1
+        ? "Revisar e confirmar " + editorPicked.size + " testes na aplicação →" : "Revisar e confirmar na aplicação →");
+    }
+
+    function openLabel(item, position, total) {
+      return "Planejar o roteiro de " + item.id + ": " + (item.title || "Caso de teste")
+        + (position ? ". Posição " + position + " de " + total + " na ordem de execução" : "");
+    }
+
+    function updateOrderChips() {
+      const list = $("case-editor-cts-list");
+      if (!list) return;
+      const positions = orderPositions();
+      list.querySelectorAll(".case-editor-cts-item").forEach((row) => {
+        const key = row.dataset.caseKey, item = byIndex.get(key), position = positions.get(key);
+        const chip = row.querySelector(".case-editor-cts-order"), open = row.querySelector(".case-editor-cts-open");
+        if (chip) { text(chip, position || ""); chip.dataset.empty = String(!position); }
+        if (open && item) open.setAttribute("aria-label", openLabel(item, position, positions.size));
+      });
+    }
+
+    function updateCaseListCount() {
+      text($("case-editor-cts-count"), editorPicked.size + " de " + editorQueue.length + " na reexecução");
+      updateOrderChips();
+      syncRerunControl();
+    }
+
+    function announceOrder(key) {
+      const item = byIndex.get(key), position = orderPositions().get(key);
+      editorMessage(position ? item.id + " agora é o " + position + "º na ordem de execução."
+        : item.id + " foi movido, mas não está marcado para a reexecução.");
+    }
+
+    // Moves a CT next to another one in the run order. Returns true when it changed.
+    function placeCase(key, targetKey, after) {
+      if (key === targetKey || !editorQueue.includes(key) || !editorQueue.includes(targetKey)) return false;
+      const next = editorQueue.filter((candidate) => candidate !== key);
+      next.splice(next.indexOf(targetKey) + (after ? 1 : 0), 0, key);
+      if (next.every((candidate, index) => candidate === editorQueue[index])) return false;
+      editorQueue = next;
+      return true;
+    }
+
+    function moveCaseBy(key, delta, focusSelector) {
+      const visible = visibleCaseKeys();
+      const index = visible.indexOf(key), neighbour = visible[index + delta];
+      if (index < 0 || !neighbour || !placeCase(key, neighbour, delta > 0)) return;
+      renderCaseList();
+      announceOrder(key);
+      const row = $("case-editor-cts-list").querySelector('[data-case-key="' + key + '"]');
+      if (!row) return;
+      let control = row.querySelector(focusSelector);
+      // At either end the pressed arrow turns off, so keep going with the other one.
+      if (control && control.disabled) control = Array.from(row.querySelectorAll(".case-editor-cts-move")).find((item) => !item.disabled) || control;
+      if (control) control.focus();
+    }
+
+    function setReorderMode(value) {
+      editorReorder = !!value;
+      const panel = $("case-editor-cts"), toggle = $("case-editor-cts-reorder");
+      if (panel) panel.dataset.reorder = String(editorReorder);
+      if (toggle) {
+        text(toggle, editorReorder ? "✓ Concluir ordem" : "⇅ Reordenar");
+        toggle.setAttribute("aria-pressed", String(editorReorder));
+      }
+      renderCaseList();
+    }
+
+    function renderCaseList() {
+      const list = $("case-editor-cts-list");
+      if (!list) return;
+      list.replaceChildren();
+      const visible = visibleCaseKeys();
+      visible.forEach((key, visibleIndex) => {
+        const item = byIndex.get(key);
+        const row = executionNode("li", "case-editor-cts-item");
+        row.dataset.active = String(key === editorCase);
+        row.dataset.picked = String(editorPicked.has(key));
+        row.dataset.caseKey = key;
+        const check = document.createElement("input");
+        check.type = "checkbox";
+        check.checked = editorPicked.has(key);
+        check.setAttribute("aria-label", "Incluir " + item.id + " na reexecução");
+        check.addEventListener("change", () => {
+          if (check.checked) editorPicked.add(key); else editorPicked.delete(key);
+          // Unticking a CT in reorder mode takes it out of the run queue shown.
+          if (editorReorder) { renderCaseList(); return; }
+          row.dataset.picked = String(check.checked);
+          updateCaseListCount();
+        });
+        const chip = executionNode("span", "case-editor-cts-order");
+        chip.setAttribute("aria-hidden", "true");
+        chip.setAttribute("title", "Posição na ordem de execução");
+        const status = String(item.status || "SKIPPED").toUpperCase();
+        const open = button("", () => {
+          // A drag ends with a click on the same card; it must not open it.
+          if (justDragged) { justDragged = false; return; }
+          switchEditorCase(key);
+        }, "case-editor-cts-open");
+        open.setAttribute("aria-current", key === editorCase ? "true" : "false");
+        open.setAttribute("aria-label", openLabel(item));
+        open.addEventListener("keydown", (event) => {
+          if (event.altKey && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+            event.preventDefault();
+            moveCaseBy(key, event.key === "ArrowUp" ? -1 : 1, ".case-editor-cts-open");
+          }
+        });
+        open.append(executionNode("small", "", String(item.id)), executionNode("strong", "", item.title || "Caso de teste"),
+          executionNode("span", "badge " + status.toLowerCase(), statusNames[status] || status));
+        const extras = (savedDrafts.get(plannerKey(key, selectedExecution(item))) || []).length;
+        if (extras) open.appendChild(executionNode("em", "", extras + (extras === 1 ? " passo extra" : " passos extras")));
+        row.append(check, chip, open);
+        if (editorReorder) {
+          const moves = executionNode("span", "case-editor-cts-moves");
+          [["up", "▲", "Subir", -1, visibleIndex === 0], ["down", "▼", "Descer", 1, visibleIndex === visible.length - 1]].forEach(([direction, symbol, verb, delta, atEnd]) => {
+            const move = button(symbol, () => moveCaseBy(key, delta, '.case-editor-cts-move[data-direction="' + direction + '"]'), "case-editor-cts-move");
+            move.dataset.direction = direction;
+            move.disabled = atEnd;
+            move.setAttribute("aria-label", verb + " " + item.id + " na ordem de execução");
+            moves.appendChild(move);
+          });
+          row.appendChild(moves);
+        }
+        const grip = executionNode("span", "case-editor-cts-grip", "⋮⋮");
+        grip.setAttribute("aria-hidden", "true");
+        row.appendChild(grip);
+        list.appendChild(row);
+      });
+      if (!visible.length) list.appendChild(executionNode("li", "case-editor-cts-empty",
+        editorReorder ? "Nenhum CT marcado. Marque CTs na lista para definir a ordem."
+          : editorListQuery.trim() ? "Nenhum CT encontrado para esta busca." : "Nenhum CT com resultado para reexecutar."));
+      updateCaseListCount();
+    }
+
+    // ---- Drag a card to change the run order -------------------------------------------------
+    function listRows(list) {
+      return Array.from(list.querySelectorAll(".case-editor-cts-item"));
+    }
+
+    function clearDropMark() {
+      if (listDrag && listDrag.mark) { delete listDrag.mark.dataset.drop; listDrag.mark = null; }
+    }
+
+    function updateListDrop(list, pointerY) {
+      listDrag.pointerY = pointerY;
+      const rows = listRows(list).filter((row) => row.dataset.caseKey !== listDrag.key);
+      let drop = null;
+      for (const row of rows) {
+        const box = row.getBoundingClientRect();
+        if (pointerY < box.top + box.height / 2) { drop = { key: row.dataset.caseKey, after: false, row }; break; }
+      }
+      if (!drop && rows.length) { const last = rows[rows.length - 1]; drop = { key: last.dataset.caseKey, after: true, row: last }; }
+      clearDropMark();
+      listDrag.drop = drop;
+      if (drop) { drop.row.dataset.drop = drop.after ? "after" : "before"; listDrag.mark = drop.row; }
+    }
+
+    function autoScrollList(list) {
+      // Long lists: hold the card near an edge and the list keeps scrolling.
+      if (!listDrag || !listDrag.active || listDrag.pointerY == null || typeof list.getBoundingClientRect !== "function") return;
+      const box = list.getBoundingClientRect(), edge = 44;
+      let step = 0;
+      if (listDrag.pointerY < box.top + edge) step = -Math.min(24, Math.ceil((box.top + edge - listDrag.pointerY) / 3));
+      else if (listDrag.pointerY > box.bottom - edge) step = Math.min(24, Math.ceil((listDrag.pointerY - (box.bottom - edge)) / 3));
+      if (!step) return;
+      list.scrollTop += step;
+      updateListDrop(list, listDrag.pointerY);
+    }
+
+    function finishListDrag(list, commit) {
+      const state = listDrag;
+      if (!state) return;
+      if (state.timer != null && typeof window.clearInterval === "function") window.clearInterval(state.timer);
+      clearDropMark();
+      listRows(list).forEach((row) => { delete row.dataset.dragging; });
+      delete list.dataset.sorting;
+      if (state.captured && typeof list.releasePointerCapture === "function") {
+        try { list.releasePointerCapture(state.id); } catch { /* already released */ }
+      }
+      listDrag = null;
+      if (!state.active) return;
+      justDragged = true;
+      if (commit && state.drop && placeCase(state.key, state.drop.key, state.drop.after)) {
+        renderCaseList();
+        announceOrder(state.key);
+      }
+    }
+
+    function enableCaseListDrag(list) {
+      list.addEventListener("pointerdown", (event) => {
+        justDragged = false;
+        if (listDrag || event.button !== 0 || !event.target.closest) return;
+        const row = event.target.closest(".case-editor-cts-item");
+        if (!row || !row.dataset.caseKey) return;
+        // Ticking a box or pressing an arrow keeps its own behaviour; touch
+        // scrolls the list and drags only from the grip.
+        if (event.target.tagName === "INPUT" || event.target.closest(".case-editor-cts-move")) return;
+        if (event.pointerType === "touch" && !event.target.closest(".case-editor-cts-grip")) return;
+        listDrag = { key: row.dataset.caseKey, id: event.pointerId, x: event.clientX, y: event.clientY, active: false, captured: false, drop: null, mark: null, timer: null, pointerY: null };
+      });
+      list.addEventListener("pointermove", (event) => {
+        if (!listDrag || event.pointerId !== listDrag.id) return;
+        if (!listDrag.active) {
+          if (Math.hypot(event.clientX - listDrag.x, event.clientY - listDrag.y) < dragThreshold) return;
+          listDrag.active = true;
+          list.dataset.sorting = "true";
+          const dragged = listRows(list).find((row) => row.dataset.caseKey === listDrag.key);
+          if (dragged) dragged.dataset.dragging = "true";
+          if (typeof list.setPointerCapture === "function") {
+            try { list.setPointerCapture(listDrag.id); listDrag.captured = true; } catch { listDrag.captured = false; }
+          }
+          if (typeof window.setInterval === "function") listDrag.timer = window.setInterval(() => autoScrollList(list), 30);
+        }
+        updateListDrop(list, event.clientY);
+      });
+      list.addEventListener("pointerup", (event) => { if (listDrag && event.pointerId === listDrag.id) finishListDrag(list, true); });
+      ["pointercancel", "lostpointercapture"].forEach((type) => {
+        list.addEventListener(type, (event) => { if (listDrag && event.pointerId === listDrag.id) finishListDrag(list, false); });
+      });
+    }
+
+    function buildCasePanel() {
+      const panel = executionNode("aside", "case-editor-cts");
+      panel.id = "case-editor-cts";
+      panel.dataset.reorder = "false";
+      panel.setAttribute("aria-label", "Testes desta base");
+      const head = executionNode("div", "case-editor-cts-head");
+      const count = executionNode("span", "case-editor-cts-count");
+      count.id = "case-editor-cts-count";
+      head.append(executionNode("h3", "", "Testes da base"), count);
+      const search = document.createElement("input");
+      search.type = "search";
+      search.id = "case-editor-cts-search";
+      search.className = "case-editor-cts-search";
+      search.placeholder = "Buscar CT ou título…";
+      search.setAttribute("aria-label", "Buscar CT");
+      search.addEventListener("input", () => { editorListQuery = search.value || ""; renderCaseList(); });
+      const actions = executionNode("div", "case-editor-cts-actions");
+      const setVisible = (value) => {
+        visibleCaseKeys().forEach((key) => { if (value) editorPicked.add(key); else editorPicked.delete(key); });
+        renderCaseList();
+      };
+      actions.append(button("Marcar todos", () => setVisible(true), "button button-ghost"), button("Limpar", () => setVisible(false), "button button-ghost"));
+      const reorder = button("⇅ Reordenar", () => setReorderMode(!editorReorder), "button button-ghost case-editor-cts-reorder");
+      reorder.id = "case-editor-cts-reorder";
+      reorder.setAttribute("aria-pressed", "false");
+      reorder.setAttribute("title", "Mostrar só os CTs marcados, na ordem em que rodam. Também dá para arrastar os cards da lista ou usar Alt + ↑/↓.");
+      const list = document.createElement("ul");
+      list.id = "case-editor-cts-list";
+      list.className = "case-editor-cts-list";
+      list.setAttribute("aria-label", "CTs com resultado, na ordem de execução");
+      enableCaseListDrag(list);
+      panel.append(head, search, actions, reorder, list);
+      return panel;
+    }
+
+    function messageParagraph(content) {
+      // Inline emphasis only; anything the model returns stays plain text.
+      const paragraph = document.createElement("p");
+      String(content).split(/(\*\*[^*\n]+\*\*|`[^`\n]+`)/g).forEach((part) => {
+        if (!part) return;
+        if (part.length > 4 && part.startsWith("**") && part.endsWith("**")) paragraph.appendChild(executionNode("strong", "", part.slice(2, -2)));
+        else if (part.length > 2 && part.startsWith("`") && part.endsWith("`")) paragraph.appendChild(executionNode("code", "", part.slice(1, -1)));
+        else paragraph.appendChild(executionNode("span", "", part));
+      });
+      return paragraph;
+    }
+
+    function applyAssistantSuggestion(message) {
+      message.suggestion.keys.forEach((key) => editorPicked.add(key));
+      message.suggestion.applied = true;
+      renderCaseList();
+      renderAssistant();
+      editorMessage(message.suggestion.keys.length + (message.suggestion.keys.length === 1 ? " CT incluído" : " CTs incluídos") + " na reexecução. Nada foi executado.");
+    }
+
+    function renderAssistant() {
+      const transcript = $("case-assistant-transcript");
+      if (!transcript) return;
+      transcript.replaceChildren();
+      if (!assistantState.messages.length) {
+        const empty = executionNode("div", "case-assistant-empty");
+        empty.append(executionNode("span", "case-assistant-spark", "✦"), executionNode("h3", "", "O que vamos testar?"),
+          executionNode("p", "", "Diga o que quer reexecutar. Comparo com os testes desta base e sugiro quais incluir; você revisa antes de confirmar."));
+        ["Sugira testes para executar novamente", "Selecione os testes que não foram aprovados"].forEach((suggestion) => {
+          empty.appendChild(button(suggestion, () => sendAssistant(suggestion), "case-assistant-chip"));
+        });
+        transcript.appendChild(empty);
+      }
+      assistantState.messages.forEach((message) => {
+        const bubble = executionNode("div", "case-assistant-message");
+        bubble.dataset.role = message.role;
+        if (message.error) bubble.dataset.error = "true";
+        bubble.appendChild(messageParagraph(message.content));
+        if (message.note) bubble.appendChild(executionNode("small", "", message.note));
+        if (message.suggestion && message.suggestion.keys.length) {
+          const card = executionNode("div", "case-assistant-suggestion");
+          const ids = message.suggestion.keys.map((key) => String(byIndex.get(key).id));
+          const apply = button(message.suggestion.applied ? "Incluído na reexecução" : "Incluir " + ids.length + (ids.length === 1 ? " CT" : " CTs") + " na reexecução",
+            () => applyAssistantSuggestion(message), "button button-primary");
+          apply.disabled = !!message.suggestion.applied;
+          card.append(executionNode("strong", "", "Sugestão: " + ids.join(", ")), apply);
+          bubble.appendChild(card);
+        }
+        transcript.appendChild(bubble);
+      });
+      if (assistantState.busy) {
+        const thinking = executionNode("div", "case-assistant-message", "Pensando…");
+        thinking.dataset.role = "assistant";
+        thinking.dataset.pending = "true";
+        transcript.appendChild(thinking);
+      }
+      transcript.scrollTop = transcript.scrollHeight;
+      const send = $("case-assistant-send");
+      if (send) send.disabled = assistantState.busy;
+    }
+
+    function directCaseAddition(message) {
+      // Explicit "adicione CT003" is a deterministic edit, never a model call.
+      const normalized = message.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().trim();
+      const command = normalized.match(/^(?:por favor[, :]?\s*)?(?:(?:quero que (?:voce |vc )?|(?:quero|gostaria de|preciso|pode|poderia|vamos) )?)(?:adicione|adiciona|adicionar|inclua|inclui|incluir|selecione|selecionar|marque|marcar|coloque|colocar|insira|inserir)\b\s*(.+)$/);
+      if (!command) return null;
+      const body = command[1];
+      const mentions = Array.from(body.matchAll(/\bct[\s-]*(\d+)\b/g));
+      if (!mentions.length || /\bct[\s-]*\d+\s*(?:a|ate|-)\s*(?:ct[\s-]*)?\d+\b/.test(body)) return null;
+      const remainder = body.replace(/\bct[\s-]*\d+\b/g, " ").replace(/[.,!?;:]/g, " ").trim();
+      if (remainder && remainder.split(/\s+/).some((word) => !directWords.has(word))) return null;
+      const known = editorQueue.map((key) => String(byIndex.get(key).id));
+      const ids = [], missing = [];
+      mentions.forEach((mention) => {
+        const digits = mention[1].replace(/^0+(?=\d)/, "");
+        const matches = known.filter((id) => /^CT\d+$/i.test(id) && id.slice(2).replace(/^0+(?=\d)/, "") === digits);
+        if (matches.length === 1) ids.push(matches[0]); else missing.push(mention[0].toUpperCase());
+      });
+      return { ids: Array.from(new Set(ids)), missing: Array.from(new Set(missing)) };
+    }
+
+    function applyDirectAddition(direct) {
+      const added = [], already = [];
+      direct.ids.forEach((id) => {
+        const key = editorQueue.find((candidate) => String(byIndex.get(candidate).id) === id);
+        if (editorPicked.has(key)) already.push(id); else { editorPicked.add(key); added.push(id); }
+      });
+      const parts = [];
+      if (added.length) parts.push(added.join(", ") + (added.length === 1 ? " foi incluído" : " foram incluídos") + " na reexecução.");
+      if (already.length) parts.push(already.join(", ") + (already.length === 1 ? " já estava incluído" : " já estavam incluídos") + "; não dupliquei.");
+      if (direct.missing.length) parts.push("Não encontrei " + direct.missing.join(", ") + " entre os testes com resultado deste relatório.");
+      parts.push("Nada foi executado. Revise e confirme na aplicação.");
+      assistantState.messages.push({ role: "assistant", content: parts.join(" ") });
+      renderCaseList();
+    }
+
+    async function requestAssistant() {
+      const root = (data.suite_context && data.suite_context.root_id) || reportConnection.sourceId;
+      const history = assistantState.messages.filter((message) => !message.error).slice(-12)
+        .map((message) => ({ role: message.role, content: message.content }));
+      const llm = assistantState.model;
+      const controller = typeof AbortController === "function" ? new AbortController() : null;
+      const timer = controller ? window.setTimeout(() => controller.abort(), 90000) : null;
+      const post = (selected) => window.fetch(reportConnection.apiUrl + "/test-suites/" + encodeURIComponent(root) + "/assistant", {
+        method: "POST", headers: { "Content-Type": "application/json" }, cache: "no-store",
+        body: JSON.stringify({ messages: history, selected_case_ids: selected, ...(llm ? { llm } : {}) }),
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+      try {
+        let response = await post(pickedIds());
+        // A CT unknown to the base (e.g. archived) must not block the chat.
+        if (response.status === 422) response = await post([]);
+        if (!response.ok) {
+          let detail = "";
+          try { const body = await response.json(); if (typeof body.detail === "string") detail = body.detail; } catch { detail = ""; }
+          throw new Error(detail || "Não foi possível obter uma sugestão agora. Confira o modelo do assistente e tente novamente. Nenhum CT foi alterado.");
+        }
+        return await response.json();
+      } catch (error) {
+        if (error && error.name === "AbortError") throw new Error("O assistente demorou demais para responder. Tente novamente ou escolha outro modelo.");
+        if (error && error.name === "TypeError") throw new Error("Não foi possível falar com a aplicação Test Lab. Confirme que ela está aberta e tente novamente.");
+        throw error;
+      } finally {
+        if (timer != null) window.clearTimeout(timer);
+      }
+    }
+
+    async function sendAssistant(value) {
+      const content = String(value == null ? "" : value).trim().slice(0, 4000);
+      if (!content || assistantState.busy) return;
+      const input = $("case-assistant-input");
+      if (input) input.value = "";
+      assistantState.messages.push({ role: "user", content });
+      const direct = directCaseAddition(content);
+      if (direct) { applyDirectAddition(direct); renderAssistant(); return; }
+      assistantState.busy = true;
+      renderAssistant();
+      try {
+        const result = await requestAssistant();
+        const keys = (Array.isArray(result.selected_case_ids) ? result.selected_case_ids : [])
+          .map((id) => editorQueue.find((key) => String(byIndex.get(key).id) === String(id)))
+          .filter((key, index, list) => key && !editorPicked.has(key) && list.indexOf(key) === index);
+        const created = Array.isArray(result.new_cases) ? result.new_cases.length : 0;
+        assistantState.messages.push({
+          role: "assistant", content: String(result.reply || "Sem sugestão para este pedido."),
+          ...(keys.length ? { suggestion: { keys, applied: false } } : {}),
+          ...(created ? { note: created + (created === 1 ? " teste novo foi proposto" : " testes novos foram propostos") + ", mas novos testes não são criados aqui. Use “Adicionar teste” na aplicação." } : {}),
+        });
+      } catch (error) {
+        assistantState.messages.push({ role: "assistant", error: true, content: error && error.message ? error.message : "Não foi possível obter uma sugestão agora. Nenhum CT foi alterado." });
+      } finally {
+        assistantState.busy = false;
+        renderAssistant();
+      }
+    }
+
+    // Searchable model picker: the catalog can hold hundreds of models, so a
+    // native <select> is unusable. Type to filter, arrows + Enter to choose.
+    const defaultModelLabel = "Modelo padrão da base";
+    const modelListLimit = 150;
+    const modelKey = (model) => model ? model.provider_id + "/" + model.model_id : "";
+
+    function modelEntries() {
+      const tokens = assistantState.modelQuery.trim().toLowerCase().split(/\s+/).filter(Boolean);
+      return [{ id: "", label: defaultModelLabel }].concat(assistantState.models)
+        .filter((entry) => tokens.every((token) => entry.label.toLowerCase().includes(token)));
+    }
+
+    function modelPickerOpen() {
+      const popup = $("case-assistant-model-popup");
+      return !!popup && !popup.hidden;
+    }
+
+    function renderModelOptions() {
+      const list = $("case-assistant-model-list");
+      if (!list) return;
+      list.replaceChildren();
+      const matches = modelEntries();
+      assistantState.modelActive = Math.max(0, Math.min(assistantState.modelActive, matches.length - 1));
+      const selected = modelKey(assistantState.model);
+      matches.slice(0, modelListLimit).forEach((entry, index) => {
+        const item = executionNode("li", "case-assistant-model-option", entry.label);
+        item.id = "case-assistant-model-option-" + index;
+        item.setAttribute("role", "option");
+        item.setAttribute("title", entry.label);
+        item.setAttribute("aria-selected", String(entry.id === selected));
+        item.dataset.active = String(index === assistantState.modelActive);
+        item.addEventListener("click", () => chooseModel(entry));
+        list.appendChild(item);
+      });
+      const note = (message) => {
+        const row = executionNode("li", "case-assistant-model-note", message);
+        row.setAttribute("role", "presentation");
+        list.appendChild(row);
+      };
+      if (assistantState.modelsStatus === "loading") note("Carregando modelos…");
+      else if (assistantState.modelsStatus === "error") note("Não foi possível carregar a lista de modelos. O modelo padrão da base continua disponível.");
+      if (assistantState.modelQuery.trim() && matches.length === 0) note("Nenhum modelo encontrado para “" + assistantState.modelQuery.trim() + "”.");
+      if (matches.length > modelListLimit) note("Mostrando " + modelListLimit + " de " + matches.length + ". Continue digitando para filtrar.");
+      const search = $("case-assistant-model-search");
+      if (search) {
+        if (matches.length) search.setAttribute("aria-activedescendant", "case-assistant-model-option-" + assistantState.modelActive);
+        else search.removeAttribute("aria-activedescendant");
+      }
+      const active = list.querySelector('[data-active="true"]');
+      if (active) active.scrollIntoView({ block: "nearest" });
+    }
+
+    function openModelPicker() {
+      const popup = $("case-assistant-model-popup"), trigger = $("case-assistant-model"), search = $("case-assistant-model-search");
+      if (!popup || !trigger || !search) return;
+      assistantState.modelQuery = "";
+      search.value = "";
+      assistantState.modelActive = Math.max(0, modelEntries().findIndex((entry) => entry.id === modelKey(assistantState.model)));
+      if (assistantState.modelsStatus === "error") assistantState.modelsStatus = "idle";
+      popup.hidden = false;
+      trigger.setAttribute("aria-expanded", "true");
+      loadAssistantModels();
+      renderModelOptions();
+      search.focus();
+    }
+
+    function closeModelPicker(restoreFocus) {
+      const popup = $("case-assistant-model-popup"), trigger = $("case-assistant-model");
+      if (!popup) return;
+      popup.hidden = true;
+      if (trigger) {
+        trigger.setAttribute("aria-expanded", "false");
+        if (restoreFocus) trigger.focus();
+      }
+    }
+
+    function chooseModel(entry) {
+      assistantState.model = entry.id ? { provider_id: entry.provider_id, model_id: entry.model_id } : null;
+      const trigger = $("case-assistant-model");
+      if (trigger) {
+        text(trigger, entry.label);
+        trigger.setAttribute("title", entry.label);
+        trigger.setAttribute("aria-label", "Modelo do assistente: " + entry.label);
+      }
+      closeModelPicker(true);
+    }
+
+    async function loadAssistantModels() {
+      if (!assistantAvailable() || assistantState.modelsStatus !== "idle") return;
+      assistantState.modelsStatus = "loading";
+      if (modelPickerOpen()) renderModelOptions();
+      try {
+        const response = await window.fetch(reportConnection.apiUrl + "/models", { cache: "no-store" });
+        if (!response.ok) throw new Error("models");
+        const options = await response.json();
+        assistantState.models = (Array.isArray(options) ? options : []).filter((model) => model && model.enabled !== false && model.id && model.provider_id
+          && (!model.input_modalities || !model.input_modalities.length || model.input_modalities.includes("text"))
+          && (!model.output_modalities || !model.output_modalities.length || model.output_modalities.includes("text")))
+          .map((model) => ({ id: model.provider_id + "/" + model.id, provider_id: model.provider_id, model_id: model.id,
+            label: (model.provider_name ? model.provider_name + ": " : "") + (model.label || model.id) }));
+        assistantState.modelsStatus = "ready";
+      } catch {
+        assistantState.modelsStatus = "error";
+      }
+      if (modelPickerOpen()) renderModelOptions();
+    }
+
+    function buildAssistantPanel() {
+      const panel = executionNode("aside", "case-editor-assistant");
+      panel.id = "case-editor-assistant";
+      panel.setAttribute("aria-label", "Assistente de testes");
+      const head = executionNode("div", "case-assistant-head");
+      head.append(executionNode("strong", "", "✦ Assistente de testes"), executionNode("span", "", "Só planejamento"));
+      const transcript = executionNode("div", "case-assistant-transcript");
+      transcript.id = "case-assistant-transcript";
+      transcript.setAttribute("role", "log");
+      transcript.setAttribute("aria-live", "polite");
+      transcript.setAttribute("aria-label", "Conversa com o assistente");
+      const composer = executionNode("div", "case-assistant-composer");
+      const input = document.createElement("textarea");
+      input.id = "case-assistant-input";
+      input.rows = 2;
+      input.maxLength = 4000;
+      input.placeholder = "Quais testes vamos reexecutar?";
+      input.setAttribute("aria-label", "Mensagem para o assistente");
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); sendAssistant(input.value); }
+      });
+      const controls = executionNode("div", "case-assistant-controls");
+      const trigger = button("", () => { if (modelPickerOpen()) closeModelPicker(true); else openModelPicker(); }, "case-assistant-model-trigger");
+      trigger.id = "case-assistant-model";
+      text(trigger, defaultModelLabel);
+      trigger.setAttribute("aria-haspopup", "listbox");
+      trigger.setAttribute("aria-expanded", "false");
+      trigger.setAttribute("aria-controls", "case-assistant-model-popup");
+      trigger.setAttribute("aria-label", "Modelo do assistente: " + defaultModelLabel);
+      const popup = executionNode("div", "case-assistant-model-popup");
+      popup.id = "case-assistant-model-popup";
+      popup.hidden = true;
+      const search = document.createElement("input");
+      search.type = "search";
+      search.id = "case-assistant-model-search";
+      search.className = "case-assistant-model-search";
+      search.placeholder = "Buscar modelo…";
+      search.setAttribute("role", "combobox");
+      search.setAttribute("aria-label", "Buscar modelo");
+      search.setAttribute("aria-autocomplete", "list");
+      search.setAttribute("aria-controls", "case-assistant-model-list");
+      search.addEventListener("input", () => {
+        assistantState.modelQuery = search.value || "";
+        assistantState.modelActive = 0;
+        renderModelOptions();
+      });
+      search.addEventListener("keydown", (event) => {
+        const count = Math.min(modelEntries().length, modelListLimit);
+        if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+          event.preventDefault();
+          if (count) assistantState.modelActive = (assistantState.modelActive + (event.key === "ArrowDown" ? 1 : count - 1)) % count;
+          renderModelOptions();
+        } else if (event.key === "Enter") {
+          event.preventDefault();
+          const entry = modelEntries()[assistantState.modelActive];
+          if (entry) chooseModel(entry);
+        } else if (event.key === "Escape") {
+          // Closes only the picker, not the whole planner.
+          event.preventDefault();
+          event.stopPropagation();
+          closeModelPicker(true);
+        }
+      });
+      const modelList = document.createElement("ul");
+      modelList.id = "case-assistant-model-list";
+      modelList.className = "case-assistant-model-list";
+      modelList.setAttribute("role", "listbox");
+      modelList.setAttribute("aria-label", "Modelos disponíveis");
+      popup.append(search, modelList);
+      const modelPicker = executionNode("div", "case-assistant-model");
+      modelPicker.append(trigger, popup);
+      const send = button("↑", () => sendAssistant(input.value), "case-assistant-send");
+      send.id = "case-assistant-send";
+      send.setAttribute("aria-label", "Enviar mensagem");
+      controls.append(modelPicker, send);
+      composer.append(input, controls);
+      panel.append(head, transcript, composer);
+      // Opening the planner never contacts the server; the model list is only
+      // requested once the user starts interacting with the assistant.
+      panel.addEventListener("focusin", loadAssistantModels);
+      const dialog = $("case-editor");
+      if (dialog) dialog.addEventListener("pointerdown", (event) => {
+        if (!modelPickerOpen()) return;
+        const popup = $("case-assistant-model-popup"), opener = $("case-assistant-model");
+        if ((popup && popup.contains(event.target)) || (opener && opener.contains(event.target))) return;
+        closeModelPicker(false);
+      });
+      return panel;
+    }
+
+    function toggleAssistantPanel() {
+      const dialog = $("case-editor");
+      const open = dialog.dataset.assistantOpen !== "true";
+      dialog.dataset.assistantOpen = String(open);
+      const toggle = $("case-editor-assistant-toggle");
+      if (toggle) toggle.setAttribute("aria-expanded", String(open));
+      if (open && $("case-assistant-input")) $("case-assistant-input").focus();
+    }
+
+    function switchEditorCase(key) {
+      key = String(key);
+      if (key === editorCase) return;
+      // Switching CTs keeps what was planned for the previous one.
+      if (editorCase) {
+        saveDraftSequence(editorPlanKey, editorSequence);
+        const explorer = caseExplorers.get(editorCase);
+        if (explorer) rebuildInlineSteps(explorer);
+      }
+      if (!loadEditorCase(key, true)) return;
+      renderCaseList();
+      const active = document.querySelector('#case-editor-cts [aria-current="true"]');
+      if (active) active.focus();
+    }
+
+    function showEditor(trigger) {
+      const dialog = $("case-editor");
+      editorTrigger = trigger;
+      setReorderMode(false);
+      renderAssistant();
+      if (typeof dialog.showModal === "function") dialog.showModal(); else dialog.setAttribute("open", "");
+      if ($("case-editor-close")) $("case-editor-close").focus();
+    }
+
     function openEditor(key, trigger, rerun = false) {
+      // The whole base is listed; only the CT being opened starts included.
+      editorQueue = rerunnableCases();
+      if (!editorQueue.includes(String(key))) editorQueue.unshift(String(key));
+      editorPicked.clear();
+      editorPicked.add(String(key));
+      if (loadEditorCase(key, rerun)) showEditor(trigger);
+    }
+
+    function openBatchEditor(trigger) {
+      const keys = rerunnableCases();
+      if (!keys.length) return;
+      editorQueue = keys;
+      editorPicked.clear();
+      keys.forEach((key) => editorPicked.add(key));
+      if (loadEditorCase(keys[0], true)) showEditor(trigger);
+    }
+
+    function loadEditorCase(key, rerun = false) {
       key = String(key);
       const current = byIndex.get(key);
       const dialog = $("case-editor");
-      if (!current || !dialog || !$("case-editor-steps")) return;
+      if (!current || !dialog || !$("case-editor-steps")) return false;
       editorCase = key;
       editorRevision = rerun ? selectedExecution(current) : { ...current, current: true, has_result: true };
-      if (!editorRevision.has_result) return;
+      if (!editorRevision.has_result) return false;
       editorPlanKey = plannerKey(key, editorRevision);
-      editorTrigger = trigger;
       editorDrag = null;
       editorTool = null;
       preparePlanner();
@@ -593,12 +1490,15 @@
         drafts.filter((item) => item.gap === gap).forEach((item) => editorSequence.push(draftFields(item)));
         if (gap < steps.length) editorSequence.push({ type: "recorded", stepIndex: gap, step: steps[gap] });
       }
-      text($("case-editor-title"), "Planejar reexecução · " + current.id + " · " + (editorRevision.title || current.title || "Caso de teste"));
+      // The screen name stays for screen readers; sighted users see only the CT.
+      const heading = $("case-editor-title");
+      if (heading) heading.replaceChildren(executionNode("span", "result-sr-only", "Planejar reexecução · "),
+        executionNode("span", "", current.id + " · " + (editorRevision.title || current.title || "Caso de teste")));
       text($("case-editor-rerun"), reportConnection ? "Revisar e confirmar na aplicação →" : "Como reexecutar");
-      editorMessage("Rascunho visual · não executado · não altera este resultado. " + (rerun && Number.isInteger(editorRevision.version) ? "Base: execução #" + (editorRevision.version + 1) + "." : ""));
+      editorMessage(rerun && Number.isInteger(editorRevision.version) ? "Base: execução #" + (editorRevision.version + 1) + "." : "");
+      editorSelectedStep = null;
       renderEditor();
-      if (typeof dialog.showModal === "function") dialog.showModal(); else dialog.setAttribute("open", "");
-      if ($("case-editor-close")) $("case-editor-close").focus();
+      return true;
     }
 
     readSavedDrafts();
@@ -761,15 +1661,27 @@
     // single instance and its listeners when navigating to another report view.
     const reportToolbar = document.querySelector(".report-topbar .toolbar");
     const reportToolbarHome = reportToolbar && reportToolbar.parentElement;
-    const reportPrint = $("print-report");
+    // The overview and tests views rerun every CT with a result; a result reruns only its CT.
+    // App-only: created after the export snapshot, so downloads never carry it.
+    // Same markup as the single-CT button of the results view: only the arrow is a span.
+    const testsRerun = reportConnection && reportToolbar ? button(" Reexecutar testes", () => openBatchEditor(testsRerun), "button button-rerun") : null;
+    if (testsRerun) {
+      testsRerun.id = "tests-rerun";
+      testsRerun.hidden = true;
+      const icon = executionNode("span", "", "↻");
+      icon.setAttribute("aria-hidden", "true");
+      testsRerun.prepend(icon);
+      testsRerun.setAttribute("aria-label", "Reexecutar testes: planejar a reexecução de todos os CTs com resultado");
+      reportToolbar.prepend(testsRerun);
+    }
 
     function syncResultHeader(view) {
+      if (testsRerun) {
+        testsRerun.hidden = view !== "tests" && view !== "overview";
+        testsRerun.disabled = !rerunnableCases().length;
+      }
       const destination = view === "results" ? $("result-report-actions") : reportToolbarHome;
       if (reportToolbar && destination && reportToolbar.parentElement !== destination) destination.appendChild(reportToolbar);
-      if (reportPrint && reportToolbarHome && reportToolbar) {
-        const printDestination = view === "results" ? reportToolbarHome : reportToolbar;
-        if (reportPrint.parentElement !== printDestination) printDestination.appendChild(reportPrint);
-      }
     }
 
     function rebuildInlineSteps(model, requestedKey) {
@@ -1821,7 +2733,11 @@
       if (request.trigger) request.trigger.focus({ preventScroll: true });
     });
     listen("case-editor-close", "click", closeEditor);
-    listen("case-editor", "cancel", (event) => { event.preventDefault(); closeEditor(); });
+    listen("case-editor", "cancel", (event) => {
+      event.preventDefault();
+      if (modelPickerOpen()) { closeModelPicker(true); return; }
+      closeEditor();
+    });
     listen("case-editor", "close", () => { editorDrag = null; if (editorTrigger) editorTrigger.focus(); });
     const plannerSteps = $("case-editor-steps");
     if (plannerSteps) plannerSteps.addEventListener("wheel", (event) => {
@@ -1844,7 +2760,10 @@
         const explorer = caseExplorers.get(editorCase);
         if (explorer) rebuildInlineSteps(explorer);
       }
-      requestCaseRerun(editorCase, editorMessage);
+      if (!editorQueue.length) { requestCaseRerun(editorCase, editorMessage); return; }
+      const picked = editorQueue.filter((key) => editorPicked.has(key));
+      if (!picked.length) { editorMessage("Marque ao menos um CT para reexecutar. Nenhuma reexecução foi solicitada."); return; }
+      if (picked.length === 1) requestCaseRerun(picked[0], editorMessage); else requestBatchRerun(picked, editorMessage);
     });
     listen("case-rerun", "click", () => openEditor(selectedCase, $("case-rerun"), true));
     listen("case-history", "click", openCaseHistory);
@@ -2060,7 +2979,6 @@
       } catch { downloadFeedback(control, "Não foi possível baixar o relatório completo com os prints. Tente novamente."); }
       finally { control.disabled = false; control.removeAttribute("aria-busy"); }
     });
-    listen("print-report", "click", () => window.print());
 
     let printState = null;
     function preparePrint() {

@@ -48,11 +48,18 @@ export default defineConfig(async () => {
       // Keep browser errors local. Forwarding a rejection over a disconnected
       // HMR socket can itself reject and recursively flood the error overlay.
       forwardConsole: false,
+      // Pre-transform the big client modules as soon as `vinext dev` starts,
+      // so the first visit to a screen (e.g. the lazy "Meus testes") does not
+      // wait for on-demand compilation of ~400 KB of TSX.
+      warmup: {
+        clientFiles: ["./app/AutoJevApp.tsx", "./app/components/*.tsx"],
+      },
       watch: {
         ignored: [
           "**/backend/.venv/**",
           "**/backend/data/**",
           "**/__pycache__/**",
+          "**/.playwright-mcp/**",
         ],
         ...(isCodexSeatbeltSandbox
           ? { useFsEvents: false, usePolling: true }

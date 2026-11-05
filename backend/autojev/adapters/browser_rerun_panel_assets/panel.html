@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
-  <title>AutoJev · Reexecução</title>
+  <title>Test Lab · Reexecução</title>
   <style>
     :root{color-scheme:dark;--bg:#10191b;--surface:#182326;--line:#344347;--text:#eef4f3;--muted:#9fb0b3;--amber:#ffd15a;--green:#6fd5aa;--blue:#84bfff;--red:#ff9d9a}
     *{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;min-width:0;background:var(--bg);color:var(--text);font:13px/1.4 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
@@ -22,7 +22,7 @@
 </head>
 <body>
   <header class="header">
-    <div><div class="brand">AUTOJEV · AO VIVO</div><h1 id="panel-title">Sua reexecução</h1></div>
+    <div><div class="brand">TEST LAB · AO VIVO</div><h1 id="panel-title">Sua reexecução</h1></div>
     <div class="counter" aria-label="Progresso da reexecução"><strong id="completed">0</strong><span id="total"> / 0</span><small>etapas concluídas</small></div>
   </header>
   <main class="body">
@@ -57,7 +57,7 @@
     <section class="action" id="preparation" aria-labelledby="preparation-heading" hidden>
       <div class="eyebrow" id="preparation-eyebrow">Prepare a página</div>
       <h2 id="preparation-heading">Prepare a página para continuar</h2>
-      <p class="hint" id="preparation-hint">Prepare a página e os dados iniciais do teste. Depois, marque a autorização e clique em “Continuar reexecução”. Se houver um login preenchido no site autorizado, o AutoJev tentará entrar. A ação do teste só será executada se os pré-requisitos forem confirmados.</p>
+      <p class="hint" id="preparation-hint">Prepare a página e os dados iniciais do teste. Depois, marque a autorização e clique em “Continuar reexecução”. Se houver um login preenchido no site autorizado, o Test Lab tentará entrar. A ação do teste só será executada se os pré-requisitos forem confirmados.</p>
       <p class="hint" id="preparation-feedback" hidden></p>
       <details class="prep-details"><summary id="preparation-details-label">Ver detalhes da preparação</summary><div class="url-row"><span>Página esperada</span><b id="expected-url"></b></div><div class="url-row"><span>Página aberta</span><b id="current-url"></b></div><p id="preparation-instruction"></p></details>
       <label class="consent"><input id="preparation-consent" type="checkbox"><span id="preparation-consent-label">Autorizo tentar entrar com o login preenchido e executar a ação original somente se a conferência dos pré-requisitos passar.</span></label>
@@ -280,7 +280,7 @@
 
       $('confirm-capture').addEventListener('click', async event => {
         if (!event.isTrusted || !canCapture() || !staged || reading || previewBusy || previewUnsynced) return;
-        if (typeof window.__autojev_rerun_command !== 'function') { status('A conexão com o AutoJev não está disponível. Aguarde e tente novamente.', 'error'); return; }
+        if (typeof window.__autojev_rerun_command !== 'function') { status('A conexão com o Test Lab não está disponível. Aguarde e tente novamente.', 'error'); return; }
         const key = checkpointKey;
         const cp = checkpoint();
         busy = true;
@@ -384,7 +384,7 @@
       });
       $('confirm-preparation').addEventListener('click', async event => {
         if (!event.isTrusted || preparationBusy || consentBusy || consentUnsynced || !consentAuthorized || !$('preparation-consent').checked || !current || !current.running || current.phase !== 'waiting_preparation' || !current.preparation) return;
-        if (typeof window.__autojev_rerun_command !== 'function') { $('preparation-status').textContent = 'A conexão com o AutoJev não está disponível. Aguarde e tente novamente.'; return; }
+        if (typeof window.__autojev_rerun_command !== 'function') { $('preparation-status').textContent = 'A conexão com o Test Lab não está disponível. Aguarde e tente novamente.'; return; }
         const key = preparationKey;
         preparationBusy = true;
         $('confirm-preparation').disabled = true;
@@ -471,8 +471,8 @@
           title: validating ? 'Entrando e conferindo preparação…' : loginReady ? 'Login realizado. Autorize para continuar' : loginRequired ? 'Faça login para continuar' : 'Prepare a página para continuar',
           instruction: validating ? 'Aguarde a conferência do login, da página e dos pré-requisitos. Não é necessário confirmar novamente.' : loginReady
             ? 'Seu login foi reconhecido e os pré-requisitos foram conferidos. Marque a autorização para o teste continuar automaticamente.' : loginRequired
-            ? 'Marque a autorização e faça login pelo próprio site. O AutoJev identifica o login e continua automaticamente após conferir a página e os pré-requisitos. Se preferir, preencha usuário e senha e clique em “Continuar reexecução” para o AutoJev tentar entrar.'
-            : 'Prepare a página e os dados iniciais do teste. Depois, marque a autorização e clique em “Continuar reexecução”. Se houver um login preenchido no site autorizado, o AutoJev tentará entrar. A ação do teste só será executada se os pré-requisitos forem confirmados.',
+            ? 'Marque a autorização e faça login pelo próprio site. O Test Lab identifica o login e continua automaticamente após conferir a página e os pré-requisitos. Se preferir, preencha usuário e senha e clique em “Continuar reexecução” para o Test Lab tentar entrar.'
+            : 'Prepare a página e os dados iniciais do teste. Depois, marque a autorização e clique em “Continuar reexecução”. Se houver um login preenchido no site autorizado, o Test Lab tentará entrar. A ação do teste só será executada se os pré-requisitos forem confirmados.',
           consent_label: 'Autorizo tentar entrar com o login preenchido e executar a ação original somente se a conferência dos pré-requisitos passar.',
           button_label: validating ? 'Entrando e conferindo preparação…' : 'Continuar reexecução',
           details_label: 'Ver detalhes da preparação',
