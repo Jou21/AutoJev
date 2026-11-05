@@ -171,7 +171,7 @@ async function workspace(t, providedSuite, onReport, initialProps = {}) {
   }
   const all = () => [...elements(tree)];
   const find = predicate => { const result = all().find(predicate); assert.ok(result, "Expected component element"); return result; };
-  const button = label => find(node => node.type === "button" && (node.props["aria-label"] === label || text(node).startsWith(label)));
+  const button = label => all().find(node => node.type === "button" && (node.props["aria-label"] === label || text(node) === label)) || find(node => node.type === "button" && text(node).startsWith(label));
   const field = label => [...elements(find(node => node.type === "label" && text(node).startsWith(label)))].find(node => ["input", "textarea"].includes(node.type));
   async function click(label) { const node = button(label); assert.ok(!node.props.disabled); node.props.onClick({ currentTarget: fakeTarget(label), preventDefault() {} }); await settle(); }
   async function change(label, value) { const node = field(label); assert.ok(node); node.props.onChange({ target: { value } }); await settle(); }
@@ -1337,12 +1337,18 @@ test("review checkboxes and unavailable dialog require explicit removal before s
   checkbox("Selecionar todos os testes da revisão").props.onChange(); await view.settle();
   assert.equal(view.button("Executar 2 testes").props.disabled,false);
   await view.click("Executar 2 testes");
-  assert.equal(view.button("Executar selecionados").props.disabled,true);
+  assert.equal(view.button("Executar").props.disabled,true);
+  assert.equal(checkbox("Incluir indisponível CT002").props.checked,true);
   assert.equal(view.calls.some(call=>call.path.endsWith("/start")),false);
+  checkbox("Incluir indisponível CT002").props.onChange(); await view.settle();
+  assert.equal(view.button("Executar").props.disabled,false);
+  checkbox("Incluir indisponível CT002").props.onChange(); await view.settle();
+  assert.equal(view.button("Executar").props.disabled,true);
   await view.click("Desmarcar indisponíveis");
   assert.equal(checkbox("Executar CT002").props.checked,false);
-  assert.equal(view.button("Executar selecionados").props.disabled,false);
-  await view.click("Executar selecionados");
+  assert.equal(checkbox("Incluir indisponível CT002").props.checked,false);
+  assert.equal(view.button("Executar").props.disabled,false);
+  await view.click("Executar");
   const update=view.calls.find(call=>call.method==="PUT" && call.path.includes("/plans/"));
   assert.deepEqual(update.body.items.map(item=>item.case_id),["CT001"]);
   assert.equal(view.calls.filter(call=>call.path.endsWith("/validate")).length,2);
@@ -1355,16 +1361,16 @@ test("subset revalidation cannot start a newly unavailable remaining test", asyn
   let checks=0;
   const view=await workspace(t,suite,undefined,{validationReply:checked=>{checks++;return {...checked,available:false,items:checked.items.map(item=>({...item,available:checks===1 && item.case_id==="CT001",code:"incomplete"}))};}});
   await view.click("Marcar todos"); await view.click("Revisar execução"); await view.click("Executar 2 testes");
-  await view.click("Desmarcar indisponíveis"); await view.click("Executar selecionados");
+  await view.click("Desmarcar indisponíveis"); await view.click("Executar");
   assert.equal(checks,2);
-  assert.equal(view.button("Executar selecionados").props.disabled,true);
+  assert.equal(view.button("Executar").props.disabled,true);
   assert.equal(view.calls.some(call=>call.path.endsWith("/start")),false);
 });
 
 test("all unavailable tests leave modal execution disabled after unchecking", async t => {
  const view=await workspace(t,undefined,undefined,{initialCaseId:"CT001",validationReply:checked=>({...checked,available:false,items:checked.items.map(item=>({...item,available:false,code:"incomplete"}))})});
  await view.click("Revisar execução"); await view.click("Executar 1 teste"); await view.click("Desmarcar indisponíveis");
- assert.equal(view.button("Executar selecionados").props.disabled,true);
+ assert.equal(view.button("Executar").props.disabled,true);
  assert.equal(view.calls.some(call=>call.path.endsWith("/start")),false);
 });
 

@@ -612,6 +612,8 @@
 .suite-unavailable-dialog p { margin: 0 0 20px; color: var(--muted); font-size: 13px; line-height: 1.7; }
 .suite-unavailable-dialog ul { display: grid; gap: 8px; max-height: 35dvh; overflow: auto; margin: 0 0 24px; padding: 0; list-style: none; }
 .suite-unavailable-dialog li { padding: 12px 14px; border: 1px solid #f2c45b30; border-radius: 10px; background: #f2c45b08; color: var(--text-primary); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.suite-unavailable-check { display: flex; align-items: center; gap: 10px; cursor: pointer; }
+.suite-unavailable-check input { flex: 0 0 16px; width: 16px; height: 16px; margin: 0; accent-color: var(--suite-accent); }
 .suite-unavailable-dialog .suite-heading-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .suite-unavailable-dialog .button { min-height: 38px; border-radius: 9px; font-size: 12px; }
 .suite-unavailable-dialog p[role="status"] { margin: 16px 0 0; }
