@@ -1808,7 +1808,43 @@ test("unselected selector cards can be dragged before selecting tests", async t 
  assert.deepEqual(plannedIds(view),[]);
  button("CT002").props.onClick(); await view.settle();
  button("CT001").props.onClick(); await view.settle();
+ assert.deepEqual(plannedIds(view),[]);
+ assert.ok(!card("CT001").props.className.includes("selected"));
+ assert.ok(!card("CT002").props.className.includes("selected"));
+ for (const id of ["CT002", "CT001"]) {
+   view.find(n=>n.props["aria-label"]===`Incluir ${id}`).props.onChange(); await view.settle();
+ }
  assert.deepEqual(plannedIds(view),["CT002","CT001"]);
+ assert.ok(card("CT001").props.className.includes("selected"));
+ assert.ok(card("CT002").props.className.includes("selected"));
+ button("CT002").props.onClick(); await view.settle();
+ assert.deepEqual(plannedIds(view),["CT002","CT001"]);
+ view.find(n=>n.props["aria-label"]==="Incluir CT002").props.onChange(); await view.settle();
+ assert.deepEqual(plannedIds(view),["CT001"]);
+ assert.ok(!card("CT002").props.className.includes("selected"));
+});
+
+test("bulk selection marks displayed cards in their order and clears without changing the catalog", async t => {
+ const suite = suiteFixture();
+ suite.cases.push(...["CT002", "CT003"].map(id => ({...suite.cases[0], id, title:id})));
+ const view = await workspace(t, suite, undefined, {initialTab:"planner"});
+ const ids = () => view.all().filter(node => node.props["data-selector-case"]).map(node => node.props["data-selector-case"]);
+ assert.equal(view.button("Limpar").props.disabled, true);
+ await view.click("Marcar todos");
+ assert.deepEqual(plannedIds(view), ["CT001", "CT002", "CT003"]);
+ assert.equal(view.button("Marcar todos").props.disabled, true);
+ await view.click("Limpar");
+ assert.deepEqual(plannedIds(view), []);
+ assert.deepEqual(ids(), ["CT001", "CT002", "CT003"]);
+ view.find(node => node.props["aria-label"] === "Buscar CTs").props.onChange({target:{value:"CT002"}}); await view.settle();
+ await view.click("Marcar todos");
+ assert.deepEqual(plannedIds(view), ["CT002"]);
+ view.find(node => node.props["aria-label"] === "Buscar CTs").props.onChange({target:{value:""}}); await view.settle();
+ await view.click("Marcar todos");
+ assert.deepEqual(plannedIds(view), ["CT002", "CT001", "CT003"]);
+ await view.click("Limpar");
+ assert.deepEqual(plannedIds(view), []);
+ assert.equal(view.calls.some(call => call.method !== "GET"), false);
 });
 
 test("checking and unchecking cases preserves their catalog positions", async t => {

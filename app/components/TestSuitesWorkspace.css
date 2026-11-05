@@ -126,6 +126,8 @@
 .suite-workspace .suite-selector { padding: 14px 10px; }
 .suite-selector .suite-catalog-filters { grid-template-columns: minmax(0, 1fr); gap: 8px; padding: 0 4px; }
 .suite-selector .text-button { margin: 0 4px 8px; font-size: 11px; }
+.suite-selector-bulk { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 5px 8px 9px; }
+.suite-selector-bulk .text-button { font-size: 11px; }
 .suite-available-list { display: grid; max-height: 650px; overflow: auto; scrollbar-width: thin; }
 .suite-available-list > div { display: flex; align-items: center; gap: 9px; padding: 11px 8px; border-radius: 8px; }
 .suite-available-list > div.selected { background: #f2c45b0a; }
