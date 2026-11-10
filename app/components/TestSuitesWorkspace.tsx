@@ -10,6 +10,7 @@ import { caseAdditionReply, directCaseAddition } from "./suite-planning-chat";
 import { nearestStepDrop, plannedSteps, placePlannedStep, type PlannedIntegration, type PlannedStep, type StepKind, type StepDropPosition } from "./suite-capture-plan";
 import { bindHorizontalRail, bindHorizontalRailPan, moveRailItem, placeRailItem } from "./suite-horizontal-rail";
 import { suiteExecutionHistory } from "./suite-execution-history";
+import { downloadExecutionReport, executionReportPath, exportProgressLabel, reportExportUnavailable, type ExportProgress, type PreparationProgress } from "./suite-report-export";
 import FunctionalFlows from "./FunctionalFlows";
 import { caseFlowLabel, flowMemberships, matchesFunctionalFlow, type FlowClassification, type FunctionalFlow } from "./functional-flows";
 import "./TestSuitesWorkspace.css";
@@ -60,6 +61,54 @@ export default function TestSuitesWorkspace(props: Props) {
   const [saved, setSaved] = useState<Round | null>(null), [dirty, setDirty] = useState(!!props.initialCaseId), [validation, setValidation] = useState<Validation | null>(null);
   const [roundCredentials, setRoundCredentials] = useState<Record<string, string>>({});
   const [authenticationOpen, setAuthenticationOpen] = useState(false);
+  const [exportGroup, setExportGroup] = useState<Group | null>(null);
+  const [exportSelection, setExportSelection] = useState("");
+  const [exportBusy, setExportBusy] = useState(false), [exportError, setExportError] = useState("");
+  const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null);
+  const exportController = useRef<AbortController | null>(null);
+  const closeExport = () => { exportController.current?.abort(); setExportGroup(null); };
+  useEffect(() => () => { exportController.current?.abort(); exportController.current = null; }, []);
+  useEffect(() => () => { exportController.current?.abort(); }, [rootId]);
+  const exportDialog = useRef<HTMLDialogElement>(null);
+  const exportTrigger = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    if (!exportGroup) return;
+    const dialog = exportDialog.current;
+    if (!dialog?.open) dialog?.showModal();
+    return () => { dialog?.close(); exportTrigger.current?.focus(); };
+  }, [exportGroup]);
+  const exportEntries = exportGroup ? suiteExecutionHistory(exportGroup).filter(item => item.status !== "draft") : [];
+  const selectedExport = exportEntries.find(item => `${item.kind}:${item.id}` === exportSelection);
+  const exportSelected = async () => {
+    if (!exportGroup || !selectedExport || reportExportUnavailable(selectedExport) || exportController.current) return;
+    const controller = new AbortController();
+    exportController.current = controller;
+    setExportBusy(true); setExportError(""); setExportProgress(null);
+    try {
+      const exportId = crypto.randomUUID();
+      const selectedPath = executionReportPath(exportGroup.id, selectedExport);
+      const path = `${selectedPath}${selectedPath.includes("?") ? "&" : "?"}export_id=${exportId}`;
+      const progressPath = `/test-suites/report-exports/${exportId}`;
+      await downloadExecutionReport(signal => request<Response>(path, { raw: true, signal }), `${props.apiBase || "/api"}${path}`, `autojev-${selectedExport.kind}-${encode(selectedExport.id)}.html`, {
+        signal: controller.signal,
+        readPreparation: signal => request<PreparationProgress>(progressPath, { signal }),
+        cancelPreparation: () => request(progressPath, { method: "DELETE" }),
+        onProgress: progress => { if (exportController.current === controller && !controller.signal.aborted) setExportProgress(progress); },
+      });
+    } catch (caught) {
+      if (exportController.current === controller && !controller.signal.aborted) setExportError(caught instanceof Error ? caught.message : "Não foi possível exportar o relatório.");
+    } finally {
+      if (exportController.current === controller) { exportController.current = null; setExportBusy(false); }
+    }
+  };
+  const importFile = useRef<HTMLInputElement>(null);
+  const [importNotice, setImportNotice] = useState("");
+  const importReport = (file: File) => perform(async () => {
+    const result = await request<{ id: string; message: string }>("/test-suites/import", { method: "POST", headers: { "Content-Type": "text/html; charset=utf-8" }, body: file });
+    setQuery(""); setFilter("all"); setBasePage(1); setExpanded(result.id);
+    setImportNotice(result.message);
+    await refresh();
+  });
   const [reviewExcluded, setReviewExcluded] = useState<string[]>([]);
   const [unavailableOpen, setUnavailableOpen] = useState(false);
   const [reviewHighlight, setReviewHighlight] = useState(0);
@@ -579,12 +628,35 @@ export default function TestSuitesWorkspace(props: Props) {
   if (!rootId) {
     const firstIndex = (currentBasePage - 1) * basePageSize;
     const changePage = (page: number) => { setBasePage(page); setExpanded(null); };
-    return <div className="view-stack suite-workspace suite-home"><header className="suite-page-heading"><div><h1>Meus testes</h1><p>Explore uma vez. Depois, ajuste sua base de testes e execute o que precisar.</p></div><button className="button primary" onClick={() => navigate("#/nova-exploracao")}><Plus size={18} />Nova exploração</button></header>
+    return <div className="view-stack suite-workspace suite-home"><header className="suite-page-heading"><div><h1>Meus testes</h1><p>Explore uma vez. Depois, ajuste sua base de testes e execute o que precisar.</p></div><div className="suite-heading-actions"><button type="button" className="button secondary" disabled={busy} onClick={() => importFile.current?.click()}><FilePlus2 size={16} />Importar relatório HTML</button><button className="button primary" onClick={() => navigate("#/nova-exploracao")}><Plus size={18} />Nova exploração</button></div></header>
+      {exportGroup && <dialog ref={exportDialog} className="suite-unavailable-dialog suite-export-dialog" aria-labelledby="suite-export-title" aria-describedby="suite-export-description" onKeyDown={event => { if (event.key === "Escape") { event.preventDefault(); closeExport(); } }} onCancel={event => { event.preventDefault(); closeExport(); }} onClose={closeExport}>
+        <header className="suite-export-heading"><span className="suite-app-icon"><Download size={22} /></span><div><h2 id="suite-export-title">Exportar relatório</h2><span>{host(exportGroup.app_url)} · {date(exportGroup.created_at)}</span></div></header>
+        <p id="suite-export-description">Escolha uma execução desta base. O download contém somente o relatório HTML selecionado, com suas evidências e metadados portáteis.</p>
+        <fieldset disabled={exportBusy}><legend>Execuções desta base</legend><div className="suite-export-list">{exportEntries.map(item => {
+          const key = `${item.kind}:${item.id}`, reason = reportExportUnavailable(item);
+          return <label key={key} className="suite-export-option" data-unavailable={!!reason}>
+            <input type="radio" name="suite-report-execution" value={key} checked={exportSelection === key} disabled={!!reason} aria-describedby={reason ? `export-reason-${key}` : undefined} onChange={() => { if (!exportController.current) { setExportSelection(key); setExportProgress(null); setExportError(""); } }} />
+            <span><strong>{item.status === "draft" ? `Rascunho: ${item.title}` : item.title}</strong><span>{date(item.created_at)} · {item.count} testes</span>{reason && <small id={`export-reason-${key}`}>{reason}</small>}</span><Status value={item.status} />
+          </label>;
+        })}</div></fieldset>
+        {exportProgress && <section className="suite-export-progress" aria-label="Progresso da exportação">
+          <p role="status">{exportProgressLabel(exportProgress)}</p>
+          <div className="suite-export-bar">
+            <progress aria-label="Progresso do relatório" max={100} value={exportProgress.percent} />
+            {exportProgress.percent !== undefined && <span>{Math.floor(exportProgress.percent)}%</span>}
+          </div>
+        </section>}
+        {exportError && <p className="suite-error" role="alert">{exportError}</p>}
+        <footer className="suite-heading-actions"><button type="button" className="button secondary" onClick={closeExport}>{exportBusy ? "Cancelar exportação" : "Fechar"}</button><button type="button" className="button primary" disabled={exportBusy || !selectedExport || !!reportExportUnavailable(selectedExport)} onClick={() => void exportSelected()}>{exportBusy ? <LoaderCircle size={16} className="spin" /> : <Download size={16} />}{exportBusy ? "Exportando…" : "Baixar HTML"}</button></footer>
+      </dialog>}
+      <input ref={importFile} type="file" accept=".html,.htm,text/html" hidden aria-label="Relatório HTML AutoJev" onChange={event => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void importReport(file); }} />
+      <p className="suite-muted">Importe o relatório HTML baixado pelo AutoJev, sem limite de tamanho do arquivo imposto pelo importador. HTML antigo sem metadados não é importável. Somente receitas e evidências textuais portáteis são importadas, sem imagens ou arquivos locais. Revise dados e URLs antes de compartilhar; credenciais devem ser informadas novamente ao executar.</p>
+      {importNotice && <p className="suite-notice" role="status">{importNotice}</p>}
       {error && <p className="suite-error" role="alert">{error}</p>}
       <div className="suite-toolbar"><label className="suite-search"><Search size={17} /><input aria-label="Buscar bases de testes" placeholder="Buscar aplicação ou identificação…" value={query} onChange={event => { setQuery(event.target.value); changePage(1); }} /></label><div className="suite-tabs"><button aria-pressed={filter === "all"} onClick={() => { setFilter("all"); changePage(1); }}>Todos</button><button aria-pressed={filter === "live"} onClick={() => { setFilter("live"); changePage(1); }}>Em andamento</button></div><span className="suite-list-count" role="status">{filteredGroups.length} {filteredGroups.length === 1 ? "base" : "bases de testes"}</span><button className="button ghost" disabled={busy} onClick={() => void perform(refresh)}><RefreshCcw size={16} />Atualizar</button></div>
       {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- Named list with independent keyboard scrolling. */}
       <div id="suite-group-list" ref={baseList} className="suite-group-list" role="region" aria-label="Aplicações testadas, mais recentes primeiro" tabIndex={0}>{filteredGroups.slice(firstIndex, firstIndex + basePageSize).map(group => <section className="suite-group panel" key={group.id}>
-        <div className="suite-group-main"><button type="button" className="suite-expand" aria-label={`Mostrar execuções de ${host(group.app_url)} iniciadas em ${date(group.created_at)}`} aria-expanded={expanded === group.id} onClick={() => setExpanded(expanded === group.id ? null : group.id)}>{expanded === group.id ? <ChevronDown /> : <ChevronRight />}</button><span className="suite-app-icon"><Layers3 size={19} /></span><div className="suite-group-name"><button type="button" className="suite-group-title" title={`Grupo ${group.id}`} aria-label={`Abrir exploração de ${host(group.app_url)}, criada em ${date(group.created_at)}`} onClick={() => navigate(`#/exploracoes/${encode(group.id)}`)}>{host(group.app_url)}</button><span>Criado em {date(group.created_at)}{group.active_count > 0 && " · Em andamento"}</span></div><div className="suite-group-stat"><strong>{group.case_count}</strong><span>testes</span></div><div className="suite-group-stat"><strong>{1 + group.legacy_runs.length + group.rounds.filter(item => item.status !== "draft").length}</strong><span>execuções</span></div><div className="suite-group-activity"><span>Última atividade</span><time dateTime={group.latest_activity}>{date(group.latest_activity)}</time></div><button type="button" className="button secondary suite-group-open" aria-label={`Ver testes de ${host(group.app_url)}, criado em ${date(group.created_at)}`} title="Abre os testes desta base em uma nova aba" disabled={busy} onClick={() => void perform(() => openReport(group.id, "consolidated", undefined, undefined, "tests"))}>Ver testes<ArrowRight size={16} /></button></div>
+        <div className="suite-group-main"><button type="button" className="suite-expand" aria-label={`Mostrar execuções de ${host(group.app_url)} iniciadas em ${date(group.created_at)}`} aria-expanded={expanded === group.id} onClick={() => setExpanded(expanded === group.id ? null : group.id)}>{expanded === group.id ? <ChevronDown /> : <ChevronRight />}</button><span className="suite-app-icon"><Layers3 size={19} /></span><div className="suite-group-name"><button type="button" className="suite-group-title" title={`Grupo ${group.id}`} aria-label={`Abrir exploração de ${host(group.app_url)}, criada em ${date(group.created_at)}`} onClick={() => navigate(`#/exploracoes/${encode(group.id)}`)}>{host(group.app_url)}</button><span>Criado em {date(group.created_at)}{group.active_count > 0 && " · Em andamento"}</span></div><div className="suite-group-stat"><strong>{group.case_count}</strong><span>testes</span></div><div className="suite-group-stat"><strong>{1 + group.legacy_runs.length + group.rounds.filter(item => item.status !== "draft").length}</strong><span>execuções</span></div><div className="suite-group-activity"><span>Última atividade</span><time dateTime={group.latest_activity}>{date(group.latest_activity)}</time></div><button type="button" className="button secondary suite-group-export" aria-label={`Exportar relatório de ${host(group.app_url)}, criado em ${date(group.created_at)}`} onClick={event => { exportTrigger.current = event.currentTarget; setExportProgress(null); setExportError(""); setExportGroup(group); setExportSelection(""); }}><Download size={16} />Exportar relatório</button><button type="button" className="button secondary suite-group-open" aria-label={`Ver testes de ${host(group.app_url)}, criado em ${date(group.created_at)}`} title="Abre os testes desta base em uma nova aba" disabled={busy} onClick={() => void perform(() => openReport(group.id, "consolidated", undefined, undefined, "tests"))}>Ver testes<ArrowRight size={16} /></button></div>
         {expanded === group.id && <div className="suite-child-list">{suiteExecutionHistory(group).map(item => <button key={`${item.kind}:${item.id}`} data-history-id={item.id} data-history-kind={item.kind} onClick={() => navigate(item.href)}>
           {item.kind === "initial" ? <Globe2 size={16} /> : item.kind === "round" ? <ClipboardList size={16} /> : <RefreshCcw size={16} />}
           <strong>{item.status === "draft" ? `Rascunho: ${item.title}` : item.title}</strong><span>{item.count} testes · {date(item.created_at)}</span><Status value={item.status} />
@@ -888,7 +960,7 @@ export default function TestSuitesWorkspace(props: Props) {
         </div>
         </>}
         {unavailableOpen && <dialog className="suite-unavailable-dialog" ref={node => { if (node && !node.open) node.showModal(); }} aria-labelledby="suite-unavailable-title" onCancel={() => setUnavailableOpen(false)}><h2 id="suite-unavailable-title">Testes indisponíveis</h2><p>Os testes indisponíveis precisam ser desmarcados antes de executar. Nenhum teste será iniciado até sua confirmação.</p><ul>{validation?.items.filter(item => !item.available).map(item => <li key={item.case_id}><label className="suite-unavailable-check"><input type="checkbox" aria-label={`Incluir indisponível ${item.case_id}`} checked={!reviewExcluded.includes(item.case_id)} disabled={busy} onChange={() => setReviewExcluded(current => current.includes(item.case_id) ? current.filter(id => id !== item.case_id) : [...current, item.case_id])} /><span>{item.case_id}: {item.reason || "Indisponível"}</span></label></li>)}</ul><div className="suite-heading-actions"><button type="button" className="button secondary" disabled={busy || !reviewUnavailable.length} onClick={() => setReviewExcluded(current => [...new Set([...current, ...reviewUnavailable.map(item => item.case_id)])])}>Desmarcar indisponíveis</button><button type="button" className="button ghost" disabled={busy} onClick={() => setUnavailableOpen(false)}>Cancelar</button><button type="button" className="button primary" disabled={busy || !!reviewUnavailable.length || !reviewSelected.length || reviewChecking} onClick={() => void perform(() => startReviewedRound())}>Executar</button></div>{!reviewSelected.length && <p role="status">Nenhum teste disponível selecionado.</p>}</dialog>}
-        {authenticationOpen && <dialog ref={node => { if (node && !node.open) node.showModal(); }} aria-labelledby="suite-authentication-title" onCancel={() => { setAuthenticationOpen(false); setRoundCredentials({}); }}><form onSubmit={event => { event.preventDefault(); void perform(() => startReviewedRound(true)); }}><h2 id="suite-authentication-title">Autenticação necessária</h2><p>Estes testes precisam de dados privados para entrar no site. O cofre desta execução está vazio. Os valores serão usados somente nesta rodada, sem salvar no roteiro ou histórico.</p>{requiredRoundInputs.map((key, index) => <label key={key} htmlFor={`suite-private-${index}`}>{key}<input id={`suite-private-${index}`} type="password" autoComplete="off" required maxLength={8000} disabled={busy} value={roundCredentials[key] || ""} onChange={event => setRoundCredentials(current => ({ ...current, [key]: event.target.value }))} /></label>)}<button type="button" className="button ghost" disabled={busy} onClick={() => { setAuthenticationOpen(false); setRoundCredentials({}); }}>Cancelar</button><button type="submit" className="button primary" disabled={busy || missingRoundInputs}>Autenticar e executar</button></form></dialog>}
+        {authenticationOpen && <dialog className="suite-unavailable-dialog suite-authentication-dialog" ref={node => { if (node && !node.open) node.showModal(); }} aria-labelledby="suite-authentication-title" onCancel={() => { setAuthenticationOpen(false); setRoundCredentials({}); }}><form onSubmit={event => { event.preventDefault(); void perform(() => startReviewedRound(true)); }}><h2 id="suite-authentication-title">Autenticação necessária</h2><p>Estes testes precisam de dados privados para entrar no site. O cofre desta execução está vazio. Os valores serão usados somente nesta rodada, sem salvar no roteiro ou histórico.</p>{requiredRoundInputs.map((key, index) => <label key={key} htmlFor={`suite-private-${index}`}>{key}<input id={`suite-private-${index}`} type="password" autoComplete="off" required maxLength={8000} disabled={busy} value={roundCredentials[key] || ""} onChange={event => setRoundCredentials(current => ({ ...current, [key]: event.target.value }))} /></label>)}<div className="suite-heading-actions"><button type="button" className="button ghost" disabled={busy} onClick={() => { setAuthenticationOpen(false); setRoundCredentials({}); }}>Cancelar</button><button type="submit" className="button primary" disabled={busy || missingRoundInputs}>Autenticar e executar</button></div></form></dialog>}
         {validation && <section id="suite-plan-review" ref={reviewPanel} tabIndex={-1} aria-label="Revisão antes de executar" className="panel suite-review"><div className="suite-review-scope"><label className="suite-review-check"><input type="checkbox" aria-label="Selecionar todos os testes da revisão" checked={!!validation.items.length && !reviewExcluded.length} disabled={busy || reviewChecking} ref={node => { if (node) node.indeterminate = reviewSelected.length > 0 && reviewSelected.length < validation.items.length; }} onChange={() => setReviewExcluded(reviewExcluded.length ? [] : validation.items.map(item => item.case_id))} />Marcar todos</label><p>Somente os testes marcados serão executados. Os demais resultados não mudam.</p><details><summary>Cuidados da execução</summary>{validation.effects.map(effect => <p key={effect}>{effect}</p>)}</details></div><div className="suite-review-list" role="list" aria-label="Testes que serão executados">{validation.items.map(item => <div className="suite-review-case" role="listitem" key={item.case_id}><input type="checkbox" aria-label={`Executar ${item.case_id}`} checked={!reviewExcluded.includes(item.case_id)} disabled={busy || reviewChecking} onChange={() => setReviewExcluded(current => current.includes(item.case_id) ? current.filter(id => id !== item.case_id) : [...current, item.case_id])} /><strong>{item.case_id}</strong><span className="suite-review-identity" title={suite.cases.find(value => value.id === item.case_id)?.title}>{suite.cases.find(value => value.id === item.case_id)?.title || item.case_id}{!item.available && item.code !== "checking" && <small>{item.reason || "Indisponível"}</small>}</span><span className="suite-review-availability">{item.available ? <><Check size={14} /><small>{item.code === "manual" ? "Manual" : "Pronto"}</small></> : item.code === "checking" ? <><LoaderCircle className="spin" size={14} /><small>Conferindo roteiro…</small></> : <small>Indisponível</small>}</span></div>)}</div></section>}
       </div>
 

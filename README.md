@@ -201,3 +201,45 @@ no multi-user authentication and intentionally allows localhost/private target
 URLs so it can test development applications. Put the API behind an
 authenticated gateway and an isolated browser worker before a shared
 deployment.
+
+### Compartilhar relatórios entre instalações
+
+Use **Baixar relatório** no relatório existente e envie somente esse HTML.
+Em **Meus testes**, use **Exportar relatório** na linha da base e selecione uma execução encerrada (inicial, rodada ou vinculada). **Baixar HTML** exporta somente essa execução, não o consolidado, preservando evidências e metadados portáteis. Rascunhos não aparecem na seleção; execuções em andamento ou sem testes ficam indisponíveis. Exportar não executa CTs. Em navegadores com `showSaveFilePicker`, a escolha do arquivo abre no clique, antes de solicitar o relatório; depois, a resposta é gravada em fluxo, sem acumular todo o HTML na memória do navegador. Cancelar essa escolha não solicita relatório. Nos demais navegadores, o download usa o anexo nativo: a pasta e a exibição do diálogo dependem das configurações do navegador. O modal mostra apenas etapa e uma barra: inicialmente indeterminada, depois baseada nos CTs realmente renderizados (incluindo suas imagens), consultados por identificador efêmero da exportação selecionada. Preparação ocupa 0–90%, bytes recebidos 90–99% e somente o fechamento confirmado do arquivo chega a 100%. Esses pesos são fases, não previsão de duração. Cache válido pula a renderização sem reutilizar telemetria de outra exportação. Cancelar interrompe a transferência e solicita cancelamento cooperativo da preparação; nenhuma geração parcial é publicada no cache. No download nativo, o modal informa apenas a entrega ao navegador, sem alegar gravação concluída.
+
+Na outra instalação, em **Meus testes**, use **Importar relatório HTML**.
+Não há arquivo JSON separado nem botão de exportação por base.
+A importação grava uma nova base SQLite de forma atômica, com identificação e
+horário locais, no topo da lista. Não inicia navegador nem executa testes.
+Abra a base, selecione os CTs, valide a preparação e confirme uma nova execução.
+Receitas determinísticas e jornadas completas são preservadas quando disponíveis;
+a validação de estado continua obrigatória a cada passo. Credenciais precisam ser
+informadas novamente na instalação de destino; provedores e configurações não
+são importados.
+
+Um bloco não executável de metadados `autojev-report` v1 embutido no HTML
+(com caracteres de fechamento de script escapados) transporta definições, resultados,
+conferências e evidências **textuais**; não transporta imagens, arquivos locais,
+cookies ou cofre de credenciais. O navegador envia o arquivo diretamente, sem
+convertê-lo inteiro em texto ou JSON. O backend decodifica UTF-8 incrementalmente,
+descarta apresentação e imagens e retém apenas o bloco inerte de metadados;
+nunca executa, renderiza ou segue referências do HTML recebido. Não há teto de
+bytes para o HTML ou seus metadados na importação/exportação. Continuam valendo
+os limites de complexidade: 500 CTs, listas/profundidade/textos limitados,
+marcação com até 16 KiB por tag após compactação dos valores longos de atributos,
+URLs HTTP(S) sem credenciais (URLs principais
+sem query/fragmento). Campos desconhecidos e receitas inválidas são rejeitados,
+sem salvar parte da base. Limites físicos de memória (metadados), CPU, disco e
+configurações de proxy/servidor ainda se aplicam; não há promessa de recursos
+ilimitados. Revise textos livres antes de compartilhar: filtros de
+estrutura não conseguem identificar todo dado privado escrito em prosa.
+
+**HTML antigo não é importável**: o relatório de apresentação remove receitas
+privadas intencionalmente. Não é possível reconstruir ações executáveis a partir
+dele. Baixe novamente o HTML na instalação original atualizada. Um HTML novo pode
+conter testes históricos sem receita; eles continuam visíveis, mas indisponíveis
+para reexecução automática até uma nova exploração/gravação apropriada.
+
+Relatórios vazios ou com dados fora do esquema seguro continuam disponíveis para
+leitura, mas exibem aviso de que não podem ser importados; não recebem metadados
+parciais. A prévia online continua leve e baixa o HTML completo pelo botão existente.

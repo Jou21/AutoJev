@@ -85,6 +85,10 @@ class TestSuiteService:
         self.tasks: dict[str, asyncio.Task] = {}
         self.signals: dict[str, asyncio.Event] = {}
         self.report_gate = Lock()
+        from autojev.services.report_cache import ReportCache
+        self.report_cache = ReportCache()
+        from autojev.services.report_progress import ReportProgress
+        self.report_progress = ReportProgress()
         # Startup reconciliation never submits/repeats browser work.
         for plan in self.store.list():
             if plan["status"] in ACTIVE:
@@ -106,8 +110,15 @@ class TestSuiteService:
         original = scenario_report_origin(self.repository, identity)["report_exploration_id"]
         return (self.store.session(original) or {}).get("root_id", original)
 
-    def render_report(self, snapshot, path, artifact_dir, image_url=None):
+    def render_report(self, snapshot, path, artifact_dir, image_url=None, progress=None):
         from autojev.adapters.report import StandaloneHtmlReport
+        from autojev.services.portable_reports import export_package
+        if image_url is None:
+            try:
+                snapshot = {**snapshot, "portable_report": export_package(self, snapshot)}
+            except (ValueError, TypeError, KeyError):
+                # Historical/unsafe data must not break presentation or leak into metadata.
+                snapshot = {**snapshot, "portable_unavailable": True}
         # Real reports can embed hundreds of megabytes of evidence. Serialize
         # encoding, not browsing or streaming, so repeated downloads stay bounded.
         if image_url is not None:
@@ -115,8 +126,12 @@ class TestSuiteService:
             # nor reads/encodes its screenshots. Evidence is fetched on demand.
             StandaloneHtmlReport(artifact_dir, image_url=image_url).generate(snapshot, str(path))
         else:
+            if progress:
+                progress.update("queued")
             with self.report_gate:
-                StandaloneHtmlReport(artifact_dir).generate(snapshot, str(path))
+                if progress:
+                    progress.update("preparing")
+                self.report_cache.render(StandaloneHtmlReport(artifact_dir, progress=progress), snapshot, path, artifact_dir, progress=progress)
 
     def groups(self):
         # Preload every lookup once: resolving roots/cases/states per run and
@@ -521,6 +536,21 @@ class TestSuiteService:
                 raise NotFoundError("CT não encontrado neste conjunto ou nesta rodada.")
         if (case_id or focus_case_id) is not None:
             snapshot["suite_context"]["focused_case_id"] = case_id or focus_case_id
+        sources = {}
+        if context == "round":
+            for item in plan["items"]:
+                owner = item.get("execution_id") or item.get("source_exploration_id")
+                outcomes = self.repository.get_exploration(owner)["scenarios"] if item.get("execution_id") else []
+                if item.get("execution_id") and len(outcomes) != 1:
+                    owner, source_case = None, None
+                else:
+                    source_case = outcomes[0]["id"] if outcomes else item.get("source_scenario_id")
+                sources[item["case_id"]] = (owner, source_case)
+        else:
+            for case in self.store.cases(root):
+                if case["mode"] == "manual":
+                    sources[case["id"]] = (None, None)
+        snapshot["_portable_sources"] = sources
         # Scope-specific exports must not be replaced by the legacy freshness
         # endpoint's differently scoped report when the app regains focus.
         snapshot.pop("scenario_revisions_key", None)

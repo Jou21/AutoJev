@@ -75,11 +75,13 @@ class StandaloneHtmlReport:
         re.IGNORECASE,
     )
 
-    def __init__(self, artifact_root: Path, *, image_url: Callable[[str, str], str] | None = None) -> None:
+    def __init__(self, artifact_root: Path, *, image_url: Callable[[str, str], str] | None = None, progress=None) -> None:
+        self.progress = progress
         self.artifact_root = artifact_root.resolve()
         self.image_url = image_url
         self.online_image_sizes: dict[str, int] = {}
         self._capture_files: dict[tuple[str, str], Path | None] = {}
+        self.capture_dependencies: dict[Path, tuple | None] = {}
 
     def _capture_file(self, exploration_id: str, filename: str) -> Path | None:
         """The resolved capture if it is a file inside that run's screenshots dir.
@@ -93,6 +95,10 @@ class StandaloneHtmlReport:
         if key not in self._capture_files:
             allowed = (self.artifact_root / exploration_id / "screenshots").resolve()
             candidate = (self.artifact_root / exploration_id / "screenshots" / filename).resolve()
+            if allowed in candidate.parents:
+                from autojev.services.report_cache import ReportCache
+                source = self.artifact_root / exploration_id / "screenshots" / filename
+                self.capture_dependencies[source] = ReportCache.signature(source)
             self._capture_files[key] = candidate if allowed in candidate.parents and candidate.is_file() else None
         return self._capture_files[key]
 
@@ -100,6 +106,8 @@ class StandaloneHtmlReport:
         return self._capture_file(exploration_id, Path(relative_path).name)
 
     def _image_data(self, exploration_id: str, relative_path: str) -> str | None:
+        if self.progress:
+            self.progress.check()
         candidate = self._image_path(exploration_id, relative_path)
         if candidate is None:
             return None
@@ -1772,6 +1780,7 @@ class StandaloneHtmlReport:
 
     def generate(self, exploration: dict[str, Any], output_path: str) -> str:
         self._capture_files = {}
+        self.capture_dependencies = {}
         exploration = without_rerun_recipes(exploration)
         exploration = localize_report_presentation(prepare_scenario_timelines(exploration))
         exploration_id = str(exploration["id"])
@@ -1934,7 +1943,15 @@ class StandaloneHtmlReport:
         tokens, _ = self._usage(exploration)
         cost_summary = self._cost_summary(exploration)
         completion_status, completion_reason = self._completion(exploration)
-        cards = [self._scenario_card(exploration_id, scenario) for scenario in scenarios]
+        cards = []
+        for index, scenario in enumerate(scenarios):
+            if self.progress:
+                self.progress.update("rendering", index, len(scenarios))
+            cards.append(self._scenario_card(exploration_id, scenario))
+            if self.progress:
+                self.progress.update("rendering", index + 1, len(scenarios))
+        if self.progress:
+            self.progress.update("assembling", len(scenarios), len(scenarios))
         execution_observations = self._execution_observations(
             exploration_id, contexts,
         )
@@ -1964,6 +1981,13 @@ class StandaloneHtmlReport:
             "observations": execution_observations,
             "case_cards": cards,
         })
+        if exploration.get("portable_report") is not None:
+            from autojev.services.portable_reports import embedded
+            document = document.replace("</body>", embedded(exploration["portable_report"]) + "</body>")
+        if exploration.get("portable_unavailable"):
+            document = document.replace("</body>", '<p role="note">Este HTML é apenas apresentação: os dados não atendem aos limites de portabilidade e não podem ser importados.</p></body>')
+        if exploration.get("portable_report") is not None or exploration.get("portable_unavailable"):
+            document = document.replace("<head>", '<head><!-- autojev-portable-v1 -->')
         output = Path(output_path)
         output.parent.mkdir(parents=True, exist_ok=True)
         # Exact bytes: write_text() would turn every LF into CRLF on Windows, so

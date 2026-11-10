@@ -14,9 +14,9 @@ async function compiled(path) {
 }
 const source = await compiled("../app/components/TestSuitesWorkspace.tsx");
 const dependencies = {};
-for (const name of ["suite-planning-chat", "suite-capture-plan", "suite-execution-history", "suite-horizontal-rail", "suite-step-evidence", "functional-flows"]) {
+for (const name of ["suite-planning-chat", "suite-capture-plan", "suite-execution-history", "suite-report-export", "suite-horizontal-rail", "suite-step-evidence", "functional-flows"]) {
   const compiledModule = { exports: {} };
-  new Function("module", "exports", await compiled(`../app/components/${name}.ts`))(compiledModule, compiledModule.exports);
+  new Function("require", "module", "exports", await compiled(`../app/components/${name}.ts`))(name => dependencies[name] || nativeRequire(name), compiledModule, compiledModule.exports);
   dependencies[`./${name}`] = compiledModule.exports;
 }
 const flowUiModule = { exports: {} };
@@ -47,7 +47,7 @@ function* elements(node) {
 }
 
 async function workspace(t, providedSuite, onReport, initialProps = {}) {
-  const slots = [], effects = [], calls = [], focus = [], scroll = [];
+  const slots = [], effects = [], calls = [], focus = [], scroll = [], downloads = [];
   const domRefs = new Set();
   const listeners = new Map();
   const intervals = new Map(); let intervalId = 0;
@@ -84,14 +84,21 @@ async function workspace(t, providedSuite, onReport, initialProps = {}) {
   function ImagePreviewFixture() {}
   let savedPlan;
   const compiledModule = { exports: {} };
-  new Function("require", "module", "exports", "window", source)(name => name === "react" ? hooks
+  new Function("require", "module", "exports", "window", source)(name => name === "./suite-report-export" ? { ...dependencies[name], downloadExecutionReport: async (load, _url, filename, options) => {
+      options.onProgress({ stage: "preparing", elapsedMs: 0, bytes: 0 });
+      const response = await load(options.signal);
+      if (!response.ok || !response.headers.get("content-type")?.includes("text/html")) throw new Error("O relatório HTML não está disponível. Tente novamente mais tarde.");
+      downloads.push({ html: await response.text(), filename });
+      options.onProgress({ stage: "complete", elapsedMs: 100, bytes: 10 }); return true;
+    } } : name === "react" ? hooks
     : name === "./PlanningChat" ? { __esModule: true, default: ChatFixture }
       : name === "./StepEvidencePreview" ? { __esModule: true, default: ImagePreviewFixture }
       : name.endsWith(".css") ? {} : dependencies[name] || nativeRequire(name), compiledModule, compiledModule.exports,
   browser);
   const request = async (path, options = {}) => {
-    calls.push({ path, method: options.method || "GET", body: options.body && JSON.parse(options.body) });
+    calls.push({ path, method: options.method || "GET", body: options.body && (path === "/test-suites/import" ? options.body : JSON.parse(options.body)) });
     if (options.method && initialProps.rejectWrite?.(path, options)) throw new Error("O CT foi alterado em outra tela. Atualize sua versão.");
+    if (options.raw && initialProps.exportResponse) return initialProps.exportResponse(options);
     if (path === "/test-suites/root-fixture" && !options.method) return structuredClone(suite);
     if (path === "/test-suites/old-run/case-context/CT009" && !options.method && initialProps.caseContext) return structuredClone(initialProps.caseContext);
     if (path.startsWith("/test-suites/root-fixture/cases/") && path.endsWith("/catalog-state") && options.method === "PATCH") {
@@ -101,6 +108,10 @@ async function workspace(t, providedSuite, onReport, initialProps = {}) {
       assert.equal(body.expected_revision, item.catalog_revision || 0);
       item.archived = body.archived; item.catalog_revision = (item.catalog_revision || 0) + 1;
       return { id: item.id, archived: item.archived, catalog_revision: item.catalog_revision };
+    }
+    if (path === "/test-suites/import" && options.method === "POST") {
+      if (initialProps.importError) throw new Error(initialProps.importError);
+      return { id: suite.id, message: "Base importada para revisão." };
     }
     if (path === "/test-suites" && !options.method) return structuredClone(initialProps.groupsReply || [{ ...suite, created_at: suite.created_at || "2026-10-14T16:22:00Z", initial_status: "completed", legacy_runs: suite.legacy_runs || [] }]);
     if (path.startsWith("/test-suites/rounds/") && !options.method) {
@@ -153,7 +164,7 @@ async function workspace(t, providedSuite, onReport, initialProps = {}) {
     assert.fail("Unexpected request: " + path);
   };
   const props = { rootId: suite.id, apiBase: "http://api.fixture.invalid/api", request, navigate() { assert.fail("No navigation expected"); }, openReport: onReport || (() => { assert.fail("No export expected"); }), ...initialProps };
-  const fakeTarget = name => ({ focus(options) { focus.push({ name, options }); }, scrollIntoView(options) { scroll.push({ name, options }); }, reportValidity() { return true; } });
+  const fakeTarget = name => ({ close() {}, showModal() { focus.push({ name: "export-dialog" }); }, focus(options) { focus.push({ name, options }); }, scrollIntoView(options) { scroll.push({ name, options }); }, reportValidity() { return true; } });
   function render() {
     cursor = 0; dirty = false;
     tree = compiledModule.exports.default(props);
@@ -177,7 +188,7 @@ async function workspace(t, providedSuite, onReport, initialProps = {}) {
   async function change(label, value) { const node = field(label); assert.ok(node); node.props.onChange({ target: { value } }); await settle(); }
   t.after(() => { for (const slot of slots) slot?.cleanup?.(); });
   await settle();
-  return { all, find, button, field, click, change, settle, calls, focus, scroll, chat: () => find(node => node.type === ChatFixture), image: () => find(node => node.type === ImagePreviewFixture),
+  return { all, find, button, field, click, change, settle, calls, focus, scroll, downloads, chat: () => find(node => node.type === ChatFixture), image: () => find(node => node.type === ImagePreviewFixture),
     async tick() { for (const callback of [...intervals.values()]) await callback(); await settle(); },
     async windowEvent(type, event) { for (const callback of listeners.get(type) || []) callback(event); await settle(); },
     async navigate(hash) { const event = { detail: { hash }, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } }; for (const callback of listeners.get("autojev:before-navigate") || []) callback(event); await settle(); return !event.defaultPrevented; },
@@ -216,7 +227,7 @@ test("base cards open the original exploration from the whole card, the base fro
   const view = await workspace(t, suite, async (...args) => { reports.push(args); }, { rootId: undefined, navigate: hash => navigations.push(hash) });
   const card = view.find(node => node.props.className === "suite-group-main");
   const actions = [...elements(card)].filter(node => node.type === "button");
-  assert.equal(actions.length, 3, "Opening the base, opening the original exploration and expanding history are the only focus targets");
+  assert.equal(actions.length, 4, "Base rows expose exploration, history, tests and report export independently");
   const open = actions.find(node => node.props.className.includes("suite-group-open"));
   assert.equal(open.props.type, "button");
   assert.match(open.props["aria-label"], /^Ver testes de fixture\.invalid, criado em /);
@@ -1738,6 +1749,7 @@ test("private round inputs appear only on demand and never enter saved plans", a
   assert.equal(view.button("Executar 1 teste").props.disabled, false);
   await view.click("Executar 1 teste");
   assert.equal(inputs().length, 2);
+  assert.equal(view.find(node => node.type === "dialog" && node.props["aria-labelledby"] === "suite-authentication-title").props.className, "suite-unavailable-dialog suite-authentication-dialog");
   assert.ok(inputs().every(node => node.props.autoComplete === "off" && node.props.required));
   assert.equal(view.button("Autenticar e executar").props.disabled, true);
   inputs()[0].props.onChange({ target: { value: "round-user" } }); await view.settle();
@@ -1767,7 +1779,7 @@ test("private round inputs are discarded on cancel and leaving review", async t 
   assert.equal(input(), undefined);
   await view.click("Executar 1 teste"); assert.equal(input().props.value, "");
   input().props.onChange({ target: { value: "not-retained" } }); await view.settle();
-  view.find(node => node.type === "dialog").props.onCancel(); await view.settle();
+  view.find(node => node.type === "dialog").props.onCancel({ preventDefault() {} }); await view.settle();
   await view.click("Ajustar"); await view.click("Revisar execução"); await view.click("Executar 1 teste");
   assert.equal(input().props.value, "");
   assert.equal(view.calls.some(call => call.path.endsWith("/start")), false);
@@ -1925,4 +1937,123 @@ test("checking and unchecking cases preserves their catalog positions", async t 
  assert.deepEqual(plannedIds(view),["CT003","CT004"]);
  const badges=view.all().filter(n=>n.props.className==="suite-selector-position");
  assert.deepEqual(badges.map(text),["1","2"]);
+});
+
+test("portable import sends HTML without dispatching and refreshes the newest bases", async t => {
+  const ui = await workspace(t, undefined, undefined, { rootId: undefined });
+  const input = ui.find(node => node.type === "input" && node.props.type === "file");
+  assert.equal(input.props.accept, ".html,.htm,text/html");
+  const file = new File(["<html>portable report</html>"], "report.html", { type: "text/html" });
+  file.text = () => { throw new Error("Must send the File directly"); };
+  input.props.onChange({ target: { files: [file], value: "report.html" } });
+  await ui.settle();
+  const imported = ui.calls.find(call => call.path === "/test-suites/import");
+  assert.ok(imported);
+  assert.equal(imported.body, file);
+  assert.ok(ui.all().some(node => node.props.role === "status" && text(node).includes("Base importada")));
+  assert.equal(ui.calls.filter(call => /start|rerun/.test(call.path)).length, 0);
+  assert.equal(ui.all().some(node => text(node) === "Exportar pacote JSON"), false);
+  assert.ok(ui.button("Importar relatório HTML"));
+});
+
+test("portable import accepts large Files and reports backend format errors", async t => {
+  const ui = await workspace(t, undefined, undefined, { rootId: undefined, importError: "HTML antigo é apenas apresentação." });
+  const file = new File([" ".repeat(9 * 1024 * 1024), "<html></html>"], "large.html", { type: "text/html" });
+  file.text = () => { throw new Error("Must not read the entire File"); };
+  ui.find(node => node.type === "input" && node.props.type === "file").props.onChange({ target: { files: [file], value: "large.html" } });
+  await ui.settle();
+  assert.equal(ui.calls.find(call => call.path === "/test-suites/import").body, file);
+  assert.ok(ui.all().some(node => node.props.role === "alert" && text(node).includes("apenas apresentação")));
+});
+
+test("base report export scopes executions, enforces one radio and downloads only selected HTML", async t => {
+  const group = { ...suiteFixture(), created_at: "2026-10-20T12:00:00Z", latest_activity: "2026-10-21T12:00:00Z", initial_status: "completed", case_count: 1, active_count: 0,
+    rounds: [
+      { id: "round/a", name: "Rodada histórica", count: 2, status: "completed", created_at: "2026-10-21T12:00:00Z" },
+      { id: "draft", name: "Não executada", count: 1, status: "draft", created_at: "2026-10-22T12:00:00Z" },
+      { id: "live", name: "Em andamento", count: 1, status: "running", created_at: "2026-10-22T12:00:00Z" },
+      { id: "empty", name: "Sem testes", count: 0, status: "failed", created_at: "2026-10-22T12:00:00Z" },
+    ], legacy_runs: [{ id: "legacy/a", count: 1, status: "completed", created_at: "2026-10-19T12:00:00Z" }] };
+  const html = '<!doctype html><html><script id="autojev-portable-v1" type="application/json">{"snapshot":"selected"}</script></html>';
+  const view = await workspace(t, group, undefined, { rootId: undefined,
+    groupsReply: [group, { ...group, id: "other-base", app_url: "https://other.invalid", rounds: [{ id: "other-round", name: "Other execution", count: 1, status: "completed" }], legacy_runs: [] }],
+    exportResponse: () => new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } }),
+  });
+  const open = async () => view.click(`Exportar relatório de fixture.invalid, criado em ${new Date(group.created_at).toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" })}`);
+  const radios = () => view.all().filter(node => node.type === "input" && node.props.type === "radio");
+  const select = async key => { const radio = radios().find(node => node.props.value === key); assert.ok(radio); assert.ok(!radio.props.disabled); radio.props.onChange(); await view.settle(); };
+  await open();
+  assert.equal(view.focus.at(-1).name, "export-dialog");
+  assert.equal(radios().length, 5);
+  assert.ok(!text(view.find(node => node.type === "dialog")).includes("Rascunho"));
+  assert.ok(!text(view.find(node => node.type === "dialog")).includes("Não executada"));
+  assert.ok(!radios().some(node => node.props.value === "round:draft"));
+  assert.ok(!radios().some(node => node.props.value.includes("other")));
+  assert.equal(new Set(radios().map(node => node.props.name)).size, 1);
+  assert.equal(view.button("Baixar HTML").props.disabled, true);
+  for (const id of ["live", "empty"]) {
+    const radio = radios().find(node => node.props.value === `round:${id}`);
+    assert.equal(radio.props.disabled, true);
+    assert.ok(view.find(node => node.props.id === radio.props["aria-describedby"]));
+  }
+  await select("initial:root-fixture"); await select("round:round/a");
+  assert.deepEqual(radios().filter(node => node.props.checked).map(node => node.props.value), ["round:round/a"]);
+  await view.click("Fechar");
+  assert.ok(!view.all().some(node => node.type === "dialog"));
+  assert.equal(view.calls.filter(call => call.path.includes("report")).length, 0);
+  await open();
+  view.find(node => node.type === "dialog").props.onCancel({ preventDefault() {} }); await view.settle();
+  assert.ok(!view.all().some(node => node.type === "dialog"));
+  for (const [key, path] of [
+    ["round:round/a", "/test-suites/root-fixture/report?scope=round&round_id=round%2Fa"],
+    ["initial:root-fixture", "/test-suites/root-fixture/report?scope=initial"],
+    ["linked:legacy/a", "/explorations/legacy%2Fa/report"],
+  ]) {
+    await open(); assert.equal(view.button("Baixar HTML").props.disabled, true);
+    await select(key); await view.click("Baixar HTML");
+    assert.equal(view.calls.findLast(call => call.path.includes("/report?")).path.replace(/([?&])export_id=[^&]+/, ""), path);
+    assert.match(text(view.find(node => node.type === "dialog")), /Relatório salvo/);
+    await view.click("Fechar");
+  }
+  assert.equal(view.downloads.length, 3);
+  assert.ok(view.downloads.every(file => file.html === html && file.filename.endsWith(".html")));
+  assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
+  assert.equal(view.calls.filter(call => call.path.includes("/report?")).length, 3);
+});
+
+test("report export rejects non HTML without downloading or executing", async t => {
+  const view = await workspace(t, { ...suiteFixture(), initial_status: "completed" }, undefined, { rootId: undefined,
+    exportResponse: () => new Response('{"report":"not HTML"}', { headers: { "content-type": "application/json" } }),
+  });
+  await view.click("Exportar relatório");
+  view.find(node => node.type === "input" && node.props.type === "radio").props.onChange(); await view.settle();
+  await view.click("Baixar HTML");
+  assert.match(text(view.find(node => node.props.role === "alert")), /HTML não está disponível/);
+  assert.equal(view.downloads.length, 0);
+  assert.equal(view.calls.filter(call => call.method !== "GET").length, 0);
+});
+
+test("export cancellation aborts request, locks selection and prevents parallel exports", async t => {
+  let signal;
+  const view = await workspace(t, { ...suiteFixture(), initial_status: "completed" }, undefined, { rootId: undefined,
+    exportResponse: options => new Promise((_, reject) => {
+      signal = options.signal;
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    }),
+  });
+  await view.click("Exportar relatório");
+  const radio = view.find(node => node.type === "input" && node.props.type === "radio");
+  radio.props.onChange(); await view.settle();
+  const start = view.button("Baixar HTML").props.onClick;
+  start(); start(); await view.settle();
+  assert.equal(view.calls.filter(call => call.path.includes("report")).length, 1);
+  assert.equal(view.find(node => node.type === "fieldset").props.disabled, true);
+  assert.match(text(view.find(node => node.type === "dialog")), /Preparando o relatório/);
+  assert.doesNotMatch(text(view.find(node => node.type === "dialog")), /Tempo decorrido|Tempo restante|bytes recebidos/);
+  assert.equal(view.find(node => node.type === "progress").props.value, undefined);
+  assert.equal(signal.aborted, false);
+  await view.click("Cancelar exportação");
+  assert.equal(signal.aborted, true);
+  assert.ok(!view.all().some(node => node.type === "dialog"));
+  assert.equal(view.downloads.length, 0);
 });

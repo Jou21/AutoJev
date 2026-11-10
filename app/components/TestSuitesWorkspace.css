@@ -607,6 +607,9 @@
 .suite-catalog-empty { padding: 25px 10px; color: var(--muted); font-size: 12px; text-align: center; }
 .suite-catalog-empty strong { color: var(--text); font-size: 14px; }
 .suite-workspace .suite-unavailable-dialog { position: fixed; inset: 0; margin: auto; width: min(580px, calc(100vw - 40px)); max-height: calc(100dvh - 48px); overflow: auto; padding: 28px; border: 1px solid var(--suite-line); border-radius: 20px; background: var(--suite-panel); color: var(--text-primary); box-shadow: 0 24px 90px #0009; }
+.suite-authentication-dialog form > label { display: grid; gap: 8px; margin-bottom: 16px; font-size: 13px; overflow-wrap: anywhere; }
+.suite-authentication-dialog form > label input { box-sizing: border-box; width: 100%; min-width: 0; min-height: 42px; padding: 10px 12px; border: 1px solid var(--suite-line); border-radius: 10px; background: var(--suite-soft); color: var(--text-primary); }
+.suite-authentication-dialog .suite-heading-actions { margin-top: 24px; }
 .suite-unavailable-dialog::backdrop { background: #0009; backdrop-filter: blur(4px); }
 .suite-unavailable-dialog h2 { margin: 0 0 12px; font-size: 21px; font-weight: 650; }
 .suite-unavailable-dialog p { margin: 0 0 20px; color: var(--muted); font-size: 13px; line-height: 1.7; }
@@ -810,3 +813,34 @@
   .suite-history-workspace .suite-round-case > .suite-status { margin-left: 24px; }
   .suite-history-workspace .suite-round-case > .button { margin-left: auto; }
 }
+
+.suite-group-export { position: relative; z-index: 2; flex-shrink: 0; }
+.suite-export-dialog { width: min(600px, calc(100vw - 32px)); box-sizing: border-box; color-scheme: dark; }
+.suite-export-heading { display: flex; align-items: center; gap: 14px; margin-bottom: 20px; }
+.suite-export-heading > div { min-width: 0; overflow-wrap: anywhere; }
+.suite-export-heading h2 { margin-bottom: 5px; }
+.suite-export-heading > div > span { color: var(--muted); font-size: 12px; }
+.suite-export-dialog fieldset { min-width: 0; margin: 0 0 24px; padding: 0; border: 0; }
+.suite-export-dialog legend { margin-bottom: 10px; color: var(--muted); font-size: 12px; }
+.suite-export-list { display: grid; gap: 10px; max-height: 40dvh; overflow: auto; padding: 4px; }
+.suite-export-option { display: flex; align-items: center; gap: 12px; padding: 14px; border: 1px solid var(--suite-line); border-radius: 12px; background: var(--suite-soft); cursor: pointer; }
+.suite-export-option:has(input:checked) { border-color: var(--suite-accent); background: #f2c45b0d; }
+.suite-export-option[data-unavailable="true"] { opacity: .6; cursor: not-allowed; }
+.suite-export-option input { flex: 0 0 16px; width: 16px; height: 16px; margin: 0; padding: 0; border: 0; border-radius: 50%; background: transparent; box-shadow: none; accent-color: var(--suite-accent); }
+.suite-workspace .suite-export-option input:focus-visible { outline: none; }
+.suite-export-option:has(input:focus-visible) { outline: 2px solid var(--suite-accent); outline-offset: 3px; }
+.suite-export-option > span:not(.suite-status) { display: grid; gap: 6px; flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 13px; }
+.suite-export-option > span > span, .suite-export-option small { color: var(--muted); font-size: 11px; line-height: 1.5; }
+@media (max-width: 1150px) and (min-width: 641px) { .suite-home .suite-group-main { flex-wrap: wrap; } .suite-group-export { margin-left: auto; } }
+@media (max-width: 640px) {
+  .suite-home .suite-group-main > .suite-group-export { grid-column: 2 / -1; grid-row: 3; justify-self: end; min-height: 32px; padding: 6px 9px; font-size: 10px; }
+  .suite-export-option { flex-wrap: wrap; gap: 9px; padding: 12px; }
+  .suite-export-option > .suite-status { margin-left: 25px; }
+}
+
+.suite-export-progress { padding: 12px; border: 1px solid var(--border); border-radius: 10px; }
+.suite-export-progress p { margin: 5px 0; }
+.suite-export-progress progress { display: block; width: 100%; margin-top: 6px; }
+.suite-export-bar { display: flex; align-items: center; gap: 12px; }
+.suite-export-bar progress { flex: 1; min-width: 0; accent-color: var(--primary); }
+.suite-export-bar span { font-variant-numeric: tabular-nums; font-size: .85rem; }

@@ -204,6 +204,20 @@ def groups(request: Request):
     return service(request).groups()
 
 
+@router.post("/import", status_code=201)
+async def import_report(request: Request):
+    trusted(request)
+    from autojev.services.portable_reports import ReportDecoder, persist
+    decoder = ReportDecoder()
+    try:
+        async for chunk in request.stream():
+            await run_in_threadpool(decoder.feed, chunk)
+        package = await run_in_threadpool(decoder.finish)
+        return await run_in_threadpool(persist, service(request).repository, package)
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise HTTPException(422, str(exc) if isinstance(exc, ValueError) else "Pacote AutoJev inválido.") from exc
+
+
 @router.get("/rounds/{plan_id}")
 def get_plan(plan_id: str, request: Request):
     return call(lambda: service(request).store.get(plan_id))
@@ -437,29 +451,53 @@ def update_plan(root_id: str, plan_id: str, body: PlanUpdateInput, request: Requ
 
 @router.get("/{root_id}/report")
 async def report(root_id: str, request: Request, scope: Literal["consolidated", "initial", "round"] = "consolidated", round_id: str | None = None,
-                 case_id: str | None = Query(default=None, min_length=1, max_length=100), preview: bool = False):
-    # The in-app preview shows every result (opening on the clicked CT, if any);
-    # its images load from the API on demand, so the full list stays light.
-    snapshot = await run_in_threadpool(lambda: call(lambda: service(request).report_snapshot(
-        root_id, scope, round_id, None if preview else case_id, case_id if preview else None)))
-    image_url = None
-    if preview:
-        # "Baixar relatório" exports what the preview shows: every CT.
-        export_query = urlencode({"scope": scope, **({"round_id": round_id} if round_id else {})})
-        snapshot["online_preview"] = {"export_path": f'/test-suites/{quote(snapshot["id"], safe="")}/report?{export_query}'}
-        base = str(request.base_url).rstrip("/")
-        image_url = lambda owner, filename: base + "/api/explorations/" + quote(owner, safe="") + "/screenshots/" + quote(filename, safe="")
-    directory = request.app.state.settings.artifact_dir / snapshot["id"]
-    directory.mkdir(parents=True, exist_ok=True)
-    # Do not overwrite a historical report or share mutable artifacts across
-    # concurrent export requests. File removal occurs after streaming finishes.
-    with NamedTemporaryFile(dir=directory, suffix=".html", delete=False) as temporary:
-        path = Path(temporary.name)
-    try:
-        await run_in_threadpool(service(request).render_report, snapshot, path, request.app.state.settings.artifact_dir, image_url)
-    except BaseException:
-        path.unlink(missing_ok=True)
-        raise
-    from starlette.background import BackgroundTask
-    return FileResponse(path, media_type="text/html; charset=utf-8", filename=f"autojev-{scope}.html",
-                        headers={"Cache-Control": "private, no-store"}, background=BackgroundTask(path.unlink, missing_ok=True))
+                 case_id: str | None = Query(default=None, min_length=1, max_length=100), preview: bool = False, export_id: str | None = None):
+    from autojev.services.report_progress import tracked_export
+
+    async def work(progress):
+        # The in-app preview shows every result (opening on the clicked CT, if any);
+        # its images load from the API on demand, so the full list stays light.
+        snapshot = await run_in_threadpool(lambda: call(lambda: service(request).report_snapshot(
+            root_id, scope, round_id, None if preview else case_id, case_id if preview else None)))
+        image_url = None
+        if preview:
+            # "Baixar relatório" exports what the preview shows: every CT.
+            export_query = urlencode({"scope": scope, **({"round_id": round_id} if round_id else {})})
+            snapshot["online_preview"] = {"export_path": f'/test-suites/{quote(snapshot["id"], safe="")}/report?{export_query}'}
+            base = str(request.base_url).rstrip("/")
+            image_url = lambda owner, filename: base + "/api/explorations/" + quote(owner, safe="") + "/screenshots/" + quote(filename, safe="")
+        directory = request.app.state.settings.artifact_dir / snapshot["id"]
+        directory.mkdir(parents=True, exist_ok=True)
+        # Do not overwrite a historical report or share mutable artifacts across
+        # concurrent export requests. File removal occurs after streaming finishes.
+        with NamedTemporaryFile(dir=directory, suffix=".html", delete=False) as temporary:
+            path = Path(temporary.name)
+        try:
+            await run_in_threadpool(service(request).render_report, snapshot, path, request.app.state.settings.artifact_dir, image_url, progress)
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+        from starlette.background import BackgroundTask
+        return FileResponse(path, media_type="text/html; charset=utf-8", filename=f"autojev-{scope}.html",
+                            headers={"Cache-Control": "private, no-store"}, background=BackgroundTask(path.unlink, missing_ok=True))
+
+    return await tracked_export(request, export_id, (root_id, scope, round_id, case_id, preview), work)
+
+
+@router.get("/report-exports/{export_id}")
+async def report_export_progress(export_id: str, request: Request):
+    progress = service(request).report_progress.entries.get(export_id)
+    if progress is None:
+        raise HTTPException(404, "Export not found")
+    from fastapi.responses import JSONResponse
+    return JSONResponse(progress.snapshot(), headers={"Cache-Control": "private, no-store"})
+
+
+@router.delete("/report-exports/{export_id}")
+async def cancel_report_export(export_id: str, request: Request):
+    progress = service(request).report_progress.entries.get(export_id)
+    if progress is None:
+        raise HTTPException(404, "Export not found")
+    if progress.snapshot()["stage"] not in {"ready", "error", "cancelled"}:
+        progress.cancelled.set()
+    return {"cancelled": progress.cancelled.is_set()}

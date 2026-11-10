@@ -1177,89 +1177,108 @@ async def cancel_visual_reviews(exploration_id: str, request: Request) -> dict[s
 
 
 @router.get("/explorations/{exploration_id}/report", response_class=HTMLResponse)
-async def get_report(exploration_id: str, request: Request) -> FileResponse:
-    try:
-        raw_path = _repository(request).get_report_path(exploration_id)
-    except NotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    if not raw_path:
-        raise HTTPException(status_code=409, detail="Report is not ready")
-    path = Path(raw_path).resolve()
-    allowed = (request.app.state.settings.artifact_dir / exploration_id).resolve()
-    if allowed not in path.parents or not path.is_file():
-        raise HTTPException(status_code=404, detail="Report artifact was not found")
-    # Existing reports are immutable evidence. Render their updated presentation
-    # to a separate artifact, retaining original verdicts and the original HTML.
-    # No browser/model calls or historical data changes are needed.
-    raw_snapshot = _repository(request).get_exploration(exploration_id)
-    snapshot = await run_in_threadpool(project_scenario_revisions, _repository(request), raw_snapshot)
-    suites = request.app.state.test_suite_service
-    if suites.root(exploration_id) == exploration_id and suites.store.cases(exploration_id):
-        snapshot = await run_in_threadpool(suites.report_snapshot, exploration_id)
-    snapshot["visual_review_resume"] = visual_review_resume_summary(raw_snapshot)
-    marker = b'data-report-summary="execution-v2"'
-    coverage_marker = b'data-coverage-ledger="execution-evidence-v1"'
-    cost_marker = b'data-cost-breakdown="roles-v1"'
-    visual_policy_marker = b'data-visual-review-policy="bounded-v1"'
-    locale_marker = f'data-report-locale="{REPORT_LOCALE_VERSION}"'.encode("ascii")
-    layout_marker = f'data-report-layout="{REPORT_LAYOUT_VERSION}"'.encode("ascii")
-    flow_marker = f'data-report-flows="{FLOW_VERSION}"'.encode("ascii")
-    snapshot_marker = f'data-report-snapshot="{report_snapshot_key(snapshot)}"'.encode("ascii")
+async def get_report(exploration_id: str, request: Request, export_id: str | None = None) -> FileResponse:
+    from autojev.services.report_progress import tracked_export
+    from starlette.background import BackgroundTask
 
-    def valid_presentation(candidate: Path) -> bool:
-        if not candidate.is_file() or allowed not in candidate.resolve().parents:
-            return False
-        with candidate.open("rb") as artifact:
-            header = artifact.read(8192)
-            if any(required not in header for required in (
-                marker, coverage_marker, cost_marker, visual_policy_marker, locale_marker, layout_marker, flow_marker, snapshot_marker,
-            )):
+    async def work(progress):
+        try:
+            raw_path = _repository(request).get_report_path(exploration_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if not raw_path:
+            raise HTTPException(status_code=409, detail="Report is not ready")
+        path = Path(raw_path).resolve()
+        allowed = (request.app.state.settings.artifact_dir / exploration_id).resolve()
+        if allowed not in path.parents or not path.is_file():
+            raise HTTPException(status_code=404, detail="Report artifact was not found")
+        # Existing reports are immutable evidence. Render their updated presentation
+        # to a separate artifact, retaining original verdicts and the original HTML.
+        # No browser/model calls or historical data changes are needed.
+        raw_snapshot = _repository(request).get_exploration(exploration_id)
+        snapshot = await run_in_threadpool(project_scenario_revisions, _repository(request), raw_snapshot)
+        suites = request.app.state.test_suite_service
+        if suites.root(exploration_id) == exploration_id and suites.store.cases(exploration_id):
+            snapshot = await run_in_threadpool(suites.report_snapshot, exploration_id)
+        snapshot["visual_review_resume"] = visual_review_resume_summary(raw_snapshot)
+        marker = b'data-report-summary="execution-v2"'
+        coverage_marker = b'data-coverage-ledger="execution-evidence-v1"'
+        cost_marker = b'data-cost-breakdown="roles-v1"'
+        visual_policy_marker = b'data-visual-review-policy="bounded-v1"'
+        locale_marker = f'data-report-locale="{REPORT_LOCALE_VERSION}"'.encode("ascii")
+        layout_marker = f'data-report-layout="{REPORT_LAYOUT_VERSION}"'.encode("ascii")
+        flow_marker = f'data-report-flows="{FLOW_VERSION}"'.encode("ascii")
+        snapshot_marker = f'data-report-snapshot="{report_snapshot_key(snapshot)}"'.encode("ascii")
+
+        def valid_presentation(candidate: Path) -> bool:
+            if not candidate.is_file() or allowed not in candidate.resolve().parents:
                 return False
-            artifact.seek(max(candidate.stat().st_size - 1024, 0))
-            return artifact.read().rstrip().endswith(b"</html>")
+            with candidate.open("rb") as artifact:
+                header = artifact.read(8192)
+                if any(required not in header for required in (
+                    marker, coverage_marker, cost_marker, visual_policy_marker, locale_marker, layout_marker, flow_marker, snapshot_marker,
+                )):
+                    return False
+                if b"autojev-portable-v1" not in header:
+                    return False
+                artifact.seek(max(candidate.stat().st_size - 1024, 0))
+                return artifact.read().rstrip().endswith(b"</html>")
 
-    def current_report() -> Path:
-        from autojev.adapters.report import StandaloneHtmlReport
+        def current_report() -> Path:
+            from autojev.adapters.report import StandaloneHtmlReport
+            from autojev.services.portable_reports import export_package
 
-        updated = allowed / "report-ct-timeline-v1.html"
-        presentation_modified = max(
-            path.stat().st_mtime,
-            Path(getfile(StandaloneHtmlReport)).stat().st_mtime,
-            Path(getfile(prepare_scenario_timelines)).stat().st_mtime,
-            Path(getfile(presentation_scenario_steps)).stat().st_mtime,
-            Path(getfile(project_scenario_revisions)).stat().st_mtime,
-            Path(getfile(coverage_restriction_ledger)).stat().st_mtime,
-            Path(getfile(execution_duration_summary)).stat().st_mtime,
-            Path(getfile(visual_review_counts)).stat().st_mtime,
-            Path(getfile(localize_report_presentation)).stat().st_mtime,
-            Path(getfile(render_premium_report)).stat().st_mtime,
-            Path(getfile(classify_case_flows)).stat().st_mtime,
-            (REPORT_ASSETS / "premium.css").stat().st_mtime,
-            (REPORT_ASSETS / "journey.css").stat().st_mtime,
-            (REPORT_ASSETS / "premium.js").stat().st_mtime,
-        )
-        if valid_presentation(path) and path.stat().st_mtime >= presentation_modified:
-            return path
-        if valid_presentation(updated) and updated.stat().st_mtime >= presentation_modified:
+            updated = allowed / "report-ct-timeline-v1.html"
+            presentation_modified = max(
+                path.stat().st_mtime,
+                Path(getfile(StandaloneHtmlReport)).stat().st_mtime,
+                Path(getfile(export_package)).stat().st_mtime,
+                Path(getfile(suites.render_report)).stat().st_mtime,
+                Path(getfile(prepare_scenario_timelines)).stat().st_mtime,
+                Path(getfile(presentation_scenario_steps)).stat().st_mtime,
+                Path(getfile(project_scenario_revisions)).stat().st_mtime,
+                Path(getfile(coverage_restriction_ledger)).stat().st_mtime,
+                Path(getfile(execution_duration_summary)).stat().st_mtime,
+                Path(getfile(visual_review_counts)).stat().st_mtime,
+                Path(getfile(localize_report_presentation)).stat().st_mtime,
+                Path(getfile(render_premium_report)).stat().st_mtime,
+                Path(getfile(classify_case_flows)).stat().st_mtime,
+                (REPORT_ASSETS / "premium.css").stat().st_mtime,
+                (REPORT_ASSETS / "journey.css").stat().st_mtime,
+                (REPORT_ASSETS / "premium.js").stat().st_mtime,
+            )
+            if progress is None and valid_presentation(path) and path.stat().st_mtime >= presentation_modified:
+                return path
+            if progress is None and valid_presentation(updated) and updated.stat().st_mtime >= presentation_modified:
+                return updated
+
+            # A separate temporary artifact and atomic rename avoid serving a
+            # partially written HTML when two report requests arrive together.
+            with NamedTemporaryFile(dir=allowed, suffix=".html", delete=False) as temporary:
+                temporary_path = Path(temporary.name)
+            try:
+                suites.render_report(snapshot, temporary_path, request.app.state.settings.artifact_dir, progress=progress)
+                if progress is None:
+                    temporary_path.replace(updated)
+                else:
+                    return temporary_path
+            except BaseException:
+                temporary_path.unlink(missing_ok=True)
+                raise
+            finally:
+                if progress is None:
+                    temporary_path.unlink(missing_ok=True)
             return updated
 
-        # A separate temporary artifact and atomic rename avoid serving a
-        # partially written HTML when two report requests arrive together.
-        with NamedTemporaryFile(dir=allowed, suffix=".html", delete=False) as temporary:
-            temporary_path = Path(temporary.name)
-        try:
-            suites.render_report(snapshot, temporary_path, request.app.state.settings.artifact_dir)
-            temporary_path.replace(updated)
-        finally:
-            temporary_path.unlink(missing_ok=True)
-        return updated
+        # Encoding many local captures should not block the exploration's async
+        # browser/CT pipeline while the user opens a historical report.
+        path = await run_in_threadpool(current_report)
+        return FileResponse(path, media_type="text/html; charset=utf-8", filename="report.html",
+                            headers={"Cache-Control": "private, no-store", "Pragma": "no-cache"},
+                            background=BackgroundTask(path.unlink, missing_ok=True) if progress else None)
 
-    # Encoding many local captures should not block the exploration's async
-    # browser/CT pipeline while the user opens a historical report.
-    path = await run_in_threadpool(current_report)
-    return FileResponse(path, media_type="text/html; charset=utf-8", filename="report.html",
-                        headers={"Cache-Control": "private, no-store", "Pragma": "no-cache"})
 
+    return await tracked_export(request, export_id, (exploration_id,), work)
 
 @router.get("/explorations/{exploration_id}/screenshots/{filename:path}")
 async def get_screenshot(
